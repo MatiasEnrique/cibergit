@@ -1,1 +1,394 @@
-//! Personal views, persisted workspace, and refresh scheduling.
+//! Personal workspace state and account-partitioned offline data.
+use crate::domain::{Comparison, PullRequest, Repository, Revision};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Filter {
+    pub search: String,
+    pub author: String,
+    pub reviewer: String,
+    pub assignee: String,
+    pub label: String,
+    pub draft: Option<bool>,
+    pub review_status: String,
+    pub check_status: String,
+    pub target_branch: String,
+    pub source_branch: String,
+    pub personal: PersonalFilter,
+    /// open, closed, merged or all.
+    pub state: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersonalFilter {
+    #[default]
+    All,
+    ReviewRequested,
+    Own,
+    Participating,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupBy {
+    Repository,
+    TargetBranch,
+    SourceBranch,
+    SourcePrefix(String),
+    Stack,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedView {
+    pub name: String,
+    pub filter: Filter,
+    pub groups: Vec<GroupBy>,
+}
+impl Default for SavedView {
+    fn default() -> Self {
+        Self {
+            name: "All open pull requests".into(),
+            filter: Filter::default(),
+            groups: vec![GroupBy::Repository],
+        }
+    }
+}
+impl Filter {
+    pub fn matches(&self, pr: &PullRequest, login: &str) -> bool {
+        let state = if self.state.is_empty() {
+            "open"
+        } else {
+            &self.state
+        };
+        let search = self.search.to_lowercase();
+        let includes = |items: &[String], value: &str| {
+            value.is_empty() || items.iter().any(|s| s.eq_ignore_ascii_case(value))
+        };
+        let equals = |actual: &str, expected: &str| {
+            expected.is_empty() || actual.eq_ignore_ascii_case(expected)
+        };
+        (state == "all" || pr.state.eq_ignore_ascii_case(state))
+            && (search.is_empty()
+                || format!("{} #{} {}", pr.title, pr.number, pr.source_branch)
+                    .to_lowercase()
+                    .contains(&search))
+            && equals(&pr.author, &self.author)
+            && includes(&pr.reviewers, &self.reviewer)
+            && includes(&pr.assignees, &self.assignee)
+            && includes(&pr.labels, &self.label)
+            && self.draft.is_none_or(|draft| pr.draft == draft)
+            && equals(&pr.review_status, &self.review_status)
+            && equals(&pr.check_status, &self.check_status)
+            && equals(&pr.target_branch, &self.target_branch)
+            && equals(&pr.source_branch, &self.source_branch)
+            && match self.personal {
+                PersonalFilter::All => true,
+                PersonalFilter::ReviewRequested => {
+                    !login.is_empty() && includes(&pr.reviewers, login)
+                }
+                PersonalFilter::Own => !login.is_empty() && pr.author.eq_ignore_ascii_case(login),
+                PersonalFilter::Participating => {
+                    !login.is_empty()
+                        && (pr.author.eq_ignore_ascii_case(login)
+                            || includes(&pr.reviewers, login)
+                            || includes(&pr.assignees, login))
+                }
+            }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TabState {
+    pub repository_key: String,
+    pub number: u64,
+    pub revision: Revision,
+    pub selected_file: Option<String>,
+    pub scroll_offset: f32,
+    pub diff_mode: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceState {
+    pub schema_version: u32,
+    pub repositories: Vec<Repository>,
+    pub views: Vec<SavedView>,
+    pub selected_view: usize,
+    pub tabs: Vec<TabState>,
+    pub active_tab: Option<usize>,
+}
+impl Default for WorkspaceState {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            repositories: vec![],
+            views: vec![SavedView::default()],
+            selected_view: 0,
+            tabs: vec![],
+            active_tab: None,
+        }
+    }
+}
+impl WorkspaceState {
+    pub fn add_repository(&mut self, repository: Repository) {
+        if !self
+            .repositories
+            .iter()
+            .any(|r| r.cache_key() == repository.cache_key())
+        {
+            self.repositories.push(repository);
+        }
+    }
+    pub fn view(&self) -> SavedView {
+        self.views
+            .get(self.selected_view)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Local-only data store. Cache keys include explicit repository account identity.
+#[derive(Clone)]
+pub struct Store {
+    root: PathBuf,
+}
+impl Store {
+    pub fn open_default() -> Result<Self> {
+        let home = std::env::var_os("HOME").context("Cannot locate application data directory")?;
+        Self::open(PathBuf::from(home).join("Library/Application Support/cibergit"))
+    }
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        fs::create_dir_all(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        Ok(Self { root })
+    }
+    fn cache_path(&self, repo: &Repository, key: &str) -> PathBuf {
+        let digest = Sha256::digest(format!("{}\n{key}", repo.cache_key()));
+        self.root.join(format!("{:x}.json", digest))
+    }
+    pub fn load_workspace(&self) -> Result<WorkspaceState> {
+        let path = self.root.join("workspace.json");
+        if !path.exists() {
+            return Ok(WorkspaceState::default());
+        }
+        let workspace: WorkspaceState = read_json(&path)?;
+        if workspace.schema_version != 1 {
+            bail!("Workspace was saved by an unsupported application version");
+        }
+        Ok(workspace)
+    }
+    pub fn save_workspace(&self, state: &WorkspaceState) -> Result<()> {
+        write_json(&self.root.join("workspace.json"), state)
+    }
+    pub fn save_pull_requests(&self, repo: &Repository, prs: &[PullRequest]) -> Result<()> {
+        write_json(&self.cache_path(repo, "prs"), &prs)
+    }
+    pub fn load_pull_requests(&self, repo: &Repository) -> Result<Vec<PullRequest>> {
+        read_json(&self.cache_path(repo, "prs"))
+    }
+    pub fn save_comparison(
+        &self,
+        repo: &Repository,
+        number: u64,
+        comparison: &Comparison,
+    ) -> Result<()> {
+        write_json(
+            &self.cache_path(
+                repo,
+                &format!(
+                    "pr/{number}/{}/{}",
+                    comparison.revision.base_sha, comparison.revision.head_sha
+                ),
+            ),
+            comparison,
+        )
+    }
+    pub fn load_comparison(
+        &self,
+        repo: &Repository,
+        number: u64,
+        revision: &Revision,
+    ) -> Result<Comparison> {
+        read_json(&self.cache_path(
+            repo,
+            &format!("pr/{number}/{}/{}", revision.base_sha, revision.head_sha),
+        ))
+    }
+    /// Drafts are separate from disposable comparison caches and never auto-published.
+    pub fn save_draft(&self, repo: &Repository, number: u64, key: &str, text: &str) -> Result<()> {
+        write_json(
+            &self.cache_path(repo, &format!("draft/{number}/{key}")),
+            &text,
+        )
+    }
+    pub fn load_draft(&self, repo: &Repository, number: u64, key: &str) -> Result<String> {
+        read_json(&self.cache_path(repo, &format!("draft/{number}/{key}")))
+    }
+}
+fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    Ok(serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("Read {}", path.display()))?,
+    )?)
+}
+fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), stamp));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Groups are ordered paths; ambiguous branch dependencies remain explicitly labelled.
+pub fn group_path(
+    repo: &Repository,
+    pr: &PullRequest,
+    groups: &[GroupBy],
+    prs: &[PullRequest],
+) -> Vec<String> {
+    groups
+        .iter()
+        .map(|group| match group {
+            GroupBy::Repository => format!("{} · {}", repo.full_name(), repo.account.login),
+            GroupBy::TargetBranch => pr.target_branch.clone(),
+            GroupBy::SourceBranch => pr.source_branch.clone(),
+            GroupBy::SourcePrefix(prefix) => {
+                if pr.source_branch.starts_with(prefix) {
+                    prefix.clone()
+                } else {
+                    "Other branches".into()
+                }
+            }
+            GroupBy::Stack => {
+                let parents: Vec<_> = prs
+                    .iter()
+                    .filter(|p| p.source_branch == pr.target_branch && p.number != pr.number)
+                    .collect();
+                match parents.as_slice() {
+                    [] => format!("{} (inferred root)", pr.source_branch),
+                    [parent] => format!("{} (inferred)", parent.source_branch),
+                    _ => "Ambiguous stack".into(),
+                }
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+pub struct PollSchedule {
+    pub active_pr: Duration,
+    pub sidebar: Duration,
+    failures: BTreeMap<String, u32>,
+}
+impl Default for PollSchedule {
+    fn default() -> Self {
+        Self {
+            active_pr: Duration::from_secs(15),
+            sidebar: Duration::from_secs(60),
+            failures: BTreeMap::new(),
+        }
+    }
+}
+impl PollSchedule {
+    pub fn delay(&self, key: &str, active_pr: bool, focused: bool) -> Duration {
+        let base = if active_pr {
+            self.active_pr
+        } else {
+            self.sidebar
+        };
+        base * (1u32 << self.failures.get(key).copied().unwrap_or(0).min(5))
+            * if focused { 1 } else { 4 }
+    }
+    pub fn failed(&mut self, key: &str) {
+        *self.failures.entry(key.into()).or_default() += 1;
+    }
+    pub fn succeeded(&mut self, key: &str) {
+        self.failures.remove(key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn repo(login: &str) -> Repository {
+        Repository {
+            host: "github.com".into(),
+            owner: "o".into(),
+            name: "r".into(),
+            account: crate::domain::Account {
+                host: "github.com".into(),
+                login: login.into(),
+            },
+            local_path: None,
+        }
+    }
+    #[test]
+    fn cache_and_drafts_are_account_partitioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .save_draft(&repo("one"), 1, "line", "unfinished")
+            .unwrap();
+        assert_eq!(
+            store.load_draft(&repo("one"), 1, "line").unwrap(),
+            "unfinished"
+        );
+        assert!(store.load_draft(&repo("two"), 1, "line").is_err());
+        let mut state = WorkspaceState::default();
+        state.add_repository(repo("one"));
+        state.add_repository(repo("two"));
+        store.save_workspace(&state).unwrap();
+        assert_eq!(store.load_workspace().unwrap().repositories.len(), 2);
+    }
+    #[test]
+    fn default_view_is_open_and_personal_filters_use_identity() {
+        let pr = PullRequest {
+            state: "OPEN".into(),
+            author: "me".into(),
+            title: "Improve parser".into(),
+            number: 42,
+            ..Default::default()
+        };
+        assert!(Filter::default().matches(&pr, "me"));
+        assert!(
+            !Filter {
+                personal: PersonalFilter::ReviewRequested,
+                ..Default::default()
+            }
+            .matches(&pr, "me")
+        );
+        assert!(
+            Filter {
+                search: "#42".into(),
+                personal: PersonalFilter::Own,
+                ..Default::default()
+            }
+            .matches(&pr, "me")
+        );
+    }
+    #[test]
+    fn backoff_does_not_change_poll_defaults() {
+        let mut p = PollSchedule::default();
+        assert_eq!(p.delay("pr", true, true), Duration::from_secs(15));
+        p.failed("pr");
+        assert_eq!(p.delay("pr", true, true), Duration::from_secs(30));
+        p.succeeded("pr");
+        assert_eq!(p.delay("pr", true, true), Duration::from_secs(15));
+    }
+}
