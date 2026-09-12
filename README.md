@@ -27,3 +27,7 @@ Git and `gh` are user-installed prerequisites. Cibergit has no hosted service. G
 ## Decision status
 
 The documentation distinguishes agreed requirements, verified upstream constraints, and proposed implementation details. The final interview round was not answered except for Apple Silicon coverage. Its remaining proposals are recorded as unresolved, not approved requirements.
+
+## Development
+
+Implementation has started under [the coordinator brief](docs/implementation-coordinator.md). See [build/run instructions](docs/build.md) for the current native editor foundation. The V1 scope below remains pending until its acceptance evidence is recorded.

@@ -1,0 +1,19 @@
+[package]
+name = "cibergit"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A native macOS pull request workspace"
+publish = false
+
+[features]
+ui-smoke = ["gpui/test-support", "gpui_platform/test-support"]
+
+[dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.1" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.1", features = ["font-kit", "runtime_shaders"] }
+gpui-base = "=0.6.1"
+anyhow = "1"
+
+[profile.dev]
+debug = 1
