@@ -806,6 +806,11 @@ dependencies = [
  "gpui-base",
  "gpui-pre",
  "gpui-pre-platform",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smol",
+ "tempfile",
 ]
 
 [[package]]
