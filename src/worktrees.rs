@@ -307,6 +307,12 @@ struct StoredOperation {
     checkout_path: PathBuf,
     object_repository: Option<PathBuf>,
     expected_common_git_dir: Option<PathBuf>,
+    #[serde(default)]
+    managed_repository: Option<StoredManagedRepository>,
+    #[serde(default)]
+    repository_device: Option<u64>,
+    #[serde(default)]
+    repository_inode: Option<u64>,
     checkout_device: Option<u64>,
     checkout_inode: Option<u64>,
     start_oid: Option<String>,
@@ -326,11 +332,28 @@ impl StoredOperation {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredManagedRepository {
+    provider: String,
+    host: String,
+    account: String,
+    repository: String,
+    origin_url: String,
+    root: PathBuf,
+    git_dir: PathBuf,
+    common_git_dir: PathBuf,
+    root_identity: FilesystemIdentity,
+    git_dir_identity: FilesystemIdentity,
+    common_git_dir_identity: FilesystemIdentity,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredState {
     schema_version: u32,
     associations: BTreeMap<String, CheckoutAssociation>,
     operations: BTreeMap<String, StoredOperation>,
+    #[serde(default)]
+    managed_repositories: BTreeMap<String, StoredManagedRepository>,
 }
 
 impl Default for StoredState {
@@ -339,6 +362,7 @@ impl Default for StoredState {
             schema_version: SCHEMA_VERSION,
             associations: BTreeMap::new(),
             operations: BTreeMap::new(),
+            managed_repositories: BTreeMap::new(),
         }
     }
 }
@@ -514,22 +538,28 @@ impl WorktreeManager {
             .join(format!("{}.repo", repository_storage_key(&request.key)));
         let checkout_path = self.checkout_path(&request.key);
         require_missing_path(&checkout_path)?;
-        let existing_repository = if path_exists_no_follow(&repository_path)? {
+        let (existing_repository, existing_provenance) = if path_exists_no_follow(&repository_path)?
+        {
             reject_symlink_or_non_directory(&repository_path)?;
             let repository = LocalGit::open(&repository_path)?;
-            if !state_proves_managed_repository(&state, &repository_path, &repository)? {
+            let Some(provenance) = state_proves_managed_repository(
+                &state,
+                &request.key,
+                &request.repository_url,
+                &repository_path,
+                &repository,
+            )?
+            else {
                 return Err(WorktreeError::InvalidInput(
                     "existing repository path is not proven application-owned",
                 ));
-            }
-            if read_origin_url(&repository)? != request.repository_url {
-                return Err(WorktreeError::InvalidInput(
-                    "application-owned repository has a different origin URL",
-                ));
-            }
-            Some(repository)
+            };
+            state
+                .managed_repositories
+                .insert(repository_storage_key(&request.key), provenance.clone());
+            (Some(repository), Some(provenance))
         } else {
-            None
+            (None, None)
         };
         let operation = StoredOperation {
             id: operation_id(&request.key, OperationAction::Provision),
@@ -541,6 +571,13 @@ impl WorktreeManager {
             expected_common_git_dir: existing_repository
                 .as_ref()
                 .map(|repository| repository.common_git_dir().to_path_buf()),
+            managed_repository: existing_provenance.clone(),
+            repository_device: existing_provenance
+                .as_ref()
+                .map(|provenance| provenance.root_identity.device),
+            repository_inode: existing_provenance
+                .as_ref()
+                .map(|provenance| provenance.root_identity.inode),
             checkout_device: None,
             checkout_inode: None,
             start_oid: Some(request.exact_head_oid.clone()),
@@ -557,6 +594,11 @@ impl WorktreeManager {
         let (device, inode) = self.reserve_checkout_path(&operation.checkout_path)?;
         operation.checkout_device = Some(device);
         operation.checkout_inode = Some(inode);
+        if existing_repository.is_none() {
+            let identity = self.reserve_repository_path(&repository_path)?;
+            operation.repository_device = Some(identity.device);
+            operation.repository_inode = Some(identity.inode);
+        }
         state
             .operations
             .insert(storage_key(&request.key), operation.clone());
@@ -590,13 +632,62 @@ impl WorktreeManager {
                 if let Err(error) = clone_result {
                     return Err(uncertain(operation, WorktreeError::LocalGit(error)));
                 }
+                match operation_repository_identity_matches(&operation) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(uncertain(
+                            operation,
+                            WorktreeError::InvalidInput(
+                                "managed repository reservation changed during clone",
+                            ),
+                        ));
+                    }
+                    Err(error) => return Err(uncertain(operation, error)),
+                }
                 match LocalGit::open(&repository_path) {
                     Ok(repository) => repository,
                     Err(error) => return Err(uncertain(operation, error.into())),
                 }
             }
         };
+        let provenance = if let Some(provenance) = operation.managed_repository.clone() {
+            match managed_repository_matches(
+                &provenance,
+                &request.key,
+                &request.repository_url,
+                &repository_path,
+                &repository,
+            ) {
+                Ok(true) => provenance,
+                Ok(false) => {
+                    return Err(uncertain(
+                        operation,
+                        WorktreeError::InvalidInput(
+                            "application-owned repository identity changed before Git started",
+                        ),
+                    ));
+                }
+                Err(error) => return Err(uncertain(operation, error)),
+            }
+        } else {
+            match capture_managed_repository(&request.key, &request.repository_url, &repository) {
+                Ok(provenance) => provenance,
+                Err(error) => return Err(uncertain(operation, error)),
+            }
+        };
+        if !operation_repository_provenance_matches(&operation, &provenance) {
+            return Err(uncertain(
+                operation,
+                WorktreeError::InvalidInput(
+                    "managed repository reservation changed before provenance was recorded",
+                ),
+            ));
+        }
         operation.expected_common_git_dir = Some(repository.common_git_dir().to_path_buf());
+        operation.managed_repository = Some(provenance.clone());
+        state
+            .managed_repositories
+            .insert(repository_storage_key(&request.key), provenance.clone());
         state
             .operations
             .insert(storage_key(&request.key), operation.clone());
@@ -607,6 +698,24 @@ impl WorktreeManager {
             Ok(guard) => guard,
             Err(error) => return Err(uncertain(operation, error.into())),
         };
+        match managed_repository_matches(
+            &provenance,
+            &request.key,
+            &request.repository_url,
+            &repository_path,
+            &repository,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(uncertain(
+                    operation,
+                    WorktreeError::InvalidInput(
+                        "application-owned repository identity changed before Git started",
+                    ),
+                ));
+            }
+            Err(error) => return Err(uncertain(operation, error)),
+        }
         let synthetic_ref = format!("refs/cibergit/fetched/{}", storage_key(&request.key));
         let refspec = format!("+{}:{synthetic_ref}", request.fetch_ref);
         if let Err(error) = repository.run_worktree_command(
@@ -711,6 +820,29 @@ impl WorktreeManager {
                 let Some(object_repository) = operation.object_repository.clone() else {
                     return Ok(ReconcileOutcome::Incomplete(operation.report()));
                 };
+                if !operation_repository_identity_matches(&operation)? {
+                    return Ok(ReconcileOutcome::Incomplete(operation.report()));
+                }
+                let managed_provenance = if operation.action == OperationAction::Provision {
+                    let Some(provenance) = operation.managed_repository.clone() else {
+                        return Ok(ReconcileOutcome::Incomplete(operation.report()));
+                    };
+                    let Ok(repository) = LocalGit::open(&object_repository) else {
+                        return Ok(ReconcileOutcome::Incomplete(operation.report()));
+                    };
+                    if !managed_repository_matches(
+                        &provenance,
+                        &operation.key,
+                        &provenance.origin_url,
+                        &object_repository,
+                        &repository,
+                    )? {
+                        return Ok(ReconcileOutcome::Incomplete(operation.report()));
+                    }
+                    Some(provenance)
+                } else {
+                    None
+                };
                 if !worktree_record_contains(&object_repository, checkout.root())? {
                     return Ok(ReconcileOutcome::Incomplete(operation.report()));
                 }
@@ -729,6 +861,11 @@ impl WorktreeManager {
                 state
                     .associations
                     .insert(storage_key.clone(), association.clone());
+                if let Some(provenance) = managed_provenance {
+                    state
+                        .managed_repositories
+                        .insert(repository_storage_key(key), provenance);
+                }
                 state.operations.remove(&storage_key);
                 save_state(&self.store_path, &state)?;
                 self.remove_claim(&operation)?;
@@ -807,7 +944,38 @@ impl WorktreeManager {
                 CleanupBlocker::IdentityChanged,
             ));
         }
+        let managed_provenance = if self.is_managed_repository_path(repository.root()) {
+            let origin_url = read_origin_url(&repository)?;
+            let Some(provenance) = state_proves_managed_repository(
+                &state,
+                key,
+                &origin_url,
+                &creation.object_repository,
+                &repository,
+            )?
+            else {
+                return Err(WorktreeError::CleanupRefused(
+                    CleanupBlocker::IdentityChanged,
+                ));
+            };
+            Some(provenance)
+        } else {
+            None
+        };
         let git_guard = repository.lock_common_git()?;
+        if let Some(provenance) = &managed_provenance
+            && !managed_repository_matches(
+                provenance,
+                key,
+                &provenance.origin_url,
+                &creation.object_repository,
+                &repository,
+            )?
+        {
+            return Err(WorktreeError::CleanupRefused(
+                CleanupBlocker::IdentityChanged,
+            ));
+        }
         if let CleanupEligibility::Ineligible(blocker) =
             cleanup_eligibility(&association, exact_known_published_head)?
         {
@@ -821,6 +989,13 @@ impl WorktreeManager {
             checkout_path: association.path.clone(),
             object_repository: Some(creation.object_repository.clone()),
             expected_common_git_dir: Some(association.common_git_dir.clone()),
+            managed_repository: managed_provenance.clone(),
+            repository_device: managed_provenance
+                .as_ref()
+                .map(|provenance| provenance.root_identity.device),
+            repository_inode: managed_provenance
+                .as_ref()
+                .map(|provenance| provenance.root_identity.inode),
             checkout_device: Some(association.checkout_identity.device),
             checkout_inode: Some(association.checkout_identity.inode),
             start_oid: None,
@@ -828,6 +1003,11 @@ impl WorktreeManager {
             intended_remote_branch: association.intended_remote_branch.clone(),
             published_head: exact_known_published_head.map(str::to_owned),
         };
+        if let Some(provenance) = &managed_provenance {
+            state
+                .managed_repositories
+                .insert(repository_storage_key(key), provenance.clone());
+        }
         state
             .operations
             .insert(storage_key.clone(), operation.clone());
@@ -838,6 +1018,24 @@ impl WorktreeManager {
             .insert(storage_key.clone(), operation.clone());
         if let Err(error) = save_state(&self.store_path, &state) {
             return Err(uncertain(operation, error));
+        }
+        if let Some(provenance) = &managed_provenance {
+            match managed_repository_matches(
+                provenance,
+                key,
+                &provenance.origin_url,
+                &creation.object_repository,
+                &repository,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(uncertain(
+                        operation,
+                        WorktreeError::CleanupRefused(CleanupBlocker::IdentityChanged),
+                    ));
+                }
+                Err(error) => return Err(uncertain(operation, error)),
+            }
         }
         if let CleanupEligibility::Ineligible(blocker) =
             cleanup_eligibility(&association, exact_known_published_head)?
@@ -905,6 +1103,7 @@ impl WorktreeManager {
             &checkout_path,
             None,
         )?;
+        let repository_identity = FilesystemIdentity::read(repository.root())?;
         let mut operation = StoredOperation {
             id: operation_id(&request.key, OperationAction::Create),
             key: request.key.clone(),
@@ -913,6 +1112,9 @@ impl WorktreeManager {
             checkout_path: checkout_path.clone(),
             object_repository: Some(repository.root().to_path_buf()),
             expected_common_git_dir: Some(repository.common_git_dir().to_path_buf()),
+            managed_repository: None,
+            repository_device: Some(repository_identity.device),
+            repository_inode: Some(repository_identity.inode),
             checkout_device: None,
             checkout_inode: None,
             start_oid: Some(request.start_oid.clone()),
@@ -1006,6 +1208,18 @@ impl WorktreeManager {
                 WorktreeError::InvalidInput("created worktree did not retain its requested start"),
             ));
         }
+        match operation_repository_identity_matches(&operation) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(uncertain(
+                    operation,
+                    WorktreeError::InvalidInput(
+                        "created worktree belongs to an unexpected object repository",
+                    ),
+                ));
+            }
+            Err(error) => return Err(uncertain(operation, error)),
+        }
         match worktree_record_contains(&object_repository, checkout.root()) {
             Ok(true) => {}
             Ok(false) => {
@@ -1054,6 +1268,28 @@ impl WorktreeManager {
 
     fn is_managed_checkout_path(&self, path: &Path) -> bool {
         path.parent() == Some(self.managed_root.join("worktrees").as_path())
+    }
+
+    fn is_managed_repository_path(&self, path: &Path) -> bool {
+        path.parent() == Some(self.managed_root.join("repositories").as_path())
+    }
+
+    fn reserve_repository_path(&self, path: &Path) -> Result<FilesystemIdentity> {
+        fs::create_dir(path).map_err(io("reserve managed repository directory"))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(io("make managed repository directory private"))?;
+        sync_directory(path.parent().expect("repository path has parent"))?;
+        let identity = FilesystemIdentity::read(path)?;
+        if fs::read_dir(path)
+            .map_err(io("inspect managed repository reservation"))?
+            .next()
+            .is_some()
+        {
+            return Err(WorktreeError::InvalidInput(
+                "managed repository reservation is not empty",
+            ));
+        }
+        Ok(identity)
     }
 
     fn reserve_checkout_path(&self, path: &Path) -> Result<(u64, u64)> {
@@ -1452,12 +1688,53 @@ fn read_origin_url(repository: &LocalGit) -> Result<String> {
 
 fn state_proves_managed_repository(
     state: &StoredState,
+    key: &AssociationKey,
+    origin_url: &str,
     repository_path: &Path,
     repository: &LocalGit,
-) -> Result<bool> {
+) -> Result<Option<StoredManagedRepository>> {
+    let partition = repository_storage_key(key);
+    if let Some(provenance) = state.managed_repositories.get(&partition) {
+        return if managed_repository_matches(
+            provenance,
+            key,
+            origin_url,
+            repository_path,
+            repository,
+        )? {
+            Ok(Some(provenance.clone()))
+        } else {
+            Ok(None)
+        };
+    }
+
+    for operation in state.operations.values().filter(|operation| {
+        operation.action == OperationAction::Provision
+            && operation.object_repository.as_deref() == Some(repository_path)
+    }) {
+        let Some(provenance) = operation.managed_repository.as_ref() else {
+            continue;
+        };
+        return if managed_repository_matches(
+            provenance,
+            key,
+            origin_url,
+            repository_path,
+            repository,
+        )? {
+            Ok(Some(provenance.clone()))
+        } else {
+            Ok(None)
+        };
+    }
+
+    // Compatibility for state written before repository provenance became a
+    // first-class record. The durable managed association and its saved common
+    // directory identity are the proof; the managed path alone is not.
     let common_identity = FilesystemIdentity::read(repository.common_git_dir())?;
     let association_proves = state.associations.values().any(|association| {
         association.ownership == CheckoutOwnership::AppManaged
+            && same_repository_scope(&association.key, key)
             && association
                 .creation
                 .as_ref()
@@ -1465,12 +1742,66 @@ fn state_proves_managed_repository(
             && association.common_git_dir == repository.common_git_dir()
             && association.common_git_dir_identity == common_identity
     });
-    let operation_proves = state.operations.values().any(|operation| {
-        operation.action == OperationAction::Provision
-            && operation.object_repository.as_deref() == Some(repository_path)
-            && operation.expected_common_git_dir.as_deref() == Some(repository.common_git_dir())
-    });
-    Ok(association_proves || operation_proves)
+    if association_proves {
+        capture_managed_repository(key, origin_url, repository).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn capture_managed_repository(
+    key: &AssociationKey,
+    origin_url: &str,
+    repository: &LocalGit,
+) -> Result<StoredManagedRepository> {
+    if read_origin_url(repository)? != origin_url {
+        return Err(WorktreeError::InvalidInput(
+            "application-owned repository has a different origin URL",
+        ));
+    }
+    Ok(StoredManagedRepository {
+        provider: key.provider.clone(),
+        host: key.host.clone(),
+        account: key.account.clone(),
+        repository: key.repository.clone(),
+        origin_url: origin_url.to_owned(),
+        root: repository.root().to_path_buf(),
+        git_dir: repository.git_dir().to_path_buf(),
+        common_git_dir: repository.common_git_dir().to_path_buf(),
+        root_identity: FilesystemIdentity::read(repository.root())?,
+        git_dir_identity: FilesystemIdentity::read(repository.git_dir())?,
+        common_git_dir_identity: FilesystemIdentity::read(repository.common_git_dir())?,
+    })
+}
+
+fn managed_repository_matches(
+    provenance: &StoredManagedRepository,
+    key: &AssociationKey,
+    origin_url: &str,
+    repository_path: &Path,
+    repository: &LocalGit,
+) -> Result<bool> {
+    Ok(provenance.provider == key.provider
+        && provenance.host == key.host
+        && provenance.account == key.account
+        && provenance.repository == key.repository
+        && provenance.origin_url == origin_url
+        && provenance.root == repository_path
+        && provenance.root == repository.root()
+        && provenance.git_dir == repository.git_dir()
+        && provenance.common_git_dir == repository.common_git_dir()
+        && provenance.root_identity == FilesystemIdentity::read(repository.root())?
+        && provenance.git_dir_identity == FilesystemIdentity::read(repository.git_dir())?
+        && provenance.common_git_dir_identity
+            == FilesystemIdentity::read(repository.common_git_dir())?
+        && read_origin_url(repository)? == origin_url)
+}
+
+fn same_repository_scope(left: &AssociationKey, right: &AssociationKey) -> bool {
+    left.provider == right.provider
+        && left.host == right.host
+        && left.account == right.account
+        && left.repository == right.repository
 }
 
 fn worktree_record_contains(repository_path: &Path, checkout_path: &Path) -> Result<bool> {
@@ -1508,6 +1839,31 @@ fn operation_checkout_identity_matches(operation: &StoredOperation) -> Result<bo
         && metadata.is_dir()
         && metadata.dev() == expected_device
         && metadata.ino() == expected_inode)
+}
+
+fn operation_repository_identity_matches(operation: &StoredOperation) -> Result<bool> {
+    let (Some(repository_path), Some(expected_device), Some(expected_inode)) = (
+        operation.object_repository.as_ref(),
+        operation.repository_device,
+        operation.repository_inode,
+    ) else {
+        return Ok(false);
+    };
+    let metadata = fs::symlink_metadata(repository_path)
+        .map_err(io("revalidate managed repository ownership"))?;
+    Ok(!metadata.file_type().is_symlink()
+        && metadata.is_dir()
+        && metadata.dev() == expected_device
+        && metadata.ino() == expected_inode)
+}
+
+fn operation_repository_provenance_matches(
+    operation: &StoredOperation,
+    provenance: &StoredManagedRepository,
+) -> bool {
+    operation.object_repository.as_ref() == Some(&provenance.root)
+        && operation.repository_device == Some(provenance.root_identity.device)
+        && operation.repository_inode == Some(provenance.root_identity.inode)
 }
 
 fn validate_request_context(
@@ -1631,11 +1987,20 @@ fn storage_key(key: &AssociationKey) -> String {
 }
 
 fn repository_storage_key(key: &AssociationKey) -> String {
+    repository_storage_key_parts(&key.provider, &key.host, &key.account, &key.repository)
+}
+
+fn repository_storage_key_parts(
+    provider: &str,
+    host: &str,
+    account: &str,
+    repository: &str,
+) -> String {
     format!(
         "{:x}",
         Sha256::digest(format!(
             "{}\n{}\n{}\n{}",
-            key.provider, key.host, key.account, key.repository
+            provider, host, account, repository
         ))
     )
 }
@@ -1688,6 +2053,7 @@ fn validate_state(state: &StoredState) -> Result<()> {
     if state.schema_version != SCHEMA_VERSION
         || state.associations.len() > MAX_RECORDS
         || state.operations.len() > MAX_RECORDS
+        || state.managed_repositories.len() > MAX_RECORDS
     {
         return Err(WorktreeError::Store(
             "worktree store violates schema bounds".into(),
@@ -1733,6 +2099,27 @@ fn validate_state(state: &StoredState) -> Result<()> {
         if let Some(path) = &operation.object_repository {
             validate_stored_absolute_path(path)?;
         }
+        if let Some(provenance) = &operation.managed_repository {
+            validate_stored_managed_repository(provenance)?;
+            if !same_repository_scope_fields(provenance, &operation.key)
+                || operation.object_repository.as_ref() != Some(&provenance.root)
+                || operation.expected_common_git_dir.as_ref() != Some(&provenance.common_git_dir)
+                || !operation_repository_provenance_matches(operation, provenance)
+                || !matches!(
+                    operation.action,
+                    OperationAction::Provision | OperationAction::Remove
+                )
+            {
+                return Err(WorktreeError::Store(
+                    "worktree operation has inconsistent repository provenance".into(),
+                ));
+            }
+        }
+        if operation.repository_device.is_some() != operation.repository_inode.is_some() {
+            return Err(WorktreeError::Store(
+                "worktree operation has an incomplete repository identity".into(),
+            ));
+        }
         if operation.checkout_device.is_some() != operation.checkout_inode.is_some() {
             return Err(WorktreeError::Store(
                 "worktree operation has an incomplete path identity".into(),
@@ -1751,7 +2138,47 @@ fn validate_state(state: &StoredState) -> Result<()> {
             validate_oid(oid)?;
         }
     }
+    for (partition, provenance) in &state.managed_repositories {
+        validate_stored_managed_repository(provenance)?;
+        if partition
+            != &repository_storage_key_parts(
+                &provenance.provider,
+                &provenance.host,
+                &provenance.account,
+                &provenance.repository,
+            )
+        {
+            return Err(WorktreeError::Store(
+                "managed repository is stored in the wrong partition".into(),
+            ));
+        }
+    }
     Ok(())
+}
+
+fn validate_stored_managed_repository(provenance: &StoredManagedRepository) -> Result<()> {
+    for value in [
+        &provenance.provider,
+        &provenance.host,
+        &provenance.account,
+        &provenance.repository,
+    ] {
+        validate_text(value, "managed repository identity")?;
+    }
+    validate_repository_url(&provenance.origin_url)?;
+    validate_stored_absolute_path(&provenance.root)?;
+    validate_stored_absolute_path(&provenance.git_dir)?;
+    validate_stored_absolute_path(&provenance.common_git_dir)
+}
+
+fn same_repository_scope_fields(
+    provenance: &StoredManagedRepository,
+    key: &AssociationKey,
+) -> bool {
+    provenance.provider == key.provider
+        && provenance.host == key.host
+        && provenance.account == key.account
+        && provenance.repository == key.repository
 }
 
 fn save_state(path: &Path, state: &StoredState) -> Result<()> {

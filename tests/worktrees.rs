@@ -5,7 +5,7 @@ use cibergit::{
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::mpsc,
@@ -370,6 +370,276 @@ fn remote_provision_uses_local_transport_and_verifies_exact_fetched_head() {
         manager.reconcile(&key("one", 8)).unwrap(),
         ReconcileOutcome::Incomplete(_)
     ));
+}
+
+#[test]
+fn managed_repository_provenance_survives_last_checkout_removal_and_restart() {
+    let fixture = Fixture::new();
+    let remote = fixture._temp.path().join("persistent-remote.git");
+    git(
+        fixture._temp.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            fixture.source.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    );
+    let manager = fixture.manager();
+    let first = created(
+        manager
+            .provision_from_remote(ProvisionFromRemoteRequest {
+                key: key("one", 71),
+                repository_url: remote.to_string_lossy().into_owned(),
+                fetch_ref: "refs/heads/main".into(),
+                exact_head_oid: fixture.head.clone(),
+                local_branch: "cibergit/pr-71".into(),
+                intended_remote_branch: Some("fork/pr-71".into()),
+                published_head: Some(fixture.head.clone()),
+            })
+            .unwrap(),
+    );
+    let repository_path = first
+        .association
+        .creation
+        .as_ref()
+        .unwrap()
+        .object_repository
+        .clone();
+    manager
+        .remove_managed(&key("one", 71), Some(&fixture.head))
+        .unwrap();
+    drop(manager);
+
+    let restarted = fixture.manager();
+    let second = created(
+        restarted
+            .provision_from_remote(ProvisionFromRemoteRequest {
+                key: key("one", 72),
+                repository_url: remote.to_string_lossy().into_owned(),
+                fetch_ref: "refs/heads/main".into(),
+                exact_head_oid: fixture.head.clone(),
+                local_branch: "cibergit/pr-72".into(),
+                intended_remote_branch: Some("fork/pr-72".into()),
+                published_head: Some(fixture.head.clone()),
+            })
+            .unwrap(),
+    );
+    assert_eq!(
+        second
+            .association
+            .creation
+            .as_ref()
+            .unwrap()
+            .object_repository,
+        repository_path
+    );
+    assert!(matches!(
+        second.actual_head,
+        HeadState::Attached { ref branch, ref oid }
+            if branch == "cibergit/pr-72" && oid == &fixture.head
+    ));
+}
+
+#[test]
+fn managed_repository_replacement_at_the_same_paths_is_not_adopted() {
+    let fixture = Fixture::new();
+    let remote = fixture._temp.path().join("replacement-remote.git");
+    git(
+        fixture._temp.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            fixture.source.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    );
+    let manager = fixture.manager();
+    let first = created(
+        manager
+            .provision_from_remote(ProvisionFromRemoteRequest {
+                key: key("one", 73),
+                repository_url: remote.to_string_lossy().into_owned(),
+                fetch_ref: "refs/heads/main".into(),
+                exact_head_oid: fixture.head.clone(),
+                local_branch: "cibergit/pr-73".into(),
+                intended_remote_branch: None,
+                published_head: Some(fixture.head.clone()),
+            })
+            .unwrap(),
+    );
+    let repository_path = first
+        .association
+        .creation
+        .as_ref()
+        .unwrap()
+        .object_repository
+        .clone();
+    manager
+        .remove_managed(&key("one", 73), Some(&fixture.head))
+        .unwrap();
+    drop(manager);
+
+    let original_aside = fixture._temp.path().join("managed-repository-original");
+    fs::rename(&repository_path, &original_aside).unwrap();
+    git(
+        fixture._temp.path(),
+        &[
+            "clone",
+            "-q",
+            "--no-checkout",
+            remote.to_str().unwrap(),
+            repository_path.to_str().unwrap(),
+        ],
+    );
+    fs::write(repository_path.join("replacement-only.txt"), "preserve\n").unwrap();
+
+    let restarted = fixture.manager();
+    assert!(matches!(
+        restarted.provision_from_remote(ProvisionFromRemoteRequest {
+            key: key("one", 74),
+            repository_url: remote.to_string_lossy().into_owned(),
+            fetch_ref: "refs/heads/main".into(),
+            exact_head_oid: fixture.head.clone(),
+            local_branch: "cibergit/pr-74".into(),
+            intended_remote_branch: None,
+            published_head: Some(fixture.head.clone()),
+        }),
+        Err(WorktreeError::InvalidInput(_))
+    ));
+    assert_eq!(
+        fs::read_to_string(repository_path.join("replacement-only.txt")).unwrap(),
+        "preserve\n"
+    );
+    assert!(!managed_path(&fixture.managed, &key("one", 74)).exists());
+    assert!(original_aside.join(".git").is_dir());
+}
+
+#[test]
+fn interrupted_provisioning_proof_rejects_replacement_repository_identity() {
+    let fixture = Fixture::new();
+    let remote = fixture._temp.path().join("interrupted-remote.git");
+    git(
+        fixture._temp.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            fixture.source.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    );
+    let manager = fixture.manager();
+    assert!(matches!(
+        manager.provision_from_remote(ProvisionFromRemoteRequest {
+            key: key("one", 75),
+            repository_url: remote.to_string_lossy().into_owned(),
+            fetch_ref: "refs/heads/main".into(),
+            exact_head_oid: "a".repeat(40),
+            local_branch: "cibergit/pr-75".into(),
+            intended_remote_branch: None,
+            published_head: Some(fixture.head.clone()),
+        }),
+        Err(WorktreeError::Uncertain { .. })
+    ));
+    drop(manager);
+
+    let repositories = fixture.managed.join("repositories");
+    let repository_path = fs::read_dir(&repositories)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let store = fixture.state.join("worktree-associations.json");
+    let mut state: serde_json::Value = serde_json::from_slice(&fs::read(&store).unwrap()).unwrap();
+    state["managed_repositories"] = serde_json::json!({});
+    fs::write(&store, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let original_aside = fixture._temp.path().join("interrupted-repository-original");
+    fs::rename(&repository_path, &original_aside).unwrap();
+    git(
+        fixture._temp.path(),
+        &[
+            "clone",
+            "-q",
+            "--no-checkout",
+            remote.to_str().unwrap(),
+            repository_path.to_str().unwrap(),
+        ],
+    );
+    fs::write(repository_path.join("replacement-only.txt"), "preserve\n").unwrap();
+
+    let restarted = fixture.manager();
+    assert!(matches!(
+        restarted.provision_from_remote(ProvisionFromRemoteRequest {
+            key: key("one", 76),
+            repository_url: remote.to_string_lossy().into_owned(),
+            fetch_ref: "refs/heads/main".into(),
+            exact_head_oid: fixture.head.clone(),
+            local_branch: "cibergit/pr-76".into(),
+            intended_remote_branch: None,
+            published_head: Some(fixture.head.clone()),
+        }),
+        Err(WorktreeError::InvalidInput(_))
+    ));
+    assert_eq!(
+        fs::read_to_string(repository_path.join("replacement-only.txt")).unwrap(),
+        "preserve\n"
+    );
+    assert!(!managed_path(&fixture.managed, &key("one", 76)).exists());
+}
+
+#[test]
+fn failed_clone_retains_the_durably_identified_repository_reservation() {
+    let fixture = Fixture::new();
+    let missing_remote = fixture._temp.path().join("missing-remote.git");
+    let manager = fixture.manager();
+    assert!(matches!(
+        manager.provision_from_remote(ProvisionFromRemoteRequest {
+            key: key("one", 77),
+            repository_url: missing_remote.to_string_lossy().into_owned(),
+            fetch_ref: "refs/heads/main".into(),
+            exact_head_oid: fixture.head.clone(),
+            local_branch: "cibergit/pr-77".into(),
+            intended_remote_branch: None,
+            published_head: Some(fixture.head.clone()),
+        }),
+        Err(WorktreeError::Uncertain { .. })
+    ));
+
+    let repository_path = fs::read_dir(fixture.managed.join("repositories"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let metadata = fs::symlink_metadata(&repository_path).unwrap();
+    assert!(metadata.is_dir());
+    assert!(fs::read_dir(&repository_path).unwrap().next().is_none());
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.state.join("worktree-associations.json")).unwrap(),
+    )
+    .unwrap();
+    let operation = state["operations"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(
+        operation["repository_device"].as_u64(),
+        Some(metadata.dev())
+    );
+    assert_eq!(operation["repository_inode"].as_u64(), Some(metadata.ino()));
+    assert!(operation["managed_repository"].is_null());
+    assert!(matches!(
+        manager.reconcile(&key("one", 77)).unwrap(),
+        ReconcileOutcome::Incomplete(_)
+    ));
+    assert!(repository_path.is_dir());
 }
 
 #[test]
