@@ -1181,6 +1181,116 @@ mod tests {
     }
 
     #[test]
+    fn retention_over_sixty_four_removes_only_valid_owned_records() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = CollaborationCache::new(root.path().to_owned());
+        let repo = repository("octo", "retention", "alice");
+        let _initialize = cache.prepare_write(&repo, 1).unwrap();
+
+        let corrupt_identity = CacheIdentity::new(&repo, 800);
+        let corrupt_path = cache.root.join(corrupt_identity.filename());
+        private_write(&corrupt_path, b"{corrupt");
+
+        let future_identity = CacheIdentity::new(&repo, 801);
+        let future_path = cache.root.join(future_identity.filename());
+        let future = CacheRecord {
+            schema_version: SCHEMA_VERSION + 1,
+            identity: future_identity,
+            observed_at_unix_ms: now_unix_ms().unwrap(),
+            request_reservation: 1,
+            details: details(&repo, 801, "future"),
+        };
+        private_write(&future_path, &serde_json::to_vec(&future).unwrap());
+
+        let linked_identity = CacheIdentity::new(&repo, 802);
+        let linked_path = cache.root.join(linked_identity.filename());
+        let linked_source = root.path().join("linked-source");
+        private_write(&linked_source, b"linked foreign fixture");
+        fs::hard_link(&linked_source, &linked_path).unwrap();
+
+        let unknown_path = cache.root.join("unknown-preserved.bin");
+        private_write(&unknown_path, b"unknown foreign fixture");
+        let preserved = [
+            (&corrupt_path, fs::read(&corrupt_path).unwrap()),
+            (&future_path, fs::read(&future_path).unwrap()),
+            (&linked_path, fs::read(&linked_path).unwrap()),
+            (&unknown_path, fs::read(&unknown_path).unwrap()),
+        ];
+
+        let base_time = now_unix_ms().unwrap().saturating_sub(10_000);
+        for number in 1..=65 {
+            let permit = cache.prepare_write(&repo, number).unwrap();
+            cache
+                .save(
+                    permit,
+                    details(&repo, number, &format!("owned-{number}")),
+                    base_time + number,
+                )
+                .unwrap();
+        }
+
+        let valid_owned = fs::read_dir(&cache.root)
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let metadata = fs::symlink_metadata(entry.path()).ok()?;
+                read_any_record(&entry.path(), &metadata).ok().flatten()
+            })
+            .count();
+        assert_eq!(valid_owned, MAX_OWNED_RECORDS);
+        assert!(cache.load(&repo, 1).unwrap().is_none());
+        assert_eq!(
+            cache.load(&repo, 65).unwrap().unwrap().details.body,
+            "Overview owned-65"
+        );
+        assert!(cache.root.join(CONTROL_NAME).is_file());
+        assert!(cache.root.join(LOCK_NAME).is_file());
+        for (path, bytes) in preserved {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        assert_eq!(fs::metadata(&linked_source).unwrap().nlink(), 2);
+    }
+
+    #[test]
+    fn byte_and_entry_pressure_without_safe_victims_refuses_write() {
+        for pressure in ["bytes", "entries"] {
+            let root = tempfile::tempdir().unwrap();
+            let cache = CollaborationCache::new(root.path().to_owned());
+            let repo = repository("octo", pressure, "alice");
+            let permit = cache.prepare_write(&repo, 7).unwrap();
+            if pressure == "bytes" {
+                let path = cache.root.join("unknown-large.bin");
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .unwrap();
+                file.set_len(MAX_ROOT_BYTES).unwrap();
+                drop(file);
+                assert!(
+                    cache
+                        .save(permit, details(&repo, 7, pressure), now_unix_ms().unwrap())
+                        .is_err()
+                );
+                assert_eq!(fs::metadata(path).unwrap().len(), MAX_ROOT_BYTES);
+            } else {
+                let existing = fs::read_dir(&cache.root).unwrap().count();
+                for index in existing..MAX_ROOT_ENTRIES {
+                    private_write(&cache.root.join(format!("unknown-{index:03}")), b"preserve");
+                }
+                assert_eq!(fs::read_dir(&cache.root).unwrap().count(), MAX_ROOT_ENTRIES);
+                assert!(
+                    cache
+                        .save(permit, details(&repo, 7, pressure), now_unix_ms().unwrap())
+                        .is_err()
+                );
+                assert_eq!(fs::read_dir(&cache.root).unwrap().count(), MAX_ROOT_ENTRIES);
+            }
+        }
+    }
+
+    #[test]
     fn temp_name_collision_preserves_preexisting_bytes() {
         let root = tempfile::tempdir().unwrap();
         let cache = CollaborationCache::new(root.path().to_owned());

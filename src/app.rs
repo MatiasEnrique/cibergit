@@ -663,6 +663,10 @@ fn collaboration_completion_matches(
     expected_workspace == current_workspace && expected_tab == current_tab
 }
 
+fn issue_comment_is_editable(tab: &ReviewTab, comment: &cibergit::domain::IssueComment) -> bool {
+    tab.details.is_some() && tab.lifecycle.current_user_comment(comment)
+}
+
 struct ReviewTab {
     instance_generation: u64,
     repository: Repository,
@@ -691,6 +695,8 @@ struct ReviewTab {
     cached_collaboration: Option<CachedObservation>,
     collaboration_cache_notice: Option<String>,
     collaboration_cache_generation: u64,
+    #[cfg(feature = "ui-smoke")]
+    collaboration_cache_completed_generation: u64,
     pending_snapshot: Option<PendingReviewSnapshot>,
     journal_operations: Vec<JournalOperation>,
     journal_error: Option<String>,
@@ -2202,7 +2208,7 @@ impl ReviewWorkspace {
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
                         if let Root::Review(this) = root {
-                            this.inspector_scroll.scroll_to_bottom();
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
                             cx.notify();
                         }
                     });
@@ -2685,6 +2691,7 @@ impl ReviewWorkspace {
                                     tab.session.is_some()
                                         && tab.details.is_none()
                                         && tab.cached_collaboration.is_some()
+                                        && tab.lifecycle.snapshot.is_some()
                                         && matches!(tab.interactions, InteractionState::Ready(_))
                                         && !tab.details_refresh.active
                                         && matches!(tab.details_state, LoadState::Cached(_))
@@ -2774,9 +2781,77 @@ impl ReviewWorkspace {
                     });
                     assert!(draft_saved, "local draft did not become durable");
                     assert_eq!(cached.details.number, number);
+                    let late_baseline = window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                let index = this
+                                    .active_tab
+                                    .ok_or_else(|| "smoke has no active tab".to_owned())?;
+                                let durable = match &this.tabs[index].interactions {
+                                    InteractionState::Ready(controller) => {
+                                        controller.durable_composition.clone()
+                                    }
+                                    _ => None,
+                                };
+                                let expected_generation = this.tabs[index]
+                                    .collaboration_cache_generation
+                                    .saturating_add(1);
+                                let baseline = (
+                                    this.tabs[index].details.clone(),
+                                    durable,
+                                    this.tabs[index].journal_operations.clone(),
+                                    expected_generation,
+                                );
+                                this.load_cached_collaboration(index, cx);
+                                Ok(baseline)
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")))
+                        .unwrap_or_else(|error| panic!("late cache load setup failed: {error}"));
+                    let late_started = std::time::Instant::now();
+                    let late_load_safe = loop {
+                        let result = window
+                            .update(|_, cx| {
+                                weak.read_with(cx, |root, _| {
+                                    let Root::Review(this) = root else { return false };
+                                    let Some(index) = this.active_tab else { return false };
+                                    let durable = match &this.tabs[index].interactions {
+                                        InteractionState::Ready(controller) => {
+                                            controller.durable_composition.as_ref()
+                                        }
+                                        _ => None,
+                                    };
+                                    this.tabs[index].collaboration_cache_completed_generation
+                                        == late_baseline.3
+                                        && this.tabs[index].details == late_baseline.0
+                                        && durable == late_baseline.1.as_ref()
+                                        && this.tabs[index].journal_operations == late_baseline.2
+                                        && this.tabs[index].cached_collaboration.is_none()
+                                })
+                                .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if result || late_started.elapsed() > Duration::from_secs(10) {
+                            break result;
+                        }
+                        window
+                            .background_executor()
+                            .timer(Duration::from_millis(100))
+                            .await;
+                    };
+                    assert!(
+                        late_load_safe,
+                        "late disk load changed fresh details, draft, journal, or provenance"
+                    );
                     let baseline = serde_json::to_vec(&revision).expect("serialize smoke revision");
                     let report = format!(
-                        "Offline collaboration populate phase\nReal provider details admitted: true\nCached observed_at_unix_ms: {}\nCached payload: body={} bytes, issue comments={}, reviews={}, threads={}, checks={}\nActivity complete: {}\nChecks complete: {}\nLocal DraftStore draft durable: {}\nPinned revision: {}..{}\nRemote mutations: 0\n",
+                        "Offline collaboration populate phase\nReal provider details admitted: true\nCached observed_at_unix_ms: {}\nCached payload: body={} bytes, issue comments={}, reviews={}, threads={}, checks={}\nActivity complete: {}\nChecks complete: {}\nLocal DraftStore draft durable: {}\nLate production disk load left fresh details, durable draft, journal, and provenance unchanged: {}\nPinned revision: {}..{}\nRemote mutations: 0\n",
                         cached.observed_at_unix_ms,
                         cached.details.body.len(),
                         cached.details.issue_comments.len(),
@@ -2786,6 +2861,7 @@ impl ReviewWorkspace {
                         cached.details.activity_complete,
                         cached.details.checks_complete,
                         draft_saved,
+                        late_load_safe,
                         revision.base_sha,
                         revision.head_sha,
                     );
@@ -2829,6 +2905,17 @@ impl ReviewWorkspace {
                             if tab.details.is_some() {
                                 return Err("offline fixture installed fresh details".into());
                             }
+                            let LoadState::Cached(read_notice) = &tab.details_state else {
+                                return Err("offline fixture lost its cached read notice".into());
+                            };
+                            if !read_notice.contains("failed")
+                                || read_notice.contains("refreshing current data")
+                            {
+                                return Err(
+                                    "settled offline notice did not preserve the failed current read"
+                                        .into(),
+                                );
+                            }
                             if tab.canonical_full_revision != baseline {
                                 return Err("offline cache changed the pinned comparison".into());
                             }
@@ -2839,10 +2926,26 @@ impl ReviewWorkspace {
                             }
                             if cached.details.body.is_empty()
                                 || cached.details.issue_comments.is_empty()
-                                || cached.details.review_threads.is_empty()
+                                || cached.details.reviews.is_empty()
                                 || cached.details.checks.is_empty()
                             {
                                 return Err("cached Overview/Activity/Checks evidence is empty".into());
+                            }
+                            let snapshot = tab.lifecycle.snapshot.as_ref().ok_or_else(|| {
+                                "fresh lifecycle fixture did not settle".to_owned()
+                            })?;
+                            let mut selected_author_comment = cached.details.issue_comments[0].clone();
+                            selected_author_comment.author = Some(snapshot.viewer_login.clone());
+                            if !tab.lifecycle.current_user_comment(&selected_author_comment) {
+                                return Err(
+                                    "fresh lifecycle fixture did not establish selected-author editability"
+                                        .into(),
+                                );
+                            }
+                            if issue_comment_is_editable(tab, &selected_author_comment) {
+                                return Err(
+                                    "cached comment became editable from fresh lifecycle alone".into(),
+                                );
                             }
                             let state = (
                                 cached.observed_at_unix_ms,
@@ -2870,6 +2973,18 @@ impl ReviewWorkspace {
                     .background_executor()
                     .timer(Duration::from_millis(350))
                     .await;
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
                 let overview_name = format!("native-offline-overview-{appearance}.png");
                 let overview = window
                     .update(|window, _| {
@@ -2886,6 +3001,7 @@ impl ReviewWorkspace {
                         if let Root::Review(this) = root
                             && let Some(index) = this.active_tab
                         {
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
                             this.tabs[index].inspector_section = InspectorSection::Activity;
                             cx.notify();
                         }
@@ -2911,6 +3027,7 @@ impl ReviewWorkspace {
                         if let Root::Review(this) = root
                             && let Some(index) = this.active_tab
                         {
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
                             this.tabs[index].inspector_section = InspectorSection::Checks;
                             cx.notify();
                         }
@@ -2966,7 +3083,7 @@ impl ReviewWorkspace {
                         .await;
                 };
                 let report = format!(
-                    "Offline collaboration restart phase ({appearance})\nScoped provider-details transport disabled: true\nFresh details installed: false\nCached observed_at_unix_ms: {}\nCached Activity complete: {}\nCached Checks complete: {}\nCached counts: issue comments={}, reviews={}, threads={}, checks={}\nOverview capture: {}\nActivity capture: {}\nChecks capture: {}\nPinned comparison unchanged: true\nLocal DraftStore draft survived restart: true\nExplicit reconnect/refresh triggered another read only: {}\nRemote mutation dispatches from smoke path: 0\nOS notifications: not invoked\nFocus requested by smoke: false\nPhysical input, AX, acrylic identity, and network-wide offline state: not established by in-process capture.\n",
+                    "Offline collaboration restart phase ({appearance})\nScoped provider-details transport disabled: true\nFresh details installed: false\nCached observed_at_unix_ms: {}\nCached Activity complete: {}\nCached Checks complete: {}\nCached counts: issue comments={}, reviews={}, threads={}, checks={}\nOverview capture: {}\nActivity capture: {}\nChecks capture: {}\nPinned comparison unchanged: true\nLocal DraftStore draft survived restart: true\nFresh lifecycle selected-author evidence did not make cached comments editable: true\nExplicit reconnect/refresh triggered another read only: {}\nRemote mutation dispatches from smoke path: 0\nOS notifications: not invoked\nFocus requested by smoke: false\nPhysical input, AX, acrylic identity, and network-wide offline state: not established by in-process capture.\n",
                     state.0,
                     state.1,
                     state.2,
@@ -6304,6 +6421,8 @@ impl ReviewWorkspace {
             cached_collaboration: None,
             collaboration_cache_notice: None,
             collaboration_cache_generation: 0,
+            #[cfg(feature = "ui-smoke")]
+            collaboration_cache_completed_generation: 0,
             pending_snapshot: None,
             journal_operations: Vec::new(),
             journal_error: None,
@@ -8152,6 +8271,10 @@ impl ReviewWorkspace {
                     return;
                 };
                 let tab = &mut this.tabs[tab_index];
+                #[cfg(feature = "ui-smoke")]
+                {
+                    tab.collaboration_cache_completed_generation = token.generation;
+                }
                 match result {
                     Ok(Some(observation)) if tab.details.is_none() => {
                         let observed_at = observation.observed_at_unix_ms;
@@ -8354,6 +8477,7 @@ impl ReviewWorkspace {
                                 );
                                 let tab = &mut this.tabs[tab_index];
                                 tab.details = Some(details);
+                                tab.cached_collaboration = None;
                                 let notice = format!(
                                     "PR details updated; pending review could not be refreshed: {error:#}. Previous pending data is retained and no review linkage was changed."
                                 );
@@ -8383,6 +8507,7 @@ impl ReviewWorkspace {
                         let save = {
                             let tab = &mut this.tabs[tab_index];
                             tab.details = Some(details);
+                            tab.cached_collaboration = None;
                             tab.pending_snapshot = pending.clone();
                             match journal {
                                 Ok(operations) => {
@@ -12961,7 +13086,6 @@ impl ReviewWorkspace {
             .details
             .as_ref()
             .or_else(|| cached_observation.map(|observation| &observation.details));
-        let fresh_details = tab.details.is_some();
         let confirmation_open = tab.confirmation.is_some();
         let current = tab.inspector_section;
         let root = cx.entity();
@@ -13001,6 +13125,14 @@ impl ReviewWorkspace {
                     ),
                 ];
                 if let Some(details) = displayed_details {
+                    if cached_observation.is_some() && !details.body.trim().is_empty() {
+                        fields.push(markdown_detail(
+                            format!("pr-description-{}", tab.pull_request.number),
+                            "Description",
+                            &details.body,
+                            colors,
+                        ));
+                    }
                     fields.push(detail(
                         "Requested reviewers",
                         if details.requested_reviewers.is_empty() {
@@ -13023,7 +13155,10 @@ impl ReviewWorkspace {
                         ),
                         colors,
                     ));
-                    if tab.lifecycle.snapshot.is_none() && !details.body.trim().is_empty() {
+                    if cached_observation.is_none()
+                        && tab.lifecycle.snapshot.is_none()
+                        && !details.body.trim().is_empty()
+                    {
                         fields.push(markdown_detail(
                             format!("pr-description-{}", tab.pull_request.number),
                             "Description",
@@ -13032,10 +13167,12 @@ impl ReviewWorkspace {
                         ));
                     }
                 }
-                div()
-                    .child(self.render_lifecycle_overview(index, colors, cx))
-                    .children(fields)
-                    .into_any_element()
+                let lifecycle = self.render_lifecycle_overview(index, colors, cx);
+                if cached_observation.is_some() {
+                    div().children(fields).child(lifecycle).into_any_element()
+                } else {
+                    div().child(lifecycle).children(fields).into_any_element()
+                }
             }
             InspectorSection::Activity => {
                 let mut activity = Vec::new();
@@ -13553,7 +13690,7 @@ impl ReviewWorkspace {
                         .skip(comment_page * 20)
                         .take(20)
                     {
-                        let editable = fresh_details && tab.lifecycle.current_user_comment(comment);
+                        let editable = issue_comment_is_editable(tab, comment);
                         let edit_comment = comment.clone();
                         let delete_comment = comment.clone();
                         activity.push(
@@ -13842,10 +13979,18 @@ impl ReviewWorkspace {
                         .text_xs()
                         .text_color(colors.amber)
                         .child(format!(
-                            "Cached · observed {} · read-only collaboration snapshot. Cached data does not supply permissions.{}{}",
+                            "Cached · saved {} · read-only.{}{}",
                             collaboration_age_label(observation.observed_at_unix_ms),
-                            if details.activity_complete { "" } else { " Activity was incomplete when observed." },
-                            if details.checks_complete { "" } else { " Checks were incomplete when observed." },
+                            if details.activity_complete {
+                                ""
+                            } else {
+                                " Activity was incomplete when observed."
+                            },
+                            if details.checks_complete {
+                                ""
+                            } else {
+                                " Checks were incomplete when observed."
+                            },
                         ))
                         .when_some(details.notice.clone(), |notice, value| {
                             notice.child(format!(" Original provider notice: {value}"))
