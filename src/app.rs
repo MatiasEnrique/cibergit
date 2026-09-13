@@ -554,7 +554,22 @@ impl Render for SplitterDragPreview {
     }
 }
 
+/// A read can complete after its PR tab has closed and reopened. Per-tab read
+/// counters alone cannot distinguish those lifetimes, even for the same PR.
+#[derive(Clone, Copy)]
+struct TabReadEpoch {
+    instance: u64,
+    generation: u64,
+}
+
+impl TabReadEpoch {
+    fn matches(self, instance: u64, generation: u64) -> bool {
+        self.instance == instance && self.generation == generation
+    }
+}
+
 struct ReviewTab {
+    instance_generation: u64,
     repository: Repository,
     pull_request: PullRequest,
     session: Option<ReviewSession>,
@@ -5135,6 +5150,7 @@ impl ReviewWorkspace {
         let request_generation = self.issue_request_generation();
         let lifecycle = PrLifecycleController::new(repository.clone(), pull_request.number);
         self.tabs.push(ReviewTab {
+            instance_generation: request_generation,
             repository,
             pull_request,
             session,
@@ -5208,7 +5224,10 @@ impl ReviewWorkspace {
             return;
         }
         tab.interaction_generation += 1;
-        let generation = tab.interaction_generation;
+        let read_epoch = TabReadEpoch {
+            instance: tab.instance_generation,
+            generation: tab.interaction_generation,
+        };
         let repository = tab.repository.clone();
         let number = tab.pull_request.number;
         let identity = repository.cache_key();
@@ -5223,7 +5242,7 @@ impl ReviewWorkspace {
                 let Some(index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == identity
                         && tab.pull_request.number == number
-                        && tab.interaction_generation == generation
+                        && read_epoch.matches(tab.instance_generation, tab.interaction_generation)
                 }) else {
                     return;
                 };
@@ -6248,7 +6267,7 @@ impl ReviewWorkspace {
                 "Wait for the active operation before reconciling review outcomes.".into();
             return;
         }
-        let (repository, number, store, authority, expected, interaction_generation) = {
+        let (repository, number, store, authority, expected, read_epoch) = {
             let tab = &mut self.tabs[index];
             let InteractionState::Ready(controller) = &tab.interactions else {
                 self.status = "Review recovery must load before reconciliation.".into();
@@ -6266,7 +6285,10 @@ impl ReviewWorkspace {
                 controller.store.clone(),
                 controller.authority.clone(),
                 controller.durable_composition.clone(),
-                tab.interaction_generation,
+                TabReadEpoch {
+                    instance: tab.instance_generation,
+                    generation: tab.interaction_generation,
+                },
             )
         };
         if self.active_tab == Some(index) {
@@ -6307,7 +6329,7 @@ impl ReviewWorkspace {
                 let Some(index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == identity
                         && tab.pull_request.number == number
-                        && tab.interaction_generation == interaction_generation
+                        && read_epoch.matches(tab.instance_generation, tab.interaction_generation)
                 }) else {
                     return;
                 };
@@ -6518,7 +6540,10 @@ impl ReviewWorkspace {
             return;
         };
         tab.metadata_generation += 1;
-        let generation = tab.metadata_generation;
+        let read_epoch = TabReadEpoch {
+            instance: tab.instance_generation,
+            generation: tab.metadata_generation,
+        };
         let repository = tab.repository.clone();
         let number = tab.pull_request.number;
         let key = repository.cache_key();
@@ -6532,7 +6557,7 @@ impl ReviewWorkspace {
                 let Some(tab) = this.tabs.iter_mut().find(|tab| {
                     tab.repository.cache_key() == key
                         && tab.pull_request.number == number
-                        && tab.metadata_generation == generation
+                        && read_epoch.matches(tab.instance_generation, tab.metadata_generation)
                 }) else {
                     return;
                 };
@@ -6571,7 +6596,10 @@ impl ReviewWorkspace {
             return;
         };
         tab.lifecycle_generation = tab.lifecycle_generation.saturating_add(1);
-        let generation = tab.lifecycle_generation;
+        let read_epoch = TabReadEpoch {
+            instance: tab.instance_generation,
+            generation: tab.lifecycle_generation,
+        };
         let repository = tab.repository.clone();
         let number = tab.pull_request.number;
         let identity = repository.cache_key();
@@ -6591,7 +6619,7 @@ impl ReviewWorkspace {
                 let Some(tab) = this.tabs.iter_mut().find(|tab| {
                     tab.repository.cache_key() == identity
                         && tab.pull_request.number == number
-                        && tab.lifecycle_generation == generation
+                        && read_epoch.matches(tab.instance_generation, tab.lifecycle_generation)
                 }) else {
                     return;
                 };
@@ -6918,7 +6946,10 @@ impl ReviewWorkspace {
             return;
         };
         tab.details_generation += 1;
-        let generation = tab.details_generation;
+        let read_epoch = TabReadEpoch {
+            instance: tab.instance_generation,
+            generation: tab.details_generation,
+        };
         let repository = tab.repository.clone();
         let number = tab.pull_request.number;
         let key = repository.cache_key();
@@ -6943,7 +6974,7 @@ impl ReviewWorkspace {
                 let Some(tab_index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == key
                         && tab.pull_request.number == number
-                        && tab.details_generation == generation
+                        && read_epoch.matches(tab.instance_generation, tab.details_generation)
                 }) else {
                     return;
                 };
@@ -13584,6 +13615,37 @@ mod layout_tests {
         line_text_chunks, media_free_markdown, resolved_panel_widths_for,
     };
     use cibergit::domain::{ProviderCoordinates, ReviewAuxiliaryAction, ReviewAuxiliaryRequest};
+
+    #[test]
+    fn delayed_pr_reads_cannot_install_after_tab_close_and_reopen() {
+        // Metadata, lifecycle, details and draft-store reads all begin with the
+        // same per-tab counter after a reopen. An old reply used to match it.
+        let old_reads = [super::TabReadEpoch {
+            instance: 41,
+            generation: 1,
+        }; 4];
+        let reopened_reads = [super::TabReadEpoch {
+            instance: 58,
+            generation: 1,
+        }; 4];
+        let mut installed = ["new tab loading"; 4];
+        for (channel, current) in reopened_reads.iter().enumerate() {
+            if old_reads[channel].matches(current.instance, current.generation) {
+                installed[channel] = "old tab reply";
+            }
+        }
+        assert_eq!(installed, ["new tab loading"; 4]);
+        for (channel, current) in reopened_reads.iter().enumerate() {
+            if current.matches(current.instance, current.generation) {
+                installed[channel] = "current reply";
+            }
+        }
+        assert_eq!(installed, ["current reply"; 4]);
+        // A newer read or mutation invalidation in the same tab also rejects a
+        // delayed result; returning to a different view does not change epoch.
+        assert!(!reopened_reads[0].matches(58, 2));
+        assert!(reopened_reads[0].matches(58, 1));
+    }
 
     #[test]
     fn auto_uses_remaining_diff_pane_instead_of_whole_window() {
