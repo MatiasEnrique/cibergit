@@ -1372,6 +1372,15 @@ impl ReviewWorkspace {
     }
 
     fn refresh_notifications_when(&mut self, tick: Option<u64>, cx: &mut Context<Root>) {
+        self.refresh_notifications_matching(tick, None, cx);
+    }
+
+    fn refresh_notifications_matching(
+        &mut self,
+        tick: Option<u64>,
+        only_account: Option<&cibergit::domain::Account>,
+        cx: &mut Context<Root>,
+    ) {
         if !self.notifications.is_ready() {
             return;
         }
@@ -1383,16 +1392,17 @@ impl ReviewWorkspace {
         let polls = self
             .notifications
             .begin_polls_when(&repositories, |account| {
-                tick.is_none_or(|tick| {
-                    poll_due(
-                        tick,
-                        self.schedule.delay(
-                            &notifications_view::schedule_key(account),
-                            false,
-                            self.focused,
-                        ),
-                    )
-                })
+                only_account.is_none_or(|selected| selected == account)
+                    && tick.is_none_or(|tick| {
+                        poll_due(
+                            tick,
+                            self.schedule.delay(
+                                &notifications_view::schedule_key(account),
+                                false,
+                                self.focused,
+                            ),
+                        )
+                    })
             });
         for work in polls {
             let task = cx.background_spawn(async move { work.run() });
@@ -1400,7 +1410,11 @@ impl ReviewWorkspace {
                 let completion = task.await;
                 let _ = root.update(cx, |root, cx| {
                     let Root::Review(this) = root else { return };
+                    let released = this.notifications.release_poll(&completion);
                     if !this.notifications.accepts_poll(&completion) {
+                        if released {
+                            this.refresh_notifications_matching(None, Some(completion.account()), cx);
+                        }
                         return;
                     }
                     let schedule_key = completion.schedule_key();

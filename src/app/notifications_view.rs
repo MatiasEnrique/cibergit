@@ -19,7 +19,7 @@ use gpui::{Context, Div, SharedString, Stateful, SystemNotification, div, prelud
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::{
@@ -65,6 +65,7 @@ pub(super) struct NotificationRoute {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ControllerToken {
+    consent_generation: u64,
     lifetime: u64,
     account_key: String,
     selection: String,
@@ -89,6 +90,10 @@ pub(super) struct PollCompletion {
 }
 
 impl PollCompletion {
+    pub(super) fn account(&self) -> &Account {
+        &self.account
+    }
+
     pub(super) fn schedule_key(&self) -> String {
         format!("notifications:{}", account_key(&self.account))
     }
@@ -292,6 +297,7 @@ struct NotificationRuntime {
     registry: NotificationRegistry,
     preferences: HashMap<String, bool>,
     routes: HashMap<String, NotificationRoute>,
+    route_order: VecDeque<String>,
 }
 
 pub(super) struct BootstrapWork {
@@ -318,7 +324,8 @@ impl BootstrapWork {
                 store,
                 registry,
                 preferences,
-                routes,
+                route_order: routes.iter().map(|(tag, _)| tag.clone()).collect(),
+                routes: routes.into_iter().collect(),
             })
         })()
         .map_err(|error: anyhow::Error| format!("{error:#}"));
@@ -338,6 +345,7 @@ struct AccountViewState {
     selection_generation: u64,
     mark_generation: u64,
     in_flight: bool,
+    active_poll_generation: Option<u64>,
     snapshot: Option<NotificationSnapshot>,
     stale_notice: Option<String>,
     page: usize,
@@ -356,6 +364,7 @@ pub(super) struct NotificationController {
     initialization_error: Option<String>,
     queued: Vec<QueuedNotification>,
     routes: HashMap<String, NotificationRoute>,
+    route_order: VecDeque<String>,
 }
 
 impl NotificationController {
@@ -369,6 +378,7 @@ impl NotificationController {
             initialization_error: None,
             queued: Vec::new(),
             routes: HashMap::new(),
+            route_order: VecDeque::new(),
         }
     }
 
@@ -392,6 +402,7 @@ impl NotificationController {
                         .consent_enabled = *enabled;
                 }
                 self.routes = runtime.routes.clone();
+                self.route_order = runtime.route_order.clone();
                 self.runtime = Some(runtime);
                 self.initialization_error = None;
                 true
@@ -482,7 +493,6 @@ impl NotificationController {
                 state.selected_repositories.clear();
                 state.selection_generation = state.selection_generation.saturating_add(1);
                 state.generation = state.generation.saturating_add(1);
-                state.in_flight = false;
                 state.displayed = None;
                 state.snapshot = None;
                 self.queued.retain(|queued| queued.account_key != *key);
@@ -506,7 +516,6 @@ impl NotificationController {
                 state.selection = selection.clone();
                 state.selection_generation = state.selection_generation.saturating_add(1);
                 state.generation = state.generation.saturating_add(1);
-                state.in_flight = false;
                 state.displayed = None;
                 state.snapshot = None;
                 self.queued.retain(|queued| queued.account_key != key);
@@ -516,7 +525,9 @@ impl NotificationController {
             }
             state.generation = state.generation.saturating_add(1);
             state.in_flight = true;
+            state.active_poll_generation = Some(state.generation);
             let token = ControllerToken {
+                consent_generation: state.consent_generation,
                 lifetime: self.lifetime,
                 account_key: key,
                 selection,
@@ -532,6 +543,22 @@ impl NotificationController {
         work
     }
 
+    pub(super) fn release_poll(&mut self, completion: &PollCompletion) -> bool {
+        let key = account_key(&completion.account);
+        let Some(state) = self.accounts.get_mut(&key) else {
+            return false;
+        };
+        if completion.token.lifetime != self.lifetime
+            || completion.token.account_key != key
+            || state.active_poll_generation != Some(completion.token.generation)
+        {
+            return false;
+        }
+        state.active_poll_generation = None;
+        state.in_flight = false;
+        true
+    }
+
     pub(super) fn accepts_poll(&self, completion: &PollCompletion) -> bool {
         let key = account_key(&completion.account);
         self.accounts
@@ -543,6 +570,7 @@ impl NotificationController {
         &mut self,
         mut completion: PollCompletion,
     ) -> Option<AdmissionWork> {
+        self.release_poll(&completion);
         let key = account_key(&completion.account);
         let selection = completion.token.selection.clone();
         let (consent_enabled, consent_transition, consent_generation, selection_generation) =
@@ -575,7 +603,11 @@ impl NotificationController {
         if self.open {
             self.capture_displayed();
         }
-        if completion.newly_admitted.is_empty() || !consent_enabled || consent_transition {
+        if completion.newly_admitted.is_empty()
+            || !consent_enabled
+            || consent_transition
+            || completion.token.consent_generation != consent_generation
+        {
             return None;
         }
         let runtime = self.runtime.as_ref()?;
@@ -617,10 +649,15 @@ impl NotificationController {
             notification.consent_generation = state.consent_generation;
             notification.selection = state.selection.clone();
             notification.selection_generation = state.selection_generation;
-            self.routes.insert(
-                notification.notification.tag.to_string(),
-                notification.route.clone(),
-            );
+            let tag = notification.notification.tag.to_string();
+            self.route_order.retain(|existing| existing != &tag);
+            self.route_order.push_back(tag.clone());
+            self.routes.insert(tag, notification.route.clone());
+            while self.route_order.len() > MAX_RETAINED_ROUTES {
+                if let Some(expired) = self.route_order.pop_front() {
+                    self.routes.remove(&expired);
+                }
+            }
             self.queued.push(notification);
         }
         true
@@ -1046,6 +1083,7 @@ impl NotificationController {
         state.generation = state.generation.saturating_add(1);
         state.in_flight = true;
         let token = ControllerToken {
+            consent_generation: state.consent_generation,
             lifetime: self.lifetime,
             account_key: key,
             selection,
@@ -1529,7 +1567,7 @@ impl NotificationRegistry {
         Ok(self.load_unlocked()?.enabled)
     }
 
-    fn routes(&self) -> Result<HashMap<String, NotificationRoute>> {
+    fn routes(&self) -> Result<Vec<(String, NotificationRoute)>> {
         let _lock = RegistryLock::acquire(&self.lock_path())?;
         Ok(self
             .load_unlocked()?
@@ -2067,6 +2105,7 @@ mod tests {
     fn partial_success_retains_failure_backoff() {
         let mut completion = PollCompletion {
             token: ControllerToken {
+                consent_generation: 0,
                 lifetime: 1,
                 account_key: account_key(&account("alice")),
                 selection: String::new(),
@@ -2166,6 +2205,127 @@ mod tests {
         controller.begin_polls(&[repo("alice", 0)]);
         assert!(!controller.complete_mark_displayed(completion));
         assert!(controller.accounts[&account_key(&alice)].snapshot.is_none());
+    }
+
+    #[test]
+    fn selection_change_keeps_the_existing_poll_lane_until_its_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = NotificationController::new(dir.path().into());
+        assert!(controller.complete_bootstrap(controller.begin_bootstrap().run()));
+        let first = controller.begin_polls(&[repo("alice", 0)]).pop().unwrap();
+        assert!(
+            controller.begin_polls(&[repo("alice", 1)]).is_empty(),
+            "old read still owns the account lane"
+        );
+        let completion = PollCompletion {
+            token: first.token,
+            account: account("alice"),
+            snapshot: empty_snapshot(String::new()),
+            newly_admitted: vec![],
+            error: None,
+        };
+        assert!(!controller.accepts_poll(&completion));
+        assert!(controller.release_poll(&completion));
+        let second = controller.begin_polls(&[repo("alice", 1)]).pop().unwrap();
+        assert_eq!(second.chunks[0][0].name, "repo-1");
+        assert!(
+            !controller.release_poll(&completion),
+            "duplicate old reply cannot release the replacement lane"
+        );
+        assert!(controller.begin_polls(&[repo("alice", 1)]).is_empty());
+    }
+
+    #[test]
+    fn enabling_alerts_during_a_poll_does_not_catch_up_that_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = NotificationController::new(dir.path().into());
+        assert!(controller.complete_bootstrap(controller.begin_bootstrap().run()));
+        let alice = account("alice");
+        let first = controller.begin_polls(&[repo("alice", 0)]).pop().unwrap();
+        let enable = controller.begin_consent(&alice, true).unwrap();
+        assert!(controller.complete_consent(enable.run()));
+        let exact = event("alice", "before-enable", 7);
+        let snapshot = NotificationSnapshot {
+            state_version: 1,
+            unread_by_pull_request: vec![PullRequestUnreadSummary {
+                target: exact.identity.target.clone(),
+                unread_events: vec![exact.clone()],
+                unknown_candidates: vec![],
+            }],
+            repository_completeness: vec![],
+            incomplete_candidates: vec![],
+            notices: vec![],
+        };
+        assert!(
+            controller
+                .complete_poll(PollCompletion {
+                    token: first.token,
+                    account: alice.clone(),
+                    snapshot: snapshot.clone(),
+                    newly_admitted: vec![exact.clone()],
+                    error: None
+                })
+                .is_none()
+        );
+        assert_eq!(
+            controller.unread_count(),
+            1,
+            "in-app unread remains independent of OS consent"
+        );
+        let next = controller.begin_polls(&[repo("alice", 0)]).pop().unwrap();
+        assert!(
+            controller
+                .complete_poll(PollCompletion {
+                    token: next.token,
+                    account: alice,
+                    snapshot,
+                    newly_admitted: vec![exact],
+                    error: None
+                })
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn live_response_routes_expire_at_the_same_bound_as_persisted_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = NotificationController::new(dir.path().into());
+        assert!(controller.complete_bootstrap(controller.begin_bootstrap().run()));
+        let alice = account("alice");
+        let enable = controller.begin_consent(&alice, true).unwrap();
+        assert!(controller.complete_consent(enable.run()));
+        controller.begin_polls(&[repo("alice", 0)]);
+        let state = controller.accounts.get(&account_key(&alice)).unwrap();
+        let token = AdmissionToken {
+            lifetime: controller.lifetime,
+            account_key: account_key(&alice),
+            selection: state.selection.clone(),
+            selection_generation: state.selection_generation,
+            consent_generation: state.consent_generation,
+        };
+        let events = (0..=MAX_RETAINED_ROUTES)
+            .map(|n| event("alice", &n.to_string(), 7))
+            .collect::<Vec<_>>();
+        let old_tag = stable_event_tag(&alice, &events[0]);
+        let last_tag = stable_event_tag(&alice, events.last().unwrap());
+        let completion = AdmissionWork {
+            token,
+            account: alice.clone(),
+            events,
+            registry: controller.runtime.as_ref().unwrap().registry.clone(),
+        }
+        .run();
+        assert!(controller.complete_admission(completion));
+        assert_eq!(controller.routes.len(), MAX_RETAINED_ROUTES);
+        assert!(controller.route_for_tag(&old_tag).is_none());
+        assert_eq!(controller.route_for_tag(&last_tag).unwrap().pull_request, 7);
+        let mut restarted = NotificationController::new(dir.path().into());
+        assert!(restarted.complete_bootstrap(restarted.begin_bootstrap().run()));
+        assert!(restarted.route_for_tag(&old_tag).is_none());
+        assert_eq!(
+            restarted.route_for_tag(&last_tag),
+            controller.route_for_tag(&last_tag)
+        );
     }
 
     #[test]
@@ -2559,6 +2719,7 @@ mod tests {
         );
         let completion = PollCompletion {
             token: ControllerToken {
+                consent_generation: 0,
                 lifetime: controller.lifetime,
                 account_key: key,
                 selection,
