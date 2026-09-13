@@ -5464,6 +5464,11 @@ impl ReviewWorkspace {
         };
         self.status = "Saving local review recovery…".into();
         let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let save_epoch = TabReadEpoch {
+            instance: self.tabs[index].instance_generation,
+            generation: sequence,
+        };
+        let completion_latest = latest.clone();
         let snapshot_for_save = snapshot.clone();
         let task = cx.background_spawn(async move {
             let _guard = lock
@@ -5481,7 +5486,12 @@ impl ReviewWorkspace {
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
                 let Some(index) = this.tabs.iter().position(|tab| {
-                    tab.repository.cache_key() == identity && tab.pull_request.number == number
+                    tab.repository.cache_key() == identity
+                        && tab.pull_request.number == number
+                        && save_epoch.matches(
+                            tab.instance_generation,
+                            completion_latest.load(Ordering::Acquire),
+                        )
                 }) else {
                     return;
                 };
@@ -7017,6 +7027,11 @@ impl ReviewWorkspace {
                         if let Some((snapshot, store, authority, expected)) = save {
                             let (latest, lock, sequence) =
                                 this.next_review_state_write(&key, number);
+                            let save_epoch = TabReadEpoch {
+                                instance: read_epoch.instance,
+                                generation: sequence,
+                            };
+                            let completion_latest = latest.clone();
                             let saved_snapshot = snapshot.clone();
                             let task = cx.background_spawn(async move {
                                 let _guard = lock.lock().map_err(|_| {
@@ -7040,6 +7055,10 @@ impl ReviewWorkspace {
                                     let Some(index) = this.tabs.iter().position(|tab| {
                                         tab.repository.cache_key() == saved_key
                                             && tab.pull_request.number == number
+                                            && save_epoch.matches(
+                                                tab.instance_generation,
+                                                completion_latest.load(Ordering::Acquire),
+                                            )
                                     }) else {
                                         return;
                                     };
@@ -13645,6 +13664,97 @@ mod layout_tests {
         // delayed result; returning to a different view does not change epoch.
         assert!(!reopened_reads[0].matches(58, 2));
         assert!(reopened_reads[0].matches(58, 1));
+    }
+
+    #[test]
+    fn delayed_review_saves_cannot_replace_newer_or_reopened_recovery_state() {
+        use super::review_interactions::{ControllerLoad, ReviewInteractionController};
+        use cibergit::{
+            domain::{Account, ChangedFile, Comparison, Repository, Revision},
+            participation::{DiffSide, LineSelection},
+            review::ReviewSession,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let repository = Repository {
+            host: "github.com".into(),
+            owner: "octo".into(),
+            name: "repo".into(),
+            account: Account {
+                host: "github.com".into(),
+                login: "reader".into(),
+            },
+            local_path: None,
+        };
+        let session = ReviewSession::new(Comparison {
+            revision: Revision {
+                base_sha: "1".repeat(40),
+                head_sha: "2".repeat(40),
+            },
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                previous_path: None,
+                raw_path: None,
+                raw_previous_path: None,
+                status: "modified".into(),
+                additions: 1,
+                deletions: 1,
+                patch: Some("@@ -1 +1 @@\n-old\n+new".into()),
+                patch_complete: true,
+            }],
+            complete: true,
+            notice: None,
+        });
+        let load = || match ReviewInteractionController::load(root.path(), &repository, 7, &session)
+            .unwrap()
+        {
+            ControllerLoad::Ready(controller) => controller,
+            ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+        };
+        let mut controller = load();
+        controller
+            .select_line(&session, LineSelection::single(DiffSide::New, 1))
+            .unwrap();
+        let older = controller.stage_composer_text("older text".into()).unwrap();
+        controller.store.save(&older).unwrap();
+        let draft_id = controller
+            .composer
+            .as_ref()
+            .unwrap()
+            .draft_id
+            .clone()
+            .unwrap();
+        let latest = controller
+            .stage_composer_text("latest text".into())
+            .unwrap();
+        controller.store.save(&latest).unwrap();
+        // Deliver completion two before completion one. Its accepted durable
+        // baseline must survive the delayed callback, just as the disk does.
+        controller.finish_composer_save(&latest, &draft_id, "latest text", Ok(()));
+        let old_epoch = super::TabReadEpoch {
+            instance: 41,
+            generation: 1,
+        };
+        if old_epoch.matches(41, 2) {
+            controller.finish_composer_save(&older, &draft_id, "older text", Ok(()));
+        }
+        assert_eq!(controller.durable_composition.as_ref(), Some(&latest));
+        assert_eq!(controller.composer.as_ref().unwrap().body, "latest text");
+        // Another window can save while this PR tab is closed. The root write
+        // sequence stays two; lifetime, not sequence, rejects the old callback.
+        let newest = controller
+            .stage_composer_text("saved while closed".into())
+            .unwrap();
+        controller.store.save(&newest).unwrap();
+        let mut reopened = load();
+        let prior_tab_epoch = super::TabReadEpoch {
+            instance: 41,
+            generation: 2,
+        };
+        if prior_tab_epoch.matches(58, 2) {
+            reopened.finish_composer_save(&latest, &draft_id, "latest text", Ok(()));
+        }
+        assert_eq!(reopened.durable_composition.as_ref(), Some(&newest));
+        assert_eq!(load().durable_composition.as_ref(), Some(&newest));
     }
 
     #[test]
