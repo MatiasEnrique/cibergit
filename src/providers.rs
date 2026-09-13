@@ -38,6 +38,7 @@ use std::{
 };
 
 mod pr_lifecycle;
+mod stacks;
 pub use pr_lifecycle::{AdmittedMutationAttempt, MutationAdmission};
 
 const HOST: &str = "github.com";
