@@ -14,9 +14,10 @@ use crate::{
 };
 use cibergit::{
     domain::{
-        MutationAdmissionReceipt, MutationContext, MutationTerminalRecord, ProviderChoiceSet,
-        ProviderMutationOutcome, PullRequestCreationAcknowledgement, PullRequestCreationInput,
-        PullRequestCreationPreparation, PullRequestCreationRequest, Repository,
+        Account, MutationAdmissionReceipt, MutationContext, MutationTerminalRecord,
+        ProviderChoiceSet, ProviderMutationOutcome, PullRequestCreationAcknowledgement,
+        PullRequestCreationInput, PullRequestCreationPreparation, PullRequestCreationRequest,
+        Repository,
     },
     providers::{AdmittedMutationAttempt, GithubProvider, MutationAdmission},
 };
@@ -398,14 +399,28 @@ pub struct AttemptSummary {
 #[derive(Clone, Debug)]
 struct CreationStore {
     root: PathBuf,
+    draft_account: Option<(String, String)>,
 }
 
 impl CreationStore {
     #[cfg(test)]
     fn open(root: PathBuf) -> Result<Self, String> {
-        let store = Self { root };
+        let store = Self {
+            root,
+            draft_account: None,
+        };
         store.ensure_layout()?;
         Ok(store)
+    }
+
+    fn for_account(root: PathBuf, account: &Account) -> Result<Self, String> {
+        Ok(Self {
+            root,
+            draft_account: Some((
+                canonical_github(&account.host)?,
+                canonical_github(&account.login)?,
+            )),
+        })
     }
 
     fn ensure_layout(&self) -> Result<(), String> {
@@ -421,11 +436,18 @@ impl CreationStore {
     }
 
     fn draft_path(&self) -> PathBuf {
-        self.root.join("draft").join("v1").join("form.json")
+        let name = match &self.draft_account {
+            Some(account) => format!(
+                "account-{}.json",
+                stable_component(account).expect("account string tuple is serializable")
+            ),
+            None => "form.json".into(),
+        };
+        self.root.join("draft").join("v1").join(name)
     }
 
     fn draft_lock_path(&self) -> PathBuf {
-        self.root.join("draft").join("v1").join("form.lock")
+        self.draft_path().with_extension("lock")
     }
 
     fn load_draft(&self) -> Result<Option<DraftRecord>, String> {
@@ -436,6 +458,20 @@ impl CreationStore {
 
     fn load_draft_unlocked(&self) -> Result<Option<DraftRecord>, String> {
         let Some(bytes) = read_bounded_private(&self.draft_path(), MAX_DRAFT_BYTES)? else {
+            if self.draft_account.is_some() {
+                // Import only the selected account's legacy draft. Keep the original
+                // intact; the first owned save writes the new account-specific path.
+                let legacy = Self {
+                    root: self.root.clone(),
+                    draft_account: None,
+                };
+                let _legacy_guard = acquire_private_lock(&legacy.draft_lock_path())?;
+                if let Some(record) = legacy.load_draft_unlocked()?
+                    && self.draft_matches_account(&record.form)
+                {
+                    return Ok(Some(record));
+                }
+            }
             return Ok(None);
         };
         let record: DraftRecord = serde_json::from_slice(&bytes).map_err(|error| {
@@ -448,7 +484,20 @@ impl CreationStore {
             ));
         }
         record.form.validate_durable()?;
+        if !self.draft_matches_account(&record.form) {
+            return Err(
+                "Creation draft belongs to another account; the original was preserved.".into(),
+            );
+        }
         Ok(Some(record))
+    }
+
+    fn draft_matches_account(&self, form: &CreationForm) -> bool {
+        let account = &form.target_repository.account;
+        self.draft_account.as_ref().is_none_or(|expected| {
+            account.host.eq_ignore_ascii_case(&expected.0)
+                && account.login.eq_ignore_ascii_case(&expected.1)
+        })
     }
 
     fn save_draft_if_current(
@@ -458,6 +507,12 @@ impl CreationStore {
     ) -> Result<DraftRecord, String> {
         self.ensure_layout()?;
         form.validate_durable()?;
+        if !self.draft_matches_account(&form) {
+            return Err(
+                "Creation draft account differs from its storage lane; no text was overwritten."
+                    .into(),
+            );
+        }
         let _guard = acquire_private_lock(&self.draft_lock_path())?;
         let current = self.load_draft_unlocked()?;
         if current.as_ref().map(|record| record.generation) != expected_generation {
@@ -1106,6 +1161,7 @@ fn unique_dialog_identity() -> String {
 #[derive(Clone, Debug)]
 enum DialogState {
     Loading,
+    Unavailable,
     Editing,
     Preparing,
     Confirmation,
@@ -1191,7 +1247,9 @@ impl PrCreationDialog {
         let lifetime_id = unique_dialog_identity();
         // The constructor performs no filesystem I/O. The first background
         // load creates or verifies the private store.
-        let store = Some(CreationStore { root });
+        let store = repositories
+            .get(target_index)
+            .and_then(|repository| CreationStore::for_account(root, &repository.account).ok());
         let mut this = Self {
             store,
             repositories,
@@ -1275,7 +1333,7 @@ impl PrCreationDialog {
 
     fn start_load(&mut self, cx: &mut Context<Self>) {
         let Some(store) = self.store.clone() else {
-            self.state = DialogState::Editing;
+            self.state = DialogState::Unavailable;
             self.notice = Some("Private creation storage is unavailable; preparation and creation remain disabled.".into());
             return;
         };
@@ -1302,7 +1360,10 @@ impl PrCreationDialog {
                                 this.draft_lane.restore(&record);
                                 this.set_form_values(&record.form, cx);
                             } else {
+                                this.state = DialogState::Unavailable;
                                 this.notice = Some("The saved creation draft names a repository that is no longer explicitly selected. It was preserved and not guessed into another repository.".into());
+                                cx.notify();
+                                return;
                             }
                         }
                         this.state = DialogState::Editing;
@@ -1310,8 +1371,7 @@ impl PrCreationDialog {
                         this.load_choices(cx);
                     }
                     Err(error) => {
-                        this.state = DialogState::Editing;
-                        this.set_form_disabled(false, cx);
+                        this.state = DialogState::Unavailable;
                         this.notice = Some(error);
                     }
                 }
@@ -1692,6 +1752,13 @@ impl PrCreationDialog {
     }
 
     fn begin_close(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.state, DialogState::Unavailable) {
+            // No editable draft was installed. Closing preserves the unavailable
+            // original; it must not try to replace it with the empty form.
+            self.finish_close(cx);
+            cx.notify();
+            return;
+        }
         if self.state.busy() {
             self.notice = Some(
                 "Close is disabled while creation work is pending; no background result was detached."
@@ -1797,6 +1864,10 @@ impl PrCreationDialog {
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.state, DialogState::Unavailable) {
+            self.request_close(cx);
+            return;
+        }
         if self.state.busy() {
             return;
         }
@@ -1814,6 +1885,7 @@ impl PrCreationDialog {
 
     fn choose_repository(&mut self, target: bool, index: usize, cx: &mut Context<Self>) {
         if self.state.busy()
+            || matches!(self.state, DialogState::Unavailable)
             || self.close_after_save
             || self.prepare_queued.is_some()
             || matches!(self.state, DialogState::Confirmation)
@@ -1844,6 +1916,7 @@ impl PrCreationDialog {
         cx: &mut Context<Self>,
     ) {
         if self.state.busy()
+            || matches!(self.state, DialogState::Unavailable)
             || self.close_after_save
             || self.prepare_queued.is_some()
             || matches!(self.state, DialogState::Confirmation)
@@ -1862,6 +1935,7 @@ impl PrCreationDialog {
         let inert = self.close_after_save
             || self.prepare_queued.is_some()
             || self.state.busy()
+            || matches!(self.state, DialogState::Unavailable)
             || matches!(self.state, DialogState::Confirmation);
         let target_repositories = repository_choices(
             &self.repositories,
@@ -2170,7 +2244,7 @@ impl Render for PrCreationDialog {
             .on_action(cx.listener(|this, _: &PreparePullRequestCreation, window, cx| this.prepare(window, cx)))
             .on_action(cx.listener(|this, _: &ConfirmPullRequestCreation, window, cx| this.confirm(window, cx)))
             .on_action(cx.listener(|this, _: &CancelPullRequestCreation, _, cx| this.cancel(cx)))
-            .on_action(cx.listener(|this, _: &TogglePullRequestCreationDraft, _, cx| { if !this.state.busy() && !this.close_after_save && this.prepare_queued.is_none() { this.draft = !this.draft; this.form_changed(cx); cx.notify(); } }))
+            .on_action(cx.listener(|this, _: &TogglePullRequestCreationDraft, _, cx| { if !this.state.busy() && !matches!(this.state, DialogState::Unavailable) && !this.close_after_save && this.prepare_queued.is_none() { this.draft = !this.draft; this.form_changed(cx); cx.notify(); } }))
             .on_action(cx.listener(|this, _: &ClosePullRequestCreation, _, cx| this.request_close(cx)))
             .child(
                 div()
@@ -2650,8 +2724,13 @@ mod tests {
         let blocked = directory.path().join("blocked");
         fs::write(&blocked, b"not a directory").unwrap();
         let request = request("op", "attempt", "title", 'b');
-        let mut admission =
-            CreationAdmission::new(CreationStore { root: blocked }, request.clone());
+        let mut admission = CreationAdmission::new(
+            CreationStore {
+                root: blocked,
+                draft_account: None,
+            },
+            request.clone(),
+        );
         let error = match admission.admit(&context(&request)) {
             Ok(_) => panic!("blocked store unexpectedly admitted"),
             Err(error) => error.to_string(),
@@ -2712,6 +2791,109 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.load_draft().unwrap().unwrap(), latest);
+    }
+
+    #[test]
+    fn account_drafts_preserve_legacy_text_and_do_not_split_creation_authority() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("creation");
+        let legacy = CreationStore::open(root.clone()).unwrap();
+        let prepared = preparation("Alice legacy draft", 'a');
+        let input = &prepared.input;
+        let form = CreationForm {
+            target_repository: input.target_repository.clone(),
+            base_branch: input.base_branch.clone(),
+            source_repository: input.source_repository.clone(),
+            source_branch: input.source_branch.clone(),
+            local_branch: input.local_branch.clone(),
+            title: input.title.clone(),
+            body: input.body.clone(),
+            draft: input.draft,
+        };
+        let old = legacy.save_draft_if_current(None, form.clone()).unwrap();
+        let preserved = fs::read(legacy.draft_path()).unwrap();
+        let alice =
+            CreationStore::for_account(root.clone(), &input.target_repository.account).unwrap();
+        let mut bob_form = form.clone();
+        bob_form.target_repository.account.login = "bob".into();
+        bob_form.source_repository.account.login = "bob".into();
+        bob_form.body = "Bob independent text".into();
+        let bob =
+            CreationStore::for_account(root.clone(), &bob_form.target_repository.account).unwrap();
+        assert!(bob.load_draft().unwrap().is_none());
+        bob.save_draft_if_current(None, bob_form.clone()).unwrap();
+        assert_eq!(bob.load_draft().unwrap().unwrap().form, bob_form);
+        assert_eq!(alice.load_draft().unwrap(), Some(old.clone()));
+        let mut edited = form.clone();
+        edited.body = "Alice latest text".into();
+        alice
+            .save_draft_if_current(Some(old.generation), edited.clone())
+            .unwrap();
+        assert_eq!(fs::read(legacy.draft_path()).unwrap(), preserved);
+        assert_eq!(alice.load_draft().unwrap().unwrap().form, edited);
+        assert_eq!(bob.load_draft().unwrap().unwrap().form, bob_form);
+        assert!(bob.save_draft_if_current(Some(1), form).is_err());
+        let mut alias = input.target_repository.account.clone();
+        alias.login = alias.login.to_ascii_uppercase();
+        alias.host = alias.host.to_ascii_uppercase();
+        let alias = CreationStore::for_account(root, &alias).unwrap();
+        assert_eq!(alias.draft_path(), alice.draft_path());
+        assert_eq!(alias.draft_lock_path(), alice.draft_lock_path());
+        assert!(
+            alias
+                .save_draft_if_current(Some(old.generation), edited.clone())
+                .is_err()
+        );
+        assert_eq!(alice.load_draft().unwrap().unwrap().form, edited);
+        let authority = CreationAuthorityKey::from_preparation(&prepared).unwrap();
+        assert_eq!(
+            legacy.authority_lock_path(&authority).unwrap(),
+            alice.authority_lock_path(&authority).unwrap()
+        );
+        assert_eq!(
+            legacy.journal_path(&authority).unwrap(),
+            alice.journal_path(&authority).unwrap()
+        );
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn unavailable_saved_repository_can_close_without_overwriting_its_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let directory = tempdir().unwrap();
+        let store = CreationStore::open(directory.path().join("creation")).unwrap();
+        let form = CreationForm {
+            target_repository: repository("removed", "repo", "alice"),
+            source_repository: repository("removed", "repo", "alice"),
+            base_branch: "main".into(),
+            source_branch: "topic".into(),
+            local_branch: None,
+            title: "Retained removed-repository draft".into(),
+            body: "Keep this text".into(),
+            draft: false,
+        };
+        store.save_draft_if_current(None, form.clone()).unwrap();
+        let before = fs::read(store.draft_path()).unwrap();
+        let (dialog, cx) = cx.add_window_view(|window, cx| {
+            PrCreationDialog::new(
+                store.root.clone(),
+                vec![repository("owner", "repo", "alice")],
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        dialog.update(cx, |this, cx| {
+            assert!(matches!(this.state, DialogState::Unavailable));
+            assert!(this.draft_lane.durable_generation.is_none());
+            this.cancel(cx);
+            assert!(this.closed);
+        });
+        assert_eq!(fs::read(store.draft_path()).unwrap(), before);
+        assert_eq!(store.load_draft().unwrap().unwrap().form, form);
     }
 
     #[test]
@@ -2875,7 +3057,12 @@ mod tests {
         use std::{cell::RefCell, rc::Rc};
         cx.update(gpui_base::init);
         let directory = tempdir().unwrap();
-        let store = CreationStore::open(directory.path().join("creation")).unwrap();
+        let store = CreationStore::for_account(
+            directory.path().join("creation"),
+            &repository("owner", "repo", "alice").account,
+        )
+        .unwrap();
+        store.ensure_layout().unwrap();
         let (dialog, cx) = cx.add_window_view(|window, cx| {
             let mut dialog = PrCreationDialog::new(
                 store.root.clone(),
@@ -2931,7 +3118,12 @@ mod tests {
         use std::{cell::RefCell, rc::Rc};
         cx.update(gpui_base::init);
         let directory = tempdir().unwrap();
-        let store = CreationStore::open(directory.path().join("creation")).unwrap();
+        let store = CreationStore::for_account(
+            directory.path().join("creation"),
+            &repository("owner", "repo", "alice").account,
+        )
+        .unwrap();
+        store.ensure_layout().unwrap();
         let (dialog, cx) = cx.add_window_view(|window, cx| {
             let mut dialog = PrCreationDialog::new(
                 store.root.clone(),

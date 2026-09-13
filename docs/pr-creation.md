@@ -33,6 +33,8 @@ An acknowledgement shows the actual GitHub head separately from the reviewed pre
 
 Creation state lives under the app data directory in `pr-creation/`. Directories are mode `0700`; files are mode `0600`. Draft and journal records are versioned and bounded. Writes use a private temporary file, file sync, atomic rename, and directory sync. Draft saves use a generation compare-and-swap and one coalescing lane: a successful older save advances the owned durable baseline, then the latest pending text saves against it. A late window cannot overwrite newer durable text. Closing queues the latest visible form immediately, without waiting for the typing debounce, and the dialog remains open if that save fails.
 
+Each account has its own draft file and save lock, keyed by canonical GitHub host and login. The previous shared draft is read only for its matching account when that account has no draft yet; saving writes the account-specific file and preserves the original. If a saved repository is no longer added, the form explains why it cannot restore the draft and allows closing without replacing the saved text. Unreadable drafts are likewise preserved and cannot be edited through an empty replacement form.
+
 Every authority lane is the exact tuple:
 
 `github + selected account + target repository + base branch + source repository + published source branch`
