@@ -4,7 +4,8 @@
 //! the checkout's current branch, HEAD, index, files, and operation state.
 
 use crate::local_git::{
-    HeadState, LocalGit, LocalGitError, OperationState, RebaseState, run_installed_git_at,
+    CommandLimits, HeadState, LocalGit, LocalGitError, OperationState, RebaseState,
+    run_installed_git_at, run_installed_git_at_with_limits,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,6 +24,9 @@ const STORE_FILE: &str = "worktree-associations.json";
 const MAX_STORE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RECORDS: usize = 4_096;
 const MAX_TEXT_BYTES: usize = 4_096;
+// A full initial public clone exceeded the local-action 30s limit in native
+// validation. Network setup remains bounded and never runs on the UI thread.
+const NETWORK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AssociationKey {
@@ -614,7 +618,7 @@ impl WorktreeManager {
         let repository = match existing_repository {
             Some(repository) => repository,
             None => {
-                let clone_result = run_installed_git_at(
+                let clone_result = run_installed_git_at_with_limits(
                     &self.managed_root,
                     "create application-owned local repository",
                     vec![
@@ -628,6 +632,10 @@ impl WorktreeManager {
                     ],
                     true,
                     &[0],
+                    CommandLimits {
+                        deadline: NETWORK_DEADLINE,
+                        ..CommandLimits::default()
+                    },
                 );
                 if let Err(error) = clone_result {
                     return Err(uncertain(operation, WorktreeError::LocalGit(error)));
@@ -718,7 +726,8 @@ impl WorktreeManager {
         }
         let synthetic_ref = format!("refs/cibergit/fetched/{}", storage_key(&request.key));
         let refspec = format!("+{}:{synthetic_ref}", request.fetch_ref);
-        if let Err(error) = repository.run_worktree_command(
+        if let Err(error) = run_installed_git_at_with_limits(
+            repository.root(),
             "fetch exact pull request object",
             vec![
                 "fetch".into(),
@@ -731,6 +740,10 @@ impl WorktreeManager {
             ],
             true,
             &[0],
+            CommandLimits {
+                deadline: NETWORK_DEADLINE,
+                ..CommandLimits::default()
+            },
         ) {
             return Err(uncertain(operation, error.into()));
         }

@@ -375,11 +375,36 @@ pub(crate) fn run_installed_git_at(
     mutation: bool,
     accepted_exit_codes: &[i32],
 ) -> Result<Vec<u8>> {
+    run_installed_git_at_with_limits(
+        directory,
+        action,
+        args,
+        mutation,
+        accepted_exit_codes,
+        CommandLimits::default(),
+    )
+}
+
+/// Explicit network provisioning may need a longer deadline than local Git
+/// actions; output/input bounds and process-group cancellation still apply.
+pub(crate) fn run_installed_git_at_with_limits(
+    directory: &Path,
+    action: &'static str,
+    args: Vec<OsString>,
+    mutation: bool,
+    accepted_exit_codes: &[i32],
+    limits: CommandLimits,
+) -> Result<Vec<u8>> {
+    if limits.deadline.is_zero() || limits.max_output_bytes == 0 || limits.max_input_bytes == 0 {
+        return Err(LocalGitError::InvalidInput(
+            "command bounds must be nonzero",
+        ));
+    }
     let runner = LocalGit {
         root: directory.to_path_buf(),
         git_dir: directory.join(".git"),
         common_git_dir: directory.join(".git"),
-        limits: CommandLimits::default(),
+        limits,
         snapshot_content_limit: DEFAULT_SNAPSHOT_CONTENT_LIMIT,
         write_lock: Arc::new(Mutex::new(())),
     };
