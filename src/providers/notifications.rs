@@ -9,14 +9,63 @@
 //! <https://docs.github.com/en/rest/pulls/comments>
 //! <https://docs.github.com/en/rest/checks/runs>
 
-use super::{GithubProvider, PAGE_SIZE, Session, validate_sha};
+use super::{
+    GithubProvider, PAGE_SIZE, Session,
+    conditional::{ConditionalGet, RestPollDirective, RestValidators},
+    validate_sha,
+};
 use crate::domain::{Account, Repository};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_NOTIFICATION_REPOSITORIES: usize = 5;
+pub use super::conditional::{
+    BoundedDelay as NotificationDelay, RestPollDirective as NotificationPollDirective,
+};
+
+const MAX_CACHE_ITEMS_PER_PAGE: usize = 100;
+const MAX_CACHE_ITEM_SERIALIZED_BYTES: usize = 16 * 1024;
+const MAX_CACHE_PAGE_SERIALIZED_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CACHE_ENTRIES: usize = 50;
+const MAX_CACHE_SERIALIZED_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug, Default)]
+pub struct NotificationConditionalCache {
+    pages: BTreeMap<NotificationPageKey, CachedNotificationPage>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NotificationObservationRead {
+    pub batch: ProviderNotificationBatch,
+    pub cache: NotificationConditionalCache,
+    pub poll: NotificationPollDirective,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct NotificationPageKey {
+    provider: &'static str,
+    account: String,
+    host: String,
+    owner: String,
+    repository: String,
+    method: &'static str,
+    path: String,
+    query: String,
+    page: usize,
+    since: Option<String>,
+    accept: &'static str,
+    api_version: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CachedNotificationPage {
+    items: Vec<ApiNotification>,
+    validators: RestValidators,
+    next_page: Option<usize>,
+    serialized_bytes: usize,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationReadLimits {
@@ -199,6 +248,31 @@ impl GithubProvider {
         since: Option<&str>,
         limits: NotificationReadLimits,
     ) -> Result<ProviderNotificationBatch> {
+        Ok(self
+            .notification_observations_impl(repositories, since, limits, None)?
+            .batch)
+    }
+
+    pub fn notification_observations_conditional(
+        &self,
+        repositories: &[Repository],
+        since: Option<&str>,
+        limits: NotificationReadLimits,
+        cache: NotificationConditionalCache,
+    ) -> Result<NotificationObservationRead> {
+        self.notification_observations_impl(repositories, since, limits, Some(cache))
+    }
+
+    fn notification_observations_impl(
+        &self,
+        repositories: &[Repository],
+        since: Option<&str>,
+        limits: NotificationReadLimits,
+        conditional_cache: Option<NotificationConditionalCache>,
+    ) -> Result<NotificationObservationRead> {
+        let conditional = conditional_cache.is_some();
+        let mut cache = conditional_cache.unwrap_or_default();
+        let mut poll = RestPollDirective::default();
         limits.validate()?;
         ensure!(
             !repositories.is_empty() && repositories.len() <= MAX_NOTIFICATION_REPOSITORIES,
@@ -268,6 +342,8 @@ impl GithubProvider {
 
             let key = repository.full_name().to_ascii_lowercase();
             let mut repository_page = 1usize;
+            let mut staged_pages = Vec::new();
+            let mut cache_chain_valid = true;
             loop {
                 pages_read += 1;
                 let suffix = since.map_or_else(String::new, |value| format!("&since={value}"));
@@ -275,7 +351,60 @@ impl GithubProvider {
                     "repos/{}/notifications?all=true&participating=false&per_page={PAGE_SIZE}&page={repository_page}{suffix}",
                     repository.full_name()
                 );
-                let page_items: Vec<ApiNotification> = match session.get(&endpoint) {
+                let page_key = notification_page_key(self, repository, since, repository_page);
+                let cached = conditional
+                    .then(|| cache.pages.get(&page_key).cloned())
+                    .flatten();
+                let response =
+                    if conditional {
+                        session
+                            .get_conditional::<Vec<ApiNotification>>(
+                                &endpoint,
+                                cached.as_ref().map(|entry| &entry.validators),
+                            )
+                            .map(|response| match response {
+                                ConditionalGet::Modified { value, metadata } => {
+                                    poll.merge(&metadata.poll);
+                                    // A fresh representation replaces the exact old validator/body,
+                                    // even when its body or pagination metadata later fails closed.
+                                    cache.pages.remove(&page_key);
+                                    let next_page = validated_next_page(
+                                        metadata.link.as_deref(),
+                                        repository,
+                                        since,
+                                        repository_page,
+                                        value.len(),
+                                    )?;
+                                    Ok((value, next_page, Some(metadata)))
+                                }
+                                ConditionalGet::NotModified { metadata } => {
+                                    poll.merge(&metadata.poll);
+                                    let entry = cached.as_ref().ok_or_else(|| anyhow::anyhow!(
+                                    "Conditional notification response had no exact cached body"
+                                ))?;
+                                    let validators = entry
+                                        .validators
+                                        .merged_after_not_modified(&metadata.validators);
+                                    let mut metadata = metadata;
+                                    metadata.validators = validators;
+                                    Ok((entry.items.clone(), entry.next_page, Some(metadata)))
+                                }
+                            })
+                            .map_err(|error| {
+                                poll.merge(error.poll());
+                                if error.invalidates_cached_body() {
+                                    cache.pages.remove(&page_key);
+                                }
+                                anyhow::Error::new(error)
+                            })
+                            .and_then(|value| value)
+                    } else {
+                        session.get::<Vec<ApiNotification>>(&endpoint).map(|items| {
+                            let next = (items.len() == PAGE_SIZE).then_some(repository_page + 1);
+                            (items, next, None)
+                        })
+                    };
+                let (page_items, next_page, metadata) = match response {
                     Ok(items) => items,
                     Err(error) => {
                         complete = false;
@@ -318,7 +447,22 @@ impl GithubProvider {
                     });
                     continue 'repositories;
                 }
-                let last = page_items.len() < PAGE_SIZE;
+                if page_items
+                    .iter()
+                    .any(|notification| notification.validate(repository).is_err())
+                {
+                    cache_chain_valid = false;
+                    if metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.body_bytes > 0)
+                    {
+                        cache.pages.remove(&page_key);
+                    }
+                }
+                let last = next_page.is_none();
+                let cached_page = metadata.as_ref().and_then(|metadata| {
+                    cacheable_page(&page_key, &page_items, &metadata.validators, next_page)
+                });
                 let mut omitted_from_page = false;
                 for item in page_items {
                     ensure!(
@@ -352,6 +496,13 @@ impl GithubProvider {
                     break 'repositories;
                 }
                 if last {
+                    if conditional && cache_chain_valid {
+                        staged_pages.push((page_key.clone(), cached_page));
+                        for (key, page) in staged_pages.drain(..) {
+                            install_cache_page(&mut cache, key, page);
+                        }
+                        prune_cache_tail(&mut cache, &page_key, repository_page);
+                    }
                     break;
                 }
                 if pages_read == limits.max_notification_pages {
@@ -367,7 +518,10 @@ impl GithubProvider {
                     );
                     break 'repositories;
                 }
-                repository_page += 1;
+                if conditional {
+                    staged_pages.push((page_key, cached_page));
+                }
+                repository_page = next_page.expect("nonterminal notification page has a next page");
             }
         }
 
@@ -505,17 +659,177 @@ impl GithubProvider {
             .context("System timestamp is outside supported range")?;
         let mut repositories: Vec<_> = repository_completeness.into_values().collect();
         repositories.sort_by_key(|value| scope_key(&value.target));
-        Ok(ProviderNotificationBatch {
-            account: self.account.clone(),
-            observed_at_unix_ms,
-            observations,
-            incomplete_candidates: incomplete,
-            full_snapshot: since.is_none(),
-            repositories,
-            complete,
-            notices,
+        Ok(NotificationObservationRead {
+            batch: ProviderNotificationBatch {
+                account: self.account.clone(),
+                observed_at_unix_ms,
+                observations,
+                incomplete_candidates: incomplete,
+                full_snapshot: since.is_none(),
+                repositories,
+                complete,
+                notices,
+            },
+            cache,
+            poll,
         })
     }
+}
+
+fn notification_page_key(
+    provider: &GithubProvider,
+    repository: &Repository,
+    since: Option<&str>,
+    page: usize,
+) -> NotificationPageKey {
+    let path = format!("/repos/{}/notifications", repository.full_name());
+    let suffix = since.map_or_else(String::new, |value| format!("&since={value}"));
+    NotificationPageKey {
+        provider: "github",
+        account: provider.account.login.to_ascii_lowercase(),
+        host: provider.account.host.to_ascii_lowercase(),
+        owner: repository.owner.to_ascii_lowercase(),
+        repository: repository.name.to_ascii_lowercase(),
+        method: "GET",
+        path,
+        query: format!("all=true&participating=false&per_page={PAGE_SIZE}&page={page}{suffix}"),
+        page,
+        since: since.map(str::to_owned),
+        accept: "application/vnd.github+json",
+        api_version: "2026-03-10",
+    }
+}
+
+fn validated_next_page(
+    link: Option<&str>,
+    repository: &Repository,
+    since: Option<&str>,
+    page: usize,
+    item_count: usize,
+) -> Result<Option<usize>> {
+    let Some(link) = link else {
+        return Ok((item_count == PAGE_SIZE).then_some(page + 1));
+    };
+    let suffix = since.map_or_else(String::new, |value| format!("&since={value}"));
+    let expected = format!(
+        "https://api.github.com/repos/{}/notifications?all=true&participating=false&per_page={PAGE_SIZE}&page={}{suffix}",
+        repository.full_name(),
+        page + 1
+    );
+    let mut next = None;
+    for entry in link.split(',') {
+        let mut components = entry.trim().split(';');
+        let target = components
+            .next()
+            .context("Invalid notification pagination link")?
+            .trim();
+        let target = target
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+            .context("Invalid notification pagination link")?;
+        let mut relation = None;
+        for parameter in components {
+            let (name, value) = parameter
+                .trim()
+                .split_once('=')
+                .context("Invalid notification pagination link")?;
+            if name.eq_ignore_ascii_case("rel") {
+                ensure!(relation.is_none(), "Invalid notification pagination link");
+                relation = Some(value.trim_matches('"'));
+            }
+        }
+        if relation == Some("next") {
+            ensure!(
+                next.is_none() && target == expected,
+                "Foreign or nonsequential notification pagination link"
+            );
+            next = Some(page + 1);
+        }
+    }
+    Ok(next)
+}
+
+#[derive(Serialize)]
+struct CachePayload<'a> {
+    key: &'a NotificationPageKey,
+    items: &'a [ApiNotification],
+    validators: &'a RestValidators,
+    next_page: Option<usize>,
+}
+
+fn cacheable_page(
+    key: &NotificationPageKey,
+    items: &[ApiNotification],
+    validators: &RestValidators,
+    next_page: Option<usize>,
+) -> Option<CachedNotificationPage> {
+    if validators.is_empty()
+        || items.len() > MAX_CACHE_ITEMS_PER_PAGE
+        || items.iter().any(|item| {
+            serde_json::to_vec(item)
+                .map_or(true, |bytes| bytes.len() > MAX_CACHE_ITEM_SERIALIZED_BYTES)
+        })
+    {
+        return None;
+    }
+    let serialized_bytes = serde_json::to_vec(&CachePayload {
+        key,
+        items,
+        validators,
+        next_page,
+    })
+    .ok()?
+    .len();
+    (serialized_bytes <= MAX_CACHE_PAGE_SERIALIZED_BYTES).then(|| CachedNotificationPage {
+        items: items.to_vec(),
+        validators: validators.clone(),
+        next_page,
+        serialized_bytes,
+    })
+}
+
+fn install_cache_page(
+    cache: &mut NotificationConditionalCache,
+    key: NotificationPageKey,
+    page: Option<CachedNotificationPage>,
+) {
+    cache.pages.remove(&key);
+    if let Some(page) = page {
+        cache.pages.insert(key, page);
+    }
+    while cache.pages.len() > MAX_CACHE_ENTRIES
+        || cache
+            .pages
+            .values()
+            .map(|page| page.serialized_bytes)
+            .sum::<usize>()
+            > MAX_CACHE_SERIALIZED_BYTES
+    {
+        let Some(key) = cache.pages.keys().next_back().cloned() else {
+            break;
+        };
+        cache.pages.remove(&key);
+    }
+}
+
+fn prune_cache_tail(
+    cache: &mut NotificationConditionalCache,
+    terminal_key: &NotificationPageKey,
+    terminal_page: usize,
+) {
+    cache.pages.retain(|key, _| {
+        key.page <= terminal_page
+            || key.provider != terminal_key.provider
+            || key.account != terminal_key.account
+            || key.host != terminal_key.host
+            || key.owner != terminal_key.owner
+            || key.repository != terminal_key.repository
+            || key.method != terminal_key.method
+            || key.path != terminal_key.path
+            || key.since != terminal_key.since
+            || key.accept != terminal_key.accept
+            || key.api_version != terminal_key.api_version
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1124,7 +1438,7 @@ fn parse_pull_subject_url(repo: &Repository, subject: &ApiNotificationSubject) -
     Ok(number)
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ApiNotification {
     id: String,
     reason: String,
@@ -1168,7 +1482,7 @@ impl ApiNotification {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ApiNotificationSubject {
     #[serde(rename = "type")]
     kind: String,
@@ -1176,7 +1490,7 @@ struct ApiNotificationSubject {
     latest_comment_url: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ApiNotificationRepository {
     full_name: String,
     html_url: String,

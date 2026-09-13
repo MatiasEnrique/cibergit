@@ -9,7 +9,8 @@ use cibergit::{
     providers::{
         GithubProvider,
         notifications::{
-            IncompleteNotificationCandidate, NotificationAlertKind, NotificationPullRequest,
+            IncompleteNotificationCandidate, NotificationAlertKind, NotificationConditionalCache,
+            NotificationDelay, NotificationPollDirective, NotificationPullRequest,
             NotificationReadLimits, NotificationRepositoryScope, ProviderNotificationBatch,
             ProviderNotificationEvent, RepositoryNotificationCompleteness,
         },
@@ -32,6 +33,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const PAGE_SIZE: usize = 40;
@@ -81,6 +83,7 @@ pub(super) struct PollWork {
     account: Account,
     chunks: Vec<Vec<Repository>>,
     store: NotificationStore,
+    cache: NotificationConditionalCache,
 }
 
 #[derive(Debug)]
@@ -90,6 +93,8 @@ pub(super) struct PollCompletion {
     snapshot: NotificationSnapshot,
     newly_admitted: Vec<ProviderNotificationEvent>,
     error: Option<String>,
+    cache: NotificationConditionalCache,
+    poll: NotificationPollDirective,
 }
 
 impl PollCompletion {
@@ -115,13 +120,20 @@ impl PollWork {
     pub(super) fn run(self) -> PollCompletion {
         let mut batches = Vec::with_capacity(self.chunks.len());
         let mut failures = Vec::new();
+        let mut cache = self.cache;
+        let mut poll = NotificationPollDirective::default();
         for (index, chunk) in self.chunks.iter().enumerate() {
-            match GithubProvider::new(self.account.clone()).notification_observations(
+            match GithubProvider::new(self.account.clone()).notification_observations_conditional(
                 chunk,
                 None,
                 NotificationReadLimits::default(),
+                cache.clone(),
             ) {
-                Ok(batch) => batches.push((index, batch)),
+                Ok(read) => {
+                    cache = read.cache;
+                    poll.merge(&read.poll);
+                    batches.push((index, read.batch));
+                }
                 Err(error) => failures.push((index, format!("{error:#}"))),
             }
         }
@@ -135,6 +147,8 @@ impl PollWork {
                 snapshot: snapshot_from_outcome(&outcome),
                 newly_admitted: outcome.newly_admitted_alerts,
                 error: (!failures.is_empty()).then(|| format_failures(&failures, self.chunks.len())),
+                cache,
+                poll,
             },
             Err(error) => PollCompletion {
                 token: self.token,
@@ -148,6 +162,8 @@ impl PollWork {
                 error: Some(format!(
                     "Notification refresh failed; cached unread retained: {error:#}"
                 )),
+                cache,
+                poll,
             },
         }
     }
@@ -340,6 +356,46 @@ impl BootstrapWork {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServerGateReason {
+    PollInterval,
+    RateLimit,
+}
+
+#[derive(Default)]
+struct NotificationServerGate {
+    not_before: Option<Instant>,
+    suspended: bool,
+    reason: Option<ServerGateReason>,
+}
+
+impl NotificationServerGate {
+    fn allows(&self, now: Instant) -> bool {
+        !self.suspended && self.not_before.is_none_or(|deadline| now >= deadline)
+    }
+
+    fn apply(&mut self, delay: &NotificationDelay, reason: ServerGateReason, now: Instant) {
+        let deadline = match delay {
+            NotificationDelay::Seconds(seconds) => now.checked_add(Duration::from_secs(*seconds)),
+            NotificationDelay::UntilUnixSeconds(unix) => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|wall| unix.checked_sub(wall.as_secs()))
+                .and_then(|seconds| now.checked_add(Duration::from_secs(seconds))),
+            NotificationDelay::Suspend => None,
+        };
+        let Some(deadline) = deadline else {
+            self.suspended = true;
+            self.reason = Some(reason);
+            return;
+        };
+        if self.not_before.is_none_or(|current| deadline > current) {
+            self.not_before = Some(deadline);
+            self.reason = Some(reason);
+        }
+    }
+}
+
 #[derive(Default)]
 struct AccountViewState {
     account: Option<Account>,
@@ -357,6 +413,8 @@ struct AccountViewState {
     consent_generation: u64,
     consent_enabled: bool,
     consent_transition: bool,
+    conditional_cache: NotificationConditionalCache,
+    server_gate: NotificationServerGate,
 }
 
 pub(super) struct NotificationController {
@@ -470,12 +528,22 @@ impl NotificationController {
 
     #[cfg(test)]
     pub(super) fn begin_polls(&mut self, repositories: &[Repository]) -> Vec<PollWork> {
-        self.begin_polls_when(repositories, |_| true)
+        self.begin_polls_when_at(repositories, Instant::now(), |_| true)
     }
 
+    #[cfg(test)]
     pub(super) fn begin_polls_when(
         &mut self,
         repositories: &[Repository],
+        is_due: impl FnMut(&Account) -> bool,
+    ) -> Vec<PollWork> {
+        self.begin_polls_when_at(repositories, Instant::now(), is_due)
+    }
+
+    pub(super) fn begin_polls_when_at(
+        &mut self,
+        repositories: &[Repository],
+        now: Instant,
         mut is_due: impl FnMut(&Account) -> bool,
     ) -> Vec<PollWork> {
         let Some(runtime) = self.runtime.clone() else {
@@ -499,6 +567,7 @@ impl NotificationController {
                 state.generation = state.generation.saturating_add(1);
                 state.displayed = None;
                 state.snapshot = None;
+                state.conditional_cache = NotificationConditionalCache::default();
                 self.queued.retain(|queued| queued.account_key != *key);
             }
         }
@@ -522,9 +591,14 @@ impl NotificationController {
                 state.generation = state.generation.saturating_add(1);
                 state.displayed = None;
                 state.snapshot = None;
+                state.conditional_cache = NotificationConditionalCache::default();
                 self.queued.retain(|queued| queued.account_key != key);
             }
-            if state.in_flight || repositories.is_empty() || !is_due(&account) {
+            if state.in_flight
+                || repositories.is_empty()
+                || !state.server_gate.allows(now)
+                || !is_due(&account)
+            {
                 continue;
             }
             state.generation = state.generation.saturating_add(1);
@@ -542,12 +616,17 @@ impl NotificationController {
                 account,
                 chunks: repositories.chunks(5).map(<[Repository]>::to_vec).collect(),
                 store: runtime.store.clone(),
+                cache: state.conditional_cache.clone(),
             });
         }
         work
     }
 
     pub(super) fn release_poll(&mut self, completion: &PollCompletion) -> bool {
+        self.release_poll_at(completion, Instant::now())
+    }
+
+    pub(super) fn release_poll_at(&mut self, completion: &PollCompletion, now: Instant) -> bool {
         let key = account_key(&completion.account);
         let Some(state) = self.accounts.get_mut(&key) else {
             return false;
@@ -557,6 +636,20 @@ impl NotificationController {
             || state.active_poll_generation != Some(completion.token.generation)
         {
             return false;
+        }
+        if state.account.as_ref() == Some(&completion.account) {
+            if token_matches(&completion.token, self.lifetime, &key, state) {
+                if let Some(delay) = &completion.poll.x_poll_interval {
+                    state
+                        .server_gate
+                        .apply(delay, ServerGateReason::PollInterval, now);
+                }
+            }
+            if let Some(delay) = &completion.poll.rate_limit {
+                state
+                    .server_gate
+                    .apply(delay, ServerGateReason::RateLimit, now);
+            }
         }
         state.active_poll_generation = None;
         state.in_flight = false;
@@ -594,6 +687,7 @@ impl NotificationController {
                 completion.newly_admitted.retain(|event| {
                     selected_target(&event.identity.target, &state.selected_repositories)
                 });
+                state.conditional_cache = completion.cache;
                 state.snapshot = Some(completion.snapshot);
                 state.stale_notice = completion.error;
                 state.page = state.page.min(max_page(state.snapshot.as_ref()));
@@ -2114,6 +2208,8 @@ mod tests {
             snapshot: empty_snapshot("old selection".into()),
             newly_admitted: vec![],
             error: None,
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective::default(),
         };
         assert!(controller.accepts_poll(&completion));
         assert!(
@@ -2134,6 +2230,116 @@ mod tests {
     }
 
     #[test]
+    fn server_poll_interval_blocks_timer_focus_and_manual_until_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = NotificationController::new(dir.path().into());
+        assert!(controller.complete_bootstrap(controller.begin_bootstrap().run()));
+        let now = Instant::now();
+        let work = controller
+            .begin_polls_when_at(&[repo("alice", 0)], now, |_| true)
+            .pop()
+            .unwrap();
+        let completion = PollCompletion {
+            token: work.token,
+            account: account("alice"),
+            snapshot: empty_snapshot(String::new()),
+            newly_admitted: vec![],
+            error: None,
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective {
+                x_poll_interval: Some(NotificationDelay::Seconds(120)),
+                rate_limit: None,
+            },
+        };
+        assert!(controller.release_poll_at(&completion, now));
+        for label in ["timer", "focus", "manual"] {
+            assert!(
+                controller
+                    .begin_polls_when_at(
+                        &[repo("alice", 0)],
+                        now + Duration::from_secs(119),
+                        |_| true,
+                    )
+                    .is_empty(),
+                "{label} must not bypass the server gate"
+            );
+        }
+        let next = controller
+            .begin_polls_when_at(&[repo("alice", 0)], now + Duration::from_secs(120), |_| {
+                true
+            })
+            .pop()
+            .unwrap();
+        let overflow = PollCompletion {
+            token: next.token,
+            account: account("alice"),
+            snapshot: empty_snapshot(String::new()),
+            newly_admitted: vec![],
+            error: None,
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective {
+                x_poll_interval: Some(NotificationDelay::Seconds(u64::MAX)),
+                rate_limit: None,
+            },
+        };
+        assert!(controller.release_poll_at(&overflow, now + Duration::from_secs(120)));
+        assert!(
+            controller
+                .begin_polls_when_at(
+                    &[repo("alice", 0)],
+                    now + Duration::from_secs(3_600),
+                    |_| true
+                )
+                .is_empty(),
+            "an unrepresentable server delay suspends instead of shortening"
+        );
+    }
+
+    #[test]
+    fn stale_selection_applies_only_matching_account_rate_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = NotificationController::new(dir.path().into());
+        assert!(controller.complete_bootstrap(controller.begin_bootstrap().run()));
+        let now = Instant::now();
+        let first = controller
+            .begin_polls_when_at(&[repo("alice", 0), repo("bob", 0)], now, |_| true)
+            .into_iter()
+            .find(|work| work.account.login == "alice")
+            .unwrap();
+        assert!(
+            controller
+                .begin_polls_when_at(&[repo("alice", 1), repo("bob", 0)], now, |_| false)
+                .is_empty()
+        );
+        let stale = PollCompletion {
+            token: first.token,
+            account: account("alice"),
+            snapshot: empty_snapshot(String::new()),
+            newly_admitted: vec![],
+            error: Some("rate limited".into()),
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective {
+                x_poll_interval: Some(NotificationDelay::Seconds(600)),
+                rate_limit: Some(NotificationDelay::Seconds(90)),
+            },
+        };
+        assert!(controller.release_poll_at(&stale, now));
+        assert!(!controller.accepts_poll(&stale));
+        assert!(
+            controller
+                .begin_polls_when_at(&[repo("alice", 1)], now + Duration::from_secs(89), |_| true)
+                .is_empty()
+        );
+        assert_eq!(
+            controller
+                .begin_polls_when_at(&[repo("alice", 1)], now + Duration::from_secs(90), |_| true)
+                .len(),
+            1,
+            "stale X-Poll-Interval must not install, but matching rate delay must"
+        );
+    }
+
+    #[test]
     fn partial_success_retains_failure_backoff() {
         let mut completion = PollCompletion {
             token: ControllerToken {
@@ -2147,6 +2353,8 @@ mod tests {
             snapshot: empty_snapshot(String::new()),
             newly_admitted: vec![],
             error: None,
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective::default(),
         };
         completion.snapshot.repository_completeness = vec![RepositoryNotificationCompleteness {
             target: repository_scope(&repo("alice", 0)),
@@ -2188,6 +2396,8 @@ mod tests {
             snapshot: store.list_unread(&alice).unwrap(),
             newly_admitted: vec![],
             error: None,
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective::default(),
         };
         controller.complete_poll(completion);
         assert_eq!(controller.unread_count(), 0);
@@ -2255,6 +2465,8 @@ mod tests {
             snapshot: empty_snapshot(String::new()),
             newly_admitted: vec![],
             error: None,
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective::default(),
         };
         assert!(!controller.accepts_poll(&completion));
         assert!(controller.release_poll(&completion));
@@ -2295,7 +2507,9 @@ mod tests {
                     account: alice.clone(),
                     snapshot: snapshot.clone(),
                     newly_admitted: vec![exact.clone()],
-                    error: None
+                    error: None,
+                    cache: NotificationConditionalCache::default(),
+                    poll: NotificationPollDirective::default(),
                 })
                 .is_none()
         );
@@ -2312,7 +2526,9 @@ mod tests {
                     account: alice,
                     snapshot,
                     newly_admitted: vec![exact],
-                    error: None
+                    error: None,
+                    cache: NotificationConditionalCache::default(),
+                    poll: NotificationPollDirective::default(),
                 })
                 .is_some()
         );
@@ -2397,6 +2613,8 @@ mod tests {
                 snapshot: empty_snapshot(String::new()),
                 newly_admitted: vec![exact.clone()],
                 error: None,
+                cache: NotificationConditionalCache::default(),
+                poll: NotificationPollDirective::default(),
             })
             .unwrap();
         assert!(controller.complete_admission(admission.run()));
@@ -2610,6 +2828,8 @@ mod tests {
             },
             newly_admitted: vec![event("alice", "1", 7)],
             error: None,
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective::default(),
         };
         assert!(controller.complete_poll(completion).is_none());
         assert_eq!(controller.unread_count(), 0);
@@ -2853,6 +3073,8 @@ mod tests {
             },
             newly_admitted: vec![event("alice", "old", 7)],
             error: None,
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective::default(),
         };
         assert!(controller.complete_poll(completion).is_none());
         let state = controller.accounts.values().next().unwrap();

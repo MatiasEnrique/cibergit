@@ -106,6 +106,71 @@ print(json.dumps(responses[endpoint]))
             (dir, provider)
         }
 
+        fn conditional_provider_fixture(
+            login: &str,
+            responses: HashMap<String, Value>,
+            steps: Vec<Value>,
+        ) -> (TempDir, GithubProvider) {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("login"), login).unwrap();
+            fs::write(dir.path().join("responses.json"), serde_json::to_vec(&responses).unwrap()).unwrap();
+            fs::write(dir.path().join("conditional.json"), serde_json::to_vec(&steps).unwrap()).unwrap();
+            let executable = dir.path().join("gh");
+            fs::write(&executable, r#"#!/usr/bin/python3
+import json, os, pathlib, sys
+root = pathlib.Path(__file__).parent
+args = sys.argv[1:]
+login = (root / 'login').read_text()
+if args[:2] == ['auth', 'token']:
+    assert args == ['auth','token','--hostname','github.com','--user',login]
+    print('private-' + login)
+    sys.exit(0)
+assert os.environ.get('GH_TOKEN') == 'private-' + login
+included = args[:2] == ['api','--include']
+if included:
+    assert args[2:8] == ['--hostname','github.com','--method','GET','--header','Accept: application/vnd.github+json']
+    assert args[8:10] == ['--header','X-GitHub-Api-Version: 2026-03-10']
+    endpoint = args[-1]
+    call = {'endpoint': endpoint, 'args': args[:-1]}
+    with (root / 'conditional-calls').open('a') as log:
+        log.write(json.dumps(call) + '\n')
+    count_path = root / 'conditional-count'
+    count = int(count_path.read_text()) if count_path.exists() else 0
+    steps = json.loads((root / 'conditional.json').read_text())
+    assert count < len(steps), (count, endpoint)
+    step = steps[count]
+    count_path.write_text(str(count + 1))
+    assert step['endpoint'] == endpoint, (step['endpoint'], endpoint)
+    status = step['status']
+    sys.stdout.buffer.write(('HTTP/2 %d fixture\r\n' % status).encode())
+    for name, value in step.get('headers', []):
+        sys.stdout.buffer.write(('%s: %s\r\n' % (name, value)).encode())
+    sys.stdout.buffer.write(b'\r\n')
+    if 'body' in step:
+        sys.stdout.buffer.write(json.dumps(step['body']).encode())
+    sys.stdout.flush()
+    sys.exit(step.get('exit', 0))
+assert args[:7] == ['api','--hostname','github.com','--method','GET','--header','Accept: application/vnd.github+json']
+assert args[7:9] == ['--header','X-GitHub-Api-Version: 2026-03-10']
+endpoint = args[9]
+with (root / 'calls').open('a') as log:
+    log.write(endpoint + '\n')
+responses = json.loads((root / 'responses.json').read_text())
+assert endpoint in responses, endpoint
+print(json.dumps(responses[endpoint]))
+"#).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let provider = GithubProvider {
+                account: provider_account(login),
+                runner: $crate::providers::Runner {
+                    gh: executable,
+                    timeout: Duration::from_secs(10),
+                    ..$crate::providers::Runner::default()
+                },
+            };
+            (dir, provider)
+        }
+
         fn complete_responses(reason: &str, conclusion: &str) -> HashMap<String, Value> {
             HashMap::from([
                 (notifications_endpoint("repo", 1), json!([notification("thread-1", reason, 7)])),
@@ -233,6 +298,180 @@ print(json.dumps(responses[endpoint]))
             assert!(failed.identity.remote_event_id.contains("61:2026-09-13T10:03:00Z:failure"));
             assert!(batch.incomplete_candidates.iter().any(|candidate| candidate.kind == IncompleteCandidateKind::Mention));
             assert!(fs::read_to_string(dir.path().join("calls")).unwrap().lines().all(|line| !line.contains("mark") && !line.contains("subscriptions")));
+        }
+
+        #[test]
+        fn conditional_200_then_304_reuses_exact_page_and_prefers_etag() {
+            let notification_page = json!([notification("thread-1", "review_requested", 7)]);
+            let steps = vec![
+                json!({
+                    "endpoint": notifications_endpoint("repo", 1), "status": 200,
+                    "headers": [["ETag", "\"page-v1\""], ["Last-Modified", "Sun, 13 Sep 2026 12:00:00 GMT"]],
+                    "body": notification_page,
+                }),
+                json!({
+                    "endpoint": notifications_endpoint("repo", 1), "status": 304,
+                    "headers": [["X-Poll-Interval", "120"]], "exit": 1,
+                }),
+            ];
+            let (dir, provider) = conditional_provider_fixture("alice", complete_responses("review_requested", "success"), steps);
+            let first = provider.notification_observations_conditional(
+                &[provider_repo("alice")], None, NotificationReadLimits::default(),
+                NotificationConditionalCache::default(),
+            ).unwrap();
+            assert!(first.batch.complete);
+            assert_eq!(first.batch.observations.len(), 1);
+            let second = provider.notification_observations_conditional(
+                &[provider_repo("alice")], None, NotificationReadLimits::default(), first.cache,
+            ).unwrap();
+            assert!(second.batch.complete);
+            assert_eq!(second.batch.observations[0].provider_notification_id, "thread-1");
+            assert_eq!(second.poll.x_poll_interval, Some(NotificationDelay::Seconds(120)));
+            let calls = fs::read_to_string(dir.path().join("conditional-calls")).unwrap();
+            let calls: Vec<Value> = calls.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let second_args = calls[1]["args"].as_array().unwrap();
+            assert!(second_args.iter().any(|value| value == "If-None-Match: \"page-v1\""));
+            assert!(!second_args.iter().any(|value| value.as_str().is_some_and(|value| value.starts_with("If-Modified-Since:"))));
+            assert_eq!(fs::read_to_string(dir.path().join("calls")).unwrap().lines().count(), 8, "hydration must remain fresh on both reads");
+        }
+
+        #[test]
+        fn zero_cache_304_is_incomplete_and_nonzero_rate_metadata_is_sanitized() {
+            let steps = vec![
+                json!({"endpoint": notifications_endpoint("repo", 1), "status": 304, "exit": 1}),
+                json!({
+                    "endpoint": notifications_endpoint("repo", 1), "status": 429, "exit": 1,
+                    "headers": [["Retry-After", "90"], ["X-RateLimit-Remaining", "0"], ["X-RateLimit-Reset", "9999999999"]],
+                    "body": {"secret": "fixture-private-body"},
+                }),
+            ];
+            let (_dir, provider) = conditional_provider_fixture("alice", complete_responses("review_requested", "success"), steps);
+            let zero = provider.notification_observations_conditional(
+                &[provider_repo("alice")], None, NotificationReadLimits::default(), NotificationConditionalCache::default(),
+            ).unwrap();
+            assert!(!zero.batch.complete);
+            assert!(!zero.batch.repositories[0].complete);
+            assert!(zero.batch.observations.is_empty());
+            let limited = provider.notification_observations_conditional(
+                &[provider_repo("alice")], None, NotificationReadLimits::default(), zero.cache,
+            ).unwrap();
+            assert_eq!(limited.poll.rate_limit, Some(NotificationDelay::Seconds(90)));
+            let diagnostic = limited.batch.incomplete_candidates[0].reason.clone();
+            assert!(!diagnostic.contains("fixture-private"));
+        }
+
+        #[test]
+        fn cached_discovery_still_requires_fresh_successful_hydration() {
+            let steps = vec![
+                json!({
+                    "endpoint": notifications_endpoint("repo", 1), "status": 200,
+                    "headers": [["ETag", "\"page-v1\""]],
+                    "body": [notification("thread-1", "review_requested", 7)],
+                }),
+                json!({"endpoint": notifications_endpoint("repo", 1), "status": 304}),
+            ];
+            let (dir, provider) = conditional_provider_fixture(
+                "alice",
+                complete_responses("review_requested", "failure"),
+                steps,
+            );
+            let first = provider.notification_observations_conditional(
+                &[provider_repo("alice")], None, NotificationReadLimits::default(), NotificationConditionalCache::default(),
+            ).unwrap();
+            assert!(first.batch.complete);
+            let mut responses: HashMap<String, Value> = serde_json::from_slice(
+                &fs::read(dir.path().join("responses.json")).unwrap(),
+            ).unwrap();
+            responses.remove("repos/owner/repo/issues/7/timeline?per_page=100&page=1");
+            fs::write(dir.path().join("responses.json"), serde_json::to_vec(&responses).unwrap()).unwrap();
+            let reused = provider.notification_observations_conditional(
+                &[provider_repo("alice")], None, NotificationReadLimits::default(), first.cache,
+            ).unwrap();
+            assert!(!reused.batch.complete);
+            assert!(!reused.batch.repositories[0].complete);
+            assert!(reused.batch.observations[0].events.is_empty(), "cached discovery must not replay old immutable evidence");
+            assert!(reused.batch.incomplete_candidates.iter().any(|candidate| candidate.reason.contains("candidate evidence read failed")));
+        }
+
+        #[test]
+        fn transport_overflow_delay_is_a_suspension_directive() {
+            let (_dir, provider) = conditional_provider_fixture(
+                "alice",
+                HashMap::new(),
+                vec![json!({
+                    "endpoint": notifications_endpoint("repo", 1), "status": 200,
+                    "headers": [["X-Poll-Interval", "18446744073709551616"]],
+                    "body": [],
+                })],
+            );
+            let read = provider.notification_observations_conditional(
+                &[provider_repo("alice")], None, NotificationReadLimits::default(), NotificationConditionalCache::default(),
+            ).unwrap();
+            assert!(read.batch.complete);
+            assert_eq!(read.poll.x_poll_interval, Some(NotificationDelay::Suspend));
+        }
+
+        #[test]
+        fn account_is_part_of_conditional_cache_key() {
+            let page = json!([notification("thread-1", "review_requested", 7)]);
+            let (_alice_dir, alice) = conditional_provider_fixture(
+                "alice", complete_responses("review_requested", "success"),
+                vec![json!({"endpoint": notifications_endpoint("repo", 1), "status": 200, "headers": [["ETag", "\"alice\""]], "body": page.clone()})],
+            );
+            let cached = alice.notification_observations_conditional(
+                &[provider_repo("alice")], None, NotificationReadLimits::default(), NotificationConditionalCache::default(),
+            ).unwrap().cache;
+            let (bob_dir, bob) = conditional_provider_fixture(
+                "bob", complete_responses("review_requested", "success"),
+                vec![json!({"endpoint": notifications_endpoint("repo", 1), "status": 200, "headers": [["ETag", "\"bob\""]], "body": page})],
+            );
+            let _ = bob.notification_observations_conditional(
+                &[provider_repo("bob")], None, NotificationReadLimits::default(), cached,
+            ).unwrap();
+            let call: Value = serde_json::from_str(fs::read_to_string(bob_dir.path().join("conditional-calls")).unwrap().lines().next().unwrap()).unwrap();
+            assert!(!call["args"].as_array().unwrap().iter().any(|value| value.as_str().is_some_and(|value| value.starts_with("If-"))));
+        }
+
+        #[test]
+        fn mixed_304_and_200_pagination_rechecks_duplicate_movement() {
+            let first_page = (0..100)
+                .map(|index| notification_for(
+                    &format!("thread-{index}"), "subscribed", "repo", "Issue",
+                    &format!("https://api.github.com/repos/owner/repo/issues/{index}"),
+                ))
+                .collect::<Vec<_>>();
+            let next = format!(
+                "<https://api.github.com/repos/owner/repo/notifications?all=true&participating=false&per_page=100&page=2>; rel=\"next\""
+            );
+            let steps = vec![
+                json!({"endpoint": notifications_endpoint("repo", 1), "status": 200, "headers": [["ETag", "\"p1\""], ["Link", next]], "body": first_page}),
+                json!({"endpoint": notifications_endpoint("repo", 2), "status": 200, "headers": [["ETag", "\"p2\""]], "body": []}),
+                json!({"endpoint": notifications_endpoint("repo", 1), "status": 304}),
+                json!({"endpoint": notifications_endpoint("repo", 2), "status": 200, "headers": [["ETag", "\"p2-new\""]], "body": [notification_for("thread-0", "subscribed", "repo", "Issue", "https://api.github.com/repos/owner/repo/issues/0")]}),
+            ];
+            let (_dir, provider) = conditional_provider_fixture("alice", HashMap::new(), steps);
+            let first = provider.notification_observations_conditional(
+                &[provider_repo("alice")], None, NotificationReadLimits::default(), NotificationConditionalCache::default(),
+            ).unwrap();
+            assert!(first.batch.complete);
+            let error = provider.notification_observations_conditional(
+                &[provider_repo("alice")], None, NotificationReadLimits::default(), first.cache,
+            ).unwrap_err();
+            assert!(error.to_string().contains("changed during pagination"));
+        }
+
+        #[test]
+        fn exact_page_key_changes_for_account_since_and_page() {
+            let alice = GithubProvider::new(provider_account("alice"));
+            let bob = GithubProvider::new(provider_account("bob"));
+            let repository = provider_repo("alice");
+            let base = notification_page_key(&alice, &repository, None, 1);
+            assert_ne!(base, notification_page_key(&bob, &provider_repo("bob"), None, 1));
+            assert_ne!(base, notification_page_key(&alice, &repository, Some("2026-09-13T00:00:00Z"), 1));
+            assert_ne!(base, notification_page_key(&alice, &repository, None, 2));
+            assert_eq!(base.method, "GET");
+            assert_eq!(base.accept, "application/vnd.github+json");
+            assert_eq!(base.api_version, "2026-03-10");
         }
 
         fn body_mention(id: u64, recipient: &str) -> Value {

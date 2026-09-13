@@ -1951,9 +1951,10 @@ impl ReviewWorkspace {
             .iter()
             .map(|runtime| runtime.repository.clone())
             .collect::<Vec<_>>();
-        let polls = self
-            .notifications
-            .begin_polls_when(&repositories, |account| {
+        let polls = self.notifications.begin_polls_when_at(
+            &repositories,
+            std::time::Instant::now(),
+            |account| {
                 only_account.is_none_or(|selected| selected == account)
                     && tick.is_none_or(|tick| {
                         poll_due(
@@ -1965,7 +1966,8 @@ impl ReviewWorkspace {
                             ),
                         )
                     })
-            });
+            },
+        );
         for work in polls {
             let task = cx.background_spawn(async move { work.run() });
             cx.spawn(async move |root, cx| {

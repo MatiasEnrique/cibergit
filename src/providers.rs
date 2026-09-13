@@ -37,6 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod conditional;
 pub mod notifications;
 mod pr_lifecycle;
 mod stacks;
@@ -1407,6 +1408,80 @@ impl<'a> Session<'a> {
         decode(&bytes)
     }
 
+    fn get_conditional<T: serde::de::DeserializeOwned>(
+        &mut self,
+        endpoint: &str,
+        validators: Option<&conditional::RestValidators>,
+    ) -> std::result::Result<conditional::ConditionalGet<T>, conditional::RestReadError> {
+        use conditional::{ConditionalGet, RestReadError};
+
+        if self.started.elapsed() >= Duration::from_secs(180) {
+            return Err(RestReadError::operation_limit());
+        }
+        let mut token_command = self.provider.runner.gh_command();
+        token_command.args([
+            "auth",
+            "token",
+            "--hostname",
+            &self.provider.account.host,
+            "--user",
+            &self.provider.account.login,
+        ]);
+        let token = self
+            .provider
+            .runner
+            .run(token_command, "resolve selected GitHub credential")
+            .map_err(|_| RestReadError::credential())?;
+        let token = std::str::from_utf8(&token)
+            .map_err(|_| RestReadError::credential())?
+            .trim();
+        if token.is_empty() || token.len() > 4096 || token.chars().any(char::is_whitespace) {
+            return Err(RestReadError::credential());
+        }
+        let mut command = self.provider.runner.gh_command();
+        command.env("GH_TOKEN", token).args([
+            "api",
+            "--include",
+            "--hostname",
+            HOST,
+            "--method",
+            "GET",
+            "--header",
+            "Accept: application/vnd.github+json",
+            "--header",
+            API_VERSION,
+        ]);
+        if let Some(validators) = validators {
+            if let Some((name, value)) = validators.request_header() {
+                command.arg("--header").arg(format!("{name}: {value}"));
+            }
+        }
+        command.arg(endpoint);
+        let output = self
+            .provider
+            .runner
+            .run_with_status(command, "GitHub conditional read request")
+            .map_err(|_| RestReadError::transport())?;
+        self.bytes = self
+            .bytes
+            .checked_add(output.stdout.len())
+            .ok_or_else(RestReadError::operation_limit)?;
+        if self.bytes > MAX_OPERATION_BYTES {
+            return Err(RestReadError::operation_limit());
+        }
+        let parsed = conditional::parse_included_response(&output.stdout, output.status.success())?;
+        match parsed {
+            ConditionalGet::Modified { value, metadata } => {
+                let value = decode(&value)
+                    .map_err(|_| RestReadError::invalid_body(metadata.poll.clone()))?;
+                Ok(ConditionalGet::Modified { value, metadata })
+            }
+            ConditionalGet::NotModified { metadata } => {
+                Ok(ConditionalGet::NotModified { metadata })
+            }
+        }
+    }
+
     fn graphql<T: serde::de::DeserializeOwned>(
         &mut self,
         query: &str,
@@ -2141,7 +2216,8 @@ impl Runner {
         command
     }
     fn run(&self, mut command: Command, action: &'static str) -> Result<Vec<u8>> {
-        self.run_inner(&mut command, action, None)
+        let output = self.run_inner(&mut command, action, None)?;
+        ensure_success(output, action)
     }
     fn run_with_input(
         &self,
@@ -2149,14 +2225,18 @@ impl Runner {
         action: &'static str,
         input: &[u8],
     ) -> Result<Vec<u8>> {
-        self.run_inner(&mut command, action, Some(input))
+        let output = self.run_inner(&mut command, action, Some(input))?;
+        ensure_success(output, action)
+    }
+    fn run_with_status(&self, mut command: Command, action: &'static str) -> Result<RunnerOutput> {
+        self.run_inner(&mut command, action, None)
     }
     fn run_inner(
         &self,
         command: &mut Command,
         action: &'static str,
         input: Option<&[u8]>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<RunnerOutput> {
         let input = input.map(<[u8]>::to_vec);
         command
             .stdin(if input.is_some() {
@@ -2264,15 +2344,6 @@ impl Runner {
             }
             if status.is_none() {
                 match child.try_wait() {
-                    Ok(Some(current)) if !current.success() => {
-                        terminate_process_group(&mut child);
-                        bail!(
-                            "Failed to {action} (exit {}). Check authentication, permissions, rate limits, and connectivity; subprocess output withheld.",
-                            current
-                                .code()
-                                .map_or_else(|| "signal".into(), |code| code.to_string())
-                        );
-                    }
                     Ok(Some(current)) => status = Some(current),
                     Ok(None) => {}
                     Err(_) => {
@@ -2282,7 +2353,10 @@ impl Runner {
                 }
             }
             if status.is_some() && input_done && stdout_done && stderr_done {
-                return Ok(output.unwrap_or_default());
+                return Ok(RunnerOutput {
+                    stdout: output.unwrap_or_default(),
+                    status: status.expect("completed subprocess has status"),
+                });
             }
             if !input_done && started.elapsed() >= self.input_timeout.unwrap_or(self.timeout) {
                 terminate_process_group(&mut child);
@@ -2294,6 +2368,25 @@ impl Runner {
             }
             thread::sleep(Duration::from_millis(5));
         }
+    }
+}
+
+struct RunnerOutput {
+    stdout: Vec<u8>,
+    status: std::process::ExitStatus,
+}
+
+fn ensure_success(output: RunnerOutput, action: &'static str) -> Result<Vec<u8>> {
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        bail!(
+            "Failed to {action} (exit {}). Check authentication, permissions, rate limits, and connectivity; subprocess output withheld.",
+            output
+                .status
+                .code()
+                .map_or_else(|| "signal".into(), |code| code.to_string())
+        )
     }
 }
 
