@@ -339,21 +339,66 @@ fn start_smoke(
                 })
                 .unwrap_or(false);
 
-            let start_edit_requested = window
+            let pending_start = window
                 .update(|_, cx| {
                     workspace
                         .update(cx, |workspace, cx| {
                             workspace.set_rebase_step_action(0, PlanAction::Edit, cx);
                             workspace.request_start_rebase(cx);
-                            let Some(id) = workspace.rebase_pending_action_id() else {
-                                return false;
-                            };
-                            workspace.confirm_rebase_action(id, cx);
-                            true
+                            let id = workspace.rebase_pending_action_id()?;
+                            let inputs_locked = workspace.rebase_confirmation_inputs_locked(cx);
+                            workspace.set_rebase_step_action(0, PlanAction::Drop, cx);
+                            let blocked_drop_preserved_edit =
+                                workspace.rebase_plan_action(0) == Some(PlanAction::Edit);
+                            Some((id, inputs_locked, blocked_drop_preserved_edit))
                         })
-                        .unwrap_or(false)
+                        .unwrap_or(None)
+                })
+                .unwrap_or(None);
+            window
+                .background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            let pending_confirmation_capture = window
+                .update(|window, _| {
+                    window
+                        .render_to_image()
+                        .and_then(|image| {
+                            image
+                                .save(output.join(if dark {
+                                    "rebase-confirmation-dark-normal.png"
+                                } else {
+                                    "rebase-confirmation-light-normal.png"
+                                }))
+                                .map_err(Into::into)
+                        })
+                        .is_ok()
                 })
                 .unwrap_or(false);
+            let (start_edit_requested, cancel_restored_editing) = window
+                .update(|_, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            let Some((id, _, _)) = pending_start else {
+                                return (false, false);
+                            };
+                            workspace.cancel_rebase_action(id, cx);
+                            let cancel_restored_editing =
+                                !workspace.rebase_confirmation_inputs_locked(cx);
+                            workspace.set_rebase_step_action(0, PlanAction::Drop, cx);
+                            let edit_after_cancel =
+                                workspace.rebase_plan_action(0) == Some(PlanAction::Drop);
+                            workspace.set_rebase_step_action(0, PlanAction::Edit, cx);
+                            workspace.request_start_rebase(cx);
+                            let Some(reprepared_id) = workspace.rebase_pending_action_id() else {
+                                return (false, cancel_restored_editing && edit_after_cancel);
+                            };
+                            workspace.confirm_rebase_action(reprepared_id, cx);
+                            (true, cancel_restored_editing && edit_after_cancel)
+                        })
+                        .unwrap_or((false, false))
+                })
+                .unwrap_or((false, false));
             let edit_at = std::time::Instant::now();
             let edit_ready = loop {
                 window.background_executor().timer(std::time::Duration::from_millis(50)).await;
@@ -1235,11 +1280,15 @@ fn start_smoke(
                 }
             };
             let report = format!(
-                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nrebase prepare requested: {}\npopulated three-commit plan ready: {}\nplan normal capture: {}\nedit plan Start requested through confirmation: {}\nPausedForEdit observed: {}\nedit wide capture: {}\nexpanded operation details capture: {}\nexplicit Continue requested through confirmation: {}\nCompleted observed: {}\nresult normal capture: {}\nsafe archive requested and second prepare enabled: {}\nreordered conflict plan prepared: {}\nconflicting Start requested through confirmation: {}\nConflicted observed from real Git: {}\nconflict narrow capture: {}\nexplicit Abort requested through confirmation: {}\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nCreateBranch request outcome: {:?}\nCreateBranch dispatched while no-op refresh pending: {}\nCreateBranch completed authoritatively: {}\nCreateBranch terminal status/error: {}\nSwitchBranch request outcome: {:?}\nSwitchBranch dispatched: {}\nSwitchBranch completed authoritatively: {}\nSwitchBranch terminal status/error: {}\nsame-current SwitchBranch request outcome: {:?}\nsame-current SwitchBranch dispatched: {}\nsame-current SwitchBranch completed authoritatively: {}\nsame-current SwitchBranch terminal status/error: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
+                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nrebase prepare requested: {}\npopulated three-commit plan ready: {}\nplan normal capture: {}\npending plan/message inputs disabled: {}\npending Drop handler preserved exact frozen Edit: {}\nfrozen plan/confirmation capture: {}\nCancel restored editing and explicit edit/reprepare: {}\nedit plan Start requested through confirmation: {}\nPausedForEdit observed: {}\nedit wide capture: {}\nexpanded operation details capture: {}\nexplicit Continue requested through confirmation: {}\nCompleted observed: {}\nresult normal capture: {}\nsafe archive requested and second prepare enabled: {}\nreordered conflict plan prepared: {}\nconflicting Start requested through confirmation: {}\nConflicted observed from real Git: {}\nconflict narrow capture: {}\nexplicit Abort requested through confirmation: {}\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nCreateBranch request outcome: {:?}\nCreateBranch dispatched while no-op refresh pending: {}\nCreateBranch completed authoritatively: {}\nCreateBranch terminal status/error: {}\nSwitchBranch request outcome: {:?}\nSwitchBranch dispatched: {}\nSwitchBranch completed authoritatively: {}\nSwitchBranch terminal status/error: {}\nsame-current SwitchBranch request outcome: {:?}\nsame-current SwitchBranch dispatched: {}\nsame-current SwitchBranch completed authoritatively: {}\nsame-current SwitchBranch terminal status/error: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
                 if dark { "dark" } else { "light" },
                 prepare_requested,
                 plan_ready,
                 plan_capture,
+                pending_start.is_some_and(|(_, locked, _)| locked),
+                pending_start.is_some_and(|(_, _, preserved)| preserved),
+                pending_confirmation_capture,
+                cancel_restored_editing,
                 start_edit_requested,
                 edit_ready,
                 edit_capture,

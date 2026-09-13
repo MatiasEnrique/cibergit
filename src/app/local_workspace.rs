@@ -1308,7 +1308,7 @@ impl LocalWorkspace {
             let mut state = EditorState::new(window, cx)
                 .language(language)
                 .replaceable(true);
-            state.set_disabled(self.rebase.is_running(), cx);
+            state.set_disabled(self.rebase.has_pending_or_running(), cx);
             state.set_editor_style(editor_style(colors));
             state.set_highlighter_factory(highlighter_factory(), cx);
             // Initial/recovery load is the one intentional programmatic reload.
@@ -3091,11 +3091,15 @@ impl Render for LocalWorkspace {
             .on_action(cx.listener(|this, _: &LocalConfirm, _, cx| {
                 if let Some(id) = this.pending_action.as_ref().map(|pending| pending.id) {
                     this.confirm_action(id, cx);
+                } else if let Some(id) = this.rebase_pending_action_id() {
+                    this.confirm_rebase_action(id, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &LocalCancel, _, cx| {
                 if let Some(id) = this.pending_action.as_ref().map(|pending| pending.id) {
                     this.cancel_action(id, cx);
+                } else if let Some(id) = this.rebase_pending_action_id() {
+                    this.cancel_rebase_action(id, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &LocalFind, _, cx| {

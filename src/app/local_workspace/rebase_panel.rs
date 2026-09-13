@@ -142,8 +142,70 @@ impl RebaseCommand {
 struct PendingRebaseCommand {
     id: u64,
     command: RebaseCommand,
+    editable_inputs: RebaseEditableInputIdentity,
     documents: DocumentFence,
     checkout_generation: u64,
+}
+
+/// Only user-editable values that can describe (or supply) the pending
+/// command belong here. Poll generations and observed operation status are
+/// deliberately excluded so a harmless read cannot invalidate confirmation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RebaseEditableInputIdentity {
+    None,
+    Start {
+        steps: Vec<PlanStep>,
+        prepared_base_oid: String,
+        displayed_base: String,
+        reword_editor: Option<(String, String)>,
+    },
+    AmendMessage(String),
+    SplitPartMessage(String),
+}
+
+impl RebaseEditableInputIdentity {
+    fn frozen_description(&self) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::Start {
+                steps,
+                prepared_base_oid,
+                displayed_base,
+                reword_editor,
+            } => {
+                let plan = steps
+                    .iter()
+                    .enumerate()
+                    .map(|(index, step)| match &step.action {
+                        PlanAction::Reword { message } => format!(
+                            "{}. reword {} message {:?}",
+                            index + 1,
+                            step.commit_oid,
+                            message
+                        ),
+                        action => format!(
+                            "{}. {} {}",
+                            index + 1,
+                            plan_action_label(action),
+                            step.commit_oid
+                        ),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let reword = reword_editor
+                    .as_ref()
+                    .map(|(oid, message)| format!(" · selected reword editor {oid} = {message:?}"))
+                    .unwrap_or_default();
+                Some(format!(
+                    "Frozen base {prepared_base_oid} (input {displayed_base:?}) · Frozen plan {plan}{reword}"
+                ))
+            }
+            Self::AmendMessage(message) => Some(format!("Frozen amend editor = {message:?}")),
+            Self::SplitPartMessage(message) => {
+                Some(format!("Frozen split-part editor = {message:?}"))
+            }
+        }
+    }
 }
 
 pub(super) struct RebasePanel {
@@ -281,6 +343,16 @@ impl LocalWorkspace {
         self.rebase.steps.len()
     }
 
+    pub fn rebase_plan_action(&self, index: usize) -> Option<PlanAction> {
+        self.rebase.steps.get(index).map(|step| step.action.clone())
+    }
+
+    pub fn rebase_confirmation_inputs_locked(&self, cx: &App) -> bool {
+        self.rebase.pending.is_some()
+            && !self.rebase.base.read(cx).is_editable()
+            && !self.rebase.message.read(cx).is_editable()
+    }
+
     pub fn set_rebase_operation_details(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.rebase.show_operation_details = visible;
         cx.notify();
@@ -292,6 +364,9 @@ impl LocalWorkspace {
         action: PlanAction,
         cx: &mut Context<Self>,
     ) {
+        if self.refuse_rebase_input_mutation(cx) {
+            return;
+        }
         if index < self.rebase.steps.len() {
             self.rebase.selected_step = Some(index);
             self.set_rebase_action(action, cx);
@@ -299,6 +374,9 @@ impl LocalWorkspace {
     }
 
     pub fn move_rebase_plan_step(&mut self, index: usize, delta: isize, cx: &mut Context<Self>) {
+        if self.refuse_rebase_input_mutation(cx) {
+            return;
+        }
         if index < self.rebase.steps.len() {
             self.rebase.selected_step = Some(index);
             self.move_rebase_step(delta, cx);
@@ -311,10 +389,21 @@ impl LocalWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.refuse_rebase_input_mutation(cx) {
+            return;
+        }
         let candidate = candidate.into();
         self.rebase
             .base
             .update(cx, |input, cx| input.set_value(candidate, window, cx));
+        if self.rebase.preparation.is_some() {
+            self.rebase.preparation = None;
+            self.rebase.steps.clear();
+            self.rebase.selected_step = None;
+            self.rebase.status =
+                "Base input changed; prepare a new immutable inventory before Start".into();
+            cx.notify();
+        }
     }
 
     fn capture_document_fence(&self, cx: &App) -> DocumentFence {
@@ -371,7 +460,34 @@ impl LocalWorkspace {
             .update(cx, |input, cx| input.set_disabled(disabled, cx));
     }
 
+    fn refuse_rebase_input_mutation(&mut self, cx: &mut Context<Self>) -> bool {
+        if !rebase_input_is_frozen(
+            self.rebase.pending.is_some(),
+            self.rebase.in_flight.is_some(),
+        ) {
+            return false;
+        }
+        self.rebase.status = if self.rebase.pending.is_some() {
+            "Confirmation inputs are frozen. Cancel the exact pending request before editing or preparing different inputs."
+                .into()
+        } else {
+            "Rebase inputs remain frozen while the confirmed transition is running".into()
+        };
+        cx.notify();
+        true
+    }
+
+    fn pause_rebase_confirmation(&mut self, message: String, cx: &mut Context<Self>) {
+        self.rebase.status = message.clone();
+        cx.emit(LocalWorkspaceEvent::Error(message));
+        cx.notify();
+    }
+
     pub fn toggle_rebase(&mut self, cx: &mut Context<Self>) {
+        if self.rebase.open && self.rebase.pending.is_some() {
+            self.refuse_rebase_input_mutation(cx);
+            return;
+        }
         self.rebase.open = !self.rebase.open;
         if self.rebase.open {
             self.observe_rebase(cx);
@@ -444,6 +560,9 @@ impl LocalWorkspace {
     }
 
     fn select_rebase_step(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.refuse_rebase_input_mutation(cx) {
+            return;
+        }
         let Some(step) = self.rebase.steps.get(index) else {
             return;
         };
@@ -477,6 +596,9 @@ impl LocalWorkspace {
     }
 
     fn move_rebase_step(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.refuse_rebase_input_mutation(cx) {
+            return;
+        }
         let Some(index) = self.rebase.selected_step else {
             return;
         };
@@ -492,6 +614,9 @@ impl LocalWorkspace {
     }
 
     fn set_rebase_action(&mut self, action: PlanAction, cx: &mut Context<Self>) {
+        if self.refuse_rebase_input_mutation(cx) {
+            return;
+        }
         let Some(index) = self.rebase.selected_step else {
             return;
         };
@@ -503,6 +628,9 @@ impl LocalWorkspace {
     }
 
     fn apply_reword_message(&mut self, cx: &mut Context<Self>) {
+        if self.refuse_rebase_input_mutation(cx) {
+            return;
+        }
         let message = self.rebase.message.read(cx).value().to_string();
         self.set_rebase_action(PlanAction::Reword { message }, cx);
     }
@@ -522,9 +650,105 @@ impl LocalWorkspace {
         }
     }
 
+    fn selected_reword_editor(&self, cx: &App) -> Option<(String, String)> {
+        let step = self
+            .rebase
+            .selected_step
+            .and_then(|index| self.rebase.steps.get(index))?;
+        matches!(step.action, PlanAction::Reword { .. }).then(|| {
+            (
+                step.commit_oid.clone(),
+                self.rebase.message.read(cx).value().to_string(),
+            )
+        })
+    }
+
+    fn capture_rebase_editable_inputs(
+        &self,
+        command: &RebaseCommand,
+        cx: &App,
+    ) -> Result<RebaseEditableInputIdentity, String> {
+        match command {
+            RebaseCommand::Start { preparation, plan } => {
+                let Some(PrepareOutcome::Ready(displayed_preparation)) =
+                    self.rebase.preparation.as_ref()
+                else {
+                    return Err("the displayed preparation is no longer ready".into());
+                };
+                if displayed_preparation.inventory.base_oid != preparation.inventory.base_oid {
+                    return Err("the displayed prepared base changed".into());
+                }
+                if self.rebase.steps != plan.steps {
+                    return Err("the displayed plan changed before it could be frozen".into());
+                }
+                let reword_editor = self.selected_reword_editor(cx);
+                if let Some((oid, editor_message)) = &reword_editor {
+                    let applied_message = plan
+                        .steps
+                        .iter()
+                        .find(|step| &step.commit_oid == oid)
+                        .and_then(|step| match &step.action {
+                            PlanAction::Reword { message } => Some(message),
+                            _ => None,
+                        });
+                    if applied_message != Some(editor_message) {
+                        return Err("the selected Reword editor has unapplied text; apply Reword again before requesting confirmation".into());
+                    }
+                }
+                Ok(RebaseEditableInputIdentity::Start {
+                    steps: self.rebase.steps.clone(),
+                    prepared_base_oid: displayed_preparation.inventory.base_oid.clone(),
+                    displayed_base: self.rebase.base.read(cx).value().to_string(),
+                    reword_editor,
+                })
+            }
+            RebaseCommand::Amend { message, .. } => {
+                let displayed = self.rebase.message.read(cx).value().to_string();
+                let displayed_payload = (!displayed.trim().is_empty()).then_some(&displayed);
+                if displayed_payload != message.as_ref() {
+                    return Err("the displayed amend message no longer matches the request".into());
+                }
+                Ok(RebaseEditableInputIdentity::AmendMessage(displayed))
+            }
+            RebaseCommand::CommitSplitPart { message, .. } => {
+                let displayed = self.rebase.message.read(cx).value().to_string();
+                if displayed != *message {
+                    return Err(
+                        "the displayed split-part message no longer matches the request".into(),
+                    );
+                }
+                Ok(RebaseEditableInputIdentity::SplitPartMessage(displayed))
+            }
+            _ => Ok(RebaseEditableInputIdentity::None),
+        }
+    }
+
     fn route_dirty_commit(&mut self, cx: &mut Context<Self>) {
+        if self.refuse_rebase_input_mutation(cx) {
+            return;
+        }
         self.rebase.open = false;
         self.status = "Rebase preparation is dirty. Use the existing staged Commit control, then reopen Rebase; unsaved editor text must be saved first.".into();
+        cx.notify();
+    }
+
+    fn cancel_rebase_preparation(&mut self, cx: &mut Context<Self>) {
+        if self.refuse_rebase_input_mutation(cx) {
+            return;
+        }
+        self.rebase.preparation = None;
+        self.rebase.steps.clear();
+        self.rebase.selected_step = None;
+        self.rebase.status = "Preparation cancelled; Git was not changed".into();
+        cx.notify();
+    }
+
+    fn route_rebase_to_local_changes(&mut self, status: &'static str, cx: &mut Context<Self>) {
+        if self.refuse_rebase_input_mutation(cx) {
+            return;
+        }
+        self.rebase.open = false;
+        self.status = status.into();
         cx.notify();
     }
 
@@ -549,15 +773,27 @@ impl LocalWorkspace {
             self.report_error("Rebase request paused: the affected Git snapshot changed; refresh and review again".into(), cx);
             return;
         }
+        let editable_inputs = match self.capture_rebase_editable_inputs(&command, cx) {
+            Ok(identity) => identity,
+            Err(reason) => {
+                self.report_error(
+                    format!("Rebase request paused: {reason}. Review the visible inputs again."),
+                    cx,
+                );
+                return;
+            }
+        };
         let id = self.next_action_id;
         self.next_action_id = self.next_action_id.wrapping_add(1);
         let summary = command.summary();
         self.rebase.pending = Some(PendingRebaseCommand {
             id,
             command,
+            editable_inputs,
             documents: self.capture_document_fence(cx),
             checkout_generation: backend.checkout_generation,
         });
+        self.set_rebase_editors_disabled(true, cx);
         self.rebase.status = format!("Confirmation required: {summary}");
         cx.emit(LocalWorkspaceEvent::MaterialActionConfirmationRequested {
             request_id: id,
@@ -587,6 +823,17 @@ impl LocalWorkspace {
         }
         if !self.document_fence_matches(&pending.documents, cx) {
             self.report_error("Rebase confirmation paused: editor text or document generation changed. The confirmation remains pending; save/reconcile and request again or cancel.".into(), cx);
+            return;
+        }
+        let current_inputs = match self.capture_rebase_editable_inputs(&pending.command, cx) {
+            Ok(identity) => identity,
+            Err(reason) => {
+                self.pause_rebase_confirmation(format!("Rebase confirmation paused: {reason}. The exact pending request and its frozen inputs were retained; Cancel, edit/reprepare, and request a new confirmation."), cx);
+                return;
+            }
+        };
+        if current_inputs != pending.editable_inputs {
+            self.pause_rebase_confirmation("Rebase confirmation paused: the displayed plan, base, or message input drifted from the frozen request. Nothing was dispatched; the exact pending request was retained. Cancel, edit/reprepare, and request a new confirmation.".into(), cx);
             return;
         }
         if let Some(error) = self.rebase_lane_blocker(cx) {
@@ -696,6 +943,7 @@ impl LocalWorkspace {
             .is_some_and(|pending| pending.id == request_id)
         {
             self.rebase.pending = None;
+            self.set_rebase_editors_disabled(false, cx);
             self.rebase.status = "Rebase action cancelled; Git was not started".into();
             cx.notify();
         } else {
@@ -735,6 +983,9 @@ impl LocalWorkspace {
     }
 
     pub fn request_start_rebase(&mut self, cx: &mut Context<Self>) {
+        if self.refuse_rebase_input_mutation(cx) {
+            return;
+        }
         let Some(PrepareOutcome::Ready(preparation)) = self.rebase.preparation.clone() else {
             self.report_error("Rebase is not ready to start".into(), cx);
             return;
@@ -948,6 +1199,9 @@ impl LocalWorkspace {
     }
 
     fn select_base_candidate(&mut self, oid: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.refuse_rebase_input_mutation(cx) {
+            return;
+        }
         self.set_rebase_base_candidate(oid, window, cx);
         self.rebase.preparation = None;
         self.rebase.steps.clear();
@@ -964,11 +1218,15 @@ impl LocalWorkspace {
         if !self.rebase.open || !event.keystroke.modifiers.platform {
             return false;
         }
-        match event.keystroke.key.as_str() {
-            "up" => self.move_rebase_step(-1, cx),
-            "down" => self.move_rebase_step(1, cx),
+        let delta = match event.keystroke.key.as_str() {
+            "up" => -1,
+            "down" => 1,
             _ => return false,
+        };
+        if self.refuse_rebase_input_mutation(cx) {
+            return true;
         }
+        self.move_rebase_step(delta, cx);
         true
     }
 
@@ -981,6 +1239,7 @@ impl LocalWorkspace {
         let operation = self.rebase.operation.clone();
         let preparation = self.rebase.preparation.clone();
         let pending = self.rebase.pending.clone();
+        let inputs_frozen = pending.is_some();
         let selected = self.rebase.selected_step;
         let inventory = self.rebase_inventory().cloned();
         let mut plan_rows = div().flex().flex_col().gap_1();
@@ -1014,7 +1273,8 @@ impl LocalWorkspace {
                     } else {
                         colors.surface
                     })
-                    .cursor_pointer()
+                    .when(inputs_frozen, |row| row.opacity(0.52).cursor_default())
+                    .when(!inputs_frozen, |row| row.cursor_pointer())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_rebase_step(index, window, cx)
                     }))
@@ -1064,12 +1324,7 @@ impl LocalWorkspace {
                         div().flex().gap_2()
                             .child(action_button("Commit in Local Changes", colors, cx.listener(|this, _, _, cx| this.route_dirty_commit(cx))))
                             .child(action_button("Stash including untracked", colors, cx.listener(|this, _, _, cx| this.request_create_stash(cx))))
-                            .child(action_button("Cancel preparation", colors, cx.listener(|this, _, _, cx| {
-                                this.rebase.preparation = None;
-                                this.rebase.steps.clear();
-                                this.rebase.status = "Preparation cancelled; Git was not changed".into();
-                                cx.notify();
-                            })))
+                            .child(action_button("Cancel preparation", colors, cx.listener(|this, _, _, cx| this.cancel_rebase_preparation(cx))))
                     ).child(notice_box(
                         "Dirty checkout",
                         format!("{} staged · {} unstaged · {} untracked · {} conflicts. Stash includes untracked; ignored files remain outside it. The exact retained stash receipt appears after creation.", dirty.staged, dirty.unstaged, dirty.untracked, dirty.conflicts),
@@ -1093,12 +1348,17 @@ impl LocalWorkspace {
                                 ),
                         )
                         .child(plan_rows)
-                        .child(self.render_plan_editor(colors, cx))
-                        .child(action_button(
-                            "Review and start rebase",
-                            colors,
-                            cx.listener(|this, _, _, cx| this.request_start_rebase(cx)),
-                        ));
+                        .child(self.render_plan_editor(inputs_frozen, colors, cx))
+                        .child(
+                            action_button(
+                                "Review and start rebase",
+                                colors,
+                                cx.listener(|this, _, _, cx| this.request_start_rebase(cx)),
+                            )
+                            .when(inputs_frozen, |button| {
+                                button.opacity(0.52).cursor_default()
+                            }),
+                        );
                 }
             }
         } else {
@@ -1141,6 +1401,25 @@ impl LocalWorkspace {
                     pending.command.summary(),
                     colors.amber,
                     colors,
+                )
+                .children(pending.editable_inputs.frozen_description().map(|description| {
+                    div()
+                        .mt_2()
+                        .p_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.amber)
+                        .font_family(CODE_FONT)
+                        .text_xs()
+                        .whitespace_normal()
+                        .child(description)
+                }))
+                .child(
+                    div()
+                        .mt_2()
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .child("Plan, base, and message inputs are disabled until Cancel. Confirmation rechecks their exact frozen identity before dispatch."),
                 )
                 .child(
                     div()
@@ -1206,7 +1485,12 @@ impl LocalWorkspace {
             .into_any_element()
     }
 
-    fn render_plan_editor(&mut self, colors: LocalPalette, cx: &mut Context<Self>) -> AnyElement {
+    fn render_plan_editor(
+        &mut self,
+        inputs_frozen: bool,
+        colors: LocalPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let actions = div()
             .flex()
             .flex_wrap()
@@ -1250,7 +1534,8 @@ impl LocalWorkspace {
                 "Move down",
                 colors,
                 cx.listener(|this, _, _, cx| this.move_rebase_step(1, cx)),
-            ));
+            ))
+            .when(inputs_frozen, |actions| actions.opacity(0.52));
         div()
             .h(px(170.))
             .flex()
@@ -1362,7 +1647,7 @@ impl LocalWorkspace {
             RebaseState::PausedForEdit if operation.split.is_some() => {
                 body = body.child(self.render_edit_message("Split part message", colors))
                     .child(div().flex().flex_wrap().gap_2()
-                        .child(action_button("Stage via Local Changes", colors, cx.listener(|this, _, _, cx| { this.rebase.open = false; this.status = "Stage the selected split paths in Local Changes, then reopen Rebase".into(); cx.notify(); })))
+                        .child(action_button("Stage via Local Changes", colors, cx.listener(|this, _, _, cx| this.route_rebase_to_local_changes("Stage the selected split paths in Local Changes, then reopen Rebase", cx))))
                         .child(action_button("Commit staged part", colors, cx.listener(|this, _, _, cx| this.request_commit_split_part(cx))))
                         .child(action_button("Finish validated split", colors, cx.listener(|this, _, _, cx| this.request_finish_split(cx))))
                         .child(action_button("Abort", colors, cx.listener(|this, _, _, cx| this.request_abort_rebase(cx)))));
@@ -1370,7 +1655,7 @@ impl LocalWorkspace {
             RebaseState::PausedForEdit => {
                 body = body.child(self.render_edit_message("Optional amend message", colors))
                     .child(div().flex().flex_wrap().gap_2()
-                        .child(action_button("Open/stage in Local Changes", colors, cx.listener(|this, _, _, cx| { this.rebase.open = false; this.status = "Edit safely, save, and stage selected paths in Local Changes; then reopen Rebase".into(); cx.notify(); })))
+                        .child(action_button("Open/stage in Local Changes", colors, cx.listener(|this, _, _, cx| this.route_rebase_to_local_changes("Edit safely, save, and stage selected paths in Local Changes; then reopen Rebase", cx))))
                         .child(action_button("Amend", colors, cx.listener(|this, _, _, cx| this.request_amend_rebase(cx))))
                         .child(action_button("Begin split", colors, cx.listener(|this, _, _, cx| this.request_begin_split(cx))))
                         .child(action_button("Continue", colors, cx.listener(|this, _, _, cx| this.request_continue_rebase(cx))))
@@ -1472,12 +1757,22 @@ impl LocalWorkspace {
     }
 
     fn render_edit_message(&self, label: &'static str, colors: LocalPalette) -> AnyElement {
+        let inputs_frozen = self.rebase.pending.is_some();
         div()
             .h(px(150.))
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().text_xs().text_color(colors.muted).child(label))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(colors.muted)
+                    .child(if inputs_frozen {
+                        format!("{label} · frozen until Cancel")
+                    } else {
+                        label.into()
+                    }),
+            )
             .child(
                 div()
                     .flex_1()
@@ -1486,7 +1781,8 @@ impl LocalWorkspace {
                     .border_color(colors.border)
                     .rounded_md()
                     .font_family(CODE_FONT)
-                    .child(Editor::new(&self.rebase.message)),
+                    .child(Editor::new(&self.rebase.message))
+                    .when(inputs_frozen, |editor| editor.opacity(0.62)),
             )
             .into_any_element()
     }
@@ -1510,6 +1806,10 @@ fn advance_generation(generation: &mut u64) -> u64 {
 
 fn read_reply_is_current(current: u64, reply: u64, effect_in_flight: bool) -> bool {
     current == reply && !effect_in_flight
+}
+
+fn rebase_input_is_frozen(confirmation_pending: bool, effect_in_flight: bool) -> bool {
+    confirmation_pending || effect_in_flight
 }
 
 fn pick_steps(inventory: &cibergit::rebase::CommitInventory) -> Vec<PlanStep> {
@@ -1909,6 +2209,15 @@ fn disk_label(disk: &cibergit::rebase::DiskGeneration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cibergit::{
+        domain::{Account, Repository},
+        local_git::OperationState,
+        worktrees::{
+            AssociationKey, CheckoutAssociation, CheckoutOwnership, CheckoutView,
+            FilesystemIdentity,
+        },
+    };
+    use gpui::{Keystroke, Modifiers, TestApp, TestAppWindow};
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -1995,6 +2304,92 @@ mod tests {
         (temporary, checkout, store, base)
     }
 
+    fn filesystem_identity(path: &Path) -> FilesystemIdentity {
+        let metadata = fs::symlink_metadata(path).expect("fixture identity");
+        FilesystemIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    fn native_controller_fixture() -> (
+        TempDir,
+        PathBuf,
+        String,
+        RebaseStore,
+        TestAppWindow<LocalWorkspace>,
+    ) {
+        let (temporary, checkout, _fixture_store, base) = lifecycle_fixture();
+        git(
+            &checkout,
+            &["update-ref", "refs/heads/alternate-base", &base],
+        );
+        let local = LocalGit::open(&checkout).expect("local Git");
+        let snapshot = local.snapshot().expect("fixture snapshot");
+        let controller_data = temporary.path().join("controller-data");
+        let context = LocalWorkspaceContext {
+            repository: Repository {
+                host: "github.com".into(),
+                owner: "fixture".into(),
+                name: "repo".into(),
+                account: Account {
+                    host: "github.com".into(),
+                    login: "fixture".into(),
+                },
+                local_path: Some(checkout.clone()),
+            },
+            checkout: CheckoutView {
+                association: CheckoutAssociation {
+                    key: AssociationKey {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        account: "fixture".into(),
+                        repository: "fixture/repo".into(),
+                        pull_request: 17,
+                    },
+                    path: checkout.clone(),
+                    git_dir: local.git_dir().to_owned(),
+                    common_git_dir: local.common_git_dir().to_owned(),
+                    checkout_identity: filesystem_identity(&checkout),
+                    git_dir_identity: filesystem_identity(local.git_dir()),
+                    common_git_dir_identity: filesystem_identity(local.common_git_dir()),
+                    ownership: CheckoutOwnership::ExplicitlyAttached,
+                    creation: None,
+                    intended_remote_branch: Some("feature".into()),
+                    published_head_at_association: None,
+                },
+                actual_head: snapshot.head,
+                operation: OperationState::default(),
+            },
+            data_root: controller_data.clone(),
+            appearance: LocalWorkspaceAppearance { dark: true },
+        };
+        let mut app = TestApp::new();
+        app.update(gpui_base::init);
+        let mut window =
+            app.open_window(move |window, cx| LocalWorkspace::new(context, window, cx));
+        assert!(window.read(|workspace, _| workspace.is_ready()));
+        window.update(|workspace, window, cx| {
+            workspace.toggle_rebase(cx);
+            workspace.set_rebase_base_candidate(base.clone(), window, cx);
+            workspace.prepare_rebase(cx);
+        });
+        assert_eq!(window.read(|workspace, _| workspace.rebase_plan_len()), 2);
+        let store = RebaseStore::open(
+            controller_data.join("rebase-private"),
+            RebaseAssociation {
+                provider: "github".into(),
+                host: "github.com".into(),
+                account: "fixture".into(),
+                repository: "fixture/repo".into(),
+                change: "17".into(),
+            },
+            &checkout,
+        )
+        .expect("controller store observer");
+        (temporary, checkout, base, store, window)
+    }
+
     #[test]
     fn controller_plan_uses_backend_validation_after_reorder_and_actions() {
         let inventory = inventory();
@@ -2008,6 +2403,264 @@ mod tests {
         let mut invalid = pick_steps(&inventory);
         invalid[0].action = PlanAction::Squash;
         assert!(RebasePlan::validate(&inventory, invalid).is_err());
+    }
+
+    #[test]
+    fn native_controller_start_confirmation_gates_inputs_and_retains_forced_drift() {
+        let (_temporary, checkout, base, store, mut window) = native_controller_fixture();
+        let original_head = git(&checkout, &["rev-parse", "HEAD"]);
+
+        let request_id = window.update(|workspace, window, cx| {
+            workspace.set_rebase_step_action(0, PlanAction::Edit, cx);
+            workspace.request_start_rebase(cx);
+            let request_id = workspace.rebase_pending_action_id().expect("pending start");
+            assert!(workspace.rebase_confirmation_inputs_locked(cx));
+            assert_eq!(workspace.rebase_plan_action(0), Some(PlanAction::Edit));
+
+            // These are the same controller methods used by the plan-row mouse
+            // listeners and the embedding API. Neither may mutate while pending.
+            workspace.set_rebase_action(PlanAction::Drop, cx);
+            workspace.set_rebase_step_action(0, PlanAction::Drop, cx);
+            workspace.move_rebase_plan_step(0, 1, cx);
+            workspace.set_rebase_base_candidate("refs/heads/alternate-base", window, cx);
+            let key = KeyDownEvent {
+                keystroke: Keystroke {
+                    modifiers: Modifiers {
+                        platform: true,
+                        ..Default::default()
+                    },
+                    key: "down".into(),
+                    key_char: None,
+                },
+                is_held: false,
+                prefer_character_input: false,
+            };
+            assert!(workspace.handle_rebase_key(&key, cx));
+            assert_eq!(workspace.rebase_plan_action(0), Some(PlanAction::Edit));
+            assert_eq!(
+                workspace.rebase.steps[0].commit_oid,
+                workspace.rebase_inventory().unwrap().commits[0].oid
+            );
+            assert_eq!(workspace.rebase.base.read(cx).value(), base);
+
+            request_id
+        });
+
+        // A defensive check still catches mutation that bypasses every handler.
+        window.update(|workspace, _, cx| {
+            workspace.rebase.steps[0].action = PlanAction::Drop;
+            workspace.confirm_rebase_action(request_id, cx);
+            assert_eq!(workspace.rebase_pending_action_id(), Some(request_id));
+            assert!(workspace.rebase.in_flight.is_none());
+            assert!(workspace.rebase_status_message().contains("paused"));
+        });
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), original_head);
+        assert!(store.observe().expect("observe no dispatch").is_none());
+
+        // Cancel is the only route back to editing. A second forced-order drift
+        // is also retained without replacing the frozen request.
+        window.update(|workspace, _, cx| {
+            workspace.cancel_rebase_action(request_id, cx);
+            assert!(workspace.rebase.base.read(cx).is_editable());
+            assert!(workspace.rebase.message.read(cx).is_editable());
+            workspace.rebase.steps[0].action = PlanAction::Edit;
+            workspace.request_start_rebase(cx);
+            let reorder_id = workspace
+                .rebase_pending_action_id()
+                .expect("reorder request");
+            workspace.rebase.steps.swap(0, 1);
+            workspace.confirm_rebase_action(reorder_id, cx);
+            assert_eq!(workspace.rebase_pending_action_id(), Some(reorder_id));
+            assert!(workspace.rebase.in_flight.is_none());
+            workspace.cancel_rebase_action(reorder_id, cx);
+            workspace.rebase.steps.swap(0, 1);
+        });
+        assert!(store.observe().expect("observe reorder refusal").is_none());
+
+        // The raw displayed ref is independently frozen along with the
+        // preparation's resolved base OID.
+        window.update(|workspace, window, cx| {
+            workspace.request_start_rebase(cx);
+            let base_id = workspace.rebase_pending_action_id().expect("base request");
+            workspace.rebase.base.update(cx, |input, cx| {
+                input.set_value("refs/heads/alternate-base", window, cx)
+            });
+            workspace.confirm_rebase_action(base_id, cx);
+            assert_eq!(workspace.rebase_pending_action_id(), Some(base_id));
+            assert!(workspace.rebase.in_flight.is_none());
+            workspace.cancel_rebase_action(base_id, cx);
+            workspace.set_rebase_base_candidate(base.clone(), window, cx);
+            workspace.prepare_rebase(cx);
+        });
+        assert_eq!(window.read(|workspace, _| workspace.rebase_plan_len()), 2);
+        assert!(store.observe().expect("observe base refusal").is_none());
+
+        // Reword text is applied explicitly, frozen, and checked again even
+        // when a programmatic write bypasses disabled input handling.
+        window.update(|workspace, window, cx| {
+            workspace.rebase.message.update(cx, |editor, cx| {
+                editor.set_value("frozen reword", window, cx)
+            });
+            workspace.set_rebase_step_action(
+                0,
+                PlanAction::Reword {
+                    message: "frozen reword".into(),
+                },
+                cx,
+            );
+            workspace.request_start_rebase(cx);
+            let reword_id = workspace
+                .rebase_pending_action_id()
+                .expect("reword request");
+            workspace.rebase.message.update(cx, |editor, cx| {
+                editor.set_value("programmatic drift", window, cx)
+            });
+            workspace.confirm_rebase_action(reword_id, cx);
+            assert_eq!(workspace.rebase_pending_action_id(), Some(reword_id));
+            assert!(workspace.rebase.in_flight.is_none());
+            workspace.cancel_rebase_action(reword_id, cx);
+            workspace.set_rebase_step_action(0, PlanAction::Edit, cx);
+        });
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), original_head);
+        assert!(store.observe().expect("observe reword refusal").is_none());
+
+        // A benign observe changes read epochs/status only; the exact request
+        // remains valid, dispatches once, and cannot be replayed by stale ID.
+        let exact_id = window.update(|workspace, _, cx| {
+            workspace.request_start_rebase(cx);
+            let exact_id = workspace.rebase_pending_action_id().expect("exact request");
+            workspace.observe_rebase(cx);
+            exact_id
+        });
+        window.update(|workspace, _, cx| workspace.confirm_rebase_action(exact_id, cx));
+        let observed = store
+            .observe()
+            .expect("observe exact dispatch")
+            .expect("operation");
+        assert_eq!(observed.state, RebaseState::PausedForEdit);
+        assert_eq!(observed.attempt, 1);
+        window.update(|workspace, _, cx| workspace.confirm_rebase_action(exact_id, cx));
+        assert_eq!(
+            store
+                .observe()
+                .expect("observe stale confirm")
+                .expect("operation")
+                .attempt,
+            1
+        );
+    }
+
+    #[test]
+    fn native_controller_amend_and_split_messages_pause_on_drift_without_git_dispatch() {
+        let (_temporary, checkout, _base, store, mut window) = native_controller_fixture();
+        window.update(|workspace, _, cx| {
+            workspace.set_rebase_step_action(0, PlanAction::Edit, cx);
+            workspace.request_start_rebase(cx);
+            let id = workspace.rebase_pending_action_id().expect("start request");
+            workspace.confirm_rebase_action(id, cx);
+        });
+        assert_eq!(
+            store
+                .observe()
+                .expect("edit operation")
+                .expect("operation")
+                .state,
+            RebaseState::PausedForEdit
+        );
+
+        let before_amend = git(&checkout, &["rev-parse", "HEAD"]);
+        window.update(|workspace, window, cx| {
+            workspace.rebase.message.update(cx, |editor, cx| {
+                editor.set_value("frozen amend", window, cx)
+            });
+            workspace.request_amend_rebase(cx);
+            let id = workspace.rebase_pending_action_id().expect("amend request");
+            workspace.rebase.message.update(cx, |editor, cx| {
+                editor.set_value("drifted amend", window, cx)
+            });
+            workspace.confirm_rebase_action(id, cx);
+            assert_eq!(workspace.rebase_pending_action_id(), Some(id));
+            assert!(workspace.rebase.in_flight.is_none());
+            workspace.cancel_rebase_action(id, cx);
+        });
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), before_amend);
+
+        window.update(|workspace, _, cx| {
+            workspace.request_begin_split(cx);
+            let id = workspace.rebase_pending_action_id().expect("split request");
+            workspace.confirm_rebase_action(id, cx);
+        });
+        let split = store
+            .observe()
+            .expect("split operation")
+            .expect("operation");
+        assert_eq!(
+            split
+                .split
+                .as_ref()
+                .and_then(|split| split.replacement_commit_count),
+            Some(0)
+        );
+        let before_part = git(&checkout, &["rev-parse", "HEAD"]);
+        window.update(|workspace, window, cx| {
+            workspace.rebase.message.update(cx, |editor, cx| {
+                editor.set_value("frozen split part", window, cx)
+            });
+            workspace.request_commit_split_part(cx);
+            let id = workspace
+                .rebase_pending_action_id()
+                .expect("split-part request");
+            workspace.rebase.message.update(cx, |editor, cx| {
+                editor.set_value("drifted split part", window, cx)
+            });
+            workspace.confirm_rebase_action(id, cx);
+            assert_eq!(workspace.rebase_pending_action_id(), Some(id));
+            assert!(workspace.rebase.in_flight.is_none());
+        });
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), before_part);
+        assert_eq!(
+            store
+                .observe()
+                .expect("split after refusal")
+                .expect("operation")
+                .split
+                .and_then(|split| split.replacement_commit_count),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn editable_identity_excludes_benign_poll_state_and_covers_all_text_payloads() {
+        let steps = pick_steps(&inventory());
+        let start = RebaseEditableInputIdentity::Start {
+            steps: steps.clone(),
+            prepared_base_oid: oid('a'),
+            displayed_base: "refs/heads/base".into(),
+            reword_editor: None,
+        };
+        assert_eq!(start.clone(), start);
+        assert_ne!(
+            RebaseEditableInputIdentity::AmendMessage("one".into()),
+            RebaseEditableInputIdentity::AmendMessage("two".into())
+        );
+        assert_ne!(
+            RebaseEditableInputIdentity::SplitPartMessage("one".into()),
+            RebaseEditableInputIdentity::SplitPartMessage("two".into())
+        );
+        let mut reordered = steps;
+        reordered.swap(0, 1);
+        assert_ne!(
+            start,
+            RebaseEditableInputIdentity::Start {
+                steps: reordered,
+                prepared_base_oid: oid('a'),
+                displayed_base: "refs/heads/base".into(),
+                reword_editor: None,
+            }
+        );
+        assert!(rebase_input_is_frozen(true, false));
+        assert!(rebase_input_is_frozen(false, true));
+        assert!(!rebase_input_is_frozen(false, false));
     }
 
     #[test]
