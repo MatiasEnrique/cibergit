@@ -9,9 +9,10 @@ review and GitHub reports that the viewer can update it.
 Activity lists reviews in bounded pages of 20. An `Edit submitted summary…`
 control appears only for a freshly read `APPROVED`, `CHANGES_REQUESTED`, or
 `COMMENTED` review with a submission time, author, reviewed commit, and complete
-`viewerDidAuthor` / `viewerCanUpdate` evidence. Cached collaboration remains
-read-only; old saved records deserialize without capability evidence and cannot
-enable the control.
+`viewerDidAuthor` / `viewerCanUpdate` evidence. Viewer-relative capability is
+never serialized. Cached collaboration therefore remains read-only, and every
+saved record deserializes without capability evidence and cannot enable the
+control.
 
 The editor is distinct from pending-review and new-submission summary inputs.
 Its drafts are keyed by exact review coordinates within each tab. Reopening the

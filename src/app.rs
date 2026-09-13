@@ -18075,11 +18075,11 @@ mod layout_tests {
         assert_eq!(expected_body, "before");
         assert!(body.is_empty(), "upstream-compatible empty body is allowed");
 
-        let mut cached_json = serde_json::to_value(&review).unwrap();
-        cached_json
-            .as_object_mut()
-            .unwrap()
-            .remove("edit_summary_capability");
+        let cached_json = serde_json::to_value(&review).unwrap();
+        assert!(
+            cached_json.get("edit_summary_capability").is_none(),
+            "viewer-relative edit capability must never persist into collaboration cache data"
+        );
         let cached: PullRequestReview = serde_json::from_value(cached_json).unwrap();
         assert!(cached.edit_summary_capability.is_none());
         assert!(

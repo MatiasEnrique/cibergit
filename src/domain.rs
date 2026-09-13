@@ -125,8 +125,9 @@ pub struct PullRequestReview {
     pub commit_sha: Option<String>,
     /// Present only when a fresh provider details read returned every field
     /// needed to decide whether the selected viewer may edit this summary.
-    /// Old cached records deserialize to `None` and remain read-only.
-    #[serde(default)]
+    /// It is never serialized; all cached records deserialize to `None` and
+    /// remain read-only.
+    #[serde(default, skip_serializing)]
     pub edit_summary_capability: Option<SubmittedReviewEditCapability>,
     pub url: String,
 }
