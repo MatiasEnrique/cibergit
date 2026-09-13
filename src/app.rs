@@ -6046,6 +6046,9 @@ impl ReviewWorkspace {
                         (title.as_str(), viewer.as_str(), *values, *capabilities)
                     })
                     .unwrap_or(("unavailable", "unavailable", false, false));
+                let secondary_target = second_pr
+                    .map(|number| format!("cli/cli#{number}"))
+                    .unwrap_or_else(|| "none".into());
                 let passed = real_read_captured
                     && metadata_captured
                     && activity_captured
@@ -6060,8 +6063,10 @@ impl ReviewWorkspace {
                     && late_journal_callback_fenced
                     && unchanged;
                 let report = format!(
-                    "Native PR lifecycle and submitted-summary smoke: {}\nReal read-only provider preparation: cli/cli snapshot title {:?}, selected account {}, values_complete={}, capabilities_complete={}\nSynthetic metadata confirmation capture: {}\nSynthetic exact-ID discussion confirmation capture: {}\nClearly labelled synthetic owned-review summary confirmation capture: {}\nSubmitted-summary cancellation through exact native handler: {}\nCancelled/reprepared identical confirmation rejects the stale native handler token: {}\nPer-review A→B→A and repeated-edit typed drafts retained: {}\nCross-tab editor save/restore retained exact typed draft: {}\nCross-tab stale confirmation handler rejected and original retained: {}\nChanged-source rejection plus explicit refresh retained typed draft: {}\nActual journal completion apply rejected stale success and error without changing busy/sentinel state: {}\nCanonical and selected comparison identities unchanged: {}\nMutation transport: not invoked; ZERO updatePullRequestReview and zero live metadata/comment/review/merge writes\nWindow focus requested: false when CIBERGIT_SMOKE_BACKGROUND=1\nPhysical input is not implied by an in-process scene render.\n",
+                    "Native PR lifecycle and submitted-summary smoke: {}\nExact read-only target pair: cli/cli#{}, secondary {}\nReal read-only provider preparation: cli/cli snapshot title {:?}, selected account {}, values_complete={}, capabilities_complete={}\nSynthetic metadata confirmation capture: {}\nSynthetic exact-ID discussion confirmation capture: {}\nClearly labelled synthetic owned-review summary confirmation capture: {}\nSubmitted-summary cancellation through exact native handler: {}\nCancelled/reprepared identical confirmation rejects the stale native handler token: {}\nPer-review A→B→A and repeated-edit typed drafts retained: {}\nCross-tab editor save/restore retained exact typed draft: {}\nCross-tab stale confirmation handler rejected and original retained: {}\nChanged-source rejection plus explicit refresh retained typed draft: {}\nActual journal completion apply rejected stale success and error without changing busy/sentinel state: {}\nCanonical and selected comparison identities unchanged: {}\nMutation transport: not invoked; ZERO updatePullRequestReview and zero live metadata/comment/review/merge writes\nWindow focus requested: false when CIBERGIT_SMOKE_BACKGROUND=1\nPhysical input is not implied by an in-process scene render.\n",
                     if passed { "passed" } else { "failed" },
+                    primary_number,
+                    secondary_target,
                     real_title,
                     viewer,
                     values_complete,
