@@ -40,11 +40,24 @@ CIBERGIT_DATA_DIR=/tmp/cibergit-data cargo run --locked
 
 Unreadable, foreign, or future-version workspace/session data is reported and preserved. The application does not replace it with defaults on disk.
 
-The original entity editor remains available explicitly:
+## Local editing from a pull request
 
-```sh
-cargo run --locked -- --edit /absolute/path/to/file.rs
-```
+Choose **Edit locally** (Command-Shift-E) in a PR tab. Create a dedicated checkout
+at the displayed review commit, or verify and attach an existing checkout. The
+selected file opens in the focused editor. The published comparison keeps its
+commit and selection while you work locally. Return with **Published review**
+(Command-Option-Shift-E); Command-Shift-R remains review submission.
+
+A saved association reopens its existing checkout after restart. **Reconcile
+interrupted setup** checks actual Git and filesystem identity without replaying
+an interrupted operation. Incomplete setup files remain preserved for recovery.
+Initial remote provisioning and explicit object fetch have a three-minute deadline;
+local Git actions retain their separate shorter bound. Git network credentials
+and commit authorship come from the installed Git configuration.
+
+File saves use the conflict-aware document store and preserve recovery data and
+retained previous file versions. The old `--edit PATH` prototype no longer writes
+files; it opens a compatibility screen directing you to the PR workspace.
 
 ## Native review controls
 

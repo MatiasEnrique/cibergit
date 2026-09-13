@@ -31,10 +31,7 @@ use file_tree::{FileTree, TreeRowKind};
 use gpui::{prelude::*, *};
 use gpui_base::{
     Scrollbar, TextView, TextViewStyle,
-    input::{
-        Editor, EditorState, Input, InputEditorStyle, InputEvent, InputState, Textarea,
-        TextareaState,
-    },
+    input::{Input, InputEditorStyle, InputEvent, InputState, Textarea, TextareaState},
 };
 use review_interactions::{
     ActionJournal, ComposerState, ControllerLoad, InlineThread, JournalRequest, JournalStatus,
@@ -9493,121 +9490,30 @@ fn split_cell_scrolled_interactive(
     cell
 }
 
+// Compatibility landing screen for the retired M0 --edit prototype. All
+// actual file editing now goes through the PR LocalWorkspace/DocumentStore.
 pub struct EditorWorkspace {
-    editor: Entity<EditorState>,
     path: PathBuf,
-    disk_base: Option<String>,
-    message: String,
 }
 
 impl EditorWorkspace {
-    fn new(window: &mut Window, cx: &mut Context<Root>, path: PathBuf) -> Self {
-        let loaded = std::fs::read_to_string(&path);
-        let (disk_base, text, message) = match loaded {
-            Ok(text) => (Some(text.clone()), text, "Local editor · ⌘S to save".into()),
-            Err(error) => (None, String::new(), format!("Cannot open file: {error}")),
-        };
-        let colors = palette(is_dark(window));
-        let editor = cx.new(|cx| {
-            let mut state = EditorState::new(window, cx);
-            state.set_editor_style(InputEditorStyle {
-                foreground: colors.text.into(),
-                muted_foreground: colors.muted.into(),
-                background: colors.canvas.into(),
-                editor_gutter_background: Some(colors.canvas.into()),
-                ..Default::default()
-            });
-            state.set_value(text, window, cx);
-            state.focus(window, cx);
-            state
-        });
-        Self {
-            editor,
-            path,
-            disk_base,
-            message,
-        }
-    }
-
-    fn save(&mut self, cx: &mut Context<Root>) {
-        let Some(base) = &self.disk_base else {
-            self.message = "File is unavailable; buffer preserved".into();
-            cx.notify();
-            return;
-        };
-        let text = self.editor.read(cx).value().to_string();
-        self.message = match std::fs::read_to_string(&self.path) {
-            Ok(current) if current == *base => match std::fs::write(&self.path, &text) {
-                Ok(()) => {
-                    self.disk_base = Some(text);
-                    "Saved".into()
-                }
-                Err(error) => format!("Save failed: {error}"),
-            },
-            Ok(_) => {
-                "File changed on disk; unsaved text preserved. Reconciliation is pending.".into()
-            }
-            Err(error) => format!("Cannot verify disk contents: {error}"),
-        };
-        cx.notify();
+    fn new(_window: &mut Window, _cx: &mut Context<Root>, path: PathBuf) -> Self {
+        Self { path }
     }
 
     fn render(&mut self, window: &mut Window, cx: &mut Context<Root>) -> impl IntoElement {
         let colors = palette(is_dark(window));
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(colors.canvas)
-            .font_family(UI_FONT)
-            .text_color(colors.text)
-            .on_action(cx.listener(|root, _: &Save, _, cx| {
-                if let Root::Editor(this) = root {
-                    this.save(cx)
-                }
-            }))
-            .child(
-                div()
-                    .h(px(52.))
-                    .px_5()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("cibergit · Local editor"),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(colors.muted)
-                            .child(self.path.display().to_string()),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .px_5()
-                    .font_family(CODE_FONT)
-                    .child(Editor::new(&self.editor)),
-            )
-            .child(
-                div()
-                    .h(px(36.))
-                    .px_5()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_t_1()
-                    .border_color(colors.border)
-                    .text_sm()
-                    .child(self.message.clone())
-                    .child("Save  ⌘S"),
-            )
+        div().size_full().flex().flex_col().p_6().gap_4()
+            .bg(colors.canvas).font_family(UI_FONT).text_color(colors.text)
+            .child(div().text_lg().child("Open a pull request to edit locally"))
+            .child(self.path.display().to_string())
+            .child("Choose Edit locally in a pull-request tab, then create a dedicated checkout or attach an existing one.")
+            .child(div().id("open-review-from-legacy-editor").px_3().py_2().rounded_md()
+                .bg(colors.selected).cursor_pointer().child("Open review workspace")
+                .on_click(cx.listener(|root, _, window, cx| {
+                    *root = Root::review(window, cx, Startup::default());
+                    cx.notify();
+                })))
     }
 }
 
