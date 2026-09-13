@@ -19,7 +19,7 @@ use cibergit::{
         ProviderMutationOutcome, PullRequest, PullRequestDetails, Repository,
         ReviewAuxiliaryAction, ReviewAuxiliaryRequest, Revision,
     },
-    participation::{DiffSide, LineSelection, ReviewEvent, ReviewKey},
+    participation::{DiffSide, LineSelection, ReviewEvent, ReviewKey, ReviewOperationPayload},
     providers::GithubProvider,
     review::{
         AlignedRow, DiffLine, DiffLineKind, DiffMode, ParsedDiff, PatchStatus, ReviewSession,
@@ -34,9 +34,9 @@ use gpui_base::{
     input::{Input, InputEditorStyle, InputEvent, InputState, Textarea, TextareaState},
 };
 use review_interactions::{
-    ActionJournal, ComposerState, ControllerLoad, InlineThread, JournalRequest, JournalStatus,
-    ReviewInteractionController, dispatch_auxiliary, dispatch_merge, load_merge_preference,
-    next_attempt_id, place_threads, save_merge_preference,
+    ActionJournal, ComposerState, ControllerLoad, InlineThread, JournalOperation, JournalRequest,
+    JournalStatus, ReviewInteractionController, ReviewReconciliationOutcome, dispatch_auxiliary,
+    dispatch_merge, load_merge_preference, next_attempt_id, place_threads, save_merge_preference,
 };
 use std::{
     cell::Cell,
@@ -552,6 +552,8 @@ struct ReviewTab {
     session_persistence_error: Option<String>,
     details: Option<PullRequestDetails>,
     pending_snapshot: Option<PendingReviewSnapshot>,
+    journal_operations: Vec<JournalOperation>,
+    journal_error: Option<String>,
     details_state: LoadState,
     details_generation: u64,
     interactions: InteractionState,
@@ -1441,6 +1443,74 @@ impl ReviewWorkspace {
                                     .is_ok()
                         })
                         .unwrap_or(false);
+                let reconciliation_ambiguous_installed = actions.is_ok()
+                    && window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                this.install_review_reconciliation_smoke(false, cx)
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("smoke window unavailable".to_owned()))
+                        .is_ok();
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let reconciliation_ambiguous_captured = reconciliation_ambiguous_installed
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join(
+                                            "native-review-reconciliation-ambiguous.png",
+                                        ))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let reconciliation_resolved_installed = actions.is_ok()
+                    && window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                this.install_review_reconciliation_smoke(true, cx)
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("smoke window unavailable".to_owned()))
+                        .is_ok();
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let reconciliation_resolved_captured = reconciliation_resolved_installed
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join(
+                                            "native-review-reconciliation-resolved.png",
+                                        ))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
                 let submission_confirmation_installed = actions.is_ok()
                     && window
                         .update(|window, cx| {
@@ -1804,13 +1874,23 @@ impl ReviewWorkspace {
                                 "Persistence: selected/viewed state read back after queued two-tab saves\n",
                             );
                             actions.report.push_str(&format!(
-                                "Variable-height inline review scene (unified, narrow resize, horizontal end): {}\nVariable-height inline review scene (split, narrow resize, horizontal end): {}\nSubmission confirmation with pending count and older-head warning: {}\nStale merge refusal through native handler: {}\nMerge rule/capability/queue confirmation matrix: {}\nComposer: focused multiline exact-revision fixture\nInline Markdown fixture: wrapped prose plus literal fenced code; media excluded only from prose\n",
+                                "Variable-height inline review scene (unified, narrow resize, horizontal end): {}\nVariable-height inline review scene (split, narrow resize, horizontal end): {}\nAmbiguous no-ID review outcome visibly frozen with reconciliation control: {}\nExact-ID review outcome durably reconciled and later explicit prepare permitted without sending: {}\nSubmission confirmation with pending count and older-head warning: {}\nStale merge refusal through native handler: {}\nMerge rule/capability/queue confirmation matrix: {}\nComposer: focused multiline exact-revision fixture\nInline Markdown fixture: wrapped prose plus literal fenced code; media excluded only from prose\n",
                                 if interaction_unified_captured {
                                     "passed"
                                 } else {
                                     "failed"
                                 },
                                 if interaction_split_captured {
+                                    "passed"
+                                } else {
+                                    "failed"
+                                },
+                                if reconciliation_ambiguous_captured {
+                                    "passed"
+                                } else {
+                                    "failed"
+                                },
+                                if reconciliation_resolved_captured {
                                     "passed"
                                 } else {
                                     "failed"
@@ -1861,6 +1941,8 @@ impl ReviewWorkspace {
                         && review_captured
                         && interaction_unified_captured
                         && interaction_split_captured
+                        && reconciliation_ambiguous_captured
+                        && reconciliation_resolved_captured
                         && submission_confirmation_captured
                         && stale_merge_refused
                         && merge_confirmation_captured
@@ -1874,7 +1956,7 @@ impl ReviewWorkspace {
                         .map(|actions| actions.report)
                         .unwrap_or_else(|error| format!("Smoke failed: {error}\n"));
                     let report = format!(
-                        "{details}Programmatic native actions: {}\nInitial split review scene capture: {}\nReview scene capture: {}\nInline review unified capture: {}\nInline review split capture: {}\nSubmission confirmation capture: {}\nMerge confirmation capture: {}\nMerge confirmation controls capture: {}\nUnified long-line end scene capture: {}\nSplit long-line start scene capture: {}\nSplit long-line end scene capture: {}\nFilter editor scene capture: {}\nGrouping editor scene capture: {}\nNative backdrop blending and physical input: not established by in-process capture\nRemote writes: none\n",
+                        "{details}Programmatic native actions: {}\nInitial split review scene capture: {}\nReview scene capture: {}\nInline review unified capture: {}\nInline review split capture: {}\nAmbiguous reconciliation capture: {}\nResolved reconciliation capture: {}\nSubmission confirmation capture: {}\nMerge confirmation capture: {}\nMerge confirmation controls capture: {}\nUnified long-line end scene capture: {}\nSplit long-line start scene capture: {}\nSplit long-line end scene capture: {}\nFilter editor scene capture: {}\nGrouping editor scene capture: {}\nNative backdrop blending and physical input: not established by in-process capture\nRemote writes: none\n",
                         if passed { "passed" } else { "failed" },
                         if expect_restore {
                             "covered by fresh light run"
@@ -1895,6 +1977,16 @@ impl ReviewWorkspace {
                         },
                         if interaction_split_captured {
                             "native-review-interactions-split.png"
+                        } else {
+                            "failed"
+                        },
+                        if reconciliation_ambiguous_captured {
+                            "native-review-reconciliation-ambiguous.png"
+                        } else {
+                            "failed"
+                        },
+                        if reconciliation_resolved_captured {
+                            "native-review-reconciliation-resolved.png"
                         } else {
                             "failed"
                         },
@@ -2231,6 +2323,217 @@ impl ReviewWorkspace {
                 "interaction scene is not at meaningful horizontal end (offset={offset}, maximum={maximum})"
             ));
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn install_review_reconciliation_smoke(
+        &mut self,
+        exact_known_id: bool,
+        cx: &mut Context<Root>,
+    ) -> Result<(), String> {
+        let index = self
+            .active_tab
+            .ok_or_else(|| "reconciliation smoke has no active tab".to_owned())?;
+        let repository = self.tabs[index].repository.clone();
+        let number = self.tabs[index].pull_request.number;
+        let session = self.tabs[index]
+            .session
+            .clone()
+            .ok_or_else(|| "reconciliation smoke has no immutable session".to_owned())?;
+        let selection = session
+            .selected_file()
+            .into_iter()
+            .flat_map(|file| build_rows(parse_file(file), DiffMode::Unified))
+            .find_map(|row| match row {
+                DiffRow::Unified(line) => line
+                    .new_line
+                    .map(|line| LineSelection::single(DiffSide::New, line))
+                    .or_else(|| {
+                        line.old_line
+                            .map(|line| LineSelection::single(DiffSide::Old, line))
+                    }),
+                _ => None,
+            })
+            .ok_or_else(|| "reconciliation smoke needs a selectable line".to_owned())?;
+        let fixture_root = self.interaction_root.join(format!(
+            "ui-smoke-reconciliation-{}-{}",
+            std::process::id(),
+            if exact_known_id {
+                "resolved"
+            } else {
+                "ambiguous"
+            }
+        ));
+        let mut controller = match ReviewInteractionController::load(
+            &fixture_root,
+            &repository,
+            number,
+            &session,
+        )? {
+            ControllerLoad::Ready(controller) => controller,
+            ControllerLoad::RecoveryRequired(reason) => return Err(reason),
+        };
+        controller.select_line(&session, selection)?;
+        let frozen_body = "Exact frozen reconciliation smoke body";
+        let snapshot = controller.stage_composer_text(frozen_body.into())?;
+        controller
+            .store
+            .save(&snapshot)
+            .map_err(|error| error.to_string())?;
+        let draft_id = controller
+            .composer
+            .as_ref()
+            .and_then(|composer| composer.draft_id.clone())
+            .ok_or_else(|| "reconciliation smoke draft has no identity".to_owned())?;
+        controller.finish_composer_save(&snapshot, &draft_id, frozen_body, Ok(()));
+        if exact_known_id {
+            let draft = controller
+                .composition
+                .drafts
+                .iter_mut()
+                .find(|draft| draft.id == draft_id)
+                .ok_or_else(|| "reconciliation smoke draft disappeared".to_owned())?;
+            draft.remote = Some(cibergit::participation::RemoteDraftIds {
+                review_id: Some("cibergit-reconcile-review".into()),
+                comment_id: "cibergit-reconcile-comment".into(),
+            });
+            draft.dirty = true;
+        }
+        controller
+            .store
+            .save(&controller.composition)
+            .map_err(|error| error.to_string())?;
+        controller.durable_composition = Some(controller.composition.clone());
+        let operation_id = controller.prepare_pending(&session)?;
+        controller
+            .composition
+            .mark_in_flight(&operation_id, "cibergit-reconcile-attempt")
+            .map_err(|error| error.to_string())?;
+        controller
+            .composition
+            .mark_uncertain(
+                &operation_id,
+                "fixture acknowledgement was deliberately lost",
+            )
+            .map_err(|error| error.to_string())?;
+        controller
+            .store
+            .save(&controller.composition)
+            .map_err(|error| error.to_string())?;
+        controller.durable_composition = Some(controller.composition.clone());
+        let intent = controller
+            .composition
+            .operations
+            .iter()
+            .find(|operation| operation.id == operation_id)
+            .and_then(|operation| operation.payload.as_ref())
+            .and_then(|payload| match payload {
+                ReviewOperationPayload::PendingComment(intent) => Some(intent.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| "reconciliation smoke has no frozen comment payload".to_owned())?;
+        let review_id = "cibergit-reconcile-review";
+        let comment_id = if exact_known_id {
+            "cibergit-reconcile-comment"
+        } else {
+            "cibergit-unrelated-identical-comment"
+        };
+        let coordinates = |remote_id: &str| cibergit::domain::ProviderCoordinates {
+            provider: "github".into(),
+            host: repository.host.clone(),
+            owner: repository.owner.clone(),
+            repository: repository.name.clone(),
+            pull_request: number,
+            remote_id: remote_id.into(),
+        };
+        let side = match intent.position.side {
+            DiffSide::Old => "LEFT",
+            DiffSide::New => "RIGHT",
+        };
+        let pending = PendingReviewSnapshot {
+            review: cibergit::domain::PullRequestReview {
+                coordinates: coordinates(review_id),
+                author: Some(repository.account.login.clone()),
+                body: String::new(),
+                state: "PENDING".into(),
+                submitted_at: None,
+                commit_sha: Some(intent.position.commit_sha.clone()),
+                url: String::new(),
+            },
+            comments: vec![cibergit::domain::LinkedReviewComment {
+                pull_request_review_id: review_id.into(),
+                comment: cibergit::domain::ReviewComment {
+                    coordinates: coordinates(comment_id),
+                    author: Some(repository.account.login.clone()),
+                    body: intent.body.clone(),
+                    created_at: "2026-09-13T12:00:00Z".into(),
+                    updated_at: "2026-09-13T12:00:00Z".into(),
+                    url: String::new(),
+                    path: intent.position.path.clone(),
+                    line: Some(intent.position.line),
+                    original_line: Some(intent.position.line),
+                    start_line: intent.position.start_line,
+                    original_start_line: intent.position.start_line,
+                    side: Some(side.into()),
+                    diff_hunk: "@@ reconciliation smoke @@".into(),
+                    commit_sha: Some(intent.position.commit_sha.clone()),
+                    original_commit_sha: Some(intent.position.commit_sha.clone()),
+                    outdated: false,
+                },
+            }],
+            comments_complete: true,
+        };
+        let mut details = self.tabs[index]
+            .details
+            .clone()
+            .ok_or_else(|| "reconciliation smoke has no details fixture".to_owned())?;
+        details.number = number;
+        details.activity_complete = true;
+        let report = controller.authority.reconcile_if_current(
+            &controller.store,
+            controller.durable_composition.as_ref(),
+            &repository,
+            number,
+            || Ok((details, Some(pending))),
+        )?;
+        if exact_known_id {
+            if report.resolved() != 1 || report.unresolved() != 0 {
+                return Err("exact-ID reconciliation smoke did not resolve durably".into());
+            }
+            controller.composition = report.composition.clone();
+            controller.durable_composition = Some(report.composition.clone());
+            controller.reopen_draft(&draft_id)?;
+            let next = controller.prepare_pending(&session)?;
+            controller
+                .composition
+                .cancel_prepared(&next)
+                .map_err(|error| error.to_string())?;
+        } else if report.resolved() != 0 || report.unresolved() != 1 {
+            return Err("ambiguous reconciliation smoke did not remain frozen".into());
+        }
+        controller.composition = report.composition.clone();
+        controller.durable_composition = Some(report.composition);
+        controller.install_pending_snapshot(report.pending.clone());
+        controller.reconciliation_results = report.items;
+        self.tabs[index].details = Some(report.details);
+        self.tabs[index].pending_snapshot = report.pending;
+        self.tabs[index].journal_operations.clear();
+        self.tabs[index].journal_error = None;
+        self.tabs[index].interactions = InteractionState::Ready(controller);
+        self.tabs[index].inspector_section = InspectorSection::Activity;
+        self.tabs[index].confirmation = None;
+        self.tabs[index].write_in_flight = false;
+        self.inspector_open = true;
+        self.inspector_scroll.set_offset(point(px(0.), px(0.)));
+        self.status = if exact_known_id {
+            "Exact known-ID review outcome durably reconciled; a new explicit prepare was permitted without sending."
+                .into()
+        } else {
+            "Unrelated identical comment remains visibly ambiguous and frozen; no write was sent."
+                .into()
+        };
+        cx.notify();
         Ok(())
     }
 
@@ -3323,6 +3626,8 @@ impl ReviewWorkspace {
             session_persistence_error,
             details: None,
             pending_snapshot: None,
+            journal_operations: Vec::new(),
+            journal_error: None,
             details_state: LoadState::Loading("Loading PR details…".into()),
             details_generation: 0,
             interactions: InteractionState::Loading,
@@ -4243,7 +4548,7 @@ impl ReviewWorkspace {
             let details = provider.details(&repository, number)?;
             let pending = provider.pending_review(&repository, number)?;
             let mut resolved = 0usize;
-            let mut still_uncertain = 0usize;
+            let mut still_uncertain = Vec::new();
             for operation in operations.iter().filter(|operation| {
                 matches!(
                     operation.status,
@@ -4271,15 +4576,31 @@ impl ReviewWorkspace {
                         resolved += 1;
                     }
                     Some((false, _, evidence)) => {
-                        journal
-                            .mark_not_applied(operation_id, attempt_id, evidence)
-                            .map_err(anyhow::Error::msg)?;
-                        resolved += 1;
+                        still_uncertain.push(format!(
+                            "{} · The current object differs from the request, but that does not prove this attempt was NotApplied after later external changes: {evidence}",
+                            journal_operation_description(operation)
+                        ));
                     }
-                    None => still_uncertain += 1,
+                    None => {
+                        let limitation = match &operation.request {
+                            JournalRequest::Auxiliary(request)
+                                if matches!(request.action, ReviewAuxiliaryAction::Reply { .. }) =>
+                            {
+                                "No safe exact-ID reply observation route exists: the frozen request contains the target thread/review/body but no provider reply ID, and GitHub does not preserve the local attempt ID."
+                            }
+                            _ => {
+                                "The fresh read did not provide complete exact identity and payload evidence for this request."
+                            }
+                        };
+                        still_uncertain.push(format!(
+                            "{} · {limitation}",
+                            journal_operation_description(operation)
+                        ));
+                    }
                 }
             }
-            Ok::<_, anyhow::Error>((resolved, still_uncertain))
+            let operations = journal.operations().map_err(anyhow::Error::msg)?;
+            Ok::<_, anyhow::Error>((resolved, still_uncertain, operations))
         });
         cx.spawn(async move |root, cx| {
             let result = task.await;
@@ -4292,17 +4613,143 @@ impl ReviewWorkspace {
                 };
                 this.tabs[index].write_in_flight = false;
                 this.status = match result {
-                    Ok((resolved, 0)) => format!(
-                        "Authoritative reconciliation resolved {resolved} started action(s); explicit retry is now allowed only for NotApplied attempts."
-                    ),
-                    Ok((resolved, uncertain)) => format!(
-                        "Resolved {resolved} action(s); {uncertain} remain uncertain because exact provider identity/payload could not be proven. No replay occurred."
-                    ),
+                    Ok((resolved, uncertain, operations)) => {
+                        this.tabs[index].journal_operations = operations;
+                        this.tabs[index].journal_error = None;
+                        if uncertain.is_empty() {
+                            format!(
+                                "Authoritative reconciliation resolved {resolved} auxiliary / merge action(s); explicit retry is allowed only for proven NotApplied attempts."
+                            )
+                        } else {
+                            format!(
+                                "Resolved {resolved} auxiliary / merge action(s); {} remain frozen. {} No replay occurred.",
+                                uncertain.len(),
+                                uncertain.join(" | ")
+                            )
+                        }
+                    }
                     Err(error) => format!(
                         "Authoritative reconciliation read failed; journal remains frozen: {error:#}"
                     ),
                 };
                 this.refresh_details(index, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn reconcile_review_operations(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "Wait for the active operation before reconciling review outcomes.".into();
+            return;
+        }
+        let (repository, number, store, authority, expected, interaction_generation) = {
+            let tab = &mut self.tabs[index];
+            let InteractionState::Ready(controller) = &tab.interactions else {
+                self.status = "Review recovery must load before reconciliation.".into();
+                return;
+            };
+            if controller.unresolved_operations() == 0 {
+                self.status = "No review-composition outcomes require reconciliation.".into();
+                return;
+            }
+            tab.details_generation += 1;
+            tab.write_in_flight = true;
+            (
+                tab.repository.clone(),
+                tab.pull_request.number,
+                controller.store.clone(),
+                controller.authority.clone(),
+                controller.durable_composition.clone(),
+                tab.interaction_generation,
+            )
+        };
+        if self.active_tab == Some(index) {
+            self.composer_input
+                .update(cx, |input, cx| input.set_disabled(true, cx));
+            self.review_summary_input
+                .update(cx, |input, cx| input.set_disabled(true, cx));
+        }
+        self.status =
+            "Reading exact review identities under local authority; no write will be dispatched…"
+                .into();
+        let identity = repository.cache_key();
+        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let provider = GithubProvider::new(repository.account.clone());
+        let task = cx.background_spawn(async move {
+            let _guard = lock
+                .lock()
+                .map_err(|_| "Review reconciliation sequencing lock failed.".to_owned())?;
+            if latest.load(Ordering::Acquire) != sequence {
+                return Ok(None);
+            }
+            authority
+                .reconcile_if_current(&store, expected.as_ref(), &repository, number, || {
+                    let details = provider
+                        .details(&repository, number)
+                        .map_err(|error| format!("Details read failed: {error:#}"))?;
+                    let pending = provider
+                        .pending_review(&repository, number)
+                        .map_err(|error| format!("Pending-review read failed: {error:#}"))?;
+                    Ok((details, pending))
+                })
+                .map(Some)
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(index) = this.tabs.iter().position(|tab| {
+                    tab.repository.cache_key() == identity
+                        && tab.pull_request.number == number
+                        && tab.interaction_generation == interaction_generation
+                }) else {
+                    return;
+                };
+                this.tabs[index].write_in_flight = false;
+                if this.active_tab == Some(index) {
+                    this.composer_input
+                        .update(cx, |input, cx| input.set_disabled(false, cx));
+                    this.review_summary_input
+                        .update(cx, |input, cx| input.set_disabled(false, cx));
+                }
+                this.status = match result {
+                    Ok(Some(report)) => {
+                        let resolved = report.resolved();
+                        let unresolved = report.unresolved();
+                        this.tabs[index].details = Some(report.details.clone());
+                        this.tabs[index].pending_snapshot = report.pending.clone();
+                        this.tabs[index].details_state = LoadState::Ready;
+                        if let InteractionState::Ready(controller) =
+                            &mut this.tabs[index].interactions
+                        {
+                            controller.composition = report.composition.clone();
+                            controller.durable_composition = Some(report.composition);
+                            controller.install_pending_snapshot(report.pending);
+                            controller.reconciliation_results = report.items;
+                        }
+                        if unresolved == 0 {
+                            format!(
+                                "Durably reconciled {resolved} exact review outcome(s). No provider mutation was sent."
+                            )
+                        } else {
+                            format!(
+                                "Durably reconciled {resolved} exact review outcome(s); {unresolved} remain frozen because identity or payload proof is incomplete. No provider mutation was sent."
+                            )
+                        }
+                    }
+                    Ok(None) => {
+                        "A newer local review-state action superseded this reconciliation; no outcome was changed."
+                            .into()
+                    }
+                    Err(error) => format!(
+                        "Review reconciliation did not change durable state; operations remain frozen: {error}"
+                    ),
+                };
+                this.rebuild_diff(index, this.wide);
                 cx.notify();
             });
         })
@@ -4484,6 +4931,7 @@ impl ReviewWorkspace {
         let repository = tab.repository.clone();
         let number = tab.pull_request.number;
         let key = repository.cache_key();
+        let journal_root = self.interaction_root.join("action-journal");
         if tab.details.is_none() {
             tab.details_state = LoadState::Loading("Loading PR details…".into());
         }
@@ -4491,7 +4939,11 @@ impl ReviewWorkspace {
             let provider = GithubProvider::new(repository.account.clone());
             let details = provider.details(&repository, number)?;
             let pending = provider.pending_review(&repository, number)?;
-            Ok::<_, anyhow::Error>((details, pending))
+            let journal = ReviewKey::for_repository("github", &repository, number)
+                .map_err(|error| error.to_string())
+                .and_then(|key| ActionJournal::open(&journal_root, key))
+                .and_then(|journal| journal.operations());
+            Ok::<_, anyhow::Error>((details, pending, journal))
         });
         cx.spawn(async move |root, cx| {
             let result = task.await;
@@ -4505,11 +4957,18 @@ impl ReviewWorkspace {
                     return;
                 };
                 match result {
-                    Ok((details, pending)) => {
+                    Ok((details, pending, journal)) => {
                         let save = {
                             let tab = &mut this.tabs[tab_index];
                             tab.details = Some(details);
                             tab.pending_snapshot = pending.clone();
+                            match journal {
+                                Ok(operations) => {
+                                    tab.journal_operations = operations;
+                                    tab.journal_error = None;
+                                }
+                                Err(error) => tab.journal_error = Some(error),
+                            }
                             tab.details_state = LoadState::Ready;
                             if !tab.write_in_flight
                                 && let InteractionState::Ready(controller) =
@@ -7167,11 +7626,50 @@ impl ReviewWorkspace {
                                             .text_xs()
                                             .text_color(colors.amber)
                                             .child(format!(
-                                                "{} operation(s) require authoritative reconciliation before retry.",
+                                                "{} review-composition operation(s) require exact read-only reconciliation before retry.",
                                                 controller.unresolved_operations()
                                             )),
                                     )
                                 });
+                        if controller.unresolved_operations() > 0 {
+                            let reconcile_root = cx.entity();
+                            pending_card = pending_card.child(div().mt_2().child(
+                                action_link("Reconcile review outcomes", colors).on_click(
+                                    move |_, _, cx| {
+                                        reconcile_root.update(cx, |root, cx| {
+                                            if let Root::Review(this) = root {
+                                                this.reconcile_review_operations(cx);
+                                            }
+                                        });
+                                    },
+                                ),
+                            ));
+                        }
+                        for description in controller.unresolved_operation_descriptions() {
+                            pending_card = pending_card.child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(colors.amber)
+                                    .child(description),
+                            );
+                        }
+                        for item in &controller.reconciliation_results {
+                            let (label, color, explanation) = match &item.outcome {
+                                ReviewReconciliationOutcome::Reconciled(evidence) => {
+                                    ("Reconciled", colors.green, evidence)
+                                }
+                                ReviewReconciliationOutcome::Unresolved(reason) => {
+                                    ("Still unresolved", colors.amber, reason)
+                                }
+                            };
+                            pending_card = pending_card.child(
+                                div().mt_1().text_xs().text_color(color).child(format!(
+                                    "{label}: {} / attempt {} · {} · {explanation}",
+                                    item.operation_id, item.attempt_id, item.frozen_request
+                                )),
+                            );
+                        }
                         if let Some(snapshot) = &controller.pending_review {
                             let edit_root = cx.entity();
                             let edit_body = snapshot.review.body.clone();
@@ -7351,15 +7849,58 @@ impl ReviewWorkspace {
                             }
                         }
                         activity.push(pending_card);
-                        activity.push(div().mb_4().child(
-                            action_link("Reconcile started actions", colors).on_click(cx.listener(
-                                |root, _, _, cx| {
-                                    if let Root::Review(this) = root {
-                                        this.reconcile_action_journal(cx);
-                                    }
-                                },
-                            )),
-                        ));
+                        let journal_unresolved = tab
+                            .journal_operations
+                            .iter()
+                            .filter(|operation| {
+                                matches!(
+                                    operation.status,
+                                    JournalStatus::InFlight | JournalStatus::Uncertain { .. }
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        if !journal_unresolved.is_empty() {
+                            let mut journal_card = div()
+                                .mb_2()
+                                .p_3()
+                                .rounded_md()
+                                .bg(colors.elevated)
+                                .child(format!(
+                                    "{} auxiliary / merge action(s) require separate reconciliation",
+                                    journal_unresolved.len()
+                                ));
+                            for operation in journal_unresolved {
+                                journal_card = journal_card.child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(colors.amber)
+                                        .child(journal_operation_description(operation)),
+                                );
+                            }
+                            activity.push(journal_card);
+                            activity.push(
+                                div().mb_4().child(
+                                    action_link("Reconcile auxiliary / merge actions", colors)
+                                        .on_click(cx.listener(|root, _, _, cx| {
+                                            if let Root::Review(this) = root {
+                                                this.reconcile_action_journal(cx);
+                                            }
+                                        })),
+                                ),
+                            );
+                        }
+                        if let Some(error) = &tab.journal_error {
+                            activity.push(
+                                div()
+                                    .mb_4()
+                                    .text_xs()
+                                    .text_color(colors.red)
+                                    .child(format!(
+                                        "Auxiliary / merge journal could not be read and remains frozen: {error}"
+                                    )),
+                            );
+                        }
                     }
                     InteractionState::Loading => activity.push(
                         div()
@@ -8304,6 +8845,61 @@ fn journal_identity(request: &JournalRequest) -> (&str, &str) {
     }
 }
 
+fn journal_operation_description(operation: &JournalOperation) -> String {
+    let (operation_id, attempt_id) = journal_identity(&operation.request);
+    let frozen = match &operation.request {
+        JournalRequest::Auxiliary(request) => match &request.action {
+            ReviewAuxiliaryAction::UpdatePendingSummary { review, body } => format!(
+                "pending-summary review {} · body {:?}",
+                review.remote_id, body
+            ),
+            ReviewAuxiliaryAction::DeletePendingComment { review, comment } => format!(
+                "delete-pending-comment review {} · comment {}",
+                review.remote_id, comment.remote_id
+            ),
+            ReviewAuxiliaryAction::CancelPendingReview { review } => {
+                format!("cancel-pending-review {}", review.remote_id)
+            }
+            ReviewAuxiliaryAction::Reply {
+                thread,
+                pending_review,
+                body,
+            } => format!(
+                "reply thread {} · review {} · body {:?} · no exact reply ID exists in the frozen request, so GitHub activity cannot prove which reply came from this attempt",
+                thread.remote_id,
+                pending_review
+                    .as_ref()
+                    .map(|review| review.remote_id.as_str())
+                    .unwrap_or("none"),
+                body
+            ),
+            ReviewAuxiliaryAction::SetThreadResolved { thread, resolved } => format!(
+                "set-thread-resolved thread {} · resolved={resolved}",
+                thread.remote_id
+            ),
+        },
+        JournalRequest::Merge {
+            preparation,
+            request,
+        } => format!(
+            "merge {:?} · PR {} · reviewed head {} · current head {}",
+            request.action,
+            preparation.pull_request.remote_id,
+            preparation.reviewed_head_sha,
+            preparation.current_head_sha
+        ),
+    };
+    let status = match &operation.status {
+        JournalStatus::InFlight => {
+            "process stopped before a durable outcome was recorded".to_owned()
+        }
+        JournalStatus::Uncertain { reason } => reason.clone(),
+        JournalStatus::Acknowledged { summary, .. } => summary.clone(),
+        JournalStatus::NotApplied { evidence } => evidence.clone(),
+    };
+    format!("{operation_id} / attempt {attempt_id} · {frozen} · {status}")
+}
+
 fn observe_auxiliary(
     action: &ReviewAuxiliaryAction,
     details: &PullRequestDetails,
@@ -8313,45 +8909,43 @@ fn observe_auxiliary(
         ReviewAuxiliaryAction::UpdatePendingSummary { review, body } => {
             let observed = pending
                 .filter(|snapshot| snapshot.review.coordinates.remote_id == review.remote_id)?;
-            Some((
-                observed.review.body == *body,
-                true,
-                "Authoritative pending-review body compared with the exact request payload.".into(),
-            ))
+            (observed.review.body == *body).then(|| {
+                (
+                    true,
+                    true,
+                    "Authoritative pending-review body matched the exact request payload.".into(),
+                )
+            })
         }
         ReviewAuxiliaryAction::DeletePendingComment { review, comment } => {
-            let observed = pending.filter(|snapshot| {
+            let _observed = pending.filter(|snapshot| {
                 snapshot.review.coordinates.remote_id == review.remote_id
                     && snapshot.comments_complete
             })?;
-            let exists = observed
-                .comments
-                .iter()
-                .any(|linked| linked.comment.coordinates.remote_id == comment.remote_id);
-            Some((
-                !exists,
-                true,
-                "Authoritative complete pending-comment read checked the exact remote comment ID."
-                    .into(),
-            ))
+            let _ = comment;
+            // Absence can be caused by a later external deletion or submission;
+            // presence does not prove which attempt failed. GitHub exposes no
+            // attempt correlation for this mutation.
+            None
         }
-        ReviewAuxiliaryAction::CancelPendingReview { review } => Some((
-            pending
-                .is_none_or(|snapshot| snapshot.review.coordinates.remote_id != review.remote_id),
-            true,
-            "Authoritative selected-account pending-review read checked the exact review ID."
-                .into(),
-        )),
+        ReviewAuxiliaryAction::CancelPendingReview { review } => {
+            let _ = review;
+            // A missing pending review may have been submitted or cancelled by
+            // another actor, so absence alone cannot identify this attempt.
+            None
+        }
         ReviewAuxiliaryAction::SetThreadResolved { thread, resolved } => {
             let observed = details
                 .review_threads
                 .iter()
                 .find(|candidate| candidate.coordinates.remote_id == thread.remote_id)?;
-            Some((
-                observed.resolved == *resolved,
-                true,
-                "Authoritative thread read checked the exact ID and resolution payload.".into(),
-            ))
+            (observed.resolved == *resolved).then(|| {
+                (
+                    true,
+                    true,
+                    "Authoritative thread read matched the exact ID and resolution payload.".into(),
+                )
+            })
         }
         ReviewAuxiliaryAction::Reply { .. } => None,
     }
@@ -9522,11 +10116,13 @@ impl EditorWorkspace {
 mod layout_tests {
     use super::{
         COLLAPSED_PANEL_WIDTH, DEFAULT_SIDEBAR_WIDTH, DiffLine, DiffLineKind, DiffMode, DiffRow,
-        EXCEPTIONAL_LINE_CHUNK_BYTES, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
-        MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, PanelKind, PanelLayout, available_diff_width_for,
-        diff_content_width, display_columns, line_text_chunks, media_free_markdown,
+        EXCEPTIONAL_LINE_CHUNK_BYTES, JournalOperation, JournalRequest, JournalStatus,
+        MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH, MIN_SIDEBAR_WIDTH,
+        MIN_SPLIT_DIFF_WIDTH, PanelKind, PanelLayout, available_diff_width_for, diff_content_width,
+        display_columns, journal_operation_description, line_text_chunks, media_free_markdown,
         resolved_panel_widths_for,
     };
+    use cibergit::domain::{ProviderCoordinates, ReviewAuxiliaryAction, ReviewAuxiliaryRequest};
 
     #[test]
     fn auto_uses_remaining_diff_pane_instead_of_whole_window() {
@@ -9620,5 +10216,37 @@ mod layout_tests {
             safe,
             "Several ordinary words before \\`inline code\\` and several ordinary words after."
         );
+    }
+
+    #[test]
+    fn uncertain_reply_discloses_exact_frozen_attempt_and_identity_limitation() {
+        let coordinates = ProviderCoordinates {
+            provider: "github".into(),
+            host: "github.com".into(),
+            owner: "octo".into(),
+            repository: "repo".into(),
+            pull_request: 7,
+            remote_id: "thread-7".into(),
+        };
+        let operation = JournalOperation {
+            request: JournalRequest::Auxiliary(Box::new(ReviewAuxiliaryRequest {
+                operation_id: "reply-operation".into(),
+                attempt_id: "reply-attempt".into(),
+                action: ReviewAuxiliaryAction::Reply {
+                    thread: coordinates,
+                    pending_review: None,
+                    body: "frozen reply body".into(),
+                },
+            })),
+            status: JournalStatus::Uncertain {
+                reason: "transport acknowledgement was lost".into(),
+            },
+        };
+        let description = journal_operation_description(&operation);
+        assert!(description.contains("reply-operation / attempt reply-attempt"));
+        assert!(description.contains("thread-7"));
+        assert!(description.contains("frozen reply body"));
+        assert!(description.contains("no exact reply ID"));
+        assert!(description.contains("transport acknowledgement was lost"));
     }
 }

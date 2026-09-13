@@ -1,12 +1,14 @@
 use cibergit::{
     domain::{
         MergeAcknowledgement, MergeExecutionRequest, MergeMethod, MergePreparation,
-        MutationContext, PendingReviewSnapshot, ProviderMutationOutcome, PullRequestDetails,
-        Repository, ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryRequest, ReviewThread,
+        MutationContext, PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome,
+        PullRequestDetails, Repository, ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryRequest,
+        ReviewComment, ReviewThread,
     },
     participation::{
         CanonicalPublishedPatch, DraftCoordinate, DraftStore, LineSelection, LoadOutcome,
-        ReviewComposition, ReviewEvent, ReviewKey,
+        PublishedPosition, ReviewComposition, ReviewEvent, ReviewKey, ReviewOperation,
+        ReviewOperationPayload, ReviewOperationStatus, ReviewOperationTarget,
     },
     review::{ReviewSession, file_key},
 };
@@ -54,6 +56,42 @@ pub struct ReviewInteractionController {
     pub pending_review: Option<PendingReviewSnapshot>,
     pub pending_complete: bool,
     pub notice: Option<String>,
+    pub reconciliation_results: Vec<ReviewReconciliationItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewReconciliationItem {
+    pub operation_id: String,
+    pub attempt_id: String,
+    pub frozen_request: String,
+    pub outcome: ReviewReconciliationOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewReconciliationOutcome {
+    Reconciled(String),
+    Unresolved(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct ReviewReconciliationReport {
+    pub composition: ReviewComposition,
+    pub details: PullRequestDetails,
+    pub pending: Option<PendingReviewSnapshot>,
+    pub items: Vec<ReviewReconciliationItem>,
+}
+
+impl ReviewReconciliationReport {
+    pub fn resolved(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| matches!(item.outcome, ReviewReconciliationOutcome::Reconciled(_)))
+            .count()
+    }
+
+    pub fn unresolved(&self) -> usize {
+        self.items.len() - self.resolved()
+    }
 }
 
 impl ReviewInteractionController {
@@ -110,6 +148,7 @@ impl ReviewInteractionController {
             pending_review: None,
             pending_complete: true,
             notice: None,
+            reconciliation_results: Vec::new(),
         })))
     }
 
@@ -251,6 +290,7 @@ impl ReviewInteractionController {
             .composition
             .prepare_pending_comment(&draft_id, canonical)
             .map_err(|error| error.to_string())?;
+        self.reconciliation_results.clear();
         Ok(intent.operation_id)
     }
 
@@ -262,6 +302,7 @@ impl ReviewInteractionController {
             .composition
             .prepare_immediate_comment(&draft_id, canonical)
             .map_err(|error| error.to_string())?;
+        self.reconciliation_results.clear();
         Ok(intent.operation_id)
     }
 
@@ -275,6 +316,7 @@ impl ReviewInteractionController {
             .composition
             .prepare_submission(event, body, current_head)
             .map_err(|error| error.to_string())?;
+        self.reconciliation_results.clear();
         Ok(intent.operation_id)
     }
 
@@ -317,6 +359,28 @@ impl ReviewInteractionController {
         self.composition
             .operations_requiring_reconciliation()
             .count()
+    }
+
+    pub fn unresolved_operation_descriptions(&self) -> Vec<String> {
+        self.composition
+            .operations_requiring_reconciliation()
+            .map(|operation| {
+                let attempt = operation_attempt(operation).unwrap_or("missing-attempt-id");
+                let reason = match &operation.status {
+                    ReviewOperationStatus::Uncertain { reason, .. } => reason.as_str(),
+                    ReviewOperationStatus::InFlight { .. } => {
+                        "The process stopped before a durable provider outcome was recorded."
+                    }
+                    _ => unreachable!("iterator only returns unresolved operations"),
+                };
+                format!(
+                    "{} / attempt {} · {} · {reason}",
+                    operation.id,
+                    attempt,
+                    frozen_request_summary(operation)
+                )
+            })
+            .collect()
     }
 
     fn saved_composer_id(&self) -> Result<String, String> {
@@ -386,6 +450,55 @@ impl ReviewStateAuthority {
         })
     }
 
+    /// Reconcile started review-composition operations with fresh read-only
+    /// provider state while holding the same per-key authority as dispatch.
+    /// A resolved result is returned only after the replacement is durable.
+    pub fn reconcile_if_current(
+        &self,
+        store: &DraftStore,
+        expected: Option<&ReviewComposition>,
+        repository: &Repository,
+        pull_request: u64,
+        read: impl FnOnce() -> Result<(PullRequestDetails, Option<PendingReviewSnapshot>), String>,
+    ) -> Result<ReviewReconciliationReport, String> {
+        self.with_lock(|| {
+            let current = load_composition(store, &self.key)?;
+            if current.as_ref() != expected {
+                return Err(
+                    "Durable review state changed before reconciliation; the stale read was rejected and no outcome was changed."
+                        .into(),
+                );
+            }
+            let current = current.ok_or_else(|| {
+                "Durable review state disappeared before reconciliation; no outcome was changed."
+                    .to_owned()
+            })?;
+            let (details, pending) = read()?;
+            let (composition, items) = reconcile_review_operations(
+                &current,
+                repository,
+                pull_request,
+                &details,
+                pending.as_ref(),
+            );
+            if items.iter().any(|item| {
+                matches!(item.outcome, ReviewReconciliationOutcome::Reconciled(_))
+            }) {
+                store.save(&composition).map_err(|error| {
+                    format!(
+                        "Observed review success was not recorded because the durable save failed; the operation remains frozen: {error}"
+                    )
+                })?;
+            }
+            Ok(ReviewReconciliationReport {
+                composition,
+                details,
+                pending,
+                items,
+            })
+        })
+    }
+
     fn with_lock<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         let lock = open_private_lock(&self.lock_path()?)?;
         lock.lock()
@@ -410,6 +523,445 @@ impl ReviewStateAuthority {
             .join(account)
             .join(repository)
             .join(format!("pr-{}.lock", self.key.pull_request)))
+    }
+}
+
+fn reconcile_review_operations(
+    current: &ReviewComposition,
+    repository: &Repository,
+    pull_request: u64,
+    details: &PullRequestDetails,
+    pending: Option<&PendingReviewSnapshot>,
+) -> (ReviewComposition, Vec<ReviewReconciliationItem>) {
+    let mut replacement = current.clone();
+    let unresolved = current
+        .operations_requiring_reconciliation()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(unresolved.len());
+    for operation in unresolved {
+        let attempt_id = operation_attempt(&operation)
+            .unwrap_or("missing-attempt-id")
+            .to_owned();
+        let frozen_request = frozen_request_summary(&operation);
+        let observation = observe_review_operation(
+            current,
+            &operation,
+            repository,
+            pull_request,
+            details,
+            pending,
+        );
+        let outcome = match observation {
+            Ok(ObservedReviewSuccess::Comment {
+                review_id,
+                comment_id,
+                body,
+                evidence,
+            }) => match replacement.reconcile_observed_comment_success(
+                &operation.id,
+                review_id,
+                comment_id,
+                body,
+            ) {
+                Ok(()) => ReviewReconciliationOutcome::Reconciled(evidence),
+                Err(error) => ReviewReconciliationOutcome::Unresolved(format!(
+                    "Exact provider evidence could not be applied to local recovery: {error}"
+                )),
+            },
+            Ok(ObservedReviewSuccess::Submission {
+                review_id,
+                evidence,
+            }) => match replacement.reconcile_observed_submission_success(&operation.id, review_id)
+            {
+                Ok(()) => ReviewReconciliationOutcome::Reconciled(evidence),
+                Err(error) => ReviewReconciliationOutcome::Unresolved(format!(
+                    "Exact provider evidence could not be applied to local recovery: {error}"
+                )),
+            },
+            Err(reason) => ReviewReconciliationOutcome::Unresolved(reason),
+        };
+        items.push(ReviewReconciliationItem {
+            operation_id: operation.id,
+            attempt_id,
+            frozen_request,
+            outcome,
+        });
+    }
+    (replacement, items)
+}
+
+enum ObservedReviewSuccess {
+    Comment {
+        review_id: Option<String>,
+        comment_id: String,
+        body: String,
+        evidence: String,
+    },
+    Submission {
+        review_id: String,
+        evidence: String,
+    },
+}
+
+fn observe_review_operation(
+    composition: &ReviewComposition,
+    operation: &ReviewOperation,
+    repository: &Repository,
+    pull_request: u64,
+    details: &PullRequestDetails,
+    pending: Option<&PendingReviewSnapshot>,
+) -> Result<ObservedReviewSuccess, String> {
+    let expected_key = ReviewKey::for_repository("github", repository, pull_request)
+        .map_err(|error| format!("Local review identity is invalid: {error}"))?;
+    if composition.key != expected_key || details.number != pull_request {
+        return Err(
+            "The fresh read does not identify the exact selected account/repository/pull request."
+                .into(),
+        );
+    }
+    if !details.activity_complete {
+        return Err(
+            "The fresh activity read is incomplete or truncated; exact outcome proof is unavailable."
+                .into(),
+        );
+    }
+    let payload = operation.payload.as_ref().ok_or_else(|| {
+        "The frozen operation predates exact-payload recovery and cannot be proven by a read."
+            .to_owned()
+    })?;
+    match payload {
+        ReviewOperationPayload::PendingComment(intent) => {
+            if operation.target
+                != (ReviewOperationTarget::SynchronizePendingComment {
+                    draft_id: intent.draft_id.clone(),
+                })
+                || intent.operation_id != operation.id
+                || intent.key != expected_key
+            {
+                return Err(
+                    "The frozen comment operation identity or target is inconsistent.".into(),
+                );
+            }
+            let comment_id = intent.existing_comment_id.as_deref().ok_or_else(|| {
+                "GitHub does not preserve this local attempt ID on a newly created comment. Without a returned remote comment ID, even identical body and position are ambiguous and remain unresolved."
+                    .to_owned()
+            })?;
+            let review_id = intent.pending_review_id.as_deref().ok_or_else(|| {
+                "The frozen comment edit has no exact parent pending-review ID; no identity proof is available."
+                    .to_owned()
+            })?;
+            let pending = pending.ok_or_else(|| {
+                "The selected-account read returned no pending review. Absence alone cannot prove whether the edit applied or was later deleted."
+                    .to_owned()
+            })?;
+            validate_pending_review_identity(
+                pending,
+                repository,
+                pull_request,
+                review_id,
+                &intent.position.commit_sha,
+            )?;
+            if !pending.comments_complete {
+                return Err(
+                    "The pending-review comment read is incomplete; absence or a partial match cannot prove this attempt."
+                        .into(),
+                );
+            }
+            let candidates = pending
+                .comments
+                .iter()
+                .filter(|linked| {
+                    linked.pull_request_review_id == review_id
+                        && linked.comment.coordinates.remote_id == comment_id
+                })
+                .collect::<Vec<_>>();
+            let [linked] = candidates.as_slice() else {
+                return Err(if candidates.is_empty() {
+                    "The complete pending-review read did not contain the exact known comment ID. Absence alone does not prove NotApplied after possible external deletion."
+                        .into()
+                } else {
+                    "The provider read returned duplicate objects for the exact comment ID; identity is ambiguous."
+                        .into()
+                });
+            };
+            validate_comment_identity(
+                &linked.comment,
+                repository,
+                pull_request,
+                comment_id,
+                &intent.body,
+                &intent.position,
+            )?;
+            Ok(ObservedReviewSuccess::Comment {
+                review_id: Some(review_id.to_owned()),
+                comment_id: comment_id.to_owned(),
+                body: linked.comment.body.clone(),
+                evidence: format!(
+                    "Fresh complete selected-account pending-review read matched exact review {review_id}, comment {comment_id}, author, head, path, side, range, and body."
+                ),
+            })
+        }
+        ReviewOperationPayload::ImmediateComment(intent) => {
+            if operation.target
+                != (ReviewOperationTarget::PostImmediateComment {
+                    draft_id: intent.draft_id.clone(),
+                })
+                || intent.operation_id != operation.id
+                || intent.key != expected_key
+            {
+                return Err(
+                    "The frozen immediate-comment operation identity or target is inconsistent."
+                        .into(),
+                );
+            }
+            Err(
+                "GitHub does not preserve this local attempt ID and the frozen immediate-comment request has no returned remote comment ID. Similar or identical activity cannot establish identity."
+                    .into(),
+            )
+        }
+        ReviewOperationPayload::Submission(intent) => {
+            if operation.target
+                != (ReviewOperationTarget::SubmitReview {
+                    event: intent.event.clone(),
+                })
+                || intent.operation_id != operation.id
+                || intent.key != expected_key
+            {
+                return Err(
+                    "The frozen submission operation identity or target is inconsistent.".into(),
+                );
+            }
+            let review_id = intent.pending_review_id.as_deref().ok_or_else(|| {
+                "The frozen submission has no exact pending-review ID. A terminal review with similar content cannot be correlated to this attempt."
+                    .to_owned()
+            })?;
+            if !details.activity_complete {
+                return Err(
+                    "The review activity read is incomplete; a terminal review cannot be proven from a truncated page."
+                        .into(),
+                );
+            }
+            if pending.is_some_and(|snapshot| snapshot.review.coordinates.remote_id == review_id) {
+                return Err(
+                    "The exact review is still reported as pending, so terminal submission success is not established."
+                        .into(),
+                );
+            }
+            if let Some(pending) = pending {
+                validate_coordinates(
+                    &pending.review.coordinates,
+                    repository,
+                    pull_request,
+                    &pending.review.coordinates.remote_id,
+                    "selected-account pending review",
+                )?;
+                validate_selected_author(
+                    pending.review.author.as_deref(),
+                    repository,
+                    "selected-account pending review",
+                )?;
+            }
+            let candidates = details
+                .reviews
+                .iter()
+                .filter(|review| review.coordinates.remote_id == review_id)
+                .collect::<Vec<_>>();
+            let [review] = candidates.as_slice() else {
+                return Err(if candidates.is_empty() {
+                    "The complete activity read did not contain the exact known review ID. Absence alone cannot prove NotApplied after external deletion or retention changes."
+                        .into()
+                } else {
+                    "The provider read returned duplicate objects for the exact review ID; identity is ambiguous."
+                        .into()
+                });
+            };
+            validate_coordinates(
+                &review.coordinates,
+                repository,
+                pull_request,
+                review_id,
+                "review",
+            )?;
+            validate_selected_author(review.author.as_deref(), repository, "review")?;
+            let expected_state = match intent.event {
+                ReviewEvent::Comment => "COMMENTED",
+                ReviewEvent::Approve => "APPROVED",
+                ReviewEvent::RequestChanges => "CHANGES_REQUESTED",
+            };
+            if review.state != expected_state
+                || review.submitted_at.is_none()
+                || review.commit_sha.as_deref() != Some(intent.reviewed_commit_sha.as_str())
+                || review.body != intent.body
+            {
+                return Err(format!(
+                    "The exact review ID was observed, but event, terminal timestamp, reviewed head, or body differs from the frozen submission payload (expected {expected_state} at {}).",
+                    intent.reviewed_commit_sha
+                ));
+            }
+            Ok(ObservedReviewSuccess::Submission {
+                review_id: review_id.to_owned(),
+                evidence: format!(
+                    "Fresh complete activity matched exact terminal review {review_id}, selected author, event {expected_state}, reviewed head, and body."
+                ),
+            })
+        }
+    }
+}
+
+fn validate_pending_review_identity(
+    pending: &PendingReviewSnapshot,
+    repository: &Repository,
+    pull_request: u64,
+    review_id: &str,
+    reviewed_head: &str,
+) -> Result<(), String> {
+    validate_coordinates(
+        &pending.review.coordinates,
+        repository,
+        pull_request,
+        review_id,
+        "pending review",
+    )?;
+    validate_selected_author(
+        pending.review.author.as_deref(),
+        repository,
+        "pending review",
+    )?;
+    if pending.review.state != "PENDING"
+        || pending.review.submitted_at.is_some()
+        || pending.review.commit_sha.as_deref() != Some(reviewed_head)
+    {
+        return Err(
+            "The exact parent review is not authoritatively pending on the frozen reviewed head."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_comment_identity(
+    comment: &ReviewComment,
+    repository: &Repository,
+    pull_request: u64,
+    comment_id: &str,
+    body: &str,
+    position: &PublishedPosition,
+) -> Result<(), String> {
+    validate_coordinates(
+        &comment.coordinates,
+        repository,
+        pull_request,
+        comment_id,
+        "comment",
+    )?;
+    validate_selected_author(comment.author.as_deref(), repository, "comment")?;
+    let side = match position.side {
+        cibergit::participation::DiffSide::Old => "LEFT",
+        cibergit::participation::DiffSide::New => "RIGHT",
+    };
+    if comment.outdated
+        || comment.body != body
+        || comment.path != position.path
+        || comment.side.as_deref() != Some(side)
+        || comment.line != Some(position.line)
+        || comment.start_line != position.start_line
+        || comment.commit_sha.as_deref() != Some(position.commit_sha.as_str())
+    {
+        return Err(
+            "The exact comment ID was observed, but author, head, path, side, range, body, or current-anchor state differs from the frozen edit payload."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_coordinates(
+    coordinates: &ProviderCoordinates,
+    repository: &Repository,
+    pull_request: u64,
+    remote_id: &str,
+    kind: &str,
+) -> Result<(), String> {
+    if coordinates.provider != "github"
+        || coordinates.host != repository.host
+        || !coordinates.owner.eq_ignore_ascii_case(&repository.owner)
+        || !coordinates
+            .repository
+            .eq_ignore_ascii_case(&repository.name)
+        || coordinates.pull_request != pull_request
+        || coordinates.remote_id != remote_id
+    {
+        return Err(format!(
+            "The observed {kind} coordinates do not match the exact provider/repository/pull request/object ID."
+        ));
+    }
+    Ok(())
+}
+
+fn validate_selected_author(
+    author: Option<&str>,
+    repository: &Repository,
+    kind: &str,
+) -> Result<(), String> {
+    if !author.is_some_and(|author| author.eq_ignore_ascii_case(&repository.account.login)) {
+        return Err(format!(
+            "The observed {kind} author does not exactly match selected account {}.",
+            repository.account.login
+        ));
+    }
+    Ok(())
+}
+
+fn operation_attempt(operation: &ReviewOperation) -> Option<&str> {
+    match &operation.status {
+        ReviewOperationStatus::InFlight { attempt_id }
+        | ReviewOperationStatus::Uncertain { attempt_id, .. } => Some(attempt_id),
+        _ => None,
+    }
+}
+
+fn frozen_request_summary(operation: &ReviewOperation) -> String {
+    match operation.payload.as_ref() {
+        Some(ReviewOperationPayload::PendingComment(intent)) => format!(
+            "pending comment draft {} · review {} · comment {} · head {} · {} {} {:?}–{} · body {:?}",
+            intent.draft_id,
+            intent.pending_review_id.as_deref().unwrap_or("unknown"),
+            intent.existing_comment_id.as_deref().unwrap_or("unknown"),
+            intent.position.commit_sha,
+            intent.position.path,
+            match intent.position.side {
+                cibergit::participation::DiffSide::Old => "LEFT",
+                cibergit::participation::DiffSide::New => "RIGHT",
+            },
+            intent.position.start_line,
+            intent.position.line,
+            intent.body
+        ),
+        Some(ReviewOperationPayload::ImmediateComment(intent)) => format!(
+            "immediate comment draft {} · remote comment unknown · head {} · {} {} {:?}–{} · body {:?}",
+            intent.draft_id,
+            intent.position.commit_sha,
+            intent.position.path,
+            match intent.position.side {
+                cibergit::participation::DiffSide::Old => "LEFT",
+                cibergit::participation::DiffSide::New => "RIGHT",
+            },
+            intent.position.start_line,
+            intent.position.line,
+            intent.body
+        ),
+        Some(ReviewOperationPayload::Submission(intent)) => format!(
+            "submit {:?} · review {} · head {} · body {:?}",
+            intent.event,
+            intent.pending_review_id.as_deref().unwrap_or("unknown"),
+            intent.reviewed_commit_sha,
+            intent.body
+        ),
+        None => format!(
+            "legacy frozen target {:?} · exact payload unavailable",
+            operation.target
+        ),
     }
 }
 
@@ -785,6 +1337,7 @@ impl ActionJournal {
         outcome
     }
 
+    #[allow(dead_code)] // Retained for future explicit evidence-selection; no safe automatic negative proof exists today.
     pub fn mark_not_applied(
         &self,
         operation_id: &str,
@@ -1200,10 +1753,10 @@ fn short_sha(sha: &str) -> &str {
 mod tests {
     use super::*;
     use cibergit::domain::{
-        Account, ChangedFile, Comparison, MergeEligibility, ProviderCoordinates, PullRequestReview,
-        ReviewComment, Revision,
+        Account, ChangedFile, Comparison, LinkedReviewComment, MergeEligibility,
+        ProviderCoordinates, PullRequestReview, ReviewComment, Revision,
     };
-    use cibergit::participation::{DiffSide, ReviewOperationStatus};
+    use cibergit::participation::{DiffSide, RemoteDraftIds, ReviewOperationStatus};
     use std::{
         sync::{
             Arc, Barrier,
@@ -1268,6 +1821,184 @@ mod tests {
                 },
                 resolved: true,
             },
+        }
+    }
+
+    fn coordinates(remote_id: &str) -> ProviderCoordinates {
+        ProviderCoordinates {
+            provider: "github".into(),
+            host: "github.com".into(),
+            owner: "octo".into(),
+            repository: "repo".into(),
+            pull_request: 7,
+            remote_id: remote_id.into(),
+        }
+    }
+
+    fn details(reviews: Vec<PullRequestReview>, complete: bool) -> PullRequestDetails {
+        PullRequestDetails {
+            number: 7,
+            body: String::new(),
+            requested_reviewers: Vec::new(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+            merge_eligibility: MergeEligibility {
+                state: "OPEN".into(),
+                draft: false,
+                mergeable: "MERGEABLE".into(),
+                merge_state_status: "CLEAN".into(),
+                review_status: String::new(),
+                check_status: String::new(),
+                maintainer_can_modify: true,
+                can_rebase: true,
+                can_update_branch: true,
+                auto_merge_enabled: false,
+                in_merge_queue: false,
+            },
+            issue_comments: Vec::new(),
+            reviews,
+            review_threads: Vec::new(),
+            checks: Vec::new(),
+            activity_complete: complete,
+            checks_complete: true,
+            notice: None,
+        }
+    }
+
+    fn pending_snapshot(
+        review_id: &str,
+        comment_id: &str,
+        body: &str,
+        complete: bool,
+    ) -> PendingReviewSnapshot {
+        PendingReviewSnapshot {
+            review: PullRequestReview {
+                coordinates: coordinates(review_id),
+                author: Some("reader".into()),
+                body: String::new(),
+                state: "PENDING".into(),
+                submitted_at: None,
+                commit_sha: Some("2222222".into()),
+                url: String::new(),
+            },
+            comments: vec![LinkedReviewComment {
+                pull_request_review_id: review_id.into(),
+                comment: ReviewComment {
+                    coordinates: coordinates(comment_id),
+                    author: Some("reader".into()),
+                    body: body.into(),
+                    created_at: "now".into(),
+                    updated_at: "now".into(),
+                    url: String::new(),
+                    path: "src/lib.rs".into(),
+                    line: Some(1),
+                    original_line: Some(1),
+                    start_line: None,
+                    original_start_line: None,
+                    side: Some("RIGHT".into()),
+                    diff_hunk: String::new(),
+                    commit_sha: Some("2222222".into()),
+                    original_commit_sha: Some("2222222".into()),
+                    outdated: false,
+                },
+            }],
+            comments_complete: complete,
+        }
+    }
+
+    fn uncertain_comment_controller(
+        root: &Path,
+        existing_id: Option<&str>,
+    ) -> (Box<ReviewInteractionController>, String) {
+        let session = session();
+        let mut controller =
+            match ReviewInteractionController::load(root, &repository(), 7, &session).unwrap() {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+        controller
+            .select_line(&session, LineSelection::single(DiffSide::New, 1))
+            .unwrap();
+        let snapshot = controller
+            .stage_composer_text("frozen edit body".into())
+            .unwrap();
+        controller.store.save(&snapshot).unwrap();
+        let draft_id = controller
+            .composer
+            .as_ref()
+            .unwrap()
+            .draft_id
+            .clone()
+            .unwrap();
+        controller.finish_composer_save(&snapshot, &draft_id, "frozen edit body", Ok(()));
+        if let Some(comment_id) = existing_id {
+            let draft = controller
+                .composition
+                .drafts
+                .iter_mut()
+                .find(|draft| draft.id == draft_id)
+                .unwrap();
+            draft.remote = Some(RemoteDraftIds {
+                review_id: Some("pending-1".into()),
+                comment_id: comment_id.into(),
+            });
+            draft.dirty = true;
+        }
+        controller.store.save(&controller.composition).unwrap();
+        controller.durable_composition = Some(controller.composition.clone());
+        let operation_id = controller.prepare_pending(&session).unwrap();
+        controller
+            .composition
+            .mark_in_flight(&operation_id, "attempt-1")
+            .unwrap();
+        controller
+            .composition
+            .mark_uncertain(&operation_id, "server reply was lost")
+            .unwrap();
+        controller.store.save(&controller.composition).unwrap();
+        controller.durable_composition = Some(controller.composition.clone());
+        (controller, operation_id)
+    }
+
+    fn uncertain_submission_controller(root: &Path) -> (Box<ReviewInteractionController>, String) {
+        let session = session();
+        let mut controller =
+            match ReviewInteractionController::load(root, &repository(), 7, &session).unwrap() {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+        controller.composition.observed_pending_review_id = Some("pending-1".into());
+        controller.store.save(&controller.composition).unwrap();
+        controller.durable_composition = Some(controller.composition.clone());
+        let operation_id = controller
+            .prepare_submission(
+                ReviewEvent::Approve,
+                "frozen review body".into(),
+                Some("2222222"),
+            )
+            .unwrap();
+        controller
+            .composition
+            .mark_in_flight(&operation_id, "attempt-submit")
+            .unwrap();
+        controller
+            .composition
+            .mark_uncertain(&operation_id, "server reply was lost")
+            .unwrap();
+        controller.store.save(&controller.composition).unwrap();
+        controller.durable_composition = Some(controller.composition.clone());
+        (controller, operation_id)
+    }
+
+    fn terminal_review() -> PullRequestReview {
+        PullRequestReview {
+            coordinates: coordinates("pending-1"),
+            author: Some("reader".into()),
+            body: "frozen review body".into(),
+            state: "APPROVED".into(),
+            submitted_at: Some("now".into()),
+            commit_sha: Some("2222222".into()),
+            url: String::new(),
         }
     }
 
@@ -1691,6 +2422,422 @@ mod tests {
             .unwrap();
         assert_eq!(durable.drafts[0].body, "newer text");
         assert!(durable.retired_review_ids.contains("retired-review"));
+    }
+
+    #[test]
+    fn exact_existing_comment_edit_reconciles_durably_and_preserves_newer_text() {
+        let directory = tempdir().unwrap();
+        let (mut controller, operation_id) =
+            uncertain_comment_controller(directory.path(), Some("comment-1"));
+        let operation = controller
+            .composition
+            .operations
+            .iter_mut()
+            .find(|operation| operation.id == operation_id)
+            .unwrap();
+        operation.status = ReviewOperationStatus::InFlight {
+            attempt_id: "attempt-1".into(),
+        };
+        controller
+            .composition
+            .edit_draft("draft-1", "newer unsent local text")
+            .unwrap();
+        controller
+            .composition
+            .retired_review_ids
+            .insert("older-retired-review".into());
+        controller.store.save(&controller.composition).unwrap();
+        controller.durable_composition = Some(controller.composition.clone());
+        let reads = AtomicUsize::new(0);
+        let provider_mutations = AtomicUsize::new(0);
+        let report = controller
+            .authority
+            .reconcile_if_current(
+                &controller.store,
+                controller.durable_composition.as_ref(),
+                &repository(),
+                7,
+                || {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    Ok((
+                        details(Vec::new(), true),
+                        Some(pending_snapshot(
+                            "pending-1",
+                            "comment-1",
+                            "frozen edit body",
+                            true,
+                        )),
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_mutations.load(Ordering::SeqCst), 0);
+        assert_eq!(report.resolved(), 1);
+        assert_eq!(report.unresolved(), 0);
+        assert!(
+            report
+                .composition
+                .retired_review_ids
+                .contains("older-retired-review")
+        );
+        let draft = report.composition.draft("draft-1").unwrap();
+        assert_eq!(draft.body, "newer unsent local text");
+        assert_eq!(
+            draft.observed_remote_body.as_deref(),
+            Some("frozen edit body")
+        );
+        assert!(draft.dirty);
+        assert_eq!(
+            draft
+                .remote
+                .as_ref()
+                .map(|remote| remote.comment_id.as_str()),
+            Some("comment-1")
+        );
+
+        let mut restored =
+            match ReviewInteractionController::load(directory.path(), &repository(), 7, &session())
+                .unwrap()
+            {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+        assert_eq!(restored.unresolved_operations(), 0);
+        restored.reopen_draft("draft-1").unwrap();
+        let prepared = restored.prepare_pending(&session()).unwrap();
+        assert!(
+            restored
+                .composition
+                .operations
+                .iter()
+                .any(|operation| operation.id == prepared
+                    && operation.status == ReviewOperationStatus::Prepared)
+        );
+        assert_eq!(provider_mutations.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn exact_pending_review_submission_reconciles_terminal_event_head_body_and_ids() {
+        let directory = tempdir().unwrap();
+        let (controller, operation_id) = uncertain_submission_controller(directory.path());
+        let report = controller
+            .authority
+            .reconcile_if_current(
+                &controller.store,
+                controller.durable_composition.as_ref(),
+                &repository(),
+                7,
+                || Ok((details(vec![terminal_review()], true), None)),
+            )
+            .unwrap();
+        assert_eq!(report.resolved(), 1);
+        assert!(report.composition.retired_review_ids.contains("pending-1"));
+        assert!(matches!(
+            report
+                .composition
+                .operations
+                .iter()
+                .find(|operation| operation.id == operation_id)
+                .map(|operation| &operation.status),
+            Some(ReviewOperationStatus::Acknowledged {
+                remote_review_id: Some(review_id),
+                remote_comment_id: None,
+            }) if review_id == "pending-1"
+        ));
+        let restored =
+            match ReviewInteractionController::load(directory.path(), &repository(), 7, &session())
+                .unwrap()
+            {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+        assert_eq!(restored.unresolved_operations(), 0);
+        assert!(
+            restored
+                .composition
+                .retired_review_ids
+                .contains("pending-1")
+        );
+    }
+
+    #[test]
+    fn github_identity_names_accept_canonical_case_without_weakening_remote_ids() {
+        let directory = tempdir().unwrap();
+        let (controller, operation_id) =
+            uncertain_comment_controller(directory.path(), Some("comment-1"));
+        let mut pending = pending_snapshot("pending-1", "comment-1", "frozen edit body", true);
+        pending.review.coordinates.owner = "OCTO".into();
+        pending.review.coordinates.repository = "Repo".into();
+        pending.review.author = Some("READER".into());
+        pending.comments[0].comment.coordinates.owner = "Octo".into();
+        pending.comments[0].comment.coordinates.repository = "REPO".into();
+        pending.comments[0].comment.author = Some("Reader".into());
+        let report = controller
+            .authority
+            .reconcile_if_current(
+                &controller.store,
+                controller.durable_composition.as_ref(),
+                &repository(),
+                7,
+                || Ok((details(Vec::new(), true), Some(pending))),
+            )
+            .unwrap();
+        assert_eq!(report.resolved(), 1);
+        assert_eq!(report.items[0].operation_id, operation_id);
+        assert_eq!(
+            report
+                .composition
+                .draft("draft-1")
+                .and_then(|draft| draft.remote.as_ref())
+                .map(|remote| remote.comment_id.as_str()),
+            Some("comment-1"),
+            "remote object IDs remain exact"
+        );
+    }
+
+    #[test]
+    fn comment_reconciliation_rejects_heuristics_mismatches_partial_reads_and_other_account() {
+        let directory = tempdir().unwrap();
+        let (controller, _) = uncertain_comment_controller(directory.path(), Some("comment-1"));
+        let expected = controller.durable_composition.as_ref();
+        let mut cases = Vec::new();
+
+        let mut wrong_id =
+            pending_snapshot("pending-1", "unrelated-comment", "frozen edit body", true);
+        cases.push((repository(), wrong_id.clone(), "exact known comment ID"));
+        wrong_id.comments[0].comment.coordinates.remote_id = "comment-1".into();
+
+        let mut wrong_author = wrong_id.clone();
+        wrong_author.comments[0].comment.author = Some("other-user".into());
+        cases.push((repository(), wrong_author, "author"));
+
+        let mut wrong_repo = wrong_id.clone();
+        wrong_repo.comments[0].comment.coordinates.repository = "other-repo".into();
+        cases.push((repository(), wrong_repo, "coordinates"));
+
+        let mut wrong_head = wrong_id.clone();
+        wrong_head.comments[0].comment.commit_sha = Some("different-head".into());
+        cases.push((repository(), wrong_head, "differs"));
+
+        let mut wrong_body = wrong_id.clone();
+        wrong_body.comments[0].comment.body = "different body".into();
+        cases.push((repository(), wrong_body, "differs"));
+
+        let mut incomplete = wrong_id.clone();
+        incomplete.comments_complete = false;
+        cases.push((repository(), incomplete, "incomplete"));
+
+        let mut other_account = repository();
+        other_account.account.login = "other-user".into();
+        cases.push((other_account, wrong_id, "selected account"));
+
+        for (repository, pending, expected_reason) in cases {
+            let report = controller
+                .authority
+                .reconcile_if_current(&controller.store, expected, &repository, 7, || {
+                    Ok((details(Vec::new(), true), Some(pending)))
+                })
+                .unwrap();
+            assert_eq!(report.resolved(), 0);
+            assert_eq!(report.unresolved(), 1);
+            let ReviewReconciliationOutcome::Unresolved(reason) = &report.items[0].outcome else {
+                panic!("mismatch must remain unresolved")
+            };
+            assert!(
+                reason.contains(expected_reason),
+                "expected {expected_reason:?} in {reason:?}"
+            );
+        }
+
+        let truncated = controller
+            .authority
+            .reconcile_if_current(&controller.store, expected, &repository(), 7, || {
+                Ok((
+                    details(Vec::new(), false),
+                    Some(pending_snapshot(
+                        "pending-1",
+                        "comment-1",
+                        "frozen edit body",
+                        true,
+                    )),
+                ))
+            })
+            .unwrap();
+        let ReviewReconciliationOutcome::Unresolved(reason) = &truncated.items[0].outcome else {
+            panic!("truncated activity must remain unresolved")
+        };
+        assert!(reason.contains("incomplete or truncated"));
+
+        let ambiguous_directory = tempdir().unwrap();
+        let (ambiguous, _) = uncertain_comment_controller(ambiguous_directory.path(), None);
+        let report = ambiguous
+            .authority
+            .reconcile_if_current(
+                &ambiguous.store,
+                ambiguous.durable_composition.as_ref(),
+                &repository(),
+                7,
+                || {
+                    Ok((
+                        details(Vec::new(), true),
+                        Some(pending_snapshot(
+                            "pending-1",
+                            "unrelated-identical",
+                            "frozen edit body",
+                            true,
+                        )),
+                    ))
+                },
+            )
+            .unwrap();
+        let ReviewReconciliationOutcome::Unresolved(reason) = &report.items[0].outcome else {
+            panic!("new comment without a remote ID must remain unresolved")
+        };
+        assert!(reason.contains("even identical body and position are ambiguous"));
+    }
+
+    #[test]
+    fn submission_reconciliation_rejects_id_author_repo_event_head_body_and_truncation() {
+        let directory = tempdir().unwrap();
+        let (controller, _) = uncertain_submission_controller(directory.path());
+        let expected = controller.durable_composition.as_ref();
+        let mut cases = Vec::new();
+
+        let mut wrong_id = terminal_review();
+        wrong_id.coordinates.remote_id = "different-review".into();
+        cases.push((details(vec![wrong_id], true), "exact known review ID"));
+
+        let mut wrong_author = terminal_review();
+        wrong_author.author = Some("other-user".into());
+        cases.push((details(vec![wrong_author], true), "author"));
+
+        let mut wrong_repo = terminal_review();
+        wrong_repo.coordinates.repository = "other-repo".into();
+        cases.push((details(vec![wrong_repo], true), "coordinates"));
+
+        let mut wrong_event = terminal_review();
+        wrong_event.state = "COMMENTED".into();
+        cases.push((details(vec![wrong_event], true), "differs"));
+
+        let mut wrong_head = terminal_review();
+        wrong_head.commit_sha = Some("different-head".into());
+        cases.push((details(vec![wrong_head], true), "differs"));
+
+        let mut wrong_body = terminal_review();
+        wrong_body.body = "different body".into();
+        cases.push((details(vec![wrong_body], true), "differs"));
+
+        cases.push((details(vec![terminal_review()], false), "incomplete"));
+
+        for (details, expected_reason) in cases {
+            let report = controller
+                .authority
+                .reconcile_if_current(&controller.store, expected, &repository(), 7, || {
+                    Ok((details, None))
+                })
+                .unwrap();
+            assert_eq!(report.resolved(), 0);
+            let ReviewReconciliationOutcome::Unresolved(reason) = &report.items[0].outcome else {
+                panic!("mismatch must remain unresolved")
+            };
+            assert!(reason.contains(expected_reason), "{reason}");
+        }
+    }
+
+    #[test]
+    fn stale_controller_and_save_failure_leave_uncertain_state_frozen() {
+        let directory = tempdir().unwrap();
+        let (controller, _) = uncertain_comment_controller(directory.path(), Some("comment-1"));
+        let stale = controller.durable_composition.clone();
+        let mut newer = stale.clone().unwrap();
+        newer.edit_draft("draft-1", "newer durable text").unwrap();
+        let operation = newer
+            .operations
+            .iter_mut()
+            .find(|operation| operation.status.requires_reconciliation())
+            .unwrap();
+        operation.status = ReviewOperationStatus::Uncertain {
+            attempt_id: "newer-attempt".into(),
+            reason: "newer controller owns this attempt".into(),
+        };
+        controller.store.save(&newer).unwrap();
+        let stale_error = controller
+            .authority
+            .reconcile_if_current(&controller.store, stale.as_ref(), &repository(), 7, || {
+                panic!("stale CAS must reject before provider reads")
+            })
+            .unwrap_err();
+        assert!(stale_error.contains("stale read was rejected"));
+
+        let path = controller.store.record_path(&newer.key).unwrap();
+        let parent = path.parent().unwrap().to_owned();
+        let displaced = parent.with_extension("save-failure-backup");
+        let save_error = controller
+            .authority
+            .reconcile_if_current(&controller.store, Some(&newer), &repository(), 7, || {
+                fs::rename(&parent, &displaced).unwrap();
+                fs::write(&parent, b"block recovery partition").unwrap();
+                Ok((
+                    details(Vec::new(), true),
+                    Some(pending_snapshot(
+                        "pending-1",
+                        "comment-1",
+                        "frozen edit body",
+                        true,
+                    )),
+                ))
+            })
+            .unwrap_err();
+        fs::remove_file(&parent).unwrap();
+        fs::rename(&displaced, &parent).unwrap();
+        assert!(save_error.contains("operation remains frozen"));
+        let durable = load_composition(&controller.store, &newer.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.draft("draft-1").unwrap().body, "newer durable text");
+        assert_eq!(durable.operations_requiring_reconciliation().count(), 1);
+    }
+
+    #[test]
+    fn draft_store_reconciliation_never_resolves_the_auxiliary_journal() {
+        let directory = tempdir().unwrap();
+        let journal = ActionJournal::open(&directory.path().join("journal"), review_key()).unwrap();
+        let request = auxiliary_request();
+        let _ = journal.dispatch(
+            JournalRequest::Auxiliary(Box::new(request.clone())),
+            || ProviderMutationOutcome::<()>::Uncertain {
+                context: JournalRequest::Auxiliary(Box::new(request.clone())).mutation_context(),
+                reason: "lost reply".into(),
+            },
+            |_| (true, true, "unused".into()),
+        );
+        let (controller, _) = uncertain_comment_controller(directory.path(), Some("comment-1"));
+        let report = controller
+            .authority
+            .reconcile_if_current(
+                &controller.store,
+                controller.durable_composition.as_ref(),
+                &repository(),
+                7,
+                || {
+                    Ok((
+                        details(Vec::new(), true),
+                        Some(pending_snapshot(
+                            "pending-1",
+                            "comment-1",
+                            "frozen edit body",
+                            true,
+                        )),
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(report.resolved(), 1);
+        assert!(matches!(
+            journal.operations().unwrap()[0].status,
+            JournalStatus::Uncertain { .. }
+        ));
     }
 
     #[test]

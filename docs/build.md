@@ -86,6 +86,21 @@ files; it opens a compatibility screen directing you to the PR workspace.
   lack an exact local recovery link stay authoritative and are identified instead of guessed into
   local state. Replies, resolve/unresolve, pending-summary updates, comment deletion and review
   cancellation use their visible explicit controls. Partial provider reads are labelled.
+- Activity separates unresolved review-composition writes from auxiliary/merge journal actions,
+  with independent counts and read-only reconciliation controls. Review reconciliation runs fresh
+  selected-account details and pending-review reads under the same per-PR authority and durable CAS
+  used by dispatch. It sends no mutation and reports success only after saving the terminal outcome.
+  A known pending-comment edit can be proven from its exact frozen parent-review/comment IDs plus
+  matching account, repository, PR, author, reviewed head, path, side/range and body. A known
+  pending-review submission can be proven from its exact review ID plus terminal event, author,
+  reviewed head and body. New comment writes whose lost acknowledgement contains no remote comment
+  ID, missing or partial activity, other-account/object/payload mismatches, and absence after a
+  possible external deletion remain visibly frozen. Similar or identical body/position is never a
+  correlation key, and absence alone is never recorded as NotApplied. A later retry is a separate
+  explicit prepare after a durable resolution; restart never replays a write.
+- Uncertain auxiliary replies disclose the exact frozen operation/attempt, thread, pending-review
+  ID (when present), body, and the limitation: GitHub does not expose a returned reply ID or retain
+  the local attempt ID after a lost acknowledgement, so no safe automatic observation is claimed.
 - Command-Shift-R opens native review submission confirmation. Choose Comment, Approve, or Request
   changes and confirm the summary, pending count, account and exact reviewed head. If a newer head
   exists, submission remains bound to the older displayed head and shows that warning.
@@ -165,6 +180,7 @@ launches retain the standard foreground activation behavior.
 
 Each evidence directory receives `native-pr-review.png`,
 `native-review-interactions-unified.png`, `native-review-interactions-split.png`,
+`native-review-reconciliation-ambiguous.png`, `native-review-reconciliation-resolved.png`,
 `native-submit-confirmation.png`, `native-merge-confirmation.png`,
 `native-merge-confirmation-controls.png`, `native-long-line-end*.png`
 captures, `native-long-line-start-split.png`, `native-view-editor-filters.png`,
