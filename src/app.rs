@@ -2208,7 +2208,7 @@ impl ReviewWorkspace {
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
                         if let Root::Review(this) = root {
-                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                            this.inspector_scroll.scroll_to_bottom();
                             cx.notify();
                         }
                     });
