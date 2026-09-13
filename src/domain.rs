@@ -39,6 +39,20 @@ pub struct Revision {
     pub head_sha: String,
 }
 
+/// Current provider coordinates for an explicit local-checkout workflow.
+/// This observation does not replace an already displayed review revision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCheckoutSource {
+    pub number: u64,
+    pub base_repository: Repository,
+    /// None when the source repository was deleted or is unavailable. Never
+    /// substitute the base repository as a publishing destination in that case.
+    pub source_repository: Option<Repository>,
+    pub source_branch: String,
+    pub target_branch: String,
+    pub observed_revision: Revision,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PullRequest {
     pub number: u64,

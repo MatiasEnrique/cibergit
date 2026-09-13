@@ -12,7 +12,7 @@ use crate::domain::{
     Comparison, IssueComment, LinkedReviewComment, MergeAcknowledgement, MergeAction,
     MergeEligibility, MergeExecutionRequest, MergeMethod, MergePreparation, MutationContext,
     PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome, PullRequest,
-    PullRequestCheck, PullRequestDetails, PullRequestReview, Repository,
+    PullRequestCheck, PullRequestCheckoutSource, PullRequestDetails, PullRequestReview, Repository,
     ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewComment,
     ReviewThread, ReviewWriteAcknowledgement, Revision,
 };
@@ -168,6 +168,52 @@ impl GithubProvider {
         let mut pulls = vec![session.pull(repo, number)?.into_domain()];
         session.hydrate_metadata(repo, &mut pulls)?;
         Ok(pulls.pop().expect("one PR"))
+    }
+
+    /// Read the current source repository and branch without cloning or changing
+    /// the caller's pinned review. Fork coordinates come from the PR head, not
+    /// the base repository's origin. The account selects this API read only;
+    /// installed Git still owns Git transport authentication and authorship.
+    pub fn checkout_source(
+        &self,
+        repo: &Repository,
+        number: u64,
+    ) -> Result<PullRequestCheckoutSource> {
+        self.validate_repo(repo)?;
+        let pull = Session::new(self).pull(repo, number)?;
+        for branch in [&pull.head.branch, &pull.base.branch] {
+            ensure!(
+                !branch.is_empty()
+                    && branch.len() <= 1024
+                    && !branch.starts_with('-')
+                    && !branch.chars().any(char::is_control),
+                "Invalid or oversized PR branch name"
+            );
+        }
+        let observed_revision = pull.revision();
+        let source_repository = pull
+            .head
+            .repo
+            .map(|source| -> Result<Repository> {
+                validate_component(&source.owner.login, false)?;
+                validate_component(&source.name, true)?;
+                Ok(Repository {
+                    host: repo.host.clone(),
+                    owner: source.owner.login,
+                    name: source.name,
+                    account: self.account.clone(),
+                    local_path: None,
+                })
+            })
+            .transpose()?;
+        Ok(PullRequestCheckoutSource {
+            number: pull.number,
+            base_repository: repo.clone(),
+            source_repository,
+            source_branch: pull.head.branch,
+            target_branch: pull.base.branch,
+            observed_revision,
+        })
     }
 
     /// Fetch current, read-only collaboration data for Overview, Activity, and
@@ -4532,6 +4578,68 @@ else:
     }
 
     #[test]
+    fn checkout_source_preserves_fork_identity_and_case() {
+        let mut response = pull(7, 1);
+        response["head"]["repo"] = json!({"owner": {"login": "ForkOwner"}, "name": "ForkRepo"});
+        response["head"]["ref"] = json!("Feature/ExactCase");
+        let (dir, provider) = fixture(
+            "second-account",
+            vec![step("repos/owner/repo/pulls/7", response)],
+        );
+        let repo = repo("second-account");
+        let source = provider.checkout_source(&repo, 7).unwrap();
+        assert_eq!(source.base_repository, repo);
+        assert_eq!(source.observed_revision, revision());
+        assert_eq!(source.source_branch, "Feature/ExactCase");
+        let fork = source.source_repository.unwrap();
+        assert_eq!(fork.full_name(), "ForkOwner/ForkRepo");
+        assert_eq!(fork.account, account("second-account"));
+        assert!(fork.local_path.is_none());
+        exhausted(&dir, 1);
+    }
+
+    #[test]
+    fn checkout_source_distinguishes_same_repo_and_missing_head_repo() {
+        for same_repo in [true, false] {
+            let mut response = pull(7, 1);
+            if same_repo {
+                response["head"]["repo"] = response["base"]["repo"].clone();
+            }
+            let (dir, provider) =
+                fixture("alice", vec![step("repos/owner/repo/pulls/7", response)]);
+            let source = provider.checkout_source(&repo("alice"), 7).unwrap();
+            assert_eq!(source.source_repository.is_some(), same_repo);
+            if let Some(head) = source.source_repository {
+                assert_eq!(head.full_name(), "owner/repo");
+            }
+            assert_eq!(source.observed_revision, revision());
+            exhausted(&dir, 1);
+        }
+    }
+
+    #[test]
+    fn checkout_source_rejects_invalid_coordinates_and_branch_payloads() {
+        for (pointer, value) in [
+            ("/head/repo/owner/login", json!("../escape")),
+            ("/head/ref", json!("bad\nbranch")),
+            ("/head/ref", json!("x".repeat(1025))),
+            ("/base/repo/name", json!("different")),
+            ("/head/sha", json!("not-an-oid")),
+            ("/number", json!(8)),
+        ] {
+            let mut response = pull(7, 1);
+            response["head"]["repo"] = response["base"]["repo"].clone();
+            *response.pointer_mut(pointer).unwrap() = value;
+            let (dir, provider) =
+                fixture("alice", vec![step("repos/owner/repo/pulls/7", response)]);
+            assert!(provider.checkout_source(&repo("alice"), 7).is_err());
+            exhausted(&dir, 1);
+        }
+        let (_dir, provider) = fixture("alice", vec![]);
+        assert!(provider.checkout_source(&repo("bob"), 7).is_err());
+    }
+
+    #[test]
     fn validates_repository_inputs_and_accounts_before_commands() {
         for input in [
             "owner/repo",
@@ -5335,6 +5443,27 @@ else:
                 comparison.notice
             );
         }
+    }
+
+    /// Explicit opt-in schema check, public data only.
+    #[test]
+    #[ignore = "uses existing gh auth and public cli/cli API reads"]
+    fn live_public_checkout_source() {
+        let provider = GithubProvider::new(GithubProvider::accounts().unwrap().remove(0));
+        let repo = provider.repository("cli/cli").unwrap();
+        let source = provider.checkout_source(&repo, 14130).unwrap();
+        assert_eq!(source.number, 14130);
+        assert_eq!(source.base_repository, repo);
+        println!(
+            "Public cli/cli#{} source={} branch={} observed_head={}",
+            source.number,
+            source
+                .source_repository
+                .map(|repo| repo.full_name())
+                .unwrap_or_else(|| "unavailable".into()),
+            source.source_branch,
+            source.observed_revision.head_sha,
+        );
     }
 
     /// Explicit opt-in schema check, public data only.
