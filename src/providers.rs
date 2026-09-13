@@ -37,6 +37,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod pr_lifecycle;
+pub use pr_lifecycle::{AdmittedMutationAttempt, MutationAdmission};
+
 const HOST: &str = "github.com";
 const API_VERSION: &str = "X-GitHub-Api-Version: 2026-03-10";
 const PAGE_SIZE: usize = 100;
@@ -1515,7 +1518,10 @@ impl<'a> Session<'a> {
         endpoint: String,
         variables: Value,
     ) -> MutationTransport<T> {
-        if method != "PUT" || endpoint.contains(['\0', '\n', '\r']) {
+        if !matches!(method, "PUT" | "POST" | "PATCH" | "DELETE")
+            || endpoint.contains(['\0', '\n', '\r'])
+            || !endpoint.starts_with("repos/")
+        {
             return MutationTransport::Rejected("unsupported REST mutation entrypoint".into());
         }
         let input = match serde_json::to_vec(&variables) {
@@ -6242,4 +6248,13 @@ mod provider_actions_fixture;
 #[cfg(test)]
 mod provider_actions {
     crate::provider_action_tests!();
+}
+
+#[cfg(test)]
+#[path = "../tests/provider_lifecycle.rs"]
+mod provider_lifecycle_fixture;
+
+#[cfg(test)]
+mod provider_lifecycle_tests {
+    crate::provider_lifecycle_tests!();
 }

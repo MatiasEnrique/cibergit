@@ -187,6 +187,239 @@ pub enum ProviderMutationOutcome<T> {
     },
 }
 
+/// A reasoned provider capability. `available == false` is never an implicit
+/// permission claim: callers should display `reason` and refresh the snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCapability {
+    pub available: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestReviewer {
+    /// USER or TEAM.
+    pub kind: String,
+    /// A user login or team slug, without presentation prefixes.
+    pub name: String,
+}
+
+/// A current, account-isolated PR metadata observation. This mutable metadata
+/// is independent of any comparison revision displayed by the caller.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestLifecycleSnapshot {
+    pub repository: Repository,
+    /// The remote ID is the exact pull request node ID.
+    pub pull_request: ProviderCoordinates,
+    pub updated_at: String,
+    /// OPEN, CLOSED, or MERGED.
+    pub state: String,
+    pub head_sha: String,
+    pub title: String,
+    pub body: String,
+    pub base_branch: String,
+    pub draft: bool,
+    pub reviewers: Vec<PullRequestReviewer>,
+    pub assignees: Vec<String>,
+    pub labels: Vec<String>,
+    pub viewer_login: String,
+    pub viewer_permission: Option<String>,
+    pub can_update_metadata: ProviderCapability,
+    pub can_change_state: ProviderCapability,
+    pub can_change_draft: ProviderCapability,
+    pub can_request_reviewers: ProviderCapability,
+    pub can_change_labels: ProviderCapability,
+    pub can_change_assignees: ProviderCapability,
+    pub can_comment: ProviderCapability,
+    pub values_complete: bool,
+    pub capabilities_complete: bool,
+    pub notice: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderChoice {
+    /// Exact provider ID where one is available; never synthesized from a name.
+    pub remote_id: Option<String>,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderChoiceSet {
+    pub values: Vec<ProviderChoice>,
+    pub complete: bool,
+    pub notice: Option<String>,
+}
+
+/// Explicit repository-wide picker data. This is not part of per-PR sidebar
+/// hydration and is bounded independently for each collection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestLifecycleChoices {
+    pub repository: Repository,
+    pub branches: ProviderChoiceSet,
+    pub labels: ProviderChoiceSet,
+    pub assignees: ProviderChoiceSet,
+    pub reviewer_users: ProviderChoiceSet,
+    pub reviewer_teams: ProviderChoiceSet,
+}
+
+/// Immutable coordinates and observations shared by one explicit PR action.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestMutationTarget {
+    /// Includes the selected account; `local_path` is informational and is not
+    /// used as provider authority.
+    pub repository: Repository,
+    /// The remote ID is the exact pull request node ID.
+    pub pull_request: ProviderCoordinates,
+    pub observed_updated_at: String,
+    pub observed_state: String,
+    pub observed_head_sha: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PullRequestLifecycleAction {
+    UpdateTitle { observed: String, value: String },
+    UpdateBody { observed: String, value: String },
+    UpdateBaseBranch { observed: String, value: String },
+    Close,
+    Reopen,
+    ConvertToDraft,
+    MarkReadyForReview,
+    AddReviewer(PullRequestReviewer),
+    RemoveReviewer(PullRequestReviewer),
+    AddLabel(String),
+    RemoveLabel(String),
+    AddAssignee(String),
+    RemoveAssignee(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestLifecycleRequest {
+    pub operation_id: String,
+    pub attempt_id: String,
+    pub target: PullRequestMutationTarget,
+    pub action: PullRequestLifecycleAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestLifecycleAcknowledgement {
+    pub operation_id: String,
+    pub repository: Repository,
+    pub pull_request: ProviderCoordinates,
+    pub updated_at: String,
+    pub state: String,
+    pub head_sha: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PullRequestDiscussionAction {
+    Create {
+        body: String,
+    },
+    Edit {
+        comment: ProviderCoordinates,
+        selected_author: String,
+        observed_body: String,
+        observed_updated_at: String,
+        body: String,
+    },
+    Delete {
+        comment: ProviderCoordinates,
+        selected_author: String,
+        observed_body: String,
+        observed_updated_at: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestDiscussionRequest {
+    pub operation_id: String,
+    pub attempt_id: String,
+    pub target: PullRequestMutationTarget,
+    pub action: PullRequestDiscussionAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestDiscussionAcknowledgement {
+    pub operation_id: String,
+    pub repository: Repository,
+    pub pull_request: ProviderCoordinates,
+    pub comment: ProviderCoordinates,
+    pub body: Option<String>,
+    pub deleted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCreationInput {
+    pub target_repository: Repository,
+    pub base_branch: String,
+    pub source_repository: Repository,
+    pub source_branch: String,
+    /// Informational only. It makes a local/provider branch mismatch explicit;
+    /// it is never used to infer or publish a provider ref.
+    pub local_branch: Option<String>,
+    pub title: String,
+    pub body: String,
+    pub draft: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCreationPreparation {
+    pub input: PullRequestCreationInput,
+    pub observed_base_sha: String,
+    pub observed_source_head_sha: String,
+    pub viewer_login: String,
+    pub repository_permission: Option<String>,
+    pub can_create: ProviderCapability,
+    /// False for GitHub's create endpoint: preflight observes a source SHA, but
+    /// the server does not atomically require that SHA during creation.
+    pub reviewed_head_atomically_enforced: bool,
+    pub notice: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCreationRequest {
+    pub operation_id: String,
+    pub attempt_id: String,
+    pub preparation: PullRequestCreationPreparation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCreationAcknowledgement {
+    pub operation_id: String,
+    pub target_repository: Repository,
+    pub source_repository: Repository,
+    pub pull_request: ProviderCoordinates,
+    pub actual_head_sha: String,
+    pub reviewed_head_sha: String,
+    pub reviewed_head_atomically_enforced: bool,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationAdmissionReceipt {
+    pub operation_id: String,
+    pub attempt_id: String,
+    pub durable_record_id: String,
+}
+
+/// A terminal journal fact recorded while the admitted attempt still owns its
+/// cross-process per-target authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MutationTerminalRecord {
+    NotStarted { reason: String },
+    Acknowledged { acknowledgement: serde_json::Value },
+    Uncertain { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderReadEvidence<T> {
+    Observed(T),
+    /// A missing or inaccessible object is not evidence that a mutation was
+    /// not applied. The caller may keep the attempt visibly unresolved.
+    Inconclusive {
+        reason: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewWriteAcknowledgement {
     pub operation_id: String,
