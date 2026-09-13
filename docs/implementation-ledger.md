@@ -6,15 +6,17 @@ PLAN-1 owns this file only. Its assigned thread is `thr_germtczfdt`, branch `wor
 
 ## Execution checkpoint — 2026-09-12
 
-The initial ledger was integrated at `165b1ed` from worker commit `b4fb5df3dffaf06edf062930a0aa78562d5bb54f`. Its source coverage artifact is `art_c809ecdc-d937-4a8b-86e0-771ddffcd5b6`, version `av_ec810d11-a8a5-4f74-b223-374812676e61`.
+The native foundation and M1 backend are integrated; the complete M1 UI gate is still pending. Foundation commit `5abd59c` renders native text and passes a GPUI Kit edit/save round-trip; dependency/shared contracts `2734890`, raw-path contract `ed51265`, font/material direction `90ae053`/`b84cd56`. Native evidence artifact `art_38b8ddbc-509d-449c-bab5-85e11a1c88e4` revision 2 and independent upstream audit `art_6e2ffc7c-6d8e-48e4-9c32-a21d024287ee` are verified. macOS15 is the deployment minimum; runtime tested on macOS26.5.2 only. Physical input/AX and oldest-OS coverage remain M5. The disposable-file editor preview does not claim M3 race-safe save or syntax highlighting.
 
-M0 native foundation is integrated at `5abd59c` and shared contracts at `2734890`. Build, native Metal-rendered text, GPUI Kit buffer edit and disk save round-trip passed. macOS 15 is the minimum deployment target; runtime validated on macOS 26.5.2 Apple Silicon. Full physical input/AX and oldest-supported-OS validation remain M5 evidence. The disposable-file editor preview does not claim M3 race-safe saving or syntax highlighting yet. Audit: `art_6e2ffc7c-6d8e-48e4-9c32-a21d024287ee`; native evidence: `art_38b8ddbc-509d-449c-bab5-85e11a1c88e4` (use latest verified revision in coordinator state).
+Backend integration: provider `03a76f1` (worker `18775fb`), fixture startup deadline `0771a85`, workspace `165c3f8` plus independent Grok fixes `9d082f2` (worker `ad7866e`), immutable/local review `2c81da4` (worker `8282f8f`). Integrated checks pass: 16 provider tests, 16 workspace integration tests plus 3 unit tests, 21 review tests, strict all-feature Clippy. A public `cli/cli` PR14398 read matched remote/local immutable revisions, file inventory, changed text and line coordinates; both stored accounts also passed provider read evidence.
 
-M1 work is underway. Account/provider transport: `thr_8bjg7f39hz`, branch `worker/provider`, worktree `/Users/matias/Development/cibergit-provider`, base `27348909fe5e7f8042d8501e62d73d27f169a775`. Immutable/local diff core: `thr_hdkztpg3pr`, branch `worker/review`, worktree `/Users/matias/Development/cibergit-review`, same base. These are prerequisite implementation slices of the M1 tasks; no end-to-end M1 task is accepted yet.
+Backend reports: provider `art_5b0f2344-e1c8-47d3-8b36-08988692344c`; workspace `art_9a4297f9-294b-4d9a-8ad6-d292a4d193c7`; review `art_0957737d-022f-4c7e-95fd-e53a9dbb70cf`. Independent Sol provider review `art_75376c01-0d3b-4213-bf1c-bdb46740a9fd` found a mutable file-list over-return at the 300-file cap; M1-META owns the required fix/regression before acceptance. Other reviewed account/argv/credential properties had no material finding.
 
-Initial personal workspace/filter/cache source and three behavior tests are integrated at `165c3f8`. The M1-STATE backend is under independent Grok review by `thr_3sn2q2yqcx` on `worker/workspace-review`, worktree `/Users/matias/Development/cibergit-workspace-review`, base `165c3f88e654e82168a007892a59805bf4c51c56`. Per-repository account keys and separate draft files are implemented; complete offline/pending-review/session recovery awaits UI and M2 integration. JSON with atomic private-file replacement is an accepted reversible engineering choice for this early milestone, not an interview decision.
+Active Sol assignments, each based on `2c81da4ad5c27e39df4f7c601f92b850bd12a52b`: UI `thr_whqch6xvbv`, `worker/native-ui`, `/Users/matias/Development/cibergit-native-ui` (main/app/build docs); real filter/activity metadata `thr_2m9nek755p`, `worker/pr-metadata`, `/Users/matias/Development/cibergit-pr-metadata` (providers and delegated additive domain types); selected-file lazy local reads `thr_3m9mfm22eh`, `worker/lazy-diff`, `/Users/matias/Development/cibergit-lazy-diff` (review module). The verified native UI brief is `art_affd9a0e-d873-4754-a3a5-7dd5b22f5e13` revision3. Each worker uses an isolated Cargo target after a shared-target stale-artifact incident.
 
-The user now requests most implementation delegation to `gpt-5.6-sol` and use of Grok agents. The permanent coordinator retains integration/verification. Every original agreed behavior below remains in scope; all unanswered decisions remain open.
+The user requests most implementation delegation to GPT-5.6-Sol and use of Grok; the permanent coordinator retains integration/verification. The user also specified Codex app aesthetics, acrylic sidebar and IBM Plex Sans, captured in `docs/ui-direction.md`; fonts and license are bundled. Private versioned JSON with atomic replacement is a reversible early engineering choice. Real check/review/participation filter data and pending-review/complete session recovery are not accepted until their integrations pass. The agreed combined net-unmerged stack diff remains in scope; only its unanswered interaction proposals are open. All Q60–Q66 and Q68 decisions remain open.
+
+The initial ledger source was integrated at `165b1ed` from worker `b4fb5df3dffaf06edf062930a0aa78562d5bb54f`; coverage artifact `art_c809ecdc-d937-4a8b-86e0-771ddffcd5b6`, version `av_ec810d11-a8a5-4f74-b223-374812676e61`. Coordinator state artifact `art_4093b33c-94aa-410e-88b3-3ff83175ee7e` contains the current exact integration revision, artifact versions and next steps; reconcile it with live Git/workers after restart.
 
 ## Reading and maintaining the ledger
 
@@ -35,18 +37,18 @@ Dependencies name tasks or `G0` through `G5`, the runnable milestone gates below
 
 ## Implementation tasks
 
-| Task | Deliverable and acceptance rows | Milestone | Dependencies | Assignment | Initial status | Integration commit | Artifact IDs / versions |
+| Task | Deliverable and acceptance rows | Milestone | Dependencies | Assignment | Status | Integration commit | Artifact IDs / versions |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | M0-ENV | Validate toolchain, compatible pins and native editor proof; F01, F02, E01 | M0 | None | C0 | verified | 5abd59c | art_6e2ffc7c-6d8e-48e4-9c32-a21d024287ee; art_38b8ddbc-509d-449c-bab5-85e11a1c88e4 |
 | M0-BUILD | Reproducible build/run instructions, license inventory; F03, E02 | M0 | M0-ENV | C0 | verified | 5abd59c | art_38b8ddbc-509d-449c-bab5-85e11a1c88e4 |
 | M0-CONTRACT | Establish only needed shared state/provider/operation contracts; E03, E04 | M0 | M0-ENV | C0 | verified | 2734890 | art_4093b33c-94aa-410e-88b3-3ff83175ee7e |
-| M1-ACCOUNT | Existing gh accounts, provider transport and isolation; F04, F05, W02, E05, E06 | M1 | G0 | U | dependent | pending | pending |
-| M1-REPOS | Explicit local/remote repository setup and personal persistence; F06, W01, W03 | M1 | M1-ACCOUNT, M1-STATE | U | dependent | pending | pending |
-| M1-STATE | Durable session, cache and drafts; E04, E07 | M1 | G0 | U | dependent | pending | pending |
-| M1-SIDEBAR | All-open rows, ordered groups, saved filters; W04-W08 | M1 | M1-REPOS | U | dependent | pending | pending |
-| M1-TABS | Restored PR tabs, file navigation, header/panel frame; V01-V03 | M1 | M1-REPOS | U | dependent | pending | pending |
-| M1-DIFF | Immutable local/remote comparisons, adaptive text diffs; V04-V08, E08 | M1 | M1-TABS | U | dependent | pending | pending |
-| M1-SYNC | Polling, explicit revision advancement and offline read; S01-S04, R04, E09 | M1 | M1-DIFF, M1-SIDEBAR | U | dependent | pending | pending |
+| M1-ACCOUNT | Existing gh accounts, provider transport and isolation; F04, F05, W02, E05, E06 | M1 | G0 | Active assignments above | running | Backend commits above; UI pending | Reports above; G1 evidence pending |
+| M1-REPOS | Explicit local/remote repository setup and personal persistence; F06, W01, W03 | M1 | M1-ACCOUNT, M1-STATE | Active assignments above | running | Backend commits above; UI pending | Reports above; G1 evidence pending |
+| M1-STATE | Durable session, cache and drafts; E04, E07 | M1 | G0 | Active assignments above | running | Backend commits above; UI pending | Reports above; G1 evidence pending |
+| M1-SIDEBAR | All-open rows, ordered groups, saved filters; W04-W08 | M1 | M1-REPOS | Active assignments above | running | Backend commits above; UI pending | Reports above; G1 evidence pending |
+| M1-TABS | Restored PR tabs, file navigation, header/panel frame; V01-V03 | M1 | M1-REPOS | Active assignments above | running | Backend commits above; UI pending | Reports above; G1 evidence pending |
+| M1-DIFF | Immutable local/remote comparisons, adaptive text diffs; V04-V08, E08 | M1 | M1-TABS | Active assignments above | running | Backend commits above; UI pending | Reports above; G1 evidence pending |
+| M1-SYNC | Polling, explicit revision advancement and offline read; S01-S04, R04, E09 | M1 | M1-DIFF, M1-SIDEBAR | Active assignments above | running | Backend commits above; UI pending | Reports above; G1 evidence pending |
 | M2-DISCUSS | Inline threads and Overview/Activity content; V03, R01 | M2 | G1 | U | dependent | pending | pending |
 | M2-REVIEW | Pending/immediate comments, draft recovery, explicit submission; R02, R03, R05, E10 | M2 | M2-DISCUSS, M1-STATE | U | dependent | pending | pending |
 | M2-PROGRESS | Full/commit/range/since-review selection and viewed progress; V08, R06 | M2 | G1, M2-REVIEW | U | dependent | pending | pending |
