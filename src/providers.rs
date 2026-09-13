@@ -7,6 +7,9 @@
 //! request per PR. Participant sources are bounded to 100 entries each and expose
 //! incompleteness. Details paginates four top-level connections 50 at a time for at most
 //! 20 pages; nested review-thread comments are bounded to 100 with explicit flags.
+use crate::comparisons::{
+    CommitInventory, CommitInventoryEntry, InventoryAvailability, MAX_COMMIT_INVENTORY,
+};
 use crate::domain::{
     Account, BranchDeletionAcknowledgement, BranchDeletionRequest, ChangedFile, CheckKind,
     Comparison, IssueComment, LinkedReviewComment, MergeAcknowledgement, MergeAction,
@@ -39,6 +42,7 @@ const API_VERSION: &str = "X-GitHub-Api-Version: 2026-03-10";
 const PAGE_SIZE: usize = 100;
 const MAX_PR_PAGES: usize = 100;
 const MAX_FILE_PAGES: usize = 30;
+const MAX_COMMIT_INVENTORY_PAGES: usize = 10;
 const PARTICIPANT_LIMIT: usize = 100;
 const MAX_DETAILS_PAGES: usize = 20;
 const MAX_OPERATION_BYTES: usize = 64 * 1024 * 1024;
@@ -869,6 +873,261 @@ impl GithubProvider {
         Ok(Comparison {
             revision: revision.clone(),
             files: files.into_iter().map(ApiFile::into_domain).collect(),
+            complete: notices.is_empty(),
+            notice: (!notices.is_empty()).then(|| notices.join(" ")),
+        })
+    }
+
+    /// Enumerate the commit selector against the exact currently displayed PR
+    /// base/head. The mutable PR connection is never used for a historical head
+    /// and every page repeats the immutable identity guard.
+    pub fn commit_inventory(
+        &self,
+        repo: &Repository,
+        number: u64,
+        full_revision: &Revision,
+    ) -> Result<CommitInventory> {
+        self.validate_repo(repo)?;
+        validate_sha(&full_revision.base_sha)?;
+        validate_sha(&full_revision.head_sha)?;
+        ensure!(number > 0, "Invalid pull request number");
+        let unavailable = |availability, notice: String| CommitInventory {
+            full_revision: full_revision.clone(),
+            commits: Vec::new(),
+            availability,
+            notice: Some(notice),
+        };
+        let mut session = Session::new(self);
+        let mut after: Option<String> = None;
+        let mut commits = Vec::new();
+        let mut seen = HashSet::new();
+        let mut expected_total = None;
+        for page in 1..=MAX_COMMIT_INVENTORY_PAGES {
+            let response: GraphqlResult<CommitInventoryData> = session.graphql(
+                COMMIT_INVENTORY_QUERY,
+                json!({
+                    "owner": repo.owner,
+                    "name": repo.name,
+                    "number": number,
+                    "after": after,
+                }),
+            )?;
+            let Some(repository) = response.data.repository else {
+                return Ok(unavailable(
+                    InventoryAvailability::Unavailable,
+                    "GitHub did not return the selected repository for commit inventory.".into(),
+                ));
+            };
+            ensure!(
+                repository
+                    .name_with_owner
+                    .eq_ignore_ascii_case(&repo.full_name()),
+                "GitHub commit inventory repository identity mismatch"
+            );
+            let Some(pull) = repository.pull_request else {
+                return Ok(unavailable(
+                    InventoryAvailability::Unavailable,
+                    "GitHub did not return the selected pull request for commit inventory.".into(),
+                ));
+            };
+            ensure!(
+                pull.number == number,
+                "GitHub commit inventory PR identity mismatch"
+            );
+            if pull.base_ref_oid != full_revision.base_sha
+                || pull.head_ref_oid != full_revision.head_sha
+            {
+                return Ok(unavailable(
+                    if page == 1 {
+                        InventoryAvailability::Unavailable
+                    } else {
+                        InventoryAvailability::Incomplete
+                    },
+                    "The pull request revision changed or differs from the displayed revision; no mutable commit inventory was accepted.".into(),
+                ));
+            }
+            if response.partial {
+                return Ok(unavailable(
+                    InventoryAvailability::Incomplete,
+                    "GitHub returned a partial commit inventory; selection is unavailable.".into(),
+                ));
+            }
+            let connection = pull.commits;
+            ensure!(
+                expected_total.is_none_or(|total| total == connection.total_count),
+                "GitHub commit inventory total changed during pagination"
+            );
+            expected_total = Some(connection.total_count);
+            if connection.total_count > MAX_COMMIT_INVENTORY {
+                return Ok(unavailable(
+                    InventoryAvailability::Incomplete,
+                    format!(
+                        "Commit inventory exceeds the {MAX_COMMIT_INVENTORY}-commit remote limit."
+                    ),
+                ));
+            }
+            ensure!(
+                connection.nodes.len() <= PAGE_SIZE,
+                "Invalid GitHub commit inventory page size"
+            );
+            if connection.page_info.has_next_page && connection.nodes.len() != PAGE_SIZE {
+                return Ok(unavailable(
+                    InventoryAvailability::Incomplete,
+                    "GitHub returned a truncated commit inventory page; selection is unavailable."
+                        .into(),
+                ));
+            }
+            for node in connection.nodes {
+                let Some(node) = node else {
+                    return Ok(unavailable(
+                        InventoryAvailability::Incomplete,
+                        "GitHub omitted a commit from the inventory; selection is unavailable."
+                            .into(),
+                    ));
+                };
+                validate_sha(&node.commit.oid)?;
+                ensure!(
+                    seen.insert(node.commit.oid.clone()),
+                    "Repeated commit in GitHub inventory"
+                );
+                ensure!(
+                    node.commit.parents.nodes.len() <= 2,
+                    "Invalid GitHub commit parent page"
+                );
+                if node.commit.parents.total_count > node.commit.parents.nodes.len() {
+                    return Ok(unavailable(
+                        InventoryAvailability::Incomplete,
+                        "A commit has more than two parents; its parent inventory is bounded and selection is unavailable.".into(),
+                    ));
+                }
+                let parent_shas = node
+                    .commit
+                    .parents
+                    .nodes
+                    .into_iter()
+                    .map(|parent| {
+                        let parent = parent.context("GitHub omitted a commit parent")?;
+                        validate_sha(&parent.oid)?;
+                        Ok(parent.oid)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                commits.push(CommitInventoryEntry {
+                    sha: node.commit.oid,
+                    parent_shas,
+                    message_headline: node.commit.message_headline,
+                    authored_at: node.commit.authored_date,
+                    committed_at: node.commit.committed_date,
+                });
+            }
+            if !connection.page_info.has_next_page {
+                ensure!(
+                    commits.len() == connection.total_count,
+                    "GitHub commit inventory ended before its reported total"
+                );
+                return Ok(CommitInventory {
+                    full_revision: full_revision.clone(),
+                    commits,
+                    availability: InventoryAvailability::Complete,
+                    notice: None,
+                });
+            }
+            after = Some(
+                connection
+                    .page_info
+                    .end_cursor
+                    .filter(|cursor| !cursor.is_empty())
+                    .context("GitHub commit inventory omitted its continuation cursor")?,
+            );
+        }
+        Ok(unavailable(
+            InventoryAvailability::Incomplete,
+            format!("Commit inventory reached the {MAX_COMMIT_INVENTORY_PAGES}-page remote limit."),
+        ))
+    }
+
+    /// Fetch an exact direct-tree pair through GitHub's compare API. Because the
+    /// endpoint is three-dot, merge-base equality is mandatory. Commit pagination
+    /// proves the requested head from the final page instead of a capped first page.
+    pub fn direct_comparison(&self, repo: &Repository, revision: &Revision) -> Result<Comparison> {
+        self.validate_repo(repo)?;
+        validate_sha(&revision.base_sha)?;
+        validate_sha(&revision.head_sha)?;
+        let mut session = Session::new(self);
+        let head: ApiCommit = session.get(&format!(
+            "repos/{}/commits/{}",
+            repo.full_name(),
+            revision.head_sha
+        ))?;
+        ensure!(
+            head.sha == revision.head_sha,
+            "GitHub returned a different requested head commit"
+        );
+        let endpoint = |page| {
+            format!(
+                "repos/{}/compare/{}...{}?per_page={PAGE_SIZE}&page={page}",
+                repo.full_name(),
+                revision.base_sha,
+                revision.head_sha
+            )
+        };
+        let first: ApiComparison = session
+            .get(&endpoint(1))
+            .context("Exact direct comparison unavailable; selected endpoints were not advanced")?;
+        validate_direct_compare_identity(&first, revision)?;
+        ensure!(
+            first.commits.len() <= PAGE_SIZE,
+            "Invalid direct comparison commit page"
+        );
+        let page_count = first.total_commits.div_ceil(PAGE_SIZE);
+        ensure!(
+            page_count <= MAX_COMMIT_INVENTORY_PAGES,
+            "Direct comparison exceeds the bounded commit proof limit"
+        );
+        if first.total_commits == 0 {
+            ensure!(
+                revision.base_sha == revision.head_sha
+                    && first.commits.is_empty()
+                    && first.files.is_empty(),
+                "Non-identical direct endpoints returned an empty comparison"
+            );
+        } else {
+            ensure!(
+                first.commits.len() == first.total_commits.min(PAGE_SIZE),
+                "Direct comparison first commit page is truncated"
+            );
+            let last = if page_count <= 1 {
+                first.commits.last().map(|commit| commit.sha.clone())
+            } else {
+                let last_page: ApiComparison = session.get(&endpoint(page_count))?;
+                validate_direct_compare_identity(&last_page, revision)?;
+                let expected_last_page = (first.total_commits - 1) % PAGE_SIZE + 1;
+                ensure!(
+                    last_page.total_commits == first.total_commits
+                        && last_page.commits.len() == expected_last_page,
+                    "Direct comparison changed during commit pagination"
+                );
+                last_page.commits.last().map(|commit| commit.sha.clone())
+            };
+            ensure!(
+                last.as_deref() == Some(revision.head_sha.as_str()),
+                "GitHub comparison did not end at the requested head"
+            );
+        }
+        ensure!(first.files.len() <= 300, "Invalid compare file response");
+        validate_files(&first.files)?;
+        let mut notices = Vec::new();
+        if first.files.len() == 300 {
+            notices.push(
+                "Incomplete exact file inventory: GitHub caps immutable comparisons at 300 files."
+                    .to_owned(),
+            );
+        }
+        if first.files.iter().any(|file| !file.patch_complete()) {
+            notices.push("Some patches are unavailable, binary, or truncated. File metadata is retained; media contents are never fetched.".to_owned());
+        }
+        Ok(Comparison {
+            revision: revision.clone(),
+            files: first.files.into_iter().map(ApiFile::into_domain).collect(),
             complete: notices.is_empty(),
             notice: (!notices.is_empty()).then(|| notices.join(" ")),
         })
@@ -2049,6 +2308,57 @@ struct GraphqlConnection<T> {
 }
 
 #[derive(Deserialize)]
+struct CommitInventoryData {
+    repository: Option<CommitInventoryRepository>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitInventoryRepository {
+    name_with_owner: String,
+    pull_request: Option<CommitInventoryPull>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitInventoryPull {
+    number: u64,
+    base_ref_oid: String,
+    head_ref_oid: String,
+    commits: CommitInventoryConnection,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitInventoryConnection {
+    total_count: usize,
+    nodes: Vec<Option<CommitInventoryNode>>,
+    page_info: PageInfo,
+}
+
+#[derive(Deserialize)]
+struct CommitInventoryNode {
+    commit: CommitInventoryCommit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitInventoryCommit {
+    oid: String,
+    message_headline: String,
+    authored_date: String,
+    committed_date: String,
+    parents: CommitParentConnection,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitParentConnection {
+    total_count: usize,
+    nodes: Vec<Option<GraphqlOid>>,
+}
+
+#[derive(Deserialize)]
 struct GraphqlActor {
     login: String,
 }
@@ -2262,6 +2572,35 @@ struct BulkMetadataRepository {
     #[serde(flatten)]
     pulls: HashMap<String, Option<BulkPullMetadata>>,
 }
+
+const COMMIT_INVENTORY_QUERY: &str = r#"query PullRequestCommitInventory(
+  $owner: String!, $name: String!, $number: Int!, $after: String
+) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequest(number: $number) {
+      number
+      baseRefOid
+      headRefOid
+      commits(first: 100, after: $after) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          commit {
+            oid
+            messageHeadline
+            authoredDate
+            committedDate
+            parents(first: 2) {
+              totalCount
+              nodes { oid }
+            }
+          }
+        }
+      }
+    }
+  }
+}"#;
 
 const MERGE_PREPARATION_QUERY: &str = r#"query MergePreparation(
   $owner: String!, $name: String!, $number: Int!
@@ -4313,6 +4652,11 @@ struct ApiCommit {
 struct ApiComparison {
     base_commit: ApiCommit,
     merge_base_commit: ApiCommit,
+    #[serde(default)]
+    total_commits: usize,
+    #[serde(default)]
+    commits: Vec<ApiCommit>,
+    #[serde(default)]
     files: Vec<ApiFile>,
 }
 #[derive(Deserialize)]
@@ -4362,6 +4706,23 @@ fn validate_files(files: &[ApiFile]) -> Result<()> {
                 && seen.insert(&file.filename),
             "Invalid or repeated file in GitHub pagination"
         );
+    }
+    Ok(())
+}
+
+fn validate_direct_compare_identity(comparison: &ApiComparison, revision: &Revision) -> Result<()> {
+    ensure!(
+        comparison.base_commit.sha == revision.base_sha,
+        "GitHub comparison returned a different base commit"
+    );
+    ensure!(
+        comparison.merge_base_commit.sha == revision.base_sha,
+        "GitHub three-dot comparison cannot represent the requested direct-tree pair"
+    );
+    validate_sha(&comparison.base_commit.sha)?;
+    validate_sha(&comparison.merge_base_commit.sha)?;
+    for commit in &comparison.commits {
+        validate_sha(&commit.sha)?;
     }
     Ok(())
 }
@@ -4469,6 +4830,52 @@ mod tests {
     }
     fn compare_path() -> String {
         format!("repos/owner/repo/compare/{BASE}...{HEAD}?per_page=1&page=1")
+    }
+    fn inventory_commit(sha: &str, parent: &str, headline: &str) -> Value {
+        json!({"commit": {
+            "oid": sha,
+            "messageHeadline": headline,
+            "authoredDate": "2026-09-13T10:00:00Z",
+            "committedDate": "2026-09-13T10:00:00Z",
+            "parents": {"totalCount": 1, "nodes": [{"oid": parent}]}
+        }})
+    }
+    fn inventory_page(
+        base: &str,
+        head: &str,
+        nodes: Vec<Value>,
+        total: usize,
+        has_next: bool,
+        cursor: Option<&str>,
+    ) -> Value {
+        json!({"data": {"repository": {
+            "nameWithOwner": "owner/repo",
+            "pullRequest": {
+                "number": 1,
+                "baseRefOid": base,
+                "headRefOid": head,
+                "commits": {
+                    "totalCount": total,
+                    "nodes": nodes,
+                    "pageInfo": {"hasNextPage": has_next, "endCursor": cursor}
+                }
+            }
+        }}})
+    }
+    fn direct_compare(
+        base: &str,
+        merge_base: &str,
+        total: usize,
+        commits: Vec<Value>,
+        files: Vec<Value>,
+    ) -> Value {
+        json!({
+            "base_commit": {"sha": base},
+            "merge_base_commit": {"sha": merge_base},
+            "total_commits": total,
+            "commits": commits,
+            "files": files,
+        })
     }
     fn step(path: &str, response: Value) -> Value {
         json!({"endpoint": path, "response": response})
@@ -5069,6 +5476,309 @@ else:
     }
 
     #[test]
+    fn fixed_commit_inventory_paginates_and_rejects_moving_or_partial_pages() {
+        let mut previous = BASE.to_owned();
+        let mut first_nodes = Vec::new();
+        for value in 3_u64..103 {
+            let sha = format!("{value:040x}");
+            first_nodes.push(inventory_commit(&sha, &previous, "page one"));
+            previous = sha;
+        }
+        let middle = previous;
+        let first = inventory_page(BASE, HEAD, first_nodes, 101, true, Some("next"));
+        let second = inventory_page(
+            BASE,
+            HEAD,
+            vec![inventory_commit(HEAD, &middle, "second")],
+            101,
+            false,
+            None,
+        );
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                details_step(first.clone(), json!({"after": null, "number": 1})),
+                details_step(second, json!({"after": "next", "number": 1})),
+            ],
+        );
+        let result = provider
+            .commit_inventory(&repo("alice"), 1, &revision())
+            .unwrap();
+        assert_eq!(result.availability, InventoryAvailability::Complete);
+        assert_eq!(result.commits.len(), 101);
+        assert_eq!(result.commits.last().unwrap().sha, HEAD);
+        exhausted(&dir, 2);
+
+        let moved = inventory_page(
+            BASE,
+            "4444444444444444444444444444444444444444",
+            vec![inventory_commit(HEAD, &middle, "second")],
+            101,
+            false,
+            None,
+        );
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                details_step(first.clone(), json!({"after": null})),
+                details_step(moved, json!({"after": "next"})),
+            ],
+        );
+        let result = provider
+            .commit_inventory(&repo("alice"), 1, &revision())
+            .unwrap();
+        assert_eq!(result.availability, InventoryAvailability::Incomplete);
+        assert!(result.commits.is_empty());
+        assert!(result.notice.unwrap().contains("changed"));
+        exhausted(&dir, 2);
+
+        let mut truncated = first.clone();
+        truncated["data"]["repository"]["pullRequest"]["commits"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        let (dir, provider) = fixture(
+            "alice",
+            vec![details_step(truncated, json!({"after": null}))],
+        );
+        let result = provider
+            .commit_inventory(&repo("alice"), 1, &revision())
+            .unwrap();
+        assert_eq!(result.availability, InventoryAvailability::Incomplete);
+        assert!(result.commits.is_empty());
+        assert!(result.notice.unwrap().contains("truncated"));
+        exhausted(&dir, 1);
+
+        let mut partial = first;
+        partial["errors"] = json!([{"message": "truncated fixture"}]);
+        let (dir, provider) = fixture("alice", vec![details_step(partial, json!({"after": null}))]);
+        let result = provider
+            .commit_inventory(&repo("alice"), 1, &revision())
+            .unwrap();
+        assert_eq!(result.availability, InventoryAvailability::Incomplete);
+        assert!(result.commits.is_empty());
+        assert!(result.notice.unwrap().contains("partial"));
+        exhausted(&dir, 1);
+    }
+
+    #[test]
+    fn historical_or_wrong_account_commit_inventory_is_unavailable_without_leakage() {
+        let current = inventory_page(
+            BASE,
+            "4444444444444444444444444444444444444444",
+            Vec::new(),
+            0,
+            false,
+            None,
+        );
+        let (dir, provider) = fixture(
+            "selected-account",
+            vec![details_step(current, json!({"number": 1}))],
+        );
+        let inventory = provider
+            .commit_inventory(&repo("selected-account"), 1, &revision())
+            .unwrap();
+        assert_eq!(inventory.availability, InventoryAvailability::Unavailable);
+        assert!(inventory.commits.is_empty());
+        exhausted(&dir, 1);
+
+        let (_dir, provider) = fixture("selected-account", vec![]);
+        assert!(
+            provider
+                .commit_inventory(&repo("other-account"), 1, &revision())
+                .unwrap_err()
+                .to_string()
+                .contains("mismatch")
+        );
+    }
+
+    #[test]
+    fn direct_compare_proves_exact_head_from_last_page_and_discloses_file_cap() {
+        let first_commits: Vec<_> = (3_u64..103)
+            .map(|value| json!({"sha": format!("{value:040x}")}))
+            .collect();
+        let first = direct_compare(BASE, BASE, 101, first_commits, (0..300).map(file).collect());
+        let last = direct_compare(BASE, BASE, 101, vec![json!({"sha": HEAD})], Vec::new());
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                step(
+                    &format!("repos/owner/repo/commits/{HEAD}"),
+                    json!({"sha": HEAD}),
+                ),
+                step(
+                    &format!("repos/owner/repo/compare/{BASE}...{HEAD}?per_page=100&page=1"),
+                    first,
+                ),
+                step(
+                    &format!("repos/owner/repo/compare/{BASE}...{HEAD}?per_page=100&page=2"),
+                    last,
+                ),
+            ],
+        );
+        let result = provider
+            .direct_comparison(&repo("alice"), &revision())
+            .unwrap();
+        assert_eq!(result.revision, revision());
+        assert_eq!(result.files.len(), 300);
+        assert!(!result.complete);
+        assert!(result.notice.unwrap().contains("300 files"));
+        exhausted(&dir, 3);
+    }
+
+    #[test]
+    fn direct_compare_refuses_wrong_head_divergence_and_nonempty_equal_pair() {
+        let wrong = "4444444444444444444444444444444444444444";
+        let (dir, provider) = fixture(
+            "alice",
+            vec![step(
+                &format!("repos/owner/repo/commits/{HEAD}"),
+                json!({"sha": wrong}),
+            )],
+        );
+        assert!(
+            provider
+                .direct_comparison(&repo("alice"), &revision())
+                .unwrap_err()
+                .to_string()
+                .contains("different requested head")
+        );
+        exhausted(&dir, 1);
+
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                step(
+                    &format!("repos/owner/repo/commits/{HEAD}"),
+                    json!({"sha": HEAD}),
+                ),
+                step(
+                    &format!("repos/owner/repo/compare/{BASE}...{HEAD}?per_page=100&page=1"),
+                    direct_compare(BASE, wrong, 1, vec![json!({"sha": HEAD})], vec![file(0)]),
+                ),
+            ],
+        );
+        assert!(
+            provider
+                .direct_comparison(&repo("alice"), &revision())
+                .unwrap_err()
+                .to_string()
+                .contains("cannot represent")
+        );
+        exhausted(&dir, 2);
+
+        let equal = Revision {
+            base_sha: BASE.into(),
+            head_sha: BASE.into(),
+        };
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                step(
+                    &format!("repos/owner/repo/commits/{BASE}"),
+                    json!({"sha": BASE}),
+                ),
+                step(
+                    &format!("repos/owner/repo/compare/{BASE}...{BASE}?per_page=100&page=1"),
+                    direct_compare(BASE, BASE, 0, Vec::new(), vec![file(0)]),
+                ),
+            ],
+        );
+        assert!(provider.direct_comparison(&repo("alice"), &equal).is_err());
+        exhausted(&dir, 2);
+
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                step(
+                    &format!("repos/owner/repo/commits/{BASE}"),
+                    json!({"sha": BASE}),
+                ),
+                step(
+                    &format!("repos/owner/repo/compare/{BASE}...{BASE}?per_page=100&page=1"),
+                    direct_compare(BASE, BASE, 0, Vec::new(), Vec::new()),
+                ),
+            ],
+        );
+        let empty = provider.direct_comparison(&repo("alice"), &equal).unwrap();
+        assert!(empty.files.is_empty());
+        assert!(empty.complete);
+        exhausted(&dir, 2);
+    }
+
+    #[test]
+    fn divergent_remote_since_review_falls_back_without_relabeling_three_dot_diff() {
+        use crate::{
+            comparisons::{
+                BaselineResolution, ComparisonRequest, ReviewBaseline, ReviewBaselineSource,
+                select_github_comparison,
+            },
+            review::ComparisonMode,
+        };
+
+        let reviewed = "3333333333333333333333333333333333333333";
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                step(
+                    &format!("repos/owner/repo/commits/{HEAD}"),
+                    json!({"sha": HEAD}),
+                ),
+                step(
+                    &format!("repos/owner/repo/compare/{reviewed}...{HEAD}?per_page=100&page=1"),
+                    direct_compare(reviewed, BASE, 1, vec![json!({"sha": HEAD})], vec![file(0)]),
+                ),
+                step("repos/owner/repo/pulls/1", pull(1, 1)),
+                step(&compare_path(), compare(vec![file(0)])),
+                step(
+                    "repos/owner/repo/pulls/1/files?per_page=100&page=1",
+                    json!([file(0)]),
+                ),
+                step("repos/owner/repo/pulls/1", pull(1, 1)),
+            ],
+        );
+        let inventory = CommitInventory {
+            full_revision: revision(),
+            commits: Vec::new(),
+            availability: InventoryAvailability::Unavailable,
+            notice: Some("historical inventory unavailable".into()),
+        };
+        let selection = select_github_comparison(
+            &provider,
+            &repo("alice"),
+            1,
+            &revision(),
+            &inventory,
+            ComparisonRequest::SinceLastReview {
+                baseline: BaselineResolution::Found(ReviewBaseline {
+                    reviewed_head_sha: reviewed.into(),
+                    completed_at: "2026-09-13T10:00:00Z".into(),
+                    source: ReviewBaselineSource::SubmittedReview {
+                        review_id: "R1".into(),
+                    },
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(selection.comparison.revision, revision());
+        assert_eq!(selection.metadata.mode, ComparisonMode::FullPullRequest);
+        assert_eq!(
+            selection.metadata.requested_mode,
+            Some(ComparisonMode::SinceLastReview {
+                reviewed_head_sha: reviewed.into()
+            })
+        );
+        assert!(
+            selection
+                .metadata
+                .notice
+                .unwrap()
+                .contains("cannot represent")
+        );
+        exhausted(&dir, 6);
+    }
+
+    #[test]
     fn changing_revision_keeps_only_pinned_comparison() {
         let mut changed = pull(1, 2);
         changed["head"]["sha"] = json!("3333333333333333333333333333333333333333");
@@ -5463,6 +6173,44 @@ else:
                 .unwrap_or_else(|| "unavailable".into()),
             source.source_branch,
             source.observed_revision.head_sha,
+        );
+    }
+
+    /// Explicit opt-in schema and immutable comparison check, public data only.
+    #[test]
+    #[ignore = "uses existing gh auth and public cli/cli API reads"]
+    fn live_public_comparison_inventory_and_direct_commit() {
+        let provider = GithubProvider::new(GithubProvider::accounts().unwrap().remove(0));
+        let repo = provider.repository("cli/cli").unwrap();
+        let pull = provider.pull_request(&repo, 14130).unwrap();
+        let inventory = provider
+            .commit_inventory(&repo, pull.number, &pull.revision())
+            .unwrap();
+        assert_eq!(inventory.availability, InventoryAvailability::Complete);
+        let commit = inventory
+            .commits
+            .iter()
+            .find(|commit| commit.parent_shas.len() == 1)
+            .expect("public fixture has a direct commit");
+        let direct = provider
+            .direct_comparison(
+                &repo,
+                &Revision {
+                    base_sha: commit.parent_shas[0].clone(),
+                    head_sha: commit.sha.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(direct.revision.head_sha, commit.sha);
+        println!(
+            "Public cli/cli#{} immutable head={} commits={} selected={} files={} complete={} notice={:?}",
+            pull.number,
+            pull.head_sha,
+            inventory.commits.len(),
+            commit.sha,
+            direct.files.len(),
+            direct.complete,
+            direct.notice
         );
     }
 
