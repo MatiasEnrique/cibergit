@@ -8,9 +8,17 @@
 //! incompleteness. Details paginates four top-level connections 50 at a time for at most
 //! 20 pages; nested review-thread comments are bounded to 100 with explicit flags.
 use crate::domain::{
-    Account, ChangedFile, CheckKind, Comparison, IssueComment, MergeEligibility,
-    ProviderCoordinates, PullRequest, PullRequestCheck, PullRequestDetails, PullRequestReview,
-    Repository, ReviewComment, ReviewThread, Revision,
+    Account, BranchDeletionAcknowledgement, BranchDeletionRequest, ChangedFile, CheckKind,
+    Comparison, IssueComment, LinkedReviewComment, MergeAcknowledgement, MergeAction,
+    MergeEligibility, MergeExecutionRequest, MergeMethod, MergePreparation, MutationContext,
+    PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome, PullRequest,
+    PullRequestCheck, PullRequestDetails, PullRequestReview, Repository,
+    ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewComment,
+    ReviewThread, ReviewWriteAcknowledgement, Revision,
+};
+use crate::participation::{
+    DraftStore, PendingCommentIntent, ReviewComposition, ReviewEvent, ReviewOperationPayload,
+    ReviewOperationStatus, SubmissionIntent,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -33,6 +41,8 @@ const MAX_FILE_PAGES: usize = 30;
 const PARTICIPANT_LIMIT: usize = 100;
 const MAX_DETAILS_PAGES: usize = 20;
 const MAX_OPERATION_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MUTATION_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_ACTION_TEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct GithubProvider {
@@ -169,6 +179,551 @@ impl GithubProvider {
             "PR number is outside GitHub GraphQL limits"
         );
         Session::new(self).details(repo, number)
+    }
+
+    /// Import the selected account's single pending review and only comments
+    /// whose provider-reported parent review ID matches it.
+    pub fn pending_review(
+        &self,
+        repo: &Repository,
+        number: u64,
+    ) -> Result<Option<PendingReviewSnapshot>> {
+        self.validate_repo(repo)?;
+        ensure!(number > 0 && number <= i32::MAX as u64, "Invalid PR number");
+        Session::new(self).pending_review(repo, number)
+    }
+
+    /// Execute exactly one frozen participation payload. The exact InFlight
+    /// state is durably saved before dispatch; restored InFlight/Uncertain
+    /// operations are never replayed.
+    pub fn execute_review_operation(
+        &self,
+        repo: &Repository,
+        composition: &mut ReviewComposition,
+        store: &DraftStore,
+        operation_id: &str,
+        attempt_id: &str,
+    ) -> ProviderMutationOutcome<ReviewWriteAcknowledgement> {
+        let payload = match composition
+            .operations
+            .iter()
+            .find(|operation| operation.id == operation_id)
+        {
+            Some(operation) if operation.status == ReviewOperationStatus::Prepared => {
+                match operation.payload.clone() {
+                    Some(payload) => payload,
+                    None => {
+                        return rejected("prepared review operation has no frozen payload");
+                    }
+                }
+            }
+            Some(operation) if operation.status.requires_reconciliation() => {
+                return rejected(
+                    "review operation was already dispatched and must be reconciled before retry",
+                );
+            }
+            Some(_) => return rejected("review operation is not executable"),
+            None => return rejected("review operation does not exist"),
+        };
+        if let Err(reason) = validate_review_key(self, repo, composition, &payload) {
+            return rejected(reason);
+        }
+        let prepared = match self.prepare_review_mutation(repo, &payload) {
+            Ok(prepared) => prepared,
+            Err(reason) => return rejected(reason),
+        };
+        let context = MutationContext {
+            operation_id: operation_id.to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            action: prepared.action.to_owned(),
+            payload: json!({"query": prepared.query, "variables": prepared.variables}),
+        };
+        if let Err(error) = composition.mark_in_flight(operation_id, attempt_id) {
+            return rejected(error.to_string());
+        }
+        if let Err(error) = store.save(composition) {
+            if let Some(operation) = composition
+                .operations
+                .iter_mut()
+                .find(|operation| operation.id == operation_id)
+            {
+                operation.status = ReviewOperationStatus::Prepared;
+            }
+            return rejected(format!(
+                "could not durably save the in-flight review operation; dispatched zero writes: {error}"
+            ));
+        }
+        let transport = Session::new(self)
+            .graphql_mutation::<ReviewMutationData>(prepared.query, prepared.variables);
+        match transport {
+            MutationTransport::Rejected(reason) => {
+                let _ = composition.mark_uncertain(operation_id, reason.clone());
+                let _ = store.save(composition);
+                ProviderMutationOutcome::Uncertain { context, reason }
+            }
+            MutationTransport::Uncertain(reason) => {
+                let _ = composition.mark_uncertain(operation_id, reason.clone());
+                let _ = store.save(composition);
+                ProviderMutationOutcome::Uncertain { context, reason }
+            }
+            MutationTransport::Acknowledged(data) => {
+                let ack = match prepared.kind.acknowledgement(data) {
+                    Ok(ack) => ack,
+                    Err(reason) => {
+                        let _ = composition.mark_uncertain(operation_id, reason.clone());
+                        let _ = store.save(composition);
+                        return ProviderMutationOutcome::Uncertain { context, reason };
+                    }
+                };
+                let reconciled = match &payload {
+                    ReviewOperationPayload::PendingComment(intent) => composition
+                        .reconcile_observed_comment_success(
+                            operation_id,
+                            ack.review_id.clone(),
+                            ack.comment_id.clone().unwrap_or_default(),
+                            intent.body.clone(),
+                        ),
+                    ReviewOperationPayload::ImmediateComment(intent) => composition
+                        .reconcile_observed_comment_success(
+                            operation_id,
+                            ack.review_id.clone(),
+                            ack.comment_id.clone().unwrap_or_default(),
+                            intent.body.clone(),
+                        ),
+                    ReviewOperationPayload::Submission(_) => composition
+                        .reconcile_observed_submission_success(
+                            operation_id,
+                            ack.review_id.clone().unwrap_or_default(),
+                        ),
+                };
+                if let Err(error) = reconciled {
+                    let reason = format!(
+                        "GitHub acknowledged the write but local reconciliation failed: {error}"
+                    );
+                    let _ = composition.mark_uncertain(operation_id, reason.clone());
+                    let _ = store.save(composition);
+                    return ProviderMutationOutcome::Uncertain { context, reason };
+                }
+                let result = ReviewWriteAcknowledgement {
+                    operation_id: operation_id.to_owned(),
+                    review_id: ack.review_id,
+                    comment_id: ack.comment_id,
+                };
+                if let Err(error) = store.save(composition) {
+                    return ProviderMutationOutcome::Uncertain {
+                        context,
+                        reason: format!(
+                            "GitHub acknowledged the write but its local acknowledgement could not be saved; reconcile the durable InFlight attempt: {error}"
+                        ),
+                    };
+                }
+                ProviderMutationOutcome::Acknowledged(result)
+            }
+        }
+    }
+
+    /// Execute one explicit non-composition review action. The returned
+    /// uncertainty contains the exact request payload and attempt identity for
+    /// caller-owned durable reconciliation; this method never retries it.
+    pub fn execute_review_auxiliary(
+        &self,
+        repo: &Repository,
+        number: u64,
+        request: &ReviewAuxiliaryRequest,
+    ) -> ProviderMutationOutcome<ReviewAuxiliaryAcknowledgement> {
+        let prepared = match self.prepare_auxiliary_mutation(repo, number, request) {
+            Ok(prepared) => prepared,
+            Err(reason) => return rejected(reason),
+        };
+        let context = MutationContext {
+            operation_id: request.operation_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            action: prepared.action.into(),
+            payload: json!({"query": prepared.query, "variables": prepared.variables}),
+        };
+        match Session::new(self)
+            .graphql_mutation::<AuxiliaryMutationData>(prepared.query, prepared.variables)
+        {
+            MutationTransport::Rejected(reason) => rejected(reason),
+            MutationTransport::Uncertain(reason) => {
+                ProviderMutationOutcome::Uncertain { context, reason }
+            }
+            MutationTransport::Acknowledged(data) => match prepared.kind.acknowledgement(data) {
+                Ok(mut ack) => {
+                    ack.operation_id = request.operation_id.clone();
+                    ProviderMutationOutcome::Acknowledged(ack)
+                }
+                Err(reason) => ProviderMutationOutcome::Uncertain { context, reason },
+            },
+        }
+    }
+
+    fn prepare_review_mutation(
+        &self,
+        repo: &Repository,
+        payload: &ReviewOperationPayload,
+    ) -> std::result::Result<PreparedReviewMutation, String> {
+        let (key, reviewed_sha) = match payload {
+            ReviewOperationPayload::PendingComment(intent) => {
+                (&intent.key, intent.position.commit_sha.as_str())
+            }
+            ReviewOperationPayload::ImmediateComment(intent) => {
+                (&intent.key, intent.position.commit_sha.as_str())
+            }
+            ReviewOperationPayload::Submission(intent) => {
+                (&intent.key, intent.reviewed_commit_sha.as_str())
+            }
+        };
+        validate_sha(reviewed_sha).map_err(|error| error.to_string())?;
+        let mut session = Session::new(self);
+        let context = session
+            .review_action_context(repo, key.pull_request)
+            .map_err(|error| error.to_string())?;
+        if !context
+            .viewer
+            .login
+            .eq_ignore_ascii_case(&self.account.login)
+        {
+            return Err("selected GitHub credential resolved to another account".into());
+        }
+        if context.pull.state != "OPEN" {
+            return Err("pull request is not open for review actions".into());
+        }
+        match payload {
+            ReviewOperationPayload::PendingComment(intent) => {
+                prepare_pending_comment_mutation(&mut session, &context, intent)
+            }
+            ReviewOperationPayload::ImmediateComment(intent) => {
+                let variables = json!({
+                    "pullRequestId": context.pull.id,
+                    "commitOID": intent.position.commit_sha,
+                    "event": "COMMENT",
+                    "body": Value::Null,
+                    "threads": [thread_input(&intent.body, &intent.position)],
+                    "clientMutationId": intent.operation_id,
+                });
+                Ok(PreparedReviewMutation::new(
+                    "immediate-comment",
+                    ADD_REVIEW_MUTATION,
+                    variables,
+                    ReviewMutationKind::AddReviewWithComment,
+                ))
+            }
+            ReviewOperationPayload::Submission(intent) => {
+                prepare_submission_mutation(&mut session, &context, intent)
+            }
+        }
+    }
+
+    fn prepare_auxiliary_mutation(
+        &self,
+        repo: &Repository,
+        number: u64,
+        request: &ReviewAuxiliaryRequest,
+    ) -> std::result::Result<PreparedAuxiliaryMutation, String> {
+        self.validate_repo(repo)
+            .map_err(|error| error.to_string())?;
+        validate_action_identity(&request.operation_id, "operation_id")?;
+        validate_action_identity(&request.attempt_id, "attempt_id")?;
+        let mut session = Session::new(self);
+        let context = session
+            .review_action_context(repo, number)
+            .map_err(|error| error.to_string())?;
+        if !context
+            .viewer
+            .login
+            .eq_ignore_ascii_case(&self.account.login)
+        {
+            return Err("selected GitHub credential resolved to another account".into());
+        }
+        if context.pull.state != "OPEN" {
+            return Err("pull request is not open for review actions".into());
+        }
+        match &request.action {
+            ReviewAuxiliaryAction::UpdatePendingSummary { review, body } => {
+                validate_action_text(body, true)?;
+                validate_coordinates(repo, number, review)?;
+                let remote = session
+                    .review_node(&review.remote_id)
+                    .map_err(|e| e.to_string())?;
+                validate_pending_review(
+                    &remote,
+                    &context,
+                    self,
+                    remote.commit.as_ref().map(|c| c.oid.as_str()).unwrap_or(""),
+                )?;
+                Ok(PreparedAuxiliaryMutation::new(
+                    "update-pending-summary",
+                    UPDATE_REVIEW_MUTATION,
+                    json!({"reviewId": review.remote_id, "body": body, "clientMutationId": request.operation_id}),
+                    AuxiliaryMutationKind::Review,
+                ))
+            }
+            ReviewAuxiliaryAction::DeletePendingComment { review, comment } => {
+                validate_coordinates(repo, number, review)?;
+                validate_coordinates(repo, number, comment)?;
+                let remote_review = session
+                    .review_node(&review.remote_id)
+                    .map_err(|e| e.to_string())?;
+                validate_pending_review(
+                    &remote_review,
+                    &context,
+                    self,
+                    remote_review
+                        .commit
+                        .as_ref()
+                        .map(|c| c.oid.as_str())
+                        .unwrap_or(""),
+                )?;
+                let remote_comment = session
+                    .comment_node(&comment.remote_id)
+                    .map_err(|e| e.to_string())?;
+                validate_owned_comment(&remote_comment, &remote_review, self)?;
+                Ok(PreparedAuxiliaryMutation::new(
+                    "delete-pending-comment",
+                    DELETE_REVIEW_COMMENT_MUTATION,
+                    json!({"commentId": comment.remote_id, "clientMutationId": request.operation_id}),
+                    AuxiliaryMutationKind::DeletedComment,
+                ))
+            }
+            ReviewAuxiliaryAction::CancelPendingReview { review } => {
+                validate_coordinates(repo, number, review)?;
+                let remote = session
+                    .review_node(&review.remote_id)
+                    .map_err(|e| e.to_string())?;
+                validate_pending_review(
+                    &remote,
+                    &context,
+                    self,
+                    remote.commit.as_ref().map(|c| c.oid.as_str()).unwrap_or(""),
+                )?;
+                Ok(PreparedAuxiliaryMutation::new(
+                    "cancel-pending-review",
+                    DELETE_REVIEW_MUTATION,
+                    json!({"reviewId": review.remote_id, "clientMutationId": request.operation_id}),
+                    AuxiliaryMutationKind::DeletedReview,
+                ))
+            }
+            ReviewAuxiliaryAction::Reply {
+                thread,
+                pending_review,
+                body,
+            } => {
+                validate_action_text(body, false)?;
+                validate_coordinates(repo, number, thread)?;
+                let remote_thread = session
+                    .thread_node(&thread.remote_id)
+                    .map_err(|e| e.to_string())?;
+                validate_thread(&remote_thread, &context)?;
+                if !remote_thread.viewer_can_reply {
+                    return Err("selected account cannot reply to this review thread".into());
+                }
+                let pending_id = if let Some(review) = pending_review {
+                    validate_coordinates(repo, number, review)?;
+                    let remote = session
+                        .review_node(&review.remote_id)
+                        .map_err(|e| e.to_string())?;
+                    validate_pending_review(
+                        &remote,
+                        &context,
+                        self,
+                        remote.commit.as_ref().map(|c| c.oid.as_str()).unwrap_or(""),
+                    )?;
+                    Some(review.remote_id.clone())
+                } else {
+                    None
+                };
+                Ok(PreparedAuxiliaryMutation::new(
+                    "reply-review-thread",
+                    ADD_THREAD_REPLY_MUTATION,
+                    json!({"threadId": thread.remote_id, "reviewId": pending_id, "body": body, "clientMutationId": request.operation_id}),
+                    AuxiliaryMutationKind::Reply,
+                ))
+            }
+            ReviewAuxiliaryAction::SetThreadResolved { thread, resolved } => {
+                validate_coordinates(repo, number, thread)?;
+                let remote = session
+                    .thread_node(&thread.remote_id)
+                    .map_err(|e| e.to_string())?;
+                validate_thread(&remote, &context)?;
+                if remote.is_resolved == *resolved {
+                    return Err("review thread already has the requested resolution state".into());
+                }
+                if (*resolved && !remote.viewer_can_resolve)
+                    || (!*resolved && !remote.viewer_can_unresolve)
+                {
+                    return Err("selected account cannot change this review thread state".into());
+                }
+                Ok(PreparedAuxiliaryMutation::new(
+                    if *resolved {
+                        "resolve-review-thread"
+                    } else {
+                        "unresolve-review-thread"
+                    },
+                    if *resolved {
+                        RESOLVE_THREAD_MUTATION
+                    } else {
+                        UNRESOLVE_THREAD_MUTATION
+                    },
+                    json!({"threadId": thread.remote_id, "clientMutationId": request.operation_id}),
+                    AuxiliaryMutationKind::Thread,
+                ))
+            }
+        }
+    }
+
+    pub fn prepare_merge(
+        &self,
+        repo: &Repository,
+        number: u64,
+        reviewed_head_sha: &str,
+    ) -> Result<MergePreparation> {
+        self.validate_repo(repo)?;
+        validate_sha(reviewed_head_sha)?;
+        Session::new(self).merge_preparation(repo, number, reviewed_head_sha)
+    }
+
+    /// Execute one guarded PR action. Every merge-capable write carries the
+    /// reviewed head as GitHub's server-side `sha`/`expectedHeadOid` condition.
+    pub fn execute_merge(
+        &self,
+        repo: &Repository,
+        preparation: &MergePreparation,
+        request: &MergeExecutionRequest,
+    ) -> ProviderMutationOutcome<MergeAcknowledgement> {
+        if let Err(reason) = validate_merge_request(repo, preparation, request) {
+            return rejected(reason);
+        }
+        let fresh = match self.prepare_merge(
+            repo,
+            preparation.pull_request.pull_request,
+            &preparation.reviewed_head_sha,
+        ) {
+            Ok(fresh) => fresh,
+            Err(error) => return rejected(error.to_string()),
+        };
+        if fresh.current_head_sha != preparation.reviewed_head_sha
+            || fresh.current_head_sha != preparation.current_head_sha
+        {
+            return rejected("pull request head moved since merge preparation");
+        }
+        let prepared = match prepare_merge_mutation(&fresh, request) {
+            Ok(prepared) => prepared,
+            Err(reason) => return rejected(reason),
+        };
+        let context = MutationContext {
+            operation_id: request.operation_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            action: prepared.action.into(),
+            payload: json!({"query": prepared.query, "endpoint": prepared.endpoint, "variables": prepared.variables}),
+        };
+        let transport = match prepared.transport {
+            MergeTransport::Rest => Session::new(self)
+                .rest_mutation::<MergeRestResponse>(
+                    "PUT",
+                    prepared.endpoint.expect("REST endpoint"),
+                    prepared.variables,
+                )
+                .map_ack(MergeMutationAck::Rest),
+            MergeTransport::Graphql => Session::new(self)
+                .graphql_mutation::<MergeGraphqlData>(
+                    prepared.query.expect("GraphQL query"),
+                    prepared.variables,
+                )
+                .map_ack(MergeMutationAck::Graphql),
+        };
+        match transport {
+            MutationTransport::Rejected(reason) => rejected(reason),
+            MutationTransport::Uncertain(reason) => {
+                ProviderMutationOutcome::Uncertain { context, reason }
+            }
+            MutationTransport::Acknowledged(ack) => {
+                if let Err(reason) = ack.validate(&request.action, &request.operation_id) {
+                    return ProviderMutationOutcome::Uncertain { context, reason };
+                }
+                let observed = match self.prepare_merge(
+                    repo,
+                    preparation.pull_request.pull_request,
+                    &preparation.reviewed_head_sha,
+                ) {
+                    Ok(observed) => observed,
+                    Err(_) => return ProviderMutationOutcome::Uncertain {
+                        context,
+                        reason: "GitHub acknowledged the merge action but its result could not be reconciled by read".into(),
+                    },
+                };
+                let merged = observed.state == "MERGED";
+                let accepted = match request.action {
+                    MergeAction::Merge { .. } => merged,
+                    MergeAction::EnableAutoMerge { .. } => observed.auto_merge_enabled || merged,
+                    MergeAction::DisableAutoMerge => !observed.auto_merge_enabled,
+                    MergeAction::Enqueue => observed.in_merge_queue || merged,
+                    MergeAction::Dequeue => !observed.in_merge_queue,
+                };
+                if !accepted && !merged {
+                    return ProviderMutationOutcome::Uncertain {
+                        context,
+                        reason: "GitHub acknowledged the merge action but the reconciliation read did not observe it".into(),
+                    };
+                }
+                ProviderMutationOutcome::Acknowledged(MergeAcknowledgement {
+                    operation_id: request.operation_id.clone(),
+                    accepted: true,
+                    completed: merged,
+                    merged,
+                    merge_commit_sha: ack.merge_commit_sha(),
+                })
+            }
+        }
+    }
+
+    /// Assess source-ref deletion, but keep the write unavailable because
+    /// GitHub does not expose an expected-OID condition for `deleteRef`.
+    pub fn delete_merged_branch(
+        &self,
+        repo: &Repository,
+        preparation: &MergePreparation,
+        request: &BranchDeletionRequest,
+    ) -> ProviderMutationOutcome<BranchDeletionAcknowledgement> {
+        if let Err(reason) = validate_action_identity(&request.operation_id, "operation_id")
+            .and_then(|_| validate_action_identity(&request.attempt_id, "attempt_id"))
+        {
+            return rejected(reason);
+        }
+        if request.expected_merged_head_sha != preparation.reviewed_head_sha {
+            return rejected("branch deletion expected head differs from the reviewed merge head");
+        }
+        let fresh = match self.prepare_merge(
+            repo,
+            preparation.pull_request.pull_request,
+            &request.expected_merged_head_sha,
+        ) {
+            Ok(fresh) => fresh,
+            Err(error) => return rejected(error.to_string()),
+        };
+        if fresh.state != "MERGED"
+            || fresh.current_head_sha != request.expected_merged_head_sha
+            || fresh.head_repository != repo.full_name()
+            || !fresh.viewer_can_delete_head_ref
+        {
+            return rejected(
+                "source branch is not a safely deletable, freshly observed merged ref",
+            );
+        }
+        let Some(_ref_id) = fresh.head_ref_node_id.clone() else {
+            return rejected("source branch ref is already absent");
+        };
+        let descendants =
+            match Session::new(self).dependent_pull_requests(repo, &fresh.head_ref_name) {
+                Ok(descendants) => descendants,
+                Err(error) => return rejected(error.to_string()),
+            };
+        if !descendants.is_empty() {
+            return rejected("source branch is the base of an open descendant pull request");
+        }
+        rejected(
+            "safe branch deletion is unavailable: GitHub deleteRef has no server-side expected-OID condition, so a ref can advance after preflight",
+        )
     }
 
     /// Fetch a pinned PR comparison. A moving live PR is never substituted for the
@@ -379,6 +934,59 @@ fn parse_repository(input: &str) -> Result<(String, String)> {
     Ok((owner.into(), name.into()))
 }
 
+fn rejected<T>(reason: impl Into<String>) -> ProviderMutationOutcome<T> {
+    ProviderMutationOutcome::PreflightRejected {
+        reason: reason.into(),
+    }
+}
+
+fn coordinates_match(repo: &Repository, number: u64, value: &ProviderCoordinates) -> bool {
+    value.provider == "github"
+        && value.host.eq_ignore_ascii_case(&repo.host)
+        && value.owner.eq_ignore_ascii_case(&repo.owner)
+        && value.repository.eq_ignore_ascii_case(&repo.name)
+        && value.pull_request == number
+        && !value.remote_id.is_empty()
+}
+
+fn validate_review_key(
+    provider: &GithubProvider,
+    repo: &Repository,
+    composition: &ReviewComposition,
+    payload: &ReviewOperationPayload,
+) -> std::result::Result<(), String> {
+    provider
+        .validate_repo(repo)
+        .map_err(|error| error.to_string())?;
+    let key = match payload {
+        ReviewOperationPayload::PendingComment(intent) => &intent.key,
+        ReviewOperationPayload::ImmediateComment(intent) => &intent.key,
+        ReviewOperationPayload::Submission(intent) => &intent.key,
+    };
+    if key != &composition.key
+        || key.provider != "github"
+        || !key.host.eq_ignore_ascii_case(&repo.host)
+        || !key.owner.eq_ignore_ascii_case(&repo.owner)
+        || !key.repository.eq_ignore_ascii_case(&repo.name)
+        || key.account != provider.account
+        || key.pull_request == 0
+    {
+        return Err("frozen review payload belongs to another account, repository, or PR".into());
+    }
+    Ok(())
+}
+
+fn validate_node_id(id: &str) -> Result<()> {
+    ensure!(
+        !id.is_empty()
+            && id.len() <= 1024
+            && !id.contains('\0')
+            && !id.chars().any(char::is_whitespace),
+        "Invalid GitHub node ID"
+    );
+    Ok(())
+}
+
 struct Session<'a> {
     provider: &'a GithubProvider,
     started: Instant,
@@ -512,6 +1120,426 @@ impl<'a> Session<'a> {
         })
     }
 
+    fn graphql_mutation<T: serde::de::DeserializeOwned>(
+        &mut self,
+        query: &str,
+        variables: Value,
+    ) -> MutationTransport<T> {
+        if self.started.elapsed() >= Duration::from_secs(180) {
+            return MutationTransport::Rejected("GitHub operation time limit reached".into());
+        }
+        if !query.trim_start().starts_with("mutation ") {
+            return MutationTransport::Rejected(
+                "Only explicit GitHub GraphQL mutations may use the write transport".into(),
+            );
+        }
+        let input = match serde_json::to_vec(&json!({"query": query, "variables": variables})) {
+            Ok(input) if input.len() <= MAX_MUTATION_INPUT_BYTES => input,
+            Ok(_) => {
+                return MutationTransport::Rejected(
+                    "GitHub GraphQL mutation input limit reached".into(),
+                );
+            }
+            Err(_) => {
+                return MutationTransport::Rejected(
+                    "Cannot encode bounded GitHub GraphQL mutation".into(),
+                );
+            }
+        };
+        let token = match self.credential() {
+            Ok(token) => token,
+            Err(error) => return MutationTransport::Rejected(error.to_string()),
+        };
+        let mut command = self.provider.runner.gh_command();
+        command.env("GH_TOKEN", token).args([
+            "api",
+            "--hostname",
+            HOST,
+            "--method",
+            "POST",
+            "--header",
+            "Accept: application/vnd.github+json",
+            "--header",
+            API_VERSION,
+            "graphql",
+            "--input",
+            "-",
+        ]);
+        let bytes =
+            match self
+                .provider
+                .runner
+                .run_with_input(command, "GitHub GraphQL mutation", &input)
+            {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return MutationTransport::Uncertain(
+                        "GitHub mutation started but its result was not acknowledged".into(),
+                    );
+                }
+            };
+        self.bytes += bytes.len();
+        if self.bytes > MAX_OPERATION_BYTES {
+            return MutationTransport::Uncertain(
+                "GitHub mutation response exceeded the operation output limit".into(),
+            );
+        }
+        let envelope: GraphqlEnvelope<T> = match decode(&bytes) {
+            Ok(envelope) => envelope,
+            Err(_) => {
+                return MutationTransport::Uncertain(
+                    "GitHub mutation returned an invalid or incomplete acknowledgement".into(),
+                );
+            }
+        };
+        if !envelope.errors.is_empty() || envelope.data.is_none() {
+            return MutationTransport::Uncertain(
+                "GitHub mutation did not return an unambiguous acknowledgement".into(),
+            );
+        }
+        MutationTransport::Acknowledged(envelope.data.expect("checked"))
+    }
+
+    fn rest_mutation<T: serde::de::DeserializeOwned>(
+        &mut self,
+        method: &str,
+        endpoint: String,
+        variables: Value,
+    ) -> MutationTransport<T> {
+        if method != "PUT" || endpoint.contains(['\0', '\n', '\r']) {
+            return MutationTransport::Rejected("unsupported REST mutation entrypoint".into());
+        }
+        let input = match serde_json::to_vec(&variables) {
+            Ok(input) if input.len() <= MAX_MUTATION_INPUT_BYTES => input,
+            Ok(_) => {
+                return MutationTransport::Rejected(
+                    "GitHub REST mutation input limit reached".into(),
+                );
+            }
+            Err(_) => {
+                return MutationTransport::Rejected(
+                    "Cannot encode bounded GitHub REST mutation".into(),
+                );
+            }
+        };
+        let token = match self.credential() {
+            Ok(token) => token,
+            Err(error) => return MutationTransport::Rejected(error.to_string()),
+        };
+        let mut command = self.provider.runner.gh_command();
+        command.env("GH_TOKEN", token).args([
+            "api",
+            "--hostname",
+            HOST,
+            "--method",
+            method,
+            "--header",
+            "Accept: application/vnd.github+json",
+            "--header",
+            API_VERSION,
+            &endpoint,
+            "--input",
+            "-",
+        ]);
+        let bytes =
+            match self
+                .provider
+                .runner
+                .run_with_input(command, "GitHub REST mutation", &input)
+            {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return MutationTransport::Uncertain(
+                        "GitHub mutation started but its result was not acknowledged".into(),
+                    );
+                }
+            };
+        match decode(&bytes) {
+            Ok(value) => MutationTransport::Acknowledged(value),
+            Err(_) => MutationTransport::Uncertain(
+                "GitHub mutation returned an invalid or incomplete acknowledgement".into(),
+            ),
+        }
+    }
+
+    fn credential(&self) -> Result<String> {
+        let mut token_command = self.provider.runner.gh_command();
+        token_command.args([
+            "auth",
+            "token",
+            "--hostname",
+            &self.provider.account.host,
+            "--user",
+            &self.provider.account.login,
+        ]);
+        let token = self
+            .provider
+            .runner
+            .run(token_command, "resolve selected GitHub credential")?;
+        let token = std::str::from_utf8(&token)
+            .map_err(|_| anyhow::anyhow!("Invalid credential encoding"))?
+            .trim();
+        ensure!(
+            !token.is_empty() && token.len() <= 4096 && !token.chars().any(char::is_whitespace),
+            "Missing or invalid selected GitHub credential"
+        );
+        Ok(token.to_owned())
+    }
+
+    fn review_action_context(
+        &mut self,
+        repo: &Repository,
+        number: u64,
+    ) -> Result<ReviewActionContext> {
+        ensure!(number > 0 && number <= i32::MAX as u64, "Invalid PR number");
+        let response: GraphqlResult<ReviewActionContextData> = self.graphql(
+            REVIEW_ACTION_CONTEXT_QUERY,
+            json!({"owner": repo.owner, "name": repo.name, "number": number}),
+        )?;
+        ensure!(!response.partial, "GitHub action preflight was partial");
+        let repository = response
+            .data
+            .repository
+            .context("GitHub action repository is unavailable")?;
+        ensure!(
+            repository
+                .name_with_owner
+                .eq_ignore_ascii_case(&repo.full_name()),
+            "GitHub action repository mismatch"
+        );
+        let pull = repository
+            .pull_request
+            .context("GitHub action pull request is unavailable")?;
+        ensure!(
+            pull.number == number
+                && pull.url == format!("https://{}/{}/pull/{number}", repo.host, repo.full_name()),
+            "GitHub action pull request mismatch"
+        );
+        validate_sha(&pull.head_ref_oid)?;
+        Ok(ReviewActionContext {
+            viewer: response.data.viewer,
+            repository: repository.name_with_owner,
+            pull,
+        })
+    }
+
+    fn review_node(&mut self, id: &str) -> Result<ActionReviewNode> {
+        validate_node_id(id)?;
+        let response: GraphqlResult<ActionReviewNodeData> =
+            self.graphql(REVIEW_NODE_QUERY, json!({"id": id}))?;
+        ensure!(
+            !response.partial,
+            "GitHub review identity preflight was partial"
+        );
+        response
+            .data
+            .node
+            .context("GitHub review ID is unavailable or has the wrong type")
+    }
+
+    fn comment_node(&mut self, id: &str) -> Result<ActionCommentNode> {
+        validate_node_id(id)?;
+        let response: GraphqlResult<ActionCommentNodeData> =
+            self.graphql(COMMENT_NODE_QUERY, json!({"id": id}))?;
+        ensure!(
+            !response.partial,
+            "GitHub comment identity preflight was partial"
+        );
+        response
+            .data
+            .node
+            .context("GitHub comment ID is unavailable or has the wrong type")
+    }
+
+    fn thread_node(&mut self, id: &str) -> Result<ActionThreadNode> {
+        validate_node_id(id)?;
+        let response: GraphqlResult<ActionThreadNodeData> =
+            self.graphql(THREAD_NODE_QUERY, json!({"id": id}))?;
+        ensure!(
+            !response.partial,
+            "GitHub thread identity preflight was partial"
+        );
+        response
+            .data
+            .node
+            .context("GitHub thread ID is unavailable or has the wrong type")
+    }
+
+    fn merge_preparation(
+        &mut self,
+        repo: &Repository,
+        number: u64,
+        reviewed_head_sha: &str,
+    ) -> Result<MergePreparation> {
+        ensure!(number > 0 && number <= i32::MAX as u64, "Invalid PR number");
+        let response: GraphqlResult<MergePreparationData> = self.graphql(
+            MERGE_PREPARATION_QUERY,
+            json!({"owner": repo.owner, "name": repo.name, "number": number}),
+        )?;
+        ensure!(!response.partial, "GitHub merge preparation was partial");
+        ensure!(
+            response
+                .data
+                .viewer
+                .login
+                .eq_ignore_ascii_case(&self.provider.account.login),
+            "selected GitHub credential resolved to another account"
+        );
+        let repository = response
+            .data
+            .repository
+            .context("GitHub merge repository is unavailable")?;
+        ensure!(
+            repository
+                .name_with_owner
+                .eq_ignore_ascii_case(&repo.full_name()),
+            "GitHub merge repository mismatch"
+        );
+        let pull = repository
+            .pull_request
+            .context("GitHub merge pull request is unavailable")?;
+        ensure!(
+            pull.number == number
+                && pull.url == format!("https://{}/{}/pull/{number}", repo.host, repo.full_name()),
+            "GitHub merge pull request mismatch"
+        );
+        validate_sha(&pull.head_ref_oid)?;
+        let mut allowed_methods = Vec::new();
+        if repository.merge_commit_allowed {
+            allowed_methods.push(MergeMethod::Merge);
+        }
+        if repository.squash_merge_allowed {
+            allowed_methods.push(MergeMethod::Squash);
+        }
+        if repository.rebase_merge_allowed {
+            allowed_methods.push(MergeMethod::Rebase);
+        }
+        let mut blockers = Vec::new();
+        if pull.head_ref_oid != reviewed_head_sha {
+            blockers.push("head moved from the reviewed revision".into());
+        }
+        if pull.state != "OPEN" && pull.state != "MERGED" {
+            blockers.push("pull request is closed without merge".into());
+        }
+        if pull.is_draft {
+            blockers.push("pull request is a draft".into());
+        }
+        if pull.mergeable != "MERGEABLE" && pull.state != "MERGED" {
+            blockers.push(format!("mergeability is {}", pull.mergeable));
+        }
+        if !matches!(pull.merge_state_status.as_str(), "CLEAN" | "HAS_HOOKS")
+            && pull.state != "MERGED"
+        {
+            blockers.push(format!("merge state is {}", pull.merge_state_status));
+        }
+        if matches!(
+            pull.review_decision.as_deref(),
+            Some("CHANGES_REQUESTED" | "REVIEW_REQUIRED")
+        ) {
+            blockers.push(format!(
+                "review decision is {}",
+                pull.review_decision.as_deref().unwrap_or("UNKNOWN")
+            ));
+        }
+        let check_status = pull
+            .status_check_rollup
+            .as_ref()
+            .map(|value| value.state.clone())
+            .unwrap_or_else(|| "NONE".into());
+        if !matches!(check_status.as_str(), "SUCCESS" | "NONE") {
+            blockers.push(format!("check status is {check_status}"));
+        }
+        if allowed_methods.is_empty() {
+            blockers.push("repository has no supported merge method".into());
+        }
+        let permission = repository.viewer_permission.clone();
+        if !matches!(permission.as_deref(), Some("WRITE" | "MAINTAIN" | "ADMIN"))
+            && !pull.viewer_can_merge_as_admin
+        {
+            blockers.push("selected account lacks merge permission".into());
+        }
+        let head_ref = pull.head_ref.as_ref();
+        if let Some(reference) = head_ref {
+            ensure!(
+                reference.name == pull.head_ref_name && reference.target.oid == pull.head_ref_oid,
+                "GitHub head ref changed during merge preparation"
+            );
+        }
+        let queue_required = pull.is_merge_queue_enabled;
+        Ok(MergePreparation {
+            pull_request: coordinates(repo, number, pull.id.clone()),
+            pull_request_node_id: pull.id,
+            reviewed_head_sha: reviewed_head_sha.into(),
+            current_head_sha: pull.head_ref_oid,
+            head_ref_name: pull.head_ref_name,
+            head_ref_node_id: head_ref.map(|reference| reference.id.clone()),
+            head_repository: pull
+                .head_repository
+                .map(|repository| repository.name_with_owner)
+                .unwrap_or_default(),
+            state: pull.state,
+            draft: pull.is_draft,
+            mergeable: pull.mergeable,
+            merge_state_status: pull.merge_state_status,
+            review_status: pull.review_decision.unwrap_or_else(|| "NONE".into()),
+            check_status,
+            repository_permission: permission,
+            allowed_methods,
+            blockers,
+            auto_merge_allowed: repository.auto_merge_allowed,
+            auto_merge_enabled: pull.auto_merge_request.is_some(),
+            can_enable_auto_merge: pull.viewer_can_enable_auto_merge,
+            can_disable_auto_merge: pull.viewer_can_disable_auto_merge,
+            merge_queue_required: queue_required,
+            in_merge_queue: pull.is_in_merge_queue || pull.merge_queue_entry.is_some(),
+            viewer_can_merge_as_admin: pull.viewer_can_merge_as_admin,
+            viewer_can_delete_head_ref: pull.viewer_can_delete_head_ref,
+            preferred_headlines: vec![
+                (MergeMethod::Merge, pull.merge_headline),
+                (MergeMethod::Squash, pull.squash_headline),
+                (MergeMethod::Rebase, pull.rebase_headline),
+            ],
+            preferred_bodies: vec![
+                (MergeMethod::Merge, pull.merge_body),
+                (MergeMethod::Squash, pull.squash_body),
+                (MergeMethod::Rebase, pull.rebase_body),
+            ],
+        })
+    }
+
+    fn dependent_pull_requests(&mut self, repo: &Repository, branch: &str) -> Result<Vec<u64>> {
+        validate_ref_name(branch)?;
+        let response: GraphqlResult<DependentPullData> = self.graphql(
+            DEPENDENT_PULLS_QUERY,
+            json!({"owner": repo.owner, "name": repo.name, "base": branch}),
+        )?;
+        ensure!(
+            !response.partial,
+            "GitHub dependent-PR preflight was partial"
+        );
+        let repository = response
+            .data
+            .repository
+            .context("GitHub dependent-PR repository is unavailable")?;
+        ensure!(
+            repository
+                .name_with_owner
+                .eq_ignore_ascii_case(&repo.full_name()),
+            "GitHub dependent-PR repository mismatch"
+        );
+        ensure!(
+            !repository.pull_requests.page_info.has_next_page,
+            "Dependent PRs exceed the explicit 100-PR safety bound"
+        );
+        Ok(repository
+            .pull_requests
+            .nodes
+            .into_iter()
+            .flatten()
+            .map(|pull| pull.number)
+            .collect())
+    }
+
     fn hydrate_metadata(&mut self, repo: &Repository, pulls: &mut [PullRequest]) -> Result<()> {
         if pulls.is_empty() {
             return Ok(());
@@ -591,6 +1619,79 @@ impl<'a> Session<'a> {
             builder.checks_complete = false;
         }
         builder.finish(number)
+    }
+
+    fn pending_review(
+        &mut self,
+        repo: &Repository,
+        number: u64,
+    ) -> Result<Option<PendingReviewSnapshot>> {
+        let response: GraphqlResult<PendingReviewData> = self.graphql(
+            PENDING_REVIEW_QUERY,
+            json!({"owner": repo.owner, "name": repo.name, "number": number}),
+        )?;
+        ensure!(
+            !response.partial,
+            "GitHub pending-review import was partial"
+        );
+        let repository = response
+            .data
+            .repository
+            .context("GitHub pending-review repository is unavailable")?;
+        ensure!(
+            repository
+                .name_with_owner
+                .eq_ignore_ascii_case(&repo.full_name()),
+            "GitHub pending-review repository mismatch"
+        );
+        let pull = repository
+            .pull_request
+            .context("GitHub pending-review PR is unavailable")?;
+        ensure!(pull.number == number, "GitHub pending-review PR mismatch");
+        ensure!(
+            !pull.reviews.page_info.has_next_page,
+            "Pending-review list exceeds the explicit 100-review import bound"
+        );
+        let mut selected = pull.reviews.nodes.into_iter().flatten().filter(|review| {
+            review.author.as_ref().is_some_and(|author| {
+                author
+                    .login
+                    .eq_ignore_ascii_case(&self.provider.account.login)
+            })
+        });
+        let Some(review) = selected.next() else {
+            return Ok(None);
+        };
+        ensure!(
+            selected.next().is_none(),
+            "GitHub returned multiple pending reviews for the selected account"
+        );
+        let review_id = review.id.clone();
+        let comments_complete = !review.comments.page_info.has_next_page
+            && review.comments.nodes.iter().all(Option::is_some);
+        let comments = review
+            .comments
+            .nodes
+            .into_iter()
+            .flatten()
+            .map(|comment| LinkedReviewComment {
+                pull_request_review_id: review_id.clone(),
+                comment: comment.into_domain(repo, number, None),
+            })
+            .collect();
+        Ok(Some(PendingReviewSnapshot {
+            review: PullRequestReview {
+                coordinates: coordinates(repo, number, review.id),
+                author: review.author.map(|author| author.login),
+                body: review.body,
+                state: review.state,
+                submitted_at: review.submitted_at,
+                commit_sha: review.commit.map(|commit| commit.oid),
+                url: review.url,
+            },
+            comments,
+            comments_complete,
+        }))
     }
 
     fn pull(&mut self, repo: &Repository, number: u64) -> Result<ApiPullRequest> {
@@ -761,6 +1862,22 @@ impl Runner {
 struct GraphqlResult<T> {
     data: T,
     partial: bool,
+}
+
+enum MutationTransport<T> {
+    Rejected(String),
+    Acknowledged(T),
+    Uncertain(String),
+}
+
+impl<T> MutationTransport<T> {
+    fn map_ack<U>(self, map: impl FnOnce(T) -> U) -> MutationTransport<U> {
+        match self {
+            Self::Rejected(reason) => MutationTransport::Rejected(reason),
+            Self::Acknowledged(value) => MutationTransport::Acknowledged(map(value)),
+            Self::Uncertain(reason) => MutationTransport::Uncertain(reason),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -999,6 +2116,1165 @@ struct BulkMetadataRepository {
     pulls: HashMap<String, Option<BulkPullMetadata>>,
 }
 
+const MERGE_PREPARATION_QUERY: &str = r#"query MergePreparation(
+  $owner: String!, $name: String!, $number: Int!
+) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    id nameWithOwner viewerPermission mergeCommitAllowed squashMergeAllowed
+    rebaseMergeAllowed autoMergeAllowed
+    pullRequest(number: $number) {
+      id number url state isDraft headRefOid headRefName mergeable mergeStateStatus
+      reviewDecision viewerCanEnableAutoMerge viewerCanDisableAutoMerge
+      viewerCanMergeAsAdmin viewerCanDeleteHeadRef
+      headRepository { nameWithOwner }
+      headRef { id name target { oid } }
+      isMergeQueueEnabled isInMergeQueue
+      autoMergeRequest { enabledAt }
+      mergeQueueEntry { id }
+      statusCheckRollup { state }
+      mergeHeadline: viewerMergeHeadlineText(mergeType: MERGE)
+      mergeBody: viewerMergeBodyText(mergeType: MERGE)
+      squashHeadline: viewerMergeHeadlineText(mergeType: SQUASH)
+      squashBody: viewerMergeBodyText(mergeType: SQUASH)
+      rebaseHeadline: viewerMergeHeadlineText(mergeType: REBASE)
+      rebaseBody: viewerMergeBodyText(mergeType: REBASE)
+    }
+  }
+}"#;
+
+const DEPENDENT_PULLS_QUERY: &str = r#"query DependentPullRequests(
+  $owner: String!, $name: String!, $base: String!
+) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequests(first: 100, states: OPEN, baseRefName: $base) {
+      nodes { number }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}"#;
+
+const ENABLE_AUTO_MERGE_MUTATION: &str = r#"mutation EnableAutoMerge(
+  $pullRequestId: ID!, $expectedHeadOid: GitObjectID!, $mergeMethod: PullRequestMergeMethod!,
+  $commitHeadline: String, $commitBody: String, $clientMutationId: String!
+) {
+  enablePullRequestAutoMerge(input: {
+    pullRequestId: $pullRequestId, expectedHeadOid: $expectedHeadOid,
+    mergeMethod: $mergeMethod, commitHeadline: $commitHeadline, commitBody: $commitBody,
+    clientMutationId: $clientMutationId
+  }) { clientMutationId pullRequest { id state mergedAt autoMergeRequest { enabledAt } } }
+}"#;
+
+const DISABLE_AUTO_MERGE_MUTATION: &str = r#"mutation DisableAutoMerge(
+  $pullRequestId: ID!, $clientMutationId: String!
+) {
+  disablePullRequestAutoMerge(input: {
+    pullRequestId: $pullRequestId, clientMutationId: $clientMutationId
+  }) { clientMutationId pullRequest { id state mergedAt autoMergeRequest { enabledAt } } }
+}"#;
+
+const ENQUEUE_PULL_MUTATION: &str = r#"mutation EnqueuePull(
+  $pullRequestId: ID!, $expectedHeadOid: GitObjectID!, $clientMutationId: String!
+) {
+  enqueuePullRequest(input: {
+    pullRequestId: $pullRequestId, expectedHeadOid: $expectedHeadOid,
+    clientMutationId: $clientMutationId
+  }) { clientMutationId mergeQueueEntry { id } }
+}"#;
+
+const DEQUEUE_PULL_MUTATION: &str = r#"mutation DequeuePull(
+  $pullRequestId: ID!, $clientMutationId: String!
+) {
+  dequeuePullRequest(input: {
+    id: $pullRequestId, clientMutationId: $clientMutationId
+  }) { clientMutationId mergeQueueEntry { id } }
+}"#;
+
+#[derive(Deserialize)]
+struct MergePreparationData {
+    viewer: GraphqlActor,
+    repository: Option<MergeRepository>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeRepository {
+    name_with_owner: String,
+    viewer_permission: Option<String>,
+    merge_commit_allowed: bool,
+    squash_merge_allowed: bool,
+    rebase_merge_allowed: bool,
+    auto_merge_allowed: bool,
+    pull_request: Option<MergePull>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergePull {
+    id: String,
+    number: u64,
+    url: String,
+    state: String,
+    is_draft: bool,
+    head_ref_oid: String,
+    head_ref_name: String,
+    mergeable: String,
+    merge_state_status: String,
+    review_decision: Option<String>,
+    viewer_can_enable_auto_merge: bool,
+    viewer_can_disable_auto_merge: bool,
+    viewer_can_merge_as_admin: bool,
+    viewer_can_delete_head_ref: bool,
+    head_repository: Option<ActionRepositoryIdentity>,
+    head_ref: Option<MergeRef>,
+    is_merge_queue_enabled: bool,
+    is_in_merge_queue: bool,
+    auto_merge_request: Option<Value>,
+    merge_queue_entry: Option<GraphqlNodeId>,
+    status_check_rollup: Option<MergeCheckRollup>,
+    merge_headline: String,
+    merge_body: String,
+    squash_headline: String,
+    squash_body: String,
+    rebase_headline: String,
+    rebase_body: String,
+}
+#[derive(Deserialize)]
+struct MergeRef {
+    id: String,
+    name: String,
+    target: GraphqlOid,
+}
+#[derive(Deserialize)]
+struct MergeCheckRollup {
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct DependentPullData {
+    repository: Option<DependentRepository>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DependentRepository {
+    name_with_owner: String,
+    pull_requests: GraphqlConnection<DependentPull>,
+}
+#[derive(Deserialize)]
+struct DependentPull {
+    number: u64,
+}
+
+#[derive(Deserialize)]
+struct MergeRestResponse {
+    sha: Option<String>,
+    merged: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeGraphqlData {
+    enable_pull_request_auto_merge: Option<MergePullPayload>,
+    disable_pull_request_auto_merge: Option<MergePullPayload>,
+    enqueue_pull_request: Option<MergeQueuePayload>,
+    dequeue_pull_request: Option<MergeQueuePayload>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergePullPayload {
+    client_mutation_id: Option<String>,
+    pull_request: Option<GraphqlNodeId>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeQueuePayload {
+    client_mutation_id: Option<String>,
+    merge_queue_entry: Option<GraphqlNodeId>,
+}
+
+enum MergeMutationAck {
+    Rest(MergeRestResponse),
+    Graphql(MergeGraphqlData),
+}
+impl MergeMutationAck {
+    fn validate(
+        &self,
+        action: &MergeAction,
+        operation_id: &str,
+    ) -> std::result::Result<(), String> {
+        match (self, action) {
+            (Self::Rest(response), MergeAction::Merge { .. }) if response.merged => Ok(()),
+            (Self::Graphql(data), MergeAction::EnableAutoMerge { .. })
+                if data
+                    .enable_pull_request_auto_merge
+                    .as_ref()
+                    .is_some_and(|p| {
+                        p.client_mutation_id.as_deref() == Some(operation_id)
+                            && p.pull_request.is_some()
+                    }) =>
+            {
+                Ok(())
+            }
+            (Self::Graphql(data), MergeAction::DisableAutoMerge)
+                if data
+                    .disable_pull_request_auto_merge
+                    .as_ref()
+                    .is_some_and(|p| {
+                        p.client_mutation_id.as_deref() == Some(operation_id)
+                            && p.pull_request.is_some()
+                    }) =>
+            {
+                Ok(())
+            }
+            (Self::Graphql(data), MergeAction::Enqueue)
+                if data.enqueue_pull_request.as_ref().is_some_and(|p| {
+                    p.client_mutation_id.as_deref() == Some(operation_id)
+                        && p.merge_queue_entry.is_some()
+                }) =>
+            {
+                Ok(())
+            }
+            (Self::Graphql(data), MergeAction::Dequeue)
+                if data
+                    .dequeue_pull_request
+                    .as_ref()
+                    .is_some_and(|p| p.client_mutation_id.as_deref() == Some(operation_id)) =>
+            {
+                Ok(())
+            }
+            _ => Err("GitHub omitted the merge action acknowledgement".into()),
+        }
+    }
+    fn merge_commit_sha(&self) -> Option<String> {
+        match self {
+            Self::Rest(response) => response.sha.clone(),
+            Self::Graphql(_) => None,
+        }
+    }
+}
+
+enum MergeTransport {
+    Rest,
+    Graphql,
+}
+struct PreparedMergeMutation {
+    action: &'static str,
+    transport: MergeTransport,
+    query: Option<&'static str>,
+    endpoint: Option<String>,
+    variables: Value,
+}
+
+fn prepare_merge_mutation(
+    preparation: &MergePreparation,
+    request: &MergeExecutionRequest,
+) -> std::result::Result<PreparedMergeMutation, String> {
+    let common = |action, query, variables| PreparedMergeMutation {
+        action,
+        transport: MergeTransport::Graphql,
+        query: Some(query),
+        endpoint: None,
+        variables,
+    };
+    match &request.action {
+        MergeAction::Merge {
+            method,
+            commit_title,
+            commit_message,
+        } => {
+            if preparation.merge_queue_required {
+                return Err(
+                    "base branch requires merge queue; ordinary merge is unavailable".into(),
+                );
+            }
+            if !preparation.blockers.is_empty() {
+                return Err(format!(
+                    "merge is blocked: {}",
+                    preparation.blockers.join("; ")
+                ));
+            }
+            if !preparation.allowed_methods.contains(method) {
+                return Err("requested merge method is unavailable".into());
+            }
+            Ok(PreparedMergeMutation {
+                action: "merge-pull-request",
+                transport: MergeTransport::Rest,
+                query: None,
+                endpoint: Some(format!(
+                    "repos/{}/pulls/{}/merge",
+                    preparation.pull_request.owner.clone()
+                        + "/"
+                        + &preparation.pull_request.repository,
+                    preparation.pull_request.pull_request
+                )),
+                variables: json!({"sha": preparation.reviewed_head_sha, "merge_method": method.rest_name(), "commit_title": commit_title, "commit_message": commit_message}),
+            })
+        }
+        MergeAction::EnableAutoMerge {
+            method,
+            commit_title,
+            commit_message,
+        } => {
+            if !preparation.auto_merge_allowed
+                || !preparation.can_enable_auto_merge
+                || preparation.auto_merge_enabled
+            {
+                return Err("auto-merge cannot be enabled for this PR".into());
+            }
+            if !preparation.allowed_methods.contains(method) {
+                return Err("requested auto-merge method is unavailable".into());
+            }
+            Ok(common(
+                "enable-auto-merge",
+                ENABLE_AUTO_MERGE_MUTATION,
+                json!({
+                    "pullRequestId": preparation.pull_request_node_id,
+                    "expectedHeadOid": preparation.reviewed_head_sha,
+                    "mergeMethod": method.graphql_name(), "commitHeadline": commit_title,
+                    "commitBody": commit_message, "clientMutationId": request.operation_id,
+                }),
+            ))
+        }
+        MergeAction::DisableAutoMerge => {
+            if !preparation.auto_merge_enabled || !preparation.can_disable_auto_merge {
+                return Err("auto-merge is not enabled or cannot be disabled".into());
+            }
+            Ok(common(
+                "disable-auto-merge",
+                DISABLE_AUTO_MERGE_MUTATION,
+                json!({"pullRequestId": preparation.pull_request_node_id, "clientMutationId": request.operation_id}),
+            ))
+        }
+        MergeAction::Enqueue => {
+            if !preparation.merge_queue_required || preparation.in_merge_queue {
+                return Err("merge queue is unavailable or PR is already queued".into());
+            }
+            Ok(common(
+                "enqueue-pull-request",
+                ENQUEUE_PULL_MUTATION,
+                json!({"pullRequestId": preparation.pull_request_node_id, "expectedHeadOid": preparation.reviewed_head_sha, "clientMutationId": request.operation_id}),
+            ))
+        }
+        MergeAction::Dequeue => {
+            if !preparation.in_merge_queue {
+                return Err("pull request is not in the merge queue".into());
+            }
+            Ok(common(
+                "dequeue-pull-request",
+                DEQUEUE_PULL_MUTATION,
+                json!({"pullRequestId": preparation.pull_request_node_id, "clientMutationId": request.operation_id}),
+            ))
+        }
+    }
+}
+
+fn validate_merge_request(
+    repo: &Repository,
+    preparation: &MergePreparation,
+    request: &MergeExecutionRequest,
+) -> std::result::Result<(), String> {
+    validate_coordinates(
+        repo,
+        preparation.pull_request.pull_request,
+        &preparation.pull_request,
+    )?;
+    validate_action_identity(&request.operation_id, "operation_id")?;
+    validate_action_identity(&request.attempt_id, "attempt_id")?;
+    validate_sha(&preparation.reviewed_head_sha).map_err(|error| error.to_string())?;
+    if preparation.pull_request.remote_id != preparation.pull_request_node_id {
+        return Err("merge preparation PR node identity is inconsistent".into());
+    }
+    Ok(())
+}
+
+fn validate_ref_name(value: &str) -> Result<()> {
+    ensure!(
+        !value.is_empty() && value.len() <= 1024 && !value.contains(['\0', '\n', '\r']),
+        "Invalid Git ref name"
+    );
+    Ok(())
+}
+
+const PENDING_REVIEW_QUERY: &str = r#"query PendingReview(
+  $owner: String!, $name: String!, $number: Int!
+) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequest(number: $number) {
+      number
+      reviews(first: 100, states: PENDING) {
+        nodes {
+          id author { login } body state submittedAt commit { oid } url
+          comments(first: 100) {
+            nodes {
+              id author { login } body createdAt updatedAt url path line originalLine
+              startLine originalStartLine diffHunk outdated commit { oid } originalCommit { oid }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}"#;
+
+const REVIEW_ACTION_CONTEXT_QUERY: &str = r#"query ReviewActionContext(
+  $owner: String!, $name: String!, $number: Int!
+) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequest(number: $number) { id number url headRefOid state }
+  }
+}"#;
+
+const REVIEW_NODE_QUERY: &str = r#"query ReviewIdentity($id: ID!) {
+  node(id: $id) {
+    ... on PullRequestReview {
+      id state author { login } commit { oid }
+      pullRequest { id number repository { nameWithOwner } }
+    }
+  }
+}"#;
+
+const COMMENT_NODE_QUERY: &str = r#"query ReviewCommentIdentity($id: ID!) {
+  node(id: $id) {
+    ... on PullRequestReviewComment {
+      id author { login }
+      pullRequestReview {
+        id state author { login } commit { oid }
+        pullRequest { id number repository { nameWithOwner } }
+      }
+    }
+  }
+}"#;
+
+const THREAD_NODE_QUERY: &str = r#"query ReviewThreadIdentity($id: ID!) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      id isResolved viewerCanReply viewerCanResolve viewerCanUnresolve
+      pullRequest { id number repository { nameWithOwner } }
+    }
+  }
+}"#;
+
+const ADD_REVIEW_MUTATION: &str = r#"mutation AddReview(
+  $pullRequestId: ID!, $commitOID: GitObjectID!, $event: PullRequestReviewEvent,
+  $body: String, $threads: [DraftPullRequestReviewThread], $clientMutationId: String!
+) {
+  addPullRequestReview(input: {
+    pullRequestId: $pullRequestId, commitOID: $commitOID, event: $event,
+    body: $body, threads: $threads, clientMutationId: $clientMutationId
+  }) {
+    pullRequestReview { id state commit { oid } comments(last: 1) { nodes { id body pullRequestReview { id } } } }
+  }
+}"#;
+
+const ADD_REVIEW_THREAD_MUTATION: &str = r#"mutation AddReviewThread(
+  $pullRequestReviewId: ID!, $body: String!, $path: String!, $line: Int!,
+  $side: DiffSide!, $startLine: Int, $startSide: DiffSide, $clientMutationId: String!
+) {
+  addPullRequestReviewThread(input: {
+    pullRequestReviewId: $pullRequestReviewId, body: $body, path: $path,
+    line: $line, side: $side, startLine: $startLine, startSide: $startSide,
+    clientMutationId: $clientMutationId
+  }) { thread { comments(first: 1) { nodes { id body pullRequestReview { id } } } } }
+}"#;
+
+const UPDATE_REVIEW_COMMENT_MUTATION: &str = r#"mutation UpdateReviewComment(
+  $commentId: ID!, $body: String!, $clientMutationId: String!
+) {
+  updatePullRequestReviewComment(input: {
+    pullRequestReviewCommentId: $commentId, body: $body, clientMutationId: $clientMutationId
+  }) { pullRequestReviewComment { id body pullRequestReview { id } } }
+}"#;
+
+const SUBMIT_REVIEW_MUTATION: &str = r#"mutation SubmitReview(
+  $reviewId: ID!, $event: PullRequestReviewEvent!, $body: String,
+  $clientMutationId: String!
+) {
+  submitPullRequestReview(input: {
+    pullRequestReviewId: $reviewId, event: $event, body: $body,
+    clientMutationId: $clientMutationId
+  }) { pullRequestReview { id state commit { oid } } }
+}"#;
+
+const UPDATE_REVIEW_MUTATION: &str = r#"mutation UpdatePendingReview(
+  $reviewId: ID!, $body: String!, $clientMutationId: String!
+) {
+  updatePullRequestReview(input: {
+    pullRequestReviewId: $reviewId, body: $body, clientMutationId: $clientMutationId
+  }) { pullRequestReview { id } }
+}"#;
+
+const DELETE_REVIEW_COMMENT_MUTATION: &str = r#"mutation DeletePendingReviewComment(
+  $commentId: ID!, $clientMutationId: String!
+) {
+  deletePullRequestReviewComment(input: { id: $commentId, clientMutationId: $clientMutationId }) {
+    pullRequestReview { id }
+    pullRequestReviewComment { id }
+  }
+}"#;
+
+const DELETE_REVIEW_MUTATION: &str = r#"mutation CancelPendingReview(
+  $reviewId: ID!, $clientMutationId: String!
+) {
+  deletePullRequestReview(input: {
+    pullRequestReviewId: $reviewId, clientMutationId: $clientMutationId
+  }) { pullRequestReview { id } }
+}"#;
+
+const ADD_THREAD_REPLY_MUTATION: &str = r#"mutation ReplyReviewThread(
+  $threadId: ID!, $reviewId: ID, $body: String!, $clientMutationId: String!
+) {
+  addPullRequestReviewThreadReply(input: {
+    pullRequestReviewThreadId: $threadId, pullRequestReviewId: $reviewId,
+    body: $body, clientMutationId: $clientMutationId
+  }) { comment { id pullRequestReview { id } } }
+}"#;
+
+const RESOLVE_THREAD_MUTATION: &str = r#"mutation ResolveReviewThread(
+  $threadId: ID!, $clientMutationId: String!
+) {
+  resolveReviewThread(input: { threadId: $threadId, clientMutationId: $clientMutationId }) {
+    thread { id isResolved }
+  }
+}"#;
+
+const UNRESOLVE_THREAD_MUTATION: &str = r#"mutation UnresolveReviewThread(
+  $threadId: ID!, $clientMutationId: String!
+) {
+  unresolveReviewThread(input: { threadId: $threadId, clientMutationId: $clientMutationId }) {
+    thread { id isResolved }
+  }
+}"#;
+
+#[derive(Deserialize)]
+struct ReviewActionContextData {
+    viewer: GraphqlActor,
+    repository: Option<ReviewActionRepository>,
+}
+
+#[derive(Deserialize)]
+struct PendingReviewData {
+    repository: Option<PendingReviewRepository>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingReviewRepository {
+    name_with_owner: String,
+    pull_request: Option<PendingReviewPull>,
+}
+
+#[derive(Deserialize)]
+struct PendingReviewPull {
+    number: u64,
+    reviews: GraphqlConnection<PendingReviewNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingReviewNode {
+    id: String,
+    author: Option<GraphqlActor>,
+    body: String,
+    state: String,
+    submitted_at: Option<String>,
+    commit: Option<GraphqlOid>,
+    url: String,
+    comments: GraphqlConnection<DetailsReviewComment>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewActionRepository {
+    name_with_owner: String,
+    pull_request: Option<ActionPullIdentity>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActionPullIdentity {
+    id: String,
+    number: u64,
+    url: String,
+    head_ref_oid: String,
+    state: String,
+}
+
+struct ReviewActionContext {
+    viewer: GraphqlActor,
+    repository: String,
+    pull: ActionPullIdentity,
+}
+
+#[derive(Deserialize)]
+struct ActionReviewNodeData {
+    node: Option<ActionReviewNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActionReviewNode {
+    id: String,
+    state: String,
+    author: Option<GraphqlActor>,
+    commit: Option<GraphqlOid>,
+    pull_request: ActionReviewPull,
+}
+
+#[derive(Deserialize)]
+struct ActionReviewPull {
+    id: String,
+    number: u64,
+    repository: ActionRepositoryIdentity,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActionRepositoryIdentity {
+    name_with_owner: String,
+}
+
+#[derive(Deserialize)]
+struct ActionCommentNodeData {
+    node: Option<ActionCommentNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActionCommentNode {
+    id: String,
+    author: Option<GraphqlActor>,
+    pull_request_review: ActionReviewNode,
+}
+
+#[derive(Deserialize)]
+struct ActionThreadNodeData {
+    node: Option<ActionThreadNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActionThreadNode {
+    id: String,
+    is_resolved: bool,
+    viewer_can_reply: bool,
+    viewer_can_resolve: bool,
+    viewer_can_unresolve: bool,
+    pull_request: ActionReviewPull,
+}
+
+struct PreparedReviewMutation {
+    action: &'static str,
+    query: &'static str,
+    variables: Value,
+    kind: ReviewMutationKind,
+}
+
+impl PreparedReviewMutation {
+    fn new(
+        action: &'static str,
+        query: &'static str,
+        variables: Value,
+        kind: ReviewMutationKind,
+    ) -> Self {
+        Self {
+            action,
+            query,
+            variables,
+            kind,
+        }
+    }
+}
+
+enum ReviewMutationKind {
+    AddReviewWithComment,
+    AddThread,
+    UpdateComment,
+    SubmitReview,
+    AddSubmittedReview,
+}
+
+struct ReviewAck {
+    review_id: Option<String>,
+    comment_id: Option<String>,
+}
+
+impl ReviewMutationKind {
+    fn acknowledgement(self, data: ReviewMutationData) -> std::result::Result<ReviewAck, String> {
+        match self {
+            Self::AddReviewWithComment => {
+                let review = data
+                    .add_pull_request_review
+                    .and_then(|payload| payload.pull_request_review)
+                    .ok_or_else(|| {
+                        "GitHub omitted the created review acknowledgement".to_owned()
+                    })?;
+                let comment = review
+                    .comments
+                    .and_then(|comments| comments.nodes.into_iter().flatten().next())
+                    .ok_or_else(|| {
+                        "GitHub omitted the created review comment acknowledgement".to_owned()
+                    })?;
+                if comment.pull_request_review.id != review.id {
+                    return Err("GitHub acknowledged a comment linked to another review".into());
+                }
+                Ok(ReviewAck {
+                    review_id: Some(review.id),
+                    comment_id: Some(comment.id),
+                })
+            }
+            Self::AddThread => {
+                let comment = data
+                    .add_pull_request_review_thread
+                    .and_then(|payload| payload.thread)
+                    .and_then(|thread| thread.comments.nodes.into_iter().flatten().next())
+                    .ok_or_else(|| {
+                        "GitHub omitted the created review thread acknowledgement".to_owned()
+                    })?;
+                Ok(ReviewAck {
+                    review_id: Some(comment.pull_request_review.id),
+                    comment_id: Some(comment.id),
+                })
+            }
+            Self::UpdateComment => {
+                let comment = data
+                    .update_pull_request_review_comment
+                    .and_then(|payload| payload.pull_request_review_comment)
+                    .ok_or_else(|| {
+                        "GitHub omitted the updated review comment acknowledgement".to_owned()
+                    })?;
+                Ok(ReviewAck {
+                    review_id: Some(comment.pull_request_review.id),
+                    comment_id: Some(comment.id),
+                })
+            }
+            Self::SubmitReview => {
+                let review = data
+                    .submit_pull_request_review
+                    .and_then(|payload| payload.pull_request_review)
+                    .ok_or_else(|| {
+                        "GitHub omitted the submitted review acknowledgement".to_owned()
+                    })?;
+                Ok(ReviewAck {
+                    review_id: Some(review.id),
+                    comment_id: None,
+                })
+            }
+            Self::AddSubmittedReview => {
+                let review = data
+                    .add_pull_request_review
+                    .and_then(|payload| payload.pull_request_review)
+                    .ok_or_else(|| {
+                        "GitHub omitted the submitted review acknowledgement".to_owned()
+                    })?;
+                Ok(ReviewAck {
+                    review_id: Some(review.id),
+                    comment_id: None,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewMutationData {
+    add_pull_request_review: Option<AddReviewPayload>,
+    add_pull_request_review_thread: Option<AddThreadPayload>,
+    update_pull_request_review_comment: Option<UpdateCommentPayload>,
+    submit_pull_request_review: Option<SubmitReviewPayload>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddReviewPayload {
+    pull_request_review: Option<MutationReview>,
+}
+#[derive(Deserialize)]
+struct AddThreadPayload {
+    thread: Option<MutationThread>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCommentPayload {
+    pull_request_review_comment: Option<MutationComment>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubmitReviewPayload {
+    pull_request_review: Option<MutationReview>,
+}
+#[derive(Deserialize)]
+struct MutationReview {
+    id: String,
+    comments: Option<MutationCommentConnection>,
+}
+#[derive(Deserialize)]
+struct MutationThread {
+    comments: MutationCommentConnection,
+}
+#[derive(Deserialize)]
+struct MutationCommentConnection {
+    nodes: Vec<Option<MutationComment>>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MutationComment {
+    id: String,
+    pull_request_review: GraphqlNodeId,
+}
+
+struct PreparedAuxiliaryMutation {
+    action: &'static str,
+    query: &'static str,
+    variables: Value,
+    kind: AuxiliaryMutationKind,
+}
+
+impl PreparedAuxiliaryMutation {
+    fn new(
+        action: &'static str,
+        query: &'static str,
+        variables: Value,
+        kind: AuxiliaryMutationKind,
+    ) -> Self {
+        Self {
+            action,
+            query,
+            variables,
+            kind,
+        }
+    }
+}
+
+enum AuxiliaryMutationKind {
+    Review,
+    DeletedComment,
+    DeletedReview,
+    Reply,
+    Thread,
+}
+
+impl AuxiliaryMutationKind {
+    fn acknowledgement(
+        self,
+        data: AuxiliaryMutationData,
+    ) -> std::result::Result<ReviewAuxiliaryAcknowledgement, String> {
+        let mut ack = ReviewAuxiliaryAcknowledgement {
+            operation_id: String::new(),
+            review_id: None,
+            comment_id: None,
+            thread_id: None,
+            resolved: None,
+        };
+        match self {
+            Self::Review => {
+                ack.review_id = Some(
+                    data.update_pull_request_review
+                        .and_then(|payload| payload.pull_request_review)
+                        .ok_or_else(|| {
+                            "GitHub omitted the updated pending review acknowledgement".to_owned()
+                        })?
+                        .id,
+                );
+            }
+            Self::DeletedComment => {
+                let payload = data.delete_pull_request_review_comment.ok_or_else(|| {
+                    "GitHub omitted the deleted comment acknowledgement".to_owned()
+                })?;
+                ack.review_id = payload.pull_request_review.map(|node| node.id);
+                ack.comment_id = payload.pull_request_review_comment.map(|node| node.id);
+                if ack.comment_id.is_none() {
+                    return Err("GitHub omitted the deleted comment ID".into());
+                }
+            }
+            Self::DeletedReview => {
+                ack.review_id = Some(
+                    data.delete_pull_request_review
+                        .and_then(|payload| payload.pull_request_review)
+                        .ok_or_else(|| {
+                            "GitHub omitted the cancelled pending review acknowledgement".to_owned()
+                        })?
+                        .id,
+                );
+            }
+            Self::Reply => {
+                let comment = data
+                    .add_pull_request_review_thread_reply
+                    .and_then(|payload| payload.comment)
+                    .ok_or_else(|| "GitHub omitted the review reply acknowledgement".to_owned())?;
+                ack.review_id = Some(comment.pull_request_review.id);
+                ack.comment_id = Some(comment.id);
+            }
+            Self::Thread => {
+                let thread = data
+                    .resolve_review_thread
+                    .or(data.unresolve_review_thread)
+                    .and_then(|payload| payload.thread)
+                    .ok_or_else(|| {
+                        "GitHub omitted the thread resolution acknowledgement".to_owned()
+                    })?;
+                ack.thread_id = Some(thread.id);
+                ack.resolved = Some(thread.is_resolved);
+            }
+        }
+        Ok(ack)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuxiliaryMutationData {
+    update_pull_request_review: Option<AuxReviewPayload>,
+    delete_pull_request_review_comment: Option<AuxDeleteCommentPayload>,
+    delete_pull_request_review: Option<AuxReviewPayload>,
+    add_pull_request_review_thread_reply: Option<AuxReplyPayload>,
+    resolve_review_thread: Option<AuxThreadPayload>,
+    unresolve_review_thread: Option<AuxThreadPayload>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuxReviewPayload {
+    pull_request_review: Option<GraphqlNodeId>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuxDeleteCommentPayload {
+    pull_request_review: Option<GraphqlNodeId>,
+    pull_request_review_comment: Option<GraphqlNodeId>,
+}
+#[derive(Deserialize)]
+struct AuxReplyPayload {
+    comment: Option<MutationComment>,
+}
+#[derive(Deserialize)]
+struct AuxThreadPayload {
+    thread: Option<AuxThread>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuxThread {
+    id: String,
+    is_resolved: bool,
+}
+
+fn prepare_pending_comment_mutation(
+    session: &mut Session<'_>,
+    context: &ReviewActionContext,
+    intent: &PendingCommentIntent,
+) -> std::result::Result<PreparedReviewMutation, String> {
+    if intent.body.is_empty() || intent.body.len() > MAX_ACTION_TEXT_BYTES {
+        return Err("pending comment body is empty or exceeds its bound".into());
+    }
+    if let Some(review_id) = &intent.pending_review_id {
+        let review = session
+            .review_node(review_id)
+            .map_err(|error| error.to_string())?;
+        validate_pending_review(
+            &review,
+            context,
+            session.provider,
+            &intent.position.commit_sha,
+        )?;
+        if let Some(comment_id) = &intent.existing_comment_id {
+            let comment = session
+                .comment_node(comment_id)
+                .map_err(|error| error.to_string())?;
+            validate_owned_comment(&comment, &review, session.provider)?;
+            return Ok(PreparedReviewMutation::new(
+                "edit-pending-comment",
+                UPDATE_REVIEW_COMMENT_MUTATION,
+                json!({"commentId": comment_id, "body": intent.body, "clientMutationId": intent.operation_id}),
+                ReviewMutationKind::UpdateComment,
+            ));
+        }
+        let mut variables = thread_input(&intent.body, &intent.position);
+        let object = variables.as_object_mut().expect("thread object");
+        object.insert("pullRequestReviewId".into(), json!(review_id));
+        object.insert("clientMutationId".into(), json!(intent.operation_id));
+        return Ok(PreparedReviewMutation::new(
+            "add-pending-comment",
+            ADD_REVIEW_THREAD_MUTATION,
+            variables,
+            ReviewMutationKind::AddThread,
+        ));
+    }
+    if intent.existing_comment_id.is_some() {
+        return Err("an existing comment cannot be edited without its pending review ID".into());
+    }
+    Ok(PreparedReviewMutation::new(
+        "create-pending-review-comment",
+        ADD_REVIEW_MUTATION,
+        json!({
+            "pullRequestId": context.pull.id,
+            "commitOID": intent.position.commit_sha,
+            "event": Value::Null,
+            "body": Value::Null,
+            "threads": [thread_input(&intent.body, &intent.position)],
+            "clientMutationId": intent.operation_id,
+        }),
+        ReviewMutationKind::AddReviewWithComment,
+    ))
+}
+
+fn prepare_submission_mutation(
+    session: &mut Session<'_>,
+    context: &ReviewActionContext,
+    intent: &SubmissionIntent,
+) -> std::result::Result<PreparedReviewMutation, String> {
+    if intent.body.len() > MAX_ACTION_TEXT_BYTES {
+        return Err("review summary exceeds its bound".into());
+    }
+    let event = review_event_name(&intent.event);
+    if let Some(review_id) = &intent.pending_review_id {
+        let review = session
+            .review_node(review_id)
+            .map_err(|error| error.to_string())?;
+        validate_pending_review(
+            &review,
+            context,
+            session.provider,
+            &intent.reviewed_commit_sha,
+        )?;
+        return Ok(PreparedReviewMutation::new(
+            "submit-pending-review",
+            SUBMIT_REVIEW_MUTATION,
+            json!({"reviewId": review_id, "event": event, "body": intent.body, "clientMutationId": intent.operation_id}),
+            ReviewMutationKind::SubmitReview,
+        ));
+    }
+    Ok(PreparedReviewMutation::new(
+        "submit-new-review",
+        ADD_REVIEW_MUTATION,
+        json!({
+            "pullRequestId": context.pull.id,
+            "commitOID": intent.reviewed_commit_sha,
+            "event": event,
+            "body": intent.body,
+            "threads": Value::Null,
+            "clientMutationId": intent.operation_id,
+        }),
+        ReviewMutationKind::AddSubmittedReview,
+    ))
+}
+
+fn thread_input(body: &str, position: &crate::participation::PublishedPosition) -> Value {
+    let mut input = Map::new();
+    input.insert("body".into(), json!(body));
+    input.insert("path".into(), json!(position.path));
+    input.insert("line".into(), json!(position.line));
+    input.insert("side".into(), json!(position.side.provider_name()));
+    if let Some(start_line) = position.start_line {
+        input.insert("startLine".into(), json!(start_line));
+    }
+    if let Some(start_side) = position.start_side {
+        input.insert("startSide".into(), json!(start_side.provider_name()));
+    }
+    Value::Object(input)
+}
+
+fn review_event_name(event: &ReviewEvent) -> &'static str {
+    match event {
+        ReviewEvent::Comment => "COMMENT",
+        ReviewEvent::Approve => "APPROVE",
+        ReviewEvent::RequestChanges => "REQUEST_CHANGES",
+    }
+}
+
+fn validate_pending_review(
+    review: &ActionReviewNode,
+    context: &ReviewActionContext,
+    provider: &GithubProvider,
+    expected_commit: &str,
+) -> std::result::Result<(), String> {
+    if review.id.is_empty()
+        || review.state != "PENDING"
+        || review.pull_request.id != context.pull.id
+        || review.pull_request.number != context.pull.number
+        || !review
+            .pull_request
+            .repository
+            .name_with_owner
+            .eq_ignore_ascii_case(&context.repository)
+    {
+        return Err("pending review ID belongs to another PR or is no longer pending".into());
+    }
+    if !review
+        .author
+        .as_ref()
+        .is_some_and(|author| author.login.eq_ignore_ascii_case(&provider.account.login))
+    {
+        return Err("pending review is not authored by the selected account".into());
+    }
+    if review.commit.as_ref().map(|commit| commit.oid.as_str()) != Some(expected_commit) {
+        return Err("pending review targets another commit".into());
+    }
+    Ok(())
+}
+
+fn validate_owned_comment(
+    comment: &ActionCommentNode,
+    review: &ActionReviewNode,
+    provider: &GithubProvider,
+) -> std::result::Result<(), String> {
+    if comment.id.is_empty()
+        || comment.pull_request_review.id != review.id
+        || !comment
+            .author
+            .as_ref()
+            .is_some_and(|author| author.login.eq_ignore_ascii_case(&provider.account.login))
+    {
+        return Err("review comment is foreign or linked to another review".into());
+    }
+    Ok(())
+}
+
+fn validate_thread(
+    thread: &ActionThreadNode,
+    context: &ReviewActionContext,
+) -> std::result::Result<(), String> {
+    if thread.id.is_empty()
+        || thread.pull_request.id != context.pull.id
+        || thread.pull_request.number != context.pull.number
+        || !thread
+            .pull_request
+            .repository
+            .name_with_owner
+            .eq_ignore_ascii_case(&context.repository)
+    {
+        return Err("review thread belongs to another repository or PR".into());
+    }
+    Ok(())
+}
+
+fn validate_coordinates(
+    repo: &Repository,
+    number: u64,
+    coordinates: &ProviderCoordinates,
+) -> std::result::Result<(), String> {
+    if !coordinates_match(repo, number, coordinates) {
+        return Err("provider object ID belongs to another repository or PR".into());
+    }
+    validate_node_id(&coordinates.remote_id).map_err(|error| error.to_string())
+}
+
+fn validate_action_identity(value: &str, field: &str) -> std::result::Result<(), String> {
+    if value.is_empty() || value.len() > 1024 || value.contains('\0') {
+        return Err(format!("invalid {field}"));
+    }
+    Ok(())
+}
+
+fn validate_action_text(body: &str, empty_allowed: bool) -> std::result::Result<(), String> {
+    if (!empty_allowed && body.is_empty()) || body.len() > MAX_ACTION_TEXT_BYTES {
+        return Err("action text is empty or exceeds its bound".into());
+    }
+    Ok(())
+}
+
 const DETAILS_QUERY: &str = r#"query PullRequestDetails(
     $owner: String!, $name: String!, $number: Int!,
     $commentsCursor: String, $reviewsCursor: String, $threadsCursor: String,
@@ -1213,6 +3489,11 @@ struct DetailsReview {
 #[derive(Deserialize)]
 struct GraphqlOid {
     oid: String,
+}
+
+#[derive(Deserialize)]
+struct GraphqlNodeId {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -2915,4 +5196,13 @@ else:
                 .all(|comment| comment.coordinates.pull_request == 14398)
         );
     }
+}
+
+#[cfg(test)]
+#[path = "../tests/provider_actions.rs"]
+mod provider_actions_fixture;
+
+#[cfg(test)]
+mod provider_actions {
+    crate::provider_action_tests!();
 }

@@ -135,6 +135,196 @@ pub struct ReviewComment {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkedReviewComment {
+    pub pull_request_review_id: String,
+    pub comment: ReviewComment,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingReviewSnapshot {
+    pub review: PullRequestReview,
+    /// Only comments whose provider-reported parent is `review` are included.
+    pub comments: Vec<LinkedReviewComment>,
+    /// False when any review/thread/comment connection needed for linkage was
+    /// partial or capped.
+    pub comments_complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationContext {
+    pub operation_id: String,
+    pub attempt_id: String,
+    pub action: String,
+    /// Exact bounded JSON sent (or intended to be sent) to the provider.
+    pub payload: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderMutationOutcome<T> {
+    PreflightRejected {
+        reason: String,
+    },
+    Acknowledged(T),
+    /// A write was started but its authoritative result is not known. Callers
+    /// must reconcile with a read before offering an explicit retry.
+    Uncertain {
+        context: MutationContext,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewWriteAcknowledgement {
+    pub operation_id: String,
+    pub review_id: Option<String>,
+    pub comment_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewAuxiliaryAction {
+    UpdatePendingSummary {
+        review: ProviderCoordinates,
+        body: String,
+    },
+    DeletePendingComment {
+        review: ProviderCoordinates,
+        comment: ProviderCoordinates,
+    },
+    CancelPendingReview {
+        review: ProviderCoordinates,
+    },
+    Reply {
+        thread: ProviderCoordinates,
+        pending_review: Option<ProviderCoordinates>,
+        body: String,
+    },
+    SetThreadResolved {
+        thread: ProviderCoordinates,
+        resolved: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewAuxiliaryRequest {
+    pub operation_id: String,
+    pub attempt_id: String,
+    pub action: ReviewAuxiliaryAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewAuxiliaryAcknowledgement {
+    pub operation_id: String,
+    pub review_id: Option<String>,
+    pub comment_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub resolved: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+impl MergeMethod {
+    pub fn rest_name(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Squash => "squash",
+            Self::Rebase => "rebase",
+        }
+    }
+
+    pub fn graphql_name(self) -> &'static str {
+        match self {
+            Self::Merge => "MERGE",
+            Self::Squash => "SQUASH",
+            Self::Rebase => "REBASE",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergePreparation {
+    pub pull_request: ProviderCoordinates,
+    pub pull_request_node_id: String,
+    pub reviewed_head_sha: String,
+    pub current_head_sha: String,
+    pub head_ref_name: String,
+    pub head_ref_node_id: Option<String>,
+    pub head_repository: String,
+    pub state: String,
+    pub draft: bool,
+    pub mergeable: String,
+    pub merge_state_status: String,
+    pub review_status: String,
+    pub check_status: String,
+    pub repository_permission: Option<String>,
+    pub allowed_methods: Vec<MergeMethod>,
+    pub blockers: Vec<String>,
+    pub auto_merge_allowed: bool,
+    pub auto_merge_enabled: bool,
+    pub can_enable_auto_merge: bool,
+    pub can_disable_auto_merge: bool,
+    pub merge_queue_required: bool,
+    pub in_merge_queue: bool,
+    pub viewer_can_merge_as_admin: bool,
+    pub viewer_can_delete_head_ref: bool,
+    pub preferred_headlines: Vec<(MergeMethod, String)>,
+    pub preferred_bodies: Vec<(MergeMethod, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MergeAction {
+    Merge {
+        method: MergeMethod,
+        commit_title: Option<String>,
+        commit_message: Option<String>,
+    },
+    EnableAutoMerge {
+        method: MergeMethod,
+        commit_title: Option<String>,
+        commit_message: Option<String>,
+    },
+    DisableAutoMerge,
+    Enqueue,
+    Dequeue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeExecutionRequest {
+    pub operation_id: String,
+    pub attempt_id: String,
+    pub action: MergeAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeAcknowledgement {
+    pub operation_id: String,
+    /// True means GitHub accepted the request. Queue/auto-merge acceptance is
+    /// deliberately distinct from a completed merge.
+    pub accepted: bool,
+    pub completed: bool,
+    pub merged: bool,
+    pub merge_commit_sha: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchDeletionRequest {
+    pub operation_id: String,
+    pub attempt_id: String,
+    pub expected_merged_head_sha: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchDeletionAcknowledgement {
+    pub operation_id: String,
+    pub deleted_ref_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewThread {
     pub coordinates: ProviderCoordinates,
     pub path: String,
