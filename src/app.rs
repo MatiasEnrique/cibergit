@@ -13,13 +13,15 @@ mod local_workspace;
 mod review_interactions;
 mod view_editor;
 
+#[cfg(feature = "ui-smoke")]
+use cibergit::participation::ReviewOperationPayload;
 use cibergit::{
     domain::{
         MergeAction, MergeExecutionRequest, MergeMethod, MergePreparation, PendingReviewSnapshot,
         ProviderMutationOutcome, PullRequest, PullRequestDetails, Repository,
         ReviewAuxiliaryAction, ReviewAuxiliaryRequest, Revision,
     },
-    participation::{DiffSide, LineSelection, ReviewEvent, ReviewKey, ReviewOperationPayload},
+    participation::{DiffSide, LineSelection, ReviewEvent, ReviewKey},
     providers::GithubProvider,
     review::{
         AlignedRow, DiffLine, DiffLineKind, DiffMode, ParsedDiff, PatchStatus, ReviewSession,
@@ -2511,6 +2513,24 @@ impl ReviewWorkspace {
             DiffSide::Old => "LEFT",
             DiffSide::New => "RIGHT",
         };
+        let pending_comment = cibergit::domain::ReviewComment {
+            coordinates: coordinates(comment_id),
+            author: Some(repository.account.login.clone()),
+            body: intent.body.clone(),
+            created_at: "2026-09-13T12:00:00Z".into(),
+            updated_at: "2026-09-13T12:00:00Z".into(),
+            url: String::new(),
+            path: intent.position.path.clone(),
+            line: Some(intent.position.line),
+            original_line: Some(intent.position.line),
+            start_line: intent.position.start_line,
+            original_start_line: intent.position.start_line,
+            side: None,
+            diff_hunk: "@@ reconciliation smoke @@".into(),
+            commit_sha: Some(intent.position.commit_sha.clone()),
+            original_commit_sha: Some(intent.position.commit_sha.clone()),
+            outdated: false,
+        };
         let pending = PendingReviewSnapshot {
             review: cibergit::domain::PullRequestReview {
                 coordinates: coordinates(review_id),
@@ -2523,24 +2543,7 @@ impl ReviewWorkspace {
             },
             comments: vec![cibergit::domain::LinkedReviewComment {
                 pull_request_review_id: review_id.into(),
-                comment: cibergit::domain::ReviewComment {
-                    coordinates: coordinates(comment_id),
-                    author: Some(repository.account.login.clone()),
-                    body: intent.body.clone(),
-                    created_at: "2026-09-13T12:00:00Z".into(),
-                    updated_at: "2026-09-13T12:00:00Z".into(),
-                    url: String::new(),
-                    path: intent.position.path.clone(),
-                    line: Some(intent.position.line),
-                    original_line: Some(intent.position.line),
-                    start_line: intent.position.start_line,
-                    original_start_line: intent.position.start_line,
-                    side: Some(side.into()),
-                    diff_hunk: "@@ reconciliation smoke @@".into(),
-                    commit_sha: Some(intent.position.commit_sha.clone()),
-                    original_commit_sha: Some(intent.position.commit_sha.clone()),
-                    outdated: false,
-                },
+                comment: pending_comment.clone(),
             }],
             comments_complete: true,
         };
@@ -2550,6 +2553,23 @@ impl ReviewWorkspace {
             .ok_or_else(|| "reconciliation smoke has no details fixture".to_owned())?;
         details.number = number;
         details.activity_complete = true;
+        details.review_threads.push(cibergit::domain::ReviewThread {
+            coordinates: coordinates("cibergit-reconcile-thread"),
+            path: intent.position.path.clone(),
+            line: Some(intent.position.line),
+            original_line: Some(intent.position.line),
+            start_line: intent.position.start_line,
+            original_start_line: intent.position.start_line,
+            side: Some(side.into()),
+            start_side: intent.position.start_line.map(|_| side.into()),
+            resolved: false,
+            outdated: false,
+            comments: vec![cibergit::domain::ReviewComment {
+                side: Some(side.into()),
+                ..pending_comment
+            }],
+            comments_complete: true,
+        });
         let report = controller.authority.reconcile_if_current(
             &controller.store,
             controller.durable_composition.as_ref(),

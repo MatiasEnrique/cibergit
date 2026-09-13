@@ -717,8 +717,16 @@ fn observe_review_operation(
                         .into()
                 });
             };
-            validate_comment_identity(
+            validate_pending_comment_identity(
                 &linked.comment,
+                repository,
+                pull_request,
+                comment_id,
+                &intent.body,
+                &intent.position,
+            )?;
+            let thread_comment = validate_thread_comment_identity(
+                details,
                 repository,
                 pull_request,
                 comment_id,
@@ -728,9 +736,9 @@ fn observe_review_operation(
             Ok(ObservedReviewSuccess::Comment {
                 review_id: Some(review_id.to_owned()),
                 comment_id: comment_id.to_owned(),
-                body: linked.comment.body.clone(),
+                body: thread_comment.body.clone(),
                 evidence: format!(
-                    "Fresh complete selected-account pending-review read matched exact review {review_id}, comment {comment_id}, author, head, path, side, range, and body."
+                    "Fresh complete selected-account pending-review and activity-thread reads joined exact review {review_id} and comment {comment_id}; both matched author, head, path, range, and body, and the unique complete current thread proved side and start-side."
                 ),
             })
         }
@@ -872,7 +880,7 @@ fn validate_pending_review_identity(
     Ok(())
 }
 
-fn validate_comment_identity(
+fn validate_pending_comment_identity(
     comment: &ReviewComment,
     repository: &Repository,
     pull_request: u64,
@@ -895,17 +903,112 @@ fn validate_comment_identity(
     if comment.outdated
         || comment.body != body
         || comment.path != position.path
+        || comment
+            .side
+            .as_deref()
+            .is_some_and(|observed| observed != side)
+        || comment.line != Some(position.line)
+        || comment.start_line != position.start_line
+        || comment.commit_sha.as_deref() != Some(position.commit_sha.as_str())
+    {
+        return Err(
+            "The pending-review read contained the exact comment ID, but author, head, path, range, body, or current-anchor state differs from the frozen edit payload."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_thread_comment_identity<'a>(
+    details: &'a PullRequestDetails,
+    repository: &Repository,
+    pull_request: u64,
+    comment_id: &str,
+    body: &str,
+    position: &PublishedPosition,
+) -> Result<&'a ReviewComment, String> {
+    let candidates = details
+        .review_threads
+        .iter()
+        .filter(|thread| {
+            thread
+                .comments
+                .iter()
+                .any(|comment| comment.coordinates.remote_id == comment_id)
+        })
+        .collect::<Vec<_>>();
+    let [thread] = candidates.as_slice() else {
+        return Err(if candidates.is_empty() {
+            "The fresh complete activity read did not contain a review thread for the exact known comment ID; pending-review data alone does not carry authoritative diff-side evidence."
+                .into()
+        } else {
+            "The fresh activity read associated the exact known comment ID with multiple review threads; identity is ambiguous."
+                .into()
+        });
+    };
+    validate_coordinates(
+        &thread.coordinates,
+        repository,
+        pull_request,
+        &thread.coordinates.remote_id,
+        "review thread",
+    )?;
+    if !thread.comments_complete {
+        return Err(
+            "The exact comment appears in a review thread with incomplete comments; the join cannot prove a unique current placement."
+                .into(),
+        );
+    }
+    let side = match position.side {
+        cibergit::participation::DiffSide::Old => "LEFT",
+        cibergit::participation::DiffSide::New => "RIGHT",
+    };
+    let expected_start_side = position.start_line.map(|_| side);
+    if thread.outdated
+        || thread.path != position.path
+        || thread.side.as_deref() != Some(side)
+        || thread.start_side.as_deref() != expected_start_side
+        || thread.line != Some(position.line)
+        || thread.start_line != position.start_line
+    {
+        return Err(
+            "The unique review thread for the exact comment ID has a different current path, end side/line, start side/line, or outdated state than the frozen edit payload."
+                .into(),
+        );
+    }
+    let comments = thread
+        .comments
+        .iter()
+        .filter(|comment| comment.coordinates.remote_id == comment_id)
+        .collect::<Vec<_>>();
+    let [comment] = comments.as_slice() else {
+        return Err(
+            "The unique review thread returned duplicate entries for the exact comment ID; identity is ambiguous."
+                .into(),
+        );
+    };
+    validate_coordinates(
+        &comment.coordinates,
+        repository,
+        pull_request,
+        comment_id,
+        "thread comment",
+    )?;
+    validate_selected_author(comment.author.as_deref(), repository, "thread comment")?;
+    if comment.outdated
+        || comment.body != body
+        || comment.path != position.path
         || comment.side.as_deref() != Some(side)
         || comment.line != Some(position.line)
         || comment.start_line != position.start_line
         || comment.commit_sha.as_deref() != Some(position.commit_sha.as_str())
     {
         return Err(
-            "The exact comment ID was observed, but author, head, path, side, range, body, or current-anchor state differs from the frozen edit payload."
+            "The exact thread comment disagrees with the pending-review read or frozen author, head, path, side, range, body, or current-anchor state."
                 .into(),
         );
     }
-    Ok(())
+    Ok(comment)
 }
 
 fn validate_coordinates(
@@ -1943,7 +2046,7 @@ mod tests {
                     original_line: Some(1),
                     start_line: None,
                     original_start_line: None,
-                    side: Some("RIGHT".into()),
+                    side: None,
                     diff_hunk: String::new(),
                     commit_sha: Some("2222222".into()),
                     original_commit_sha: Some("2222222".into()),
@@ -1952,6 +2055,46 @@ mod tests {
             }],
             comments_complete: complete,
         }
+    }
+
+    fn review_thread(comment_id: &str, body: &str, complete: bool) -> ReviewThread {
+        ReviewThread {
+            coordinates: coordinates("thread-1"),
+            path: "src/lib.rs".into(),
+            line: Some(1),
+            original_line: Some(1),
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".into()),
+            start_side: None,
+            resolved: false,
+            outdated: false,
+            comments: vec![ReviewComment {
+                coordinates: coordinates(comment_id),
+                author: Some("reader".into()),
+                body: body.into(),
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                url: String::new(),
+                path: "src/lib.rs".into(),
+                line: Some(1),
+                original_line: Some(1),
+                start_line: None,
+                original_start_line: None,
+                side: Some("RIGHT".into()),
+                diff_hunk: String::new(),
+                commit_sha: Some("2222222".into()),
+                original_commit_sha: Some("2222222".into()),
+                outdated: false,
+            }],
+            comments_complete: complete,
+        }
+    }
+
+    fn details_with_thread(thread: ReviewThread, complete: bool) -> PullRequestDetails {
+        let mut details = details(Vec::new(), complete);
+        details.review_threads.push(thread);
+        details
     }
 
     fn uncertain_comment_controller(
@@ -2473,7 +2616,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_existing_comment_edit_reconciles_durably_and_preserves_newer_text() {
+    fn production_shaped_exact_existing_comment_edit_reconciles_durably() {
         let directory = tempdir().unwrap();
         let (mut controller, operation_id) =
             uncertain_comment_controller(directory.path(), Some("comment-1"));
@@ -2498,6 +2641,11 @@ mod tests {
         controller.durable_composition = Some(controller.composition.clone());
         let reads = AtomicUsize::new(0);
         let provider_mutations = AtomicUsize::new(0);
+        let pending = pending_snapshot("pending-1", "comment-1", "frozen edit body", true);
+        assert_eq!(
+            pending.comments[0].comment.side, None,
+            "GithubProvider pending-review comments do not carry diff-side metadata"
+        );
         let report = controller
             .authority
             .reconcile_if_current(
@@ -2508,13 +2656,11 @@ mod tests {
                 || {
                     reads.fetch_add(1, Ordering::SeqCst);
                     Ok((
-                        details(Vec::new(), true),
-                        Some(pending_snapshot(
-                            "pending-1",
-                            "comment-1",
-                            "frozen edit body",
+                        details_with_thread(
+                            review_thread("comment-1", "frozen edit body", true),
                             true,
-                        )),
+                        ),
+                        Some(pending),
                     ))
                 },
             )
@@ -2563,6 +2709,68 @@ mod tests {
                     && operation.status == ReviewOperationStatus::Prepared)
         );
         assert_eq!(provider_mutations.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn known_comment_thread_join_rejects_missing_duplicate_partial_and_wrong_range() {
+        let directory = tempdir().unwrap();
+        let (controller, _) = uncertain_comment_controller(directory.path(), Some("comment-1"));
+        let expected = controller.durable_composition.as_ref();
+        let pending = pending_snapshot("pending-1", "comment-1", "frozen edit body", true);
+        let mut cases = Vec::new();
+
+        cases.push((details(Vec::new(), true), "did not contain a review thread"));
+
+        let mut wrong_end_side = review_thread("comment-1", "frozen edit body", true);
+        wrong_end_side.side = Some("LEFT".into());
+        cases.push((details_with_thread(wrong_end_side, true), "end side/line"));
+
+        let mut wrong_end_line = review_thread("comment-1", "frozen edit body", true);
+        wrong_end_line.line = Some(2);
+        cases.push((details_with_thread(wrong_end_line, true), "end side/line"));
+
+        let mut wrong_start_side = review_thread("comment-1", "frozen edit body", true);
+        wrong_start_side.start_side = Some("RIGHT".into());
+        cases.push((
+            details_with_thread(wrong_start_side, true),
+            "start side/line",
+        ));
+
+        cases.push((
+            details_with_thread(review_thread("comment-1", "frozen edit body", false), true),
+            "incomplete comments",
+        ));
+
+        let mut duplicate =
+            details_with_thread(review_thread("comment-1", "frozen edit body", true), true);
+        let mut second = review_thread("comment-1", "frozen edit body", true);
+        second.coordinates.remote_id = "thread-2".into();
+        duplicate.review_threads.push(second);
+        cases.push((duplicate, "multiple review threads"));
+
+        let mut missing_thread_side = review_thread("comment-1", "frozen edit body", true);
+        missing_thread_side.comments[0].side = None;
+        cases.push((
+            details_with_thread(missing_thread_side, true),
+            "thread comment disagrees",
+        ));
+
+        for (details, expected_reason) in cases {
+            let report = controller
+                .authority
+                .reconcile_if_current(&controller.store, expected, &repository(), 7, || {
+                    Ok((details, Some(pending.clone())))
+                })
+                .unwrap();
+            assert_eq!(report.resolved(), 0);
+            let ReviewReconciliationOutcome::Unresolved(reason) = &report.items[0].outcome else {
+                panic!("invalid thread evidence must remain unresolved")
+            };
+            assert!(
+                reason.contains(expected_reason),
+                "expected {expected_reason:?} in {reason:?}"
+            );
+        }
     }
 
     #[test]
@@ -2621,6 +2829,12 @@ mod tests {
         pending.comments[0].comment.coordinates.owner = "Octo".into();
         pending.comments[0].comment.coordinates.repository = "REPO".into();
         pending.comments[0].comment.author = Some("Reader".into());
+        let mut thread = review_thread("comment-1", "frozen edit body", true);
+        thread.coordinates.owner = "Octo".into();
+        thread.coordinates.repository = "REPO".into();
+        thread.comments[0].coordinates.owner = "OCTO".into();
+        thread.comments[0].coordinates.repository = "Repo".into();
+        thread.comments[0].author = Some("READER".into());
         let report = controller
             .authority
             .reconcile_if_current(
@@ -2628,7 +2842,7 @@ mod tests {
                 controller.durable_composition.as_ref(),
                 &repository(),
                 7,
-                || Ok((details(Vec::new(), true), Some(pending))),
+                || Ok((details_with_thread(thread, true), Some(pending))),
             )
             .unwrap();
         assert_eq!(report.resolved(), 1);
@@ -2650,41 +2864,52 @@ mod tests {
         let (controller, _) = uncertain_comment_controller(directory.path(), Some("comment-1"));
         let expected = controller.durable_composition.as_ref();
         let mut cases = Vec::new();
+        let valid_thread = review_thread("comment-1", "frozen edit body", true);
 
         let mut wrong_id =
             pending_snapshot("pending-1", "unrelated-comment", "frozen edit body", true);
-        cases.push((repository(), wrong_id.clone(), "exact known comment ID"));
+        cases.push((
+            repository(),
+            wrong_id.clone(),
+            valid_thread.clone(),
+            "exact known comment ID",
+        ));
         wrong_id.comments[0].comment.coordinates.remote_id = "comment-1".into();
 
         let mut wrong_author = wrong_id.clone();
         wrong_author.comments[0].comment.author = Some("other-user".into());
-        cases.push((repository(), wrong_author, "author"));
+        cases.push((repository(), wrong_author, valid_thread.clone(), "author"));
 
         let mut wrong_repo = wrong_id.clone();
         wrong_repo.comments[0].comment.coordinates.repository = "other-repo".into();
-        cases.push((repository(), wrong_repo, "coordinates"));
+        cases.push((
+            repository(),
+            wrong_repo,
+            valid_thread.clone(),
+            "coordinates",
+        ));
 
         let mut wrong_head = wrong_id.clone();
         wrong_head.comments[0].comment.commit_sha = Some("different-head".into());
-        cases.push((repository(), wrong_head, "differs"));
+        cases.push((repository(), wrong_head, valid_thread.clone(), "differs"));
 
         let mut wrong_body = wrong_id.clone();
         wrong_body.comments[0].comment.body = "different body".into();
-        cases.push((repository(), wrong_body, "differs"));
+        cases.push((repository(), wrong_body, valid_thread.clone(), "differs"));
 
         let mut incomplete = wrong_id.clone();
         incomplete.comments_complete = false;
-        cases.push((repository(), incomplete, "incomplete"));
+        cases.push((repository(), incomplete, valid_thread.clone(), "incomplete"));
 
         let mut other_account = repository();
         other_account.account.login = "other-user".into();
-        cases.push((other_account, wrong_id, "selected account"));
+        cases.push((other_account, wrong_id, valid_thread, "selected account"));
 
-        for (repository, pending, expected_reason) in cases {
+        for (repository, pending, thread, expected_reason) in cases {
             let report = controller
                 .authority
                 .reconcile_if_current(&controller.store, expected, &repository, 7, || {
-                    Ok((details(Vec::new(), true), Some(pending)))
+                    Ok((details_with_thread(thread, true), Some(pending)))
                 })
                 .unwrap();
             assert_eq!(report.resolved(), 0);
@@ -2702,7 +2927,10 @@ mod tests {
             .authority
             .reconcile_if_current(&controller.store, expected, &repository(), 7, || {
                 Ok((
-                    details(Vec::new(), false),
+                    details_with_thread(
+                        review_thread("comment-1", "frozen edit body", true),
+                        false,
+                    ),
                     Some(pending_snapshot(
                         "pending-1",
                         "comment-1",
@@ -2827,7 +3055,7 @@ mod tests {
                 fs::rename(&parent, &displaced).unwrap();
                 fs::write(&parent, b"block recovery partition").unwrap();
                 Ok((
-                    details(Vec::new(), true),
+                    details_with_thread(review_thread("comment-1", "frozen edit body", true), true),
                     Some(pending_snapshot(
                         "pending-1",
                         "comment-1",
@@ -2870,7 +3098,10 @@ mod tests {
                 7,
                 || {
                     Ok((
-                        details(Vec::new(), true),
+                        details_with_thread(
+                            review_thread("comment-1", "frozen edit body", true),
+                            true,
+                        ),
                         Some(pending_snapshot(
                             "pending-1",
                             "comment-1",

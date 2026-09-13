@@ -90,8 +90,12 @@ files; it opens a compatibility screen directing you to the PR workspace.
   with independent counts and read-only reconciliation controls. Review reconciliation runs fresh
   selected-account details and pending-review reads under the same per-PR authority and durable CAS
   used by dispatch. It sends no mutation and reports success only after saving the terminal outcome.
-  A known pending-comment edit can be proven from its exact frozen parent-review/comment IDs plus
-  matching account, repository, PR, author, reviewed head, path, side/range and body. A known
+  A known pending-comment edit can be proven by joining its exact frozen parent-review/comment IDs
+  from the complete pending-review read to the unique complete, current activity thread containing
+  that same exact comment ID. Both reads must match account, repository, PR, author, reviewed head,
+  path, range and body; the thread supplies the authoritative end/start diff sides that GitHub omits
+  from its pending-review comment shape. A missing, duplicate, partial, outdated, or disagreeing
+  thread remains unresolved. A known
   pending-review submission can be proven from its exact review ID plus terminal event, author,
   reviewed head and body. New comment writes whose lost acknowledgement contains no remote comment
   ID, missing or partial activity, other-account/object/payload mismatches, and absence after a
