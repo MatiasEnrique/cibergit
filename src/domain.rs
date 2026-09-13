@@ -72,6 +72,11 @@ impl PullRequest {
 pub struct ChangedFile {
     pub path: String,
     pub previous_path: Option<String>,
+    /// Exact filesystem bytes when a local path cannot be represented as UTF-8.
+    #[serde(default)]
+    pub raw_path: Option<Vec<u8>>,
+    #[serde(default)]
+    pub raw_previous_path: Option<Vec<u8>>,
     pub status: String,
     pub additions: u64,
     pub deletions: u64,
