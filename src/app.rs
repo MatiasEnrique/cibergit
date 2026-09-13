@@ -433,6 +433,7 @@ struct RepoRuntime {
     pull_requests: Vec<PullRequest>,
     state: LoadState,
     generation: u64,
+    refresh: RefreshGate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -559,6 +560,34 @@ impl Render for SplitterDragPreview {
     }
 }
 
+/// Periodic polls never supersede an unfinished read. An explicit refresh
+/// coalesces one follow-up and prevents installing the earlier observation.
+#[derive(Default)]
+struct RefreshGate {
+    active: bool,
+    explicit_pending: bool,
+}
+
+impl RefreshGate {
+    fn request(&mut self, explicit: bool) -> bool {
+        if self.active {
+            self.explicit_pending |= explicit;
+            false
+        } else {
+            self.active = true;
+            true
+        }
+    }
+
+    /// Call only after matching the callback's repository/tab lifetime.
+    /// Result generation must still be checked before installing it.
+    /// A true result requires a fresh read instead of installing this result.
+    fn complete(&mut self) -> bool {
+        self.active = false;
+        std::mem::take(&mut self.explicit_pending)
+    }
+}
+
 /// A read can complete after its PR tab has closed and reopened. Per-tab read
 /// counters alone cannot distinguish those lifetimes, even for the same PR.
 #[derive(Clone, Copy)]
@@ -587,6 +616,7 @@ struct ReviewTab {
     request_generation: u64,
     inventory_generation: u64,
     metadata_generation: u64,
+    metadata_refresh: RefreshGate,
     diff_rows: Vec<DiffRow>,
     diff_scroll: ListState,
     diff_horizontal: ScrollHandle,
@@ -602,9 +632,11 @@ struct ReviewTab {
     journal_error: Option<String>,
     details_state: LoadState,
     details_generation: u64,
+    details_refresh: RefreshGate,
     lifecycle: PrLifecycleController,
     lifecycle_state: LoadState,
     lifecycle_generation: u64,
+    lifecycle_refresh: RefreshGate,
     interactions: InteractionState,
     interaction_generation: u64,
     confirmation: Option<NativeConfirmation>,
@@ -928,6 +960,7 @@ impl ReviewWorkspace {
                         LoadState::Loading("Loading pull requests…".into())
                     },
                     generation: 0,
+                    refresh: RefreshGate::default(),
                 }
             })
             .collect();
@@ -1202,7 +1235,7 @@ impl ReviewWorkspace {
                             poll_due(tick, this.schedule.delay(&key, true, this.focused))
                         });
                         if active_due {
-                            this.refresh_active(cx);
+                            this.refresh_active_with_intent(false, cx);
                         }
                         let repositories = this
                             .repositories
@@ -1215,7 +1248,7 @@ impl ReviewWorkspace {
                             })
                             .collect::<Vec<_>>();
                         for index in repositories {
-                            this.refresh_repository(index, cx);
+                            this.refresh_repository_with_intent(index, false, cx);
                         }
                     })
                     .is_err()
@@ -3983,6 +4016,7 @@ impl ReviewWorkspace {
                                 pull_requests: Vec::new(),
                                 state: LoadState::Loading("Loading pull requests…".into()),
                                 generation: 0,
+                                refresh: RefreshGate::default(),
                             });
                             this.save_workspace();
                             this.repositories.len() - 1
@@ -5134,11 +5168,25 @@ impl ReviewWorkspace {
     }
 
     fn refresh_repository(&mut self, index: usize, cx: &mut Context<Root>) {
+        self.refresh_repository_with_intent(index, true, cx);
+    }
+
+    fn refresh_repository_with_intent(
+        &mut self,
+        index: usize,
+        explicit: bool,
+        cx: &mut Context<Root>,
+    ) {
         let Some(runtime) = self.repositories.get_mut(index) else {
             return;
         };
-        runtime.generation += 1;
-        let generation = runtime.generation;
+        if !runtime.refresh.request(explicit) {
+            return;
+        }
+        // A removed and re-added repository must not reuse the old read ID.
+        let generation = self.issue_request_generation();
+        let runtime = &mut self.repositories[index];
+        runtime.generation = generation;
         let repository = runtime.repository.clone();
         let repo_key = repository.cache_key();
         if runtime.pull_requests.is_empty() {
@@ -5160,11 +5208,16 @@ impl ReviewWorkspace {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
-                let Some(runtime) = this.repositories.iter_mut().find(|runtime| {
+                let Some(index) = this.repositories.iter().position(|runtime| {
                     runtime.repository.cache_key() == repo_key && runtime.generation == generation
                 }) else {
                     return;
                 };
+                if this.repositories[index].refresh.complete() {
+                    this.refresh_repository(index, cx);
+                    return;
+                }
+                let runtime = &mut this.repositories[index];
                 match result {
                     Ok(pull_requests) => {
                         if let Some(store) = &this.store {
@@ -5440,6 +5493,7 @@ impl ReviewWorkspace {
             request_generation,
             inventory_generation: request_generation,
             metadata_generation: 0,
+            metadata_refresh: RefreshGate::default(),
             diff_rows: Vec::new(),
             diff_scroll: ListState::new(0, ListAlignment::Top, px(480.)),
             diff_horizontal: ScrollHandle::new(),
@@ -5455,9 +5509,11 @@ impl ReviewWorkspace {
             journal_error: None,
             details_state: LoadState::Loading("Loading PR details…".into()),
             details_generation: 0,
+            details_refresh: RefreshGate::default(),
             lifecycle,
             lifecycle_state: LoadState::Loading("Loading lifecycle metadata…".into()),
             lifecycle_generation: 0,
+            lifecycle_refresh: RefreshGate::default(),
             interactions: InteractionState::Loading,
             interaction_generation: 0,
             confirmation: None,
@@ -6826,10 +6882,23 @@ impl ReviewWorkspace {
     }
 
     fn refresh_active(&mut self, cx: &mut Context<Root>) {
+        self.refresh_active_with_intent(true, cx);
+    }
+
+    fn refresh_active_with_intent(&mut self, explicit: bool, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        self.refresh_metadata(index, explicit, cx);
+        self.refresh_details_with_intent(index, explicit, cx);
+        self.refresh_lifecycle_with_intent(index, explicit, cx);
+    }
+
+    fn refresh_metadata(&mut self, index: usize, explicit: bool, cx: &mut Context<Root>) {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
+        if !tab.metadata_refresh.request(explicit) {
+            return;
+        }
         tab.metadata_generation += 1;
         let read_epoch = TabReadEpoch {
             instance: tab.instance_generation,
@@ -6845,13 +6914,18 @@ impl ReviewWorkspace {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
-                let Some(tab) = this.tabs.iter_mut().find(|tab| {
+                let Some(index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == key
                         && tab.pull_request.number == number
                         && read_epoch.matches(tab.instance_generation, tab.metadata_generation)
                 }) else {
                     return;
                 };
+                if this.tabs[index].metadata_refresh.complete() {
+                    this.refresh_metadata(index, true, cx);
+                    return;
+                }
+                let tab = &mut this.tabs[index];
                 match result {
                     Ok(pull_request) => {
                         tab.stack.observe_selected_revision(&pull_request.head_sha);
@@ -6879,14 +6953,24 @@ impl ReviewWorkspace {
             });
         })
         .detach();
-        self.refresh_details(index, cx);
-        self.refresh_lifecycle(index, cx);
     }
 
     fn refresh_lifecycle(&mut self, index: usize, cx: &mut Context<Root>) {
+        self.refresh_lifecycle_with_intent(index, true, cx);
+    }
+
+    fn refresh_lifecycle_with_intent(
+        &mut self,
+        index: usize,
+        explicit: bool,
+        cx: &mut Context<Root>,
+    ) {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
+        if !tab.lifecycle_refresh.request(explicit) {
+            return;
+        }
         tab.lifecycle_generation = tab.lifecycle_generation.saturating_add(1);
         let read_epoch = TabReadEpoch {
             instance: tab.instance_generation,
@@ -6908,13 +6992,18 @@ impl ReviewWorkspace {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
-                let Some(tab) = this.tabs.iter_mut().find(|tab| {
+                let Some(index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == identity
                         && tab.pull_request.number == number
                         && read_epoch.matches(tab.instance_generation, tab.lifecycle_generation)
                 }) else {
                     return;
                 };
+                if this.tabs[index].lifecycle_refresh.complete() {
+                    this.refresh_lifecycle(index, cx);
+                    return;
+                }
+                let tab = &mut this.tabs[index];
                 match result {
                     Ok((snapshot, choices)) => {
                         let install = tab
@@ -7234,9 +7323,21 @@ impl ReviewWorkspace {
     }
 
     fn refresh_details(&mut self, index: usize, cx: &mut Context<Root>) {
+        self.refresh_details_with_intent(index, true, cx);
+    }
+
+    fn refresh_details_with_intent(
+        &mut self,
+        index: usize,
+        explicit: bool,
+        cx: &mut Context<Root>,
+    ) {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
+        if !tab.details_refresh.request(explicit) {
+            return;
+        }
         tab.details_generation += 1;
         let read_epoch = TabReadEpoch {
             instance: tab.instance_generation,
@@ -7266,10 +7367,20 @@ impl ReviewWorkspace {
                 let Some(tab_index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == key
                         && tab.pull_request.number == number
-                        && read_epoch.matches(tab.instance_generation, tab.details_generation)
+                        && tab.instance_generation == read_epoch.instance
                 }) else {
                     return;
                 };
+                // Mutations can invalidate the observation while this read
+                // still owns the slot. Release that slot even when its result
+                // is obsolete, then honor an explicitly queued post-effect read.
+                if this.tabs[tab_index].details_refresh.complete() {
+                    this.refresh_details(tab_index, cx);
+                    return;
+                }
+                if this.tabs[tab_index].details_generation != read_epoch.generation {
+                    return;
+                }
                 match result {
                     Ok((details, pending, journal)) => {
                         let pending = match pending {
@@ -14967,6 +15078,98 @@ mod layout_tests {
         line_text_chunks, media_free_markdown, resolved_panel_widths_for,
     };
     use cibergit::domain::{ProviderCoordinates, ReviewAuxiliaryAction, ReviewAuxiliaryRequest};
+
+    #[test]
+    fn slow_reads_finish_despite_repeated_periodic_polls() {
+        // Four independent lanes: metadata, details, lifecycle and sidebar.
+        // Model a provider taking several poll intervals, without wall-clock
+        // sleeps or network calls. Each original result must remain installable.
+        let mut lanes: [super::RefreshGate; 4] = std::array::from_fn(|_| Default::default());
+        let mut dispatched = [0; 4];
+        let mut installed = [0; 4];
+        for (index, lane) in lanes.iter_mut().enumerate() {
+            dispatched[index] += usize::from(lane.request(false));
+        }
+        for _ in 0..20 {
+            for (index, lane) in lanes.iter_mut().enumerate() {
+                dispatched[index] += usize::from(lane.request(false));
+            }
+        }
+        assert_eq!(dispatched, [1; 4], "polls must not overlap an active read");
+        for (index, lane) in lanes.iter_mut().enumerate() {
+            if !lane.complete() {
+                installed[index] += 1;
+            }
+        }
+        assert_eq!(installed, [1; 4], "slow successful reads must not starve");
+        for lane in &mut lanes {
+            assert!(
+                lane.request(false),
+                "later periodic refresh remains available"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_refresh_coalesces_and_discards_the_pre_effect_observation() {
+        let mut lane = super::RefreshGate::default();
+        assert!(lane.request(false));
+        // A mutation completed or the sidebar filter changed while its older
+        // read was active. Repeated explicit requests retain one fresh read.
+        for _ in 0..10 {
+            assert!(!lane.request(true));
+            assert!(!lane.request(false));
+        }
+        let mut displayed = "retained cache";
+        let refresh_again = lane.complete();
+        if !refresh_again {
+            displayed = "pre-effect observation";
+        }
+        assert!(refresh_again);
+        assert_eq!(displayed, "retained cache");
+        assert!(lane.request(true));
+        for _ in 0..20 {
+            assert!(!lane.request(false));
+        }
+        assert!(!lane.complete(), "polls must not queue a third read");
+        displayed = "post-effect observation";
+        assert_eq!(displayed, "post-effect observation");
+        // Errors finish the same lane, so a subsequent explicit retry can run.
+        assert!(lane.request(true));
+        assert!(!lane.complete());
+        assert!(lane.request(true));
+    }
+
+    #[test]
+    fn mutation_invalidated_read_releases_its_slot_without_installing() {
+        let mut lane = super::RefreshGate::default();
+        assert!(lane.request(false));
+        let read = super::TabReadEpoch {
+            instance: 7,
+            generation: 1,
+        };
+        let current = super::TabReadEpoch {
+            instance: 7,
+            generation: 2,
+        };
+        assert!(!read.matches(current.instance, current.generation));
+        // The mutation invalidates the result, not the task's ownership. Its
+        // callback must release the lane before rejecting the old generation.
+        assert_eq!(read.instance, current.instance);
+        assert!(!lane.complete());
+        assert!(
+            lane.request(true),
+            "post-effect refresh must not stay stuck"
+        );
+        assert!(!lane.complete());
+        // A completed mutation may also queue its refresh before the old read
+        // returns. In that order, the callback schedules exactly one follow-up.
+        assert!(lane.request(false));
+        assert!(!lane.request(true));
+        assert!(lane.complete());
+        assert!(lane.request(true));
+        assert!(!lane.complete());
+    }
 
     #[test]
     fn delayed_pr_reads_cannot_install_after_tab_close_and_reopen() {
