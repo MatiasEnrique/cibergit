@@ -21,7 +21,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -365,6 +365,27 @@ impl fmt::Debug for LocalGit {
 
 static COMMON_GIT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 
+/// Run installed Git before a repository exists (for example, an explicit
+/// application-owned clone) with the same bounds and environment isolation as
+/// [`LocalGit`]. The caller is responsible for serializing the destination.
+pub(crate) fn run_installed_git_at(
+    directory: &Path,
+    action: &'static str,
+    args: Vec<OsString>,
+    mutation: bool,
+    accepted_exit_codes: &[i32],
+) -> Result<Vec<u8>> {
+    let runner = LocalGit {
+        root: directory.to_path_buf(),
+        git_dir: directory.join(".git"),
+        common_git_dir: directory.join(".git"),
+        limits: CommandLimits::default(),
+        snapshot_content_limit: DEFAULT_SNAPSHOT_CONTENT_LIMIT,
+        write_lock: Arc::new(Mutex::new(())),
+    };
+    runner.run(action, args, None, mutation, accepted_exit_codes)
+}
+
 impl LocalGit {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_limits_and_snapshot_content_limit(
@@ -452,6 +473,27 @@ impl LocalGit {
 
     pub fn common_git_dir(&self) -> &Path {
         &self.common_git_dir
+    }
+
+    /// Acquire the same process-local lock used by all incompatible local Git
+    /// mutations for this common Git directory. Crate-internal provisioning
+    /// code uses this for multi-command worktree transactions.
+    pub(crate) fn lock_common_git(&self) -> Result<MutexGuard<'_, ()>> {
+        self.write_lock
+            .lock()
+            .map_err(|_| LocalGitError::PoisonedLock)
+    }
+
+    /// Run one bounded Git command while a crate-internal caller holds the
+    /// common-directory lock for a larger worktree transaction.
+    pub(crate) fn run_worktree_command(
+        &self,
+        action: &'static str,
+        args: Vec<OsString>,
+        mutation: bool,
+        accepted_exit_codes: &[i32],
+    ) -> Result<Vec<u8>> {
+        self.run(action, args, None, mutation, accepted_exit_codes)
     }
 
     pub fn snapshot(&self) -> Result<LocalSnapshot> {
