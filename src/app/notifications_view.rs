@@ -468,7 +468,7 @@ impl NotificationController {
             .unwrap_or(0)
     }
 
-    #[cfg(any(test, feature = "ui-smoke"))]
+    #[cfg(test)]
     pub(super) fn begin_polls(&mut self, repositories: &[Repository]) -> Vec<PollWork> {
         self.begin_polls_when(repositories, |_| true)
     }
