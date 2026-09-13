@@ -8345,17 +8345,54 @@ impl ReviewWorkspace {
                 view.child(
                     div()
                         .mt_2()
-                        .font_family(CODE_FONT)
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
                         .text_xs()
                         .text_color(colors.muted)
                         .child(format!(
-                            "Selected {} → {}   ·   canonical full {} → {}",
-                            selected.base_sha,
-                            selected.head_sha,
-                            canonical.base_sha,
-                            canonical.head_sha
-                        )),
+                            "Viewing {} → {} · Published PR {}",
+                            comparison_picker::short_sha(&selected.base_sha),
+                            comparison_picker::short_sha(&selected.head_sha),
+                            comparison_picker::short_sha(&canonical.head_sha),
+                        ))
+                        .child(
+                            div()
+                                .id("toggle-comparison-revision-details")
+                                .text_color(colors.accent)
+                                .cursor_pointer()
+                                .child(if picker.revision_details_expanded {
+                                    "Hide revision details"
+                                } else {
+                                    "Show revision details"
+                                })
+                                .on_click(cx.listener(move |root, _, _, cx| {
+                                    if let Root::Review(this) = root {
+                                        let picker = &mut this.tabs[index].comparison_picker;
+                                        picker.revision_details_expanded =
+                                            !picker.revision_details_expanded;
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
                 )
+                .when(picker.revision_details_expanded, |view| {
+                    view.child(
+                        div()
+                            .mt_1()
+                            .font_family(CODE_FONT)
+                            .text_xs()
+                            .text_color(colors.muted)
+                            .child(format!(
+                                "Selected: {} → {}. Published PR: {} → {}.",
+                                selected.base_sha,
+                                selected.head_sha,
+                                canonical.base_sha,
+                                canonical.head_sha,
+                            )),
+                    )
+                })
             })
             .child(
                 div()
@@ -8412,7 +8449,7 @@ impl ReviewWorkspace {
                     .text_xs()
                     .text_color(colors.amber)
                     .child(
-                        "Read-only review target: this pair ends before the canonical reviewed head. Return to Full PR or choose a range ending at the current head.",
+                        "This comparison ends before the published PR revision. To comment or submit a review, return to Full PR or choose a range ending at the published revision.",
                     ),
             );
         }

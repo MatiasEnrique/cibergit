@@ -75,6 +75,7 @@ pub struct ComparisonPicker {
     pub inventory: Option<CommitInventory>,
     pub inventory_loading: bool,
     pub expanded: bool,
+    pub revision_details_expanded: bool,
     pub editing_mode: PickerMode,
     pub range_first: Option<usize>,
     pub range_last: Option<usize>,
@@ -98,6 +99,7 @@ impl ComparisonPicker {
             inventory: None,
             inventory_loading: false,
             expanded: false,
+            revision_details_expanded: false,
             range_first,
             range_last,
             notice: None,
@@ -132,11 +134,11 @@ impl ComparisonPicker {
 
     pub fn inventory_reason(&self) -> String {
         if self.inventory_loading {
-            return "Loading the immutable commit list…".into();
+            return "Loading commits…".into();
         }
         match &self.inventory {
             Some(inventory) if inventory.availability == InventoryAvailability::Complete => {
-                "Complete immutable commit list".into()
+                format!("{} commits", inventory.commits.len())
             }
             Some(inventory) => inventory.notice.clone().unwrap_or_else(|| {
                 "The commit list is incomplete; commit and range selection are disabled.".into()

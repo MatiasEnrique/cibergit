@@ -277,6 +277,8 @@ cargo run --locked --features ui-smoke -- \
   --repo cli/cli --account YOUR_GH_LOGIN --pr 14130
 ```
 
+The comparison toolbar shows short revisions by default. **Show revision details** reveals the exact selected and published base/head SHAs.
+
 The focused harness writes `native-comparison-full-list.png`, commit/range/Since-fallback/return-full
 captures, `native-comparison-newer-head.png`, `native-comparison-two-tabs.png`, and a text report in
 the light directory; the restart directory receives `native-comparison-restart.png` and its report.
