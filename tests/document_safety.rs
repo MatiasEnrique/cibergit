@@ -804,3 +804,68 @@ fn symlink_and_oversized_initial_targets_are_rejected() {
         Err(DocumentError::UnsafeTarget(_))
     ));
 }
+
+#[test]
+fn pre_metadata_recovery_restores_buffer_and_still_detects_checksum_corruption() {
+    use sha2::{Digest, Sha256};
+    let fixture = Fixture::new();
+    fixture.write("legacy.txt", "old base\n");
+    let recovery_path = {
+        let mut document = fixture.store().open("legacy.txt").unwrap();
+        document.set_buffer("valuable unsaved draft\n").unwrap();
+        document.recovery_path().to_owned()
+    };
+    let current = fs::read_to_string(&recovery_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&current).unwrap();
+    let mut legacy = current.clone();
+    for field in ["metadata_sha256", "changed_seconds", "changed_nanoseconds"] {
+        let value = &parsed["payload"]["base"]["version"][field];
+        legacy = legacy.replace(&format!(",\"{field}\":{value}"), "");
+    }
+    let payload_start = "{\"payload\":".len();
+    let payload_end = legacy.rfind(",\"checksum\":").unwrap();
+    let checksum = format!(
+        "{:x}",
+        Sha256::digest(&legacy.as_bytes()[payload_start..payload_end])
+    );
+    legacy = legacy.replace(parsed["checksum"].as_str().unwrap(), &checksum);
+    fs::write(&recovery_path, &legacy).unwrap();
+
+    let mut reopened = fixture.store().open("legacy.txt").unwrap();
+    assert_eq!(reopened.buffer(), "valuable unsaved draft\n");
+    assert!(matches!(
+        reopened.recovery_status(),
+        RecoveryStatus::Restored { .. }
+    ));
+    // An old base has no metadata proof: recover the text, then require explicit
+    // reconciliation instead of adopting current metadata silently.
+    assert_eq!(reopened.status(), DocumentStatus::Conflict);
+    assert!(matches!(
+        reopened.save().unwrap(),
+        SaveOutcome::Blocked { .. }
+    ));
+    assert_eq!(fs::read_to_string(&recovery_path).unwrap(), legacy);
+    drop(reopened);
+
+    let tampered = legacy.replace("valuable unsaved draft", "tampered unsaved draft");
+    fs::write(&recovery_path, &tampered).unwrap();
+    let reopened = fixture.store().open("legacy.txt").unwrap();
+    assert!(matches!(
+        reopened.recovery_status(),
+        RecoveryStatus::Corrupt { .. }
+    ));
+    assert_eq!(fs::read_to_string(&recovery_path).unwrap(), tampered);
+}
+
+#[test]
+fn metadata_generation_with_zero_nanoseconds_keeps_its_serialized_checksum_fields() {
+    let fixture = Fixture::new();
+    fixture.write("time.txt", "base");
+    let document = fixture.store().open("time.txt").unwrap();
+    let mut version = document.base().version.clone();
+    version.changed_nanoseconds = 0;
+    let encoded = serde_json::to_string(&version).unwrap();
+    assert!(encoded.contains("\"changed_nanoseconds\":0"));
+    let decoded: cibergit::document::DiskVersion = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+}

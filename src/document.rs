@@ -10,7 +10,7 @@
 //! either pathname after any observation. Every uncertain boundary is returned
 //! explicitly and is never repaired with a destructive rollback.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::{CString, c_void},
@@ -127,7 +127,7 @@ impl RecoveryScope {
 }
 
 /// A content fingerprint plus the identity of the file that supplied it.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct DiskVersion {
     pub sha256: String,
     pub len: u64,
@@ -147,6 +147,32 @@ pub struct DiskVersion {
     pub changed_seconds: i64,
     #[serde(default)]
     pub changed_nanoseconds: i64,
+}
+
+// Recovery schema 1 predates metadata fingerprints. Its checksum is over the
+// serialized payload, so defaulted fields must not alter legacy base bytes.
+// New observations always have a metadata digest and serialize all new fields,
+// including a valid zero nanosecond component.
+impl Serialize for DiskVersion {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let legacy = self.metadata_sha256.is_empty()
+            && self.changed_seconds == 0
+            && self.changed_nanoseconds == 0;
+        let mut state = serializer.serialize_struct("DiskVersion", if legacy { 7 } else { 10 })?;
+        state.serialize_field("sha256", &self.sha256)?;
+        state.serialize_field("len", &self.len)?;
+        state.serialize_field("device", &self.device)?;
+        state.serialize_field("inode", &self.inode)?;
+        state.serialize_field("modified_seconds", &self.modified_seconds)?;
+        state.serialize_field("modified_nanoseconds", &self.modified_nanoseconds)?;
+        state.serialize_field("mode", &self.mode)?;
+        if !legacy {
+            state.serialize_field("metadata_sha256", &self.metadata_sha256)?;
+            state.serialize_field("changed_seconds", &self.changed_seconds)?;
+            state.serialize_field("changed_nanoseconds", &self.changed_nanoseconds)?;
+        }
+        state.end()
+    }
 }
 
 impl DiskVersion {
