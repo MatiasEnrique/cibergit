@@ -3011,6 +3011,18 @@ impl ReviewWorkspace {
                     .background_executor()
                     .timer(Duration::from_millis(350))
                     .await;
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
                 let activity_name = format!("native-offline-activity-{appearance}.png");
                 let activity = window
                     .update(|window, _| {
@@ -3036,6 +3048,18 @@ impl ReviewWorkspace {
                 window
                     .background_executor()
                     .timer(Duration::from_millis(350))
+                    .await;
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(250))
                     .await;
                 let checks_name = format!("native-offline-checks-{appearance}.png");
                 let checks = window
