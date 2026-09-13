@@ -42,7 +42,7 @@ fn omitted_counts_zero_ranges_and_multiple_hunks() {
 fn truncation_and_unsupported_data_never_claim_completion() {
     for patch in [
         "@@ -1,2 +1,2 @@\n one\n",
-        "@@ -1 +1 @@\n-old\n+new",
+        "@@ -1 +1 @@\n-old",
         "@@ -1,2 +1,2 @@\n one\n@@ -4 +4 @@\n four\n",
     ] {
         assert!(
@@ -87,6 +87,34 @@ fn truncation_and_unsupported_data_never_claim_completion() {
         })
         .status,
         PatchStatus::Unsupported { .. }
+    ));
+}
+
+#[test]
+fn github_patch_final_separator_is_optional_when_counts_are_complete() {
+    let patch = "@@ -393,6 +393,8 @@ func issueStateTitleWithColor()\n state := \"Open\"\n if issue.State == \"CLOSED\" {\n     state = \"Closed\"\n+} else if issue.State == \"MERGED\" {\n+    state = \"Merged\"\n }\n return state\n }";
+    let without = parse_patch(patch);
+    assert!(without.is_complete());
+    assert_eq!(without, parse_patch(&format!("{patch}\n")));
+    let file = ChangedFile {
+        path: "view.go".into(),
+        raw_path: None,
+        raw_previous_path: None,
+        previous_path: None,
+        status: "modified".into(),
+        additions: 2,
+        deletions: 0,
+        patch: Some(patch.into()),
+        patch_complete: true,
+    };
+    assert!(parse_file(&file).is_complete());
+    assert!(matches!(
+        parse_file(&ChangedFile {
+            additions: 3,
+            ..file
+        })
+        .status,
+        PatchStatus::Truncated { .. }
     ));
 }
 

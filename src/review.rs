@@ -394,6 +394,8 @@ impl ParsedDiff {
 
 /// Parse one standard unified file patch, with or without Git file headers.
 /// Hunk counts are verified; malformed/combined/binary patches are never complete.
+/// GitHub JSON patch strings may omit the final line separator. Completeness
+/// follows declared hunk counts; the transport must reject truncated responses.
 pub fn parse_patch(patch: &str) -> ParsedDiff {
     let mut parsed = ParsedDiff {
         hunks: Vec::new(),
@@ -523,13 +525,8 @@ pub fn parse_patch(patch: &str) -> ParsedDiff {
             .hunks
             .last()
             .is_some_and(|h| old_used != h.old_count || new_used != h.new_count)
-        || (!patch.is_empty() && !patch.ends_with('\n'))
     {
-        return fail(
-            parsed,
-            "Patch ends before the complete hunk or transport line",
-            false,
-        );
+        return fail(parsed, "Patch ends before the complete hunk", false);
     }
     parsed
 }

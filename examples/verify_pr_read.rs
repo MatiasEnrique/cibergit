@@ -53,6 +53,11 @@ fn main() -> Result<()> {
                 remote_file.path
             );
             if remote_file.patch_complete && local_file.patch_complete {
+                ensure!(
+                    parse_file(remote_file).is_complete() && parse_file(local_file).is_complete(),
+                    "Declared complete file did not parse completely: {}",
+                    remote_file.path
+                );
                 let changed = |file| {
                     parse_file(file)
                         .hunks
