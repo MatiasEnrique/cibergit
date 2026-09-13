@@ -5797,6 +5797,39 @@ impl ReviewWorkspace {
                                 .is_ok()
                         })
                         .unwrap_or(false);
+                let submitted_continuation_scrolled = submitted_scene.is_ok()
+                    && window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else { return false };
+                                let maximum = this.inspector_scroll.max_offset().y;
+                                this.inspector_scroll
+                                    .set_offset(point(px(0.), -maximum));
+                                cx.notify();
+                                maximum > px(0.)
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
+                let submitted_continuation_captured = submitted_continuation_scrolled
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join(
+                                            "native-submitted-summary-confirmation-continuation.png",
+                                        ))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
                 let submitted_cancelled = if let Ok((token, _, _, _)) = &submitted_scene {
                     window
                         .update(|_, cx| {
@@ -6053,6 +6086,7 @@ impl ReviewWorkspace {
                     && metadata_captured
                     && activity_captured
                     && submitted_captured
+                    && submitted_continuation_captured
                     && submitted_cancelled
                     && confirmation_aba_guard
                     && submitted_draft_retained
@@ -6063,7 +6097,7 @@ impl ReviewWorkspace {
                     && late_journal_callback_fenced
                     && unchanged;
                 let report = format!(
-                    "Native PR lifecycle and submitted-summary smoke: {}\nExact read-only target pair: cli/cli#{}, secondary {}\nReal read-only provider preparation: cli/cli snapshot title {:?}, selected account {}, values_complete={}, capabilities_complete={}\nSynthetic metadata confirmation capture: {}\nSynthetic exact-ID discussion confirmation capture: {}\nClearly labelled synthetic owned-review summary confirmation capture: {}\nSubmitted-summary cancellation through exact native handler: {}\nCancelled/reprepared identical confirmation rejects the stale native handler token: {}\nPer-review A→B→A and repeated-edit typed drafts retained: {}\nCross-tab editor save/restore retained exact typed draft: {}\nCross-tab stale confirmation handler rejected and original retained: {}\nChanged-source rejection plus explicit refresh retained typed draft: {}\nActual journal completion apply rejected stale success and error without changing busy/sentinel state: {}\nCanonical and selected comparison identities unchanged: {}\nMutation transport: not invoked; ZERO updatePullRequestReview and zero live metadata/comment/review/merge writes\nWindow focus requested: false when CIBERGIT_SMOKE_BACKGROUND=1\nPhysical input is not implied by an in-process scene render.\n",
+                    "Native PR lifecycle and submitted-summary smoke: {}\nExact read-only target pair: cli/cli#{}, secondary {}\nReal read-only provider preparation: cli/cli snapshot title {:?}, selected account {}, values_complete={}, capabilities_complete={}\nSynthetic metadata confirmation capture: {}\nSynthetic exact-ID discussion confirmation capture: {}\nClearly labelled synthetic owned-review summary top capture: {}\nSubmitted-summary bottom continuation capture showing remaining disclosure/warning/controls: {}\nSubmitted-summary cancellation through exact native handler: {}\nCancelled/reprepared identical confirmation rejects the stale native handler token: {}\nPer-review A→B→A and repeated-edit typed drafts retained: {}\nCross-tab editor save/restore retained exact typed draft: {}\nCross-tab stale confirmation handler rejected and original retained: {}\nChanged-source rejection plus explicit refresh retained typed draft: {}\nActual journal completion apply rejected stale success and error without changing busy/sentinel state: {}\nCanonical and selected comparison identities unchanged: {}\nMutation transport: not invoked; ZERO updatePullRequestReview and zero live metadata/comment/review/merge writes\nWindow focus requested: false when CIBERGIT_SMOKE_BACKGROUND=1\nPhysical input is not implied by an in-process scene render.\n",
                     if passed { "passed" } else { "failed" },
                     primary_number,
                     secondary_target,
@@ -6074,6 +6108,7 @@ impl ReviewWorkspace {
                     metadata_captured,
                     activity_captured,
                     submitted_captured,
+                    submitted_continuation_captured,
                     submitted_cancelled,
                     confirmation_aba_guard,
                     submitted_draft_retained && per_review_draft_routing,
