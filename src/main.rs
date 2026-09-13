@@ -35,6 +35,34 @@ actions!(
         OpenRepositorySetup,
     ]
 );
+actions!(
+    cibergit,
+    [
+        FileTreeUp,
+        FileTreeDown,
+        FileTreeLeft,
+        FileTreeRight,
+        FileTreeActivate,
+        DiffScrollLeft,
+        DiffScrollRight,
+        DiffScrollHome,
+        DiffScrollEnd,
+    ]
+);
+actions!(
+    cibergit,
+    [
+        ToggleSidebar,
+        ToggleFileTree,
+        SidebarNarrower,
+        SidebarWider,
+        FileTreeNarrower,
+        FileTreeWider,
+        DetailsNarrower,
+        DetailsWider,
+        ResetLayout,
+    ]
+);
 
 fn parse_startup() -> Result<Startup, String> {
     let mut args = std::env::args_os().skip(1);
@@ -104,6 +132,8 @@ fn main() {
         eprintln!("cibergit: {error}\nRun cibergit --help for usage.");
         std::process::exit(2);
     });
+    let background_smoke =
+        cfg!(feature = "ui-smoke") && std::env::var_os("CIBERGIT_SMOKE_BACKGROUND").is_some();
     gpui_platform::application().run(move |cx| {
         gpui_base::init(cx);
         load_interface_fonts(cx);
@@ -124,10 +154,29 @@ fn main() {
             KeyBinding::new("cmd-shift-i", ToggleInspector, None),
             KeyBinding::new("cmd-shift-d", CycleDiffMode, None),
             KeyBinding::new("cmd-o", OpenRepositorySetup, None),
+            KeyBinding::new("up", FileTreeUp, Some("FileTree")),
+            KeyBinding::new("down", FileTreeDown, Some("FileTree")),
+            KeyBinding::new("left", FileTreeLeft, Some("FileTree")),
+            KeyBinding::new("right", FileTreeRight, Some("FileTree")),
+            KeyBinding::new("enter", FileTreeActivate, Some("FileTree")),
+            KeyBinding::new("cmd-shift-b", ToggleSidebar, None),
+            KeyBinding::new("cmd-shift-f", ToggleFileTree, None),
+            KeyBinding::new("ctrl-alt-left", SidebarNarrower, None),
+            KeyBinding::new("ctrl-alt-right", SidebarWider, None),
+            KeyBinding::new("ctrl-alt-shift-left", FileTreeNarrower, None),
+            KeyBinding::new("ctrl-alt-shift-right", FileTreeWider, None),
+            KeyBinding::new("ctrl-cmd-alt-left", DetailsNarrower, None),
+            KeyBinding::new("ctrl-cmd-alt-right", DetailsWider, None),
+            KeyBinding::new("ctrl-alt-0", ResetLayout, None),
+            KeyBinding::new("left", DiffScrollLeft, Some("DiffPane")),
+            KeyBinding::new("right", DiffScrollRight, Some("DiffPane")),
+            KeyBinding::new("home", DiffScrollHome, Some("DiffPane")),
+            KeyBinding::new("end", DiffScrollEnd, Some("DiffPane")),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.open_window(
             WindowOptions {
+                focus: !background_smoke,
                 titlebar: Some(TitlebarOptions {
                     title: Some("cibergit".into()),
                     appears_transparent: true,
@@ -138,7 +187,7 @@ fn main() {
                     size(px(1440.), px(900.)),
                     cx,
                 ))),
-                window_min_size: Some(size(px(940.), px(620.))),
+                window_min_size: Some(size(px(1040.), px(620.))),
                 window_background: WindowBackgroundAppearance::Blurred,
                 ..Default::default()
             },
@@ -148,6 +197,8 @@ fn main() {
             },
         )
         .expect("open native window");
-        cx.activate(true);
+        if !background_smoke {
+            cx.activate(true);
+        }
     });
 }

@@ -50,8 +50,23 @@ cargo run --locked -- --edit /absolute/path/to/file.rs
 
 - Command-R refreshes reads; focus also triggers a refresh. Polling backs off after failures and slows while inactive.
 - Command-] and Command-[ select the next and previous changed file.
+- Click a directory chevron in the changed-file tree to collapse or expand it. Click the tree,
+  then use Up/Down to move through visible rows, Left/Right to collapse/expand or move between
+  parents and children, and Return to activate the focused row. Next/previous file navigation
+  follows the complete comparison order even when a destination directory is collapsed; its
+  ancestors are expanded and the selected row is revealed.
 - Command-Shift-D cycles Auto, Unified, and Side-by-side diff modes. Auto responds to window width; explicit modes do not.
+- Diff lines scroll horizontally with the trackpad/native scrollbar. After clicking the diff,
+  Left/Right scroll by one keyboard step and Home/End reach its horizontal edges. Line numbers
+  and change markers remain aligned in unified and side-by-side modes. Tabs use stable four-column
+  stops; exceptionally long lines are split into bounded UTF-8-safe shaping chunks without
+  removing source text.
 - Command-Shift-I toggles pull-request details.
+- Drag the dividers beside the repository sidebar, changed-file tree, and details pane to resize
+  them. Command-Shift-B and Command-Shift-F collapse/restore the sidebar and file tree. Control-
+  Option-Left/Right adjusts the sidebar; add Shift for the file tree and Command for details.
+  Control-Option-0, or **Reset panel layout** in the command palette, restores the native defaults.
+  Panel sizes are session-local in this milestone.
 - Command-Shift-P opens the command palette.
 - Open **Edit view…** in the sidebar (or choose **Edit sidebar filters and grouping** in the
   command palette) to compose filters and ordered grouping levels. Text fields accept exact
@@ -85,6 +100,7 @@ test ! -e /tmp/cibergit-ui-smoke-store
 mkdir -p /absolute/path/to/evidence/light
 CIBERGIT_DATA_DIR=/tmp/cibergit-ui-smoke-store \
 CIBERGIT_SMOKE_DIR=/absolute/path/to/evidence/light \
+CIBERGIT_SMOKE_BACKGROUND=1 \
 CIBERGIT_SMOKE_APPEARANCE=light \
 CIBERGIT_SMOKE_SECOND_PR=14398 \
 CARGO_TARGET_DIR=/tmp/cibergit-native-target \
@@ -94,6 +110,7 @@ cargo run --locked --features ui-smoke -- \
 mkdir -p /absolute/path/to/evidence/dark
 CIBERGIT_DATA_DIR=/tmp/cibergit-ui-smoke-store \
 CIBERGIT_SMOKE_DIR=/absolute/path/to/evidence/dark \
+CIBERGIT_SMOKE_BACKGROUND=1 \
 CIBERGIT_SMOKE_APPEARANCE=dark \
 CIBERGIT_SMOKE_EXPECT_RESTORE=1 \
 CIBERGIT_SMOKE_SECOND_PR=14398 \
@@ -102,11 +119,32 @@ cargo run --locked --features ui-smoke -- \
   --repo cli/cli --account YOUR_GH_LOGIN --pr 9847
 ```
 
-Each evidence directory receives `native-pr-review.png`, `native-view-editor-filters.png`,
-`native-view-editor-groups.png`, and `native-pr-smoke.txt`. The harness labels these as
+`CIBERGIT_SMOKE_BACKGROUND=1` is an opt-in capture mode: its native window is
+created without focus and the application does not request activation. Normal
+launches retain the standard foreground activation behavior.
+
+Each evidence directory receives `native-pr-review.png`, unified and split
+`native-long-line-end*.png` captures, `native-long-line-start-split.png`, `native-view-editor-filters.png`,
+`native-view-editor-groups.png`, and `native-pr-smoke.txt`. The fresh Auto run also writes
+`native-pr-review-split.png` before applying an explicit override.
+The harness labels these as
 programmatic native actions: the in-process captures do not prove physical keyboard/mouse input,
 Accessibility behavior, or the composited macOS blur behind the transparent sidebar. It performs
 no remote writes or destructive local editing.
+
+The native assertions measure the rendered diff viewport (after all panels), exercise a wide Auto
+split and narrow Auto unified layout, preserve an explicit override through resize/tab restore and
+restart, collapse and reveal a destination directory, adjust/reset a splitter, and scroll a unique
+long-line token to the far end in both unified and split modes before capture. Split source regions
+are independently clipped beneath fixed OLD/NEW headers and gutters while sharing one native
+horizontal offset. Read the distinct OLD/NEW sentinels in both `native-long-line-start-split.png`
+and `native-long-line-end-split.png`; checking only the scroll offset is not accepted as visual
+evidence. The real `cli/cli#14130` Overview capture also exercises narrow selectable Markdown around
+“Issue fields are not currently…”. In pinned GPUI Base 0.6.1, an inline-code mark switches the whole
+paragraph to a fragment flow whose wrapped origins can overlap at narrow widths. cibergit escapes
+inline-code delimiters into literal selectable backticks as a bounded fallback; exact visible text,
+links, fenced code blocks, and media-free rendering remain intact, while inline code does not receive
+special code styling.
 
 The first smoke run also saves a named view with an exact source-branch filter and global
 target → repository → source-prefix grouping. The restart run requires that exact view and the

@@ -1,7 +1,11 @@
 use crate::{
-    CloseTab, CycleDiffMode, NextFile, OpenRepositorySetup, PreviousFile, Refresh, Save,
-    ToggleInspector, TogglePalette,
+    CloseTab, CycleDiffMode, DetailsNarrower, DetailsWider, DiffScrollEnd, DiffScrollHome,
+    DiffScrollLeft, DiffScrollRight, FileTreeActivate, FileTreeDown, FileTreeLeft,
+    FileTreeNarrower, FileTreeRight, FileTreeUp, FileTreeWider, NextFile, OpenRepositorySetup,
+    PreviousFile, Refresh, ResetLayout, Save, SidebarNarrower, SidebarWider, ToggleFileTree,
+    ToggleInspector, TogglePalette, ToggleSidebar,
 };
+mod file_tree;
 mod view_editor;
 
 use cibergit::{
@@ -13,15 +17,18 @@ use cibergit::{
     },
     workspace::{Filter, GroupBy, PersonalFilter, PollSchedule, Store, TabState, WorkspaceState},
 };
+use file_tree::{FileTree, TreeRowKind};
 use gpui::{prelude::*, *};
 use gpui_base::{
-    TextView, TextViewStyle,
+    Scrollbar, TextView, TextViewStyle,
     input::{Editor, EditorState, Input, InputEditorStyle, InputState},
 };
 use std::{
+    cell::Cell,
     collections::HashMap,
     ops::Range,
     path::PathBuf,
+    rc::Rc,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -32,6 +39,34 @@ use view_editor::{RepositoryPulls, SidebarRow, ViewEditorController, compose_sid
 
 const UI_FONT: &str = "IBM Plex Sans";
 const CODE_FONT: &str = "Menlo";
+const DEFAULT_SIDEBAR_WIDTH: f32 = 292.;
+const DEFAULT_FILE_TREE_WIDTH: f32 = 250.;
+const DEFAULT_DETAILS_WIDTH: f32 = 274.;
+const MIN_SIDEBAR_WIDTH: f32 = 220.;
+const MIN_FILE_TREE_WIDTH: f32 = 180.;
+const MIN_DETAILS_WIDTH: f32 = 220.;
+const MAX_PANEL_WIDTH: f32 = 460.;
+const COLLAPSED_PANEL_WIDTH: f32 = 34.;
+const SPLITTER_WIDTH: f32 = 6.;
+const MIN_SPLIT_DIFF_WIDTH: f32 = 560.;
+const PANEL_KEYBOARD_STEP: f32 = 16.;
+// Menlo at the diff's 12px text size advances about 7.225px per ASCII cell on
+// the pinned renderer. Round upward; Unicode is conservatively two cells.
+const DIFF_CELL_WIDTH: f32 = 7.23;
+const DIFF_FIXED_COLUMNS: f32 = 122.;
+#[cfg(feature = "ui-smoke")]
+const SPLIT_GUTTER_WIDTH: f32 = 66.;
+const EXCEPTIONAL_LINE_CHUNK_BYTES: usize = 2_048;
+#[cfg(feature = "ui-smoke")]
+const SMOKE_LONG_LINE_TOKEN: &str = "CIBERGIT_LONG_LINE_END_7F3A";
+#[cfg(feature = "ui-smoke")]
+const SMOKE_OLD_LINE_START: &str = "CIBERGIT_OLD_START_2A6D";
+#[cfg(feature = "ui-smoke")]
+const SMOKE_OLD_LINE_END: &str = "CIBERGIT_OLD_END_9C41";
+#[cfg(feature = "ui-smoke")]
+const SMOKE_NEW_LINE_START: &str = "CIBERGIT_NEW_START_51B8";
+#[cfg(feature = "ui-smoke")]
+const SMOKE_NEW_LINE_END: &str = "CIBERGIT_NEW_END_E73F";
 
 #[derive(Clone, Debug, Default)]
 pub enum LaunchMode {
@@ -304,6 +339,130 @@ struct RepoRuntime {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelKind {
+    Sidebar,
+    FileTree,
+    Details,
+}
+
+#[derive(Clone, Debug)]
+struct PanelLayout {
+    sidebar_width: f32,
+    file_tree_width: f32,
+    details_width: f32,
+    sidebar_collapsed: bool,
+    file_tree_collapsed: bool,
+}
+
+impl Default for PanelLayout {
+    fn default() -> Self {
+        Self {
+            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            file_tree_width: DEFAULT_FILE_TREE_WIDTH,
+            details_width: DEFAULT_DETAILS_WIDTH,
+            sidebar_collapsed: false,
+            file_tree_collapsed: false,
+        }
+    }
+}
+
+impl PanelLayout {
+    fn width(&self, panel: PanelKind, inspector_open: bool) -> f32 {
+        match panel {
+            PanelKind::Sidebar if self.sidebar_collapsed => COLLAPSED_PANEL_WIDTH,
+            PanelKind::Sidebar => self.sidebar_width,
+            PanelKind::FileTree if self.file_tree_collapsed => COLLAPSED_PANEL_WIDTH,
+            PanelKind::FileTree => self.file_tree_width,
+            PanelKind::Details if !inspector_open => 0.,
+            PanelKind::Details => self.details_width,
+        }
+    }
+
+    fn adjust(&mut self, panel: PanelKind, delta: f32) {
+        let (width, collapsed, minimum) = match panel {
+            PanelKind::Sidebar => (
+                &mut self.sidebar_width,
+                &mut self.sidebar_collapsed,
+                MIN_SIDEBAR_WIDTH,
+            ),
+            PanelKind::FileTree => (
+                &mut self.file_tree_width,
+                &mut self.file_tree_collapsed,
+                MIN_FILE_TREE_WIDTH,
+            ),
+            PanelKind::Details => {
+                self.details_width =
+                    (self.details_width + delta).clamp(MIN_DETAILS_WIDTH, MAX_PANEL_WIDTH);
+                return;
+            }
+        };
+        if *collapsed && delta > 0. {
+            *collapsed = false;
+        }
+        *width = (*width + delta).clamp(minimum, MAX_PANEL_WIDTH);
+    }
+}
+
+fn resolved_panel_widths_for(
+    layout: &PanelLayout,
+    inspector_open: bool,
+    window_width: f32,
+) -> (f32, f32, f32) {
+    let mut sidebar = layout.width(PanelKind::Sidebar, inspector_open);
+    let mut tree = layout.width(PanelKind::FileTree, inspector_open);
+    let mut details = layout.width(PanelKind::Details, inspector_open);
+    let splitter_count = 2. + if inspector_open { 1. } else { 0. };
+    let panel_budget = (window_width - 360. - splitter_count * SPLITTER_WIDTH).max(0.);
+    let minimum_sidebar = if layout.sidebar_collapsed {
+        COLLAPSED_PANEL_WIDTH
+    } else {
+        MIN_SIDEBAR_WIDTH
+    };
+    let minimum_tree = if layout.file_tree_collapsed {
+        COLLAPSED_PANEL_WIDTH
+    } else {
+        MIN_FILE_TREE_WIDTH
+    };
+    let minimum_details = if inspector_open {
+        MIN_DETAILS_WIDTH
+    } else {
+        0.
+    };
+    let mut excess = (sidebar + tree + details - panel_budget).max(0.);
+    for (width, minimum) in [
+        (&mut details, minimum_details),
+        (&mut sidebar, minimum_sidebar),
+        (&mut tree, minimum_tree),
+    ] {
+        let reduction = excess.min((*width - minimum).max(0.));
+        *width -= reduction;
+        excess -= reduction;
+    }
+    (sidebar, tree, details)
+}
+
+fn available_diff_width_for(layout: &PanelLayout, inspector_open: bool, window_width: f32) -> f32 {
+    let (sidebar, tree, details) = resolved_panel_widths_for(layout, inspector_open, window_width);
+    let splitter_count = 2. + if inspector_open { 1. } else { 0. };
+    (window_width - sidebar - tree - details - splitter_count * SPLITTER_WIDTH).max(0.)
+}
+
+#[derive(Clone)]
+struct PanelResizeDrag {
+    panel: PanelKind,
+    start_width: f32,
+    start_x: Rc<Cell<Option<f32>>>,
+}
+
+struct SplitterDragPreview;
+
+impl Render for SplitterDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(2.)).h(px(24.)).bg(rgba(0x6fa8ffff))
+    }
+}
+
 struct ReviewTab {
     repository: Repository,
     pull_request: PullRequest,
@@ -313,6 +472,11 @@ struct ReviewTab {
     metadata_generation: u64,
     diff_rows: Vec<DiffRow>,
     diff_scroll: UniformListScrollHandle,
+    diff_horizontal: ScrollHandle,
+    horizontal_positions: HashMap<String, f32>,
+    diff_content_width: f32,
+    file_tree: FileTree,
+    file_tree_scroll: UniformListScrollHandle,
     inspector_section: InspectorSection,
     local_inventory: bool,
     session_persistence_error: Option<String>,
@@ -365,6 +529,9 @@ pub struct ReviewWorkspace {
     focused: bool,
     wide: bool,
     focus: FocusHandle,
+    file_tree_focus: FocusHandle,
+    diff_focus: FocusHandle,
+    panel_layout: PanelLayout,
     view_editor_scroll: ScrollHandle,
     query: Entity<InputState>,
     view_editor: ViewEditorController,
@@ -381,6 +548,62 @@ pub struct ReviewWorkspace {
 }
 
 impl ReviewWorkspace {
+    fn resolved_panel_widths(&self, window: &Window) -> (f32, f32, f32) {
+        resolved_panel_widths_for(
+            &self.panel_layout,
+            self.inspector_open,
+            window.bounds().size.width.as_f32(),
+        )
+    }
+
+    fn available_diff_width(&self, window: &Window) -> f32 {
+        available_diff_width_for(
+            &self.panel_layout,
+            self.inspector_open,
+            window.bounds().size.width.as_f32(),
+        )
+    }
+
+    fn refresh_auto_layout(&mut self, window: &Window) {
+        let wide = self.available_diff_width(window) >= MIN_SPLIT_DIFF_WIDTH;
+        if wide == self.wide {
+            return;
+        }
+        self.wide = wide;
+        if let Some(index) = self.active_tab
+            && self.tabs[index]
+                .session
+                .as_ref()
+                .is_some_and(|session| session.diff_mode() == DiffMode::Auto)
+        {
+            self.capture_scroll(index);
+            self.rebuild_diff(index, wide);
+        }
+    }
+
+    fn reset_layout(&mut self, window: &Window, cx: &mut Context<Root>) {
+        self.panel_layout = PanelLayout::default();
+        self.inspector_open = true;
+        self.refresh_auto_layout(window);
+        self.status = "Panel layout reset".into();
+        cx.notify();
+    }
+
+    fn adjust_panel(
+        &mut self,
+        panel: PanelKind,
+        delta: f32,
+        window: &Window,
+        cx: &mut Context<Root>,
+    ) {
+        if panel == PanelKind::Details && !self.inspector_open {
+            self.inspector_open = true;
+        }
+        self.panel_layout.adjust(panel, delta);
+        self.refresh_auto_layout(window);
+        cx.notify();
+    }
+
     fn new(window: &mut Window, cx: &mut Context<Root>, startup: Startup) -> Self {
         let store_result = startup
             .data_dir
@@ -426,6 +649,8 @@ impl ReviewWorkspace {
             cx,
         );
         let focus = cx.focus_handle();
+        let file_tree_focus = cx.focus_handle();
+        let diff_focus = cx.focus_handle();
         window.focus(&focus, cx);
         let repositories = workspace
             .repositories
@@ -460,8 +685,11 @@ impl ReviewWorkspace {
             command_palette: false,
             inspector_open: true,
             focused: window.is_window_active(),
-            wide: window.bounds().size.width > px(1180.),
+            wide: false,
             focus,
+            file_tree_focus,
+            diff_focus,
+            panel_layout: PanelLayout::default(),
             view_editor_scroll: ScrollHandle::new(),
             query,
             view_editor: ViewEditorController::new(),
@@ -476,6 +704,7 @@ impl ReviewWorkspace {
             session_save_locks: HashMap::new(),
             _subscriptions: Vec::new(),
         };
+        this.wide = this.available_diff_width(window) >= MIN_SPLIT_DIFF_WIDTH;
         let activation = cx.observe_window_activation(window, |root, window, cx| {
             let Root::Review(this) = root else { return };
             this.focused = window.is_window_active();
@@ -498,7 +727,7 @@ impl ReviewWorkspace {
         });
         let bounds = cx.observe_window_bounds(window, |root, window, cx| {
             let Root::Review(this) = root else { return };
-            let wide = window.bounds().size.width > px(1180.);
+            let wide = this.available_diff_width(window) >= MIN_SPLIT_DIFF_WIDTH;
             if wide != this.wide {
                 this.wide = wide;
                 if let Some(index) = this.active_tab
@@ -653,6 +882,106 @@ impl ReviewWorkspace {
                     }
                 }
                 let _ = std::fs::create_dir_all(&output);
+                let split_review_captured = if expect_restore {
+                    true
+                } else {
+                    let _ = window.update(|window, cx| {
+                        let _ = weak.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                this.panel_layout.sidebar_collapsed = true;
+                                this.panel_layout.file_tree_collapsed = true;
+                                this.inspector_open = false;
+                                this.refresh_auto_layout(window);
+                                cx.notify();
+                            }
+                        });
+                    });
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(300))
+                        .await;
+                    let captured =
+                    window
+                        .update(|window, cx| {
+                            let split = weak
+                                .read_with(cx, |root, _| {
+                                    matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| this.tabs[index].diff_rows.iter().any(|row| matches!(row, DiffRow::Split(_)))))
+                                })
+                                .unwrap_or(false);
+                            split
+                                && window
+                                    .render_to_image()
+                                    .and_then(|image| {
+                                        image
+                                            .save(output.join("native-pr-review-split.png"))
+                                            .map_err(Into::into)
+                                    })
+                                    .is_ok()
+                        })
+                        .unwrap_or(false);
+                    let _ = window.update(|window, cx| {
+                        let _ = weak.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                this.panel_layout = PanelLayout::default();
+                                this.inspector_open = true;
+                                this.refresh_auto_layout(window);
+                                cx.notify();
+                            }
+                        });
+                    });
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(300))
+                        .await;
+                    captured
+                };
+                let auto_layout_verified = if expect_restore {
+                    true
+                } else {
+                    let _ = window.update(|window, _| {
+                        window.resize(size(px(1040.), px(720.)));
+                    });
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(300))
+                        .await;
+                    let narrow = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                    !this.wide
+                                        && this.tabs[index].diff_horizontal.bounds().size.width
+                                            < px(MIN_SPLIT_DIFF_WIDTH)
+                                        && this.tabs[index].session.as_ref().is_some_and(|session| session.diff_mode() == DiffMode::Auto)
+                                        && this.tabs[index].diff_rows.iter().all(|row| !matches!(row, DiffRow::Split(_)))
+                                }))
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    let _ = window.update(|window, _| {
+                        window.resize(size(px(1440.), px(900.)));
+                    });
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(300))
+                        .await;
+                    let wide = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                    this.wide
+                                        && effective_diff_viewport_width(&this.tabs[index].diff_rows, &this.tabs[index].diff_horizontal)
+                                            >= MIN_SPLIT_DIFF_WIDTH
+                                        && this.tabs[index].session.as_ref().is_some_and(|session| session.diff_mode() == DiffMode::Auto)
+                                        && this.tabs[index].diff_rows.iter().any(|row| matches!(row, DiffRow::Split(_)))
+                                }))
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    narrow && wide
+                };
                 let actions = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
@@ -662,6 +991,7 @@ impl ReviewWorkspace {
                             this.run_primary_smoke_actions(
                                 second_pr,
                                 expect_restore,
+                                auto_layout_verified,
                                 window,
                                 cx,
                             )
@@ -730,6 +1060,184 @@ impl ReviewWorkspace {
                             .is_ok()
                     })
                     .unwrap_or(false);
+                let long_line_installed = actions.is_ok()
+                    && window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                this.install_long_line_smoke(DiffMode::Unified, cx)
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("smoke window unavailable".to_owned()))
+                        .is_ok();
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let long_line_maximum = if long_line_installed {
+                    window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                this.scroll_long_line_smoke_to_end(cx)
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("smoke window unavailable".to_owned()))
+                } else {
+                    Err("long-line fixture was not installed".to_owned())
+                };
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let long_line_verified = long_line_maximum.as_ref().is_ok_and(|maximum| {
+                    window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                this.validate_long_line_smoke(*maximum, DiffMode::Unified)
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("smoke window unavailable".to_owned()))
+                        .is_ok()
+                });
+                let long_line_captured = long_line_verified
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join("native-long-line-end.png"))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let split_long_line_installed = actions.is_ok()
+                    && window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                this.install_long_line_smoke(DiffMode::SideBySide, cx)
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("smoke window unavailable".to_owned()))
+                        .is_ok();
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let split_long_line_start_verified = split_long_line_installed
+                    && window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                this.validate_split_long_line_start()
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("smoke window unavailable".to_owned()))
+                        .is_ok();
+                let split_long_line_start_captured = split_long_line_start_verified
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join("native-long-line-start-split.png"))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let split_long_line_maximum = if split_long_line_installed {
+                    window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                this.scroll_long_line_smoke_to_end(cx)
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("smoke window unavailable".to_owned()))
+                } else {
+                    Err("split long-line fixture was not installed".to_owned())
+                };
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let split_long_line_verified =
+                    split_long_line_maximum.as_ref().is_ok_and(|maximum| {
+                        window
+                            .update(|_, cx| {
+                                weak.read_with(cx, |root, _| {
+                                    let Root::Review(this) = root else {
+                                        return Err("smoke left review workspace".to_owned());
+                                    };
+                                    this.validate_long_line_smoke(*maximum, DiffMode::SideBySide)
+                                })
+                                .unwrap_or_else(|error| {
+                                    Err(format!("smoke entity unavailable: {error:#}"))
+                                })
+                            })
+                            .unwrap_or_else(|_| Err("smoke window unavailable".to_owned()))
+                            .is_ok()
+                    });
+                let split_long_line_captured = split_long_line_verified
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join("native-long-line-end-split.png"))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.restore_real_diff_after_long_line(cx);
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
                 let editor_opened = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
@@ -786,6 +1294,14 @@ impl ReviewWorkspace {
                             actions.report.push_str(
                                 "Persistence: selected/viewed state read back after queued two-tab saves\n",
                             );
+                            actions.report.push_str(&format!(
+                                "Long-line source end: {SMOKE_LONG_LINE_TOKEN}\nUnified horizontal maximum offset: {}px\nUnified far-end native render state: {}\nSplit start sentinels: OLD={SMOKE_OLD_LINE_START}, NEW={SMOKE_NEW_LINE_START}\nSplit start native render state: {}\nSplit end sentinels: OLD={SMOKE_OLD_LINE_END}, NEW={SMOKE_NEW_LINE_END}\nSplit horizontal maximum offset: {}px\nSplit far-end native render state: {}\n",
+                                long_line_maximum.as_ref().copied().unwrap_or_default(),
+                                if long_line_verified { "passed" } else { "failed" },
+                                if split_long_line_start_verified { "passed" } else { "failed" },
+                                split_long_line_maximum.as_ref().copied().unwrap_or_default(),
+                                if split_long_line_verified { "passed" } else { "failed" },
+                            ));
                             Ok(actions)
                         })
                         .unwrap_or_else(|error| {
@@ -802,17 +1318,43 @@ impl ReviewWorkspace {
                             })
                             .is_ok();
                     let passed = validation.is_ok()
+                        && split_review_captured
                         && review_captured
+                        && long_line_captured
+                        && split_long_line_start_captured
+                        && split_long_line_captured
                         && filter_editor_captured
                         && group_editor_captured;
                     let details = validation
                         .map(|actions| actions.report)
                         .unwrap_or_else(|error| format!("Smoke failed: {error}\n"));
                     let report = format!(
-                        "{details}Programmatic native actions: {}\nReview scene capture: {}\nFilter editor scene capture: {}\nGrouping editor scene capture: {}\nNative backdrop blending and physical input: not established by in-process capture\nRemote writes: none\n",
+                        "{details}Programmatic native actions: {}\nInitial split review scene capture: {}\nReview scene capture: {}\nUnified long-line end scene capture: {}\nSplit long-line start scene capture: {}\nSplit long-line end scene capture: {}\nFilter editor scene capture: {}\nGrouping editor scene capture: {}\nNative backdrop blending and physical input: not established by in-process capture\nRemote writes: none\n",
                         if passed { "passed" } else { "failed" },
+                        if expect_restore {
+                            "covered by fresh light run"
+                        } else if split_review_captured {
+                            "native-pr-review-split.png"
+                        } else {
+                            "failed"
+                        },
                         if review_captured {
                             "native-pr-review.png"
+                        } else {
+                            "failed"
+                        },
+                        if long_line_captured {
+                            "native-long-line-end.png"
+                        } else {
+                            "failed"
+                        },
+                        if split_long_line_start_captured {
+                            "native-long-line-start-split.png"
+                        } else {
+                            "failed"
+                        },
+                        if split_long_line_captured {
+                            "native-long-line-end-split.png"
                         } else {
                             "failed"
                         },
@@ -852,10 +1394,159 @@ impl ReviewWorkspace {
     }
 
     #[cfg(feature = "ui-smoke")]
+    fn install_long_line_smoke(
+        &mut self,
+        mode: DiffMode,
+        cx: &mut Context<Root>,
+    ) -> Result<(), String> {
+        let index = self
+            .active_tab
+            .ok_or_else(|| "long-line smoke has no active tab".to_owned())?;
+        let text = format!(
+            "LONG-LINE-BEGIN {} {SMOKE_LONG_LINE_TOKEN}",
+            "0123456789abcdef".repeat(256)
+        );
+        let line = DiffLine {
+            kind: DiffLineKind::Addition,
+            old_line: None,
+            new_line: Some(1),
+            text,
+        };
+        let rows = vec![
+            DiffRow::Hunk(format!("Native {mode:?} long-line reachability fixture")),
+            match mode {
+                DiffMode::SideBySide => {
+                    let shared = "0123456789abcdef".repeat(256);
+                    DiffRow::Split(AlignedRow {
+                        old: Some(DiffLine {
+                            kind: DiffLineKind::Deletion,
+                            old_line: Some(1),
+                            new_line: None,
+                            text: format!("{SMOKE_OLD_LINE_START} {shared} {SMOKE_OLD_LINE_END}"),
+                        }),
+                        new: Some(DiffLine {
+                            kind: DiffLineKind::Addition,
+                            old_line: None,
+                            new_line: Some(1),
+                            text: format!("{SMOKE_NEW_LINE_START} {shared} {SMOKE_NEW_LINE_END}"),
+                        }),
+                    })
+                }
+                DiffMode::Auto | DiffMode::Unified => DiffRow::Unified(line),
+            },
+        ];
+        if let Some(session) = &mut self.tabs[index].session {
+            session.set_diff_mode(mode);
+        }
+        self.tabs[index].diff_content_width = diff_content_width(&rows, mode);
+        self.tabs[index].diff_rows = rows;
+        self.tabs[index].diff_scroll = UniformListScrollHandle::new();
+        self.tabs[index].diff_horizontal = ScrollHandle::new();
+        self.tabs[index]
+            .diff_scroll
+            .scroll_to_item(1, ScrollStrategy::Nearest);
+        cx.notify();
+        Ok(())
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn scroll_long_line_smoke_to_end(&mut self, cx: &mut Context<Root>) -> Result<f32, String> {
+        let index = self
+            .active_tab
+            .ok_or_else(|| "long-line smoke has no active tab".to_owned())?;
+        let handle = &self.tabs[index].diff_horizontal;
+        let maximum = handle.max_offset().x.as_f32();
+        if maximum < 1_000. {
+            return Err(format!(
+                "long-line viewport did not expose meaningful horizontal overflow ({maximum}px)"
+            ));
+        }
+        handle.set_offset(point(px(-maximum), px(0.)));
+        cx.notify();
+        Ok(maximum)
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn validate_long_line_smoke(&self, maximum: f32, mode: DiffMode) -> Result<(), String> {
+        let index = self
+            .active_tab
+            .ok_or_else(|| "long-line smoke has no active tab".to_owned())?;
+        let tab = &self.tabs[index];
+        if tab
+            .session
+            .as_ref()
+            .is_none_or(|session| session.diff_mode() != mode)
+        {
+            return Err(format!("long-line scene did not expose {mode:?} mode"));
+        }
+        let rendered_source_has_token = tab.diff_rows.iter().any(|row| match (mode, row) {
+            (DiffMode::Unified, DiffRow::Unified(line)) => {
+                line.text.ends_with(SMOKE_LONG_LINE_TOKEN)
+            }
+            (DiffMode::SideBySide, DiffRow::Split(row)) => {
+                row.old
+                    .as_ref()
+                    .is_some_and(|line| line.text.ends_with(SMOKE_OLD_LINE_END))
+                    && row
+                        .new
+                        .as_ref()
+                        .is_some_and(|line| line.text.ends_with(SMOKE_NEW_LINE_END))
+            }
+            _ => false,
+        });
+        let offset = tab.diff_horizontal.offset().x.as_f32();
+        if !rendered_source_has_token || (offset + maximum).abs() > 1. {
+            return Err(format!(
+                "long-line far-end render state is invalid (token={rendered_source_has_token}, offset={offset}, maximum={maximum})"
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn validate_split_long_line_start(&self) -> Result<(), String> {
+        let index = self
+            .active_tab
+            .ok_or_else(|| "split long-line smoke has no active tab".to_owned())?;
+        let tab = &self.tabs[index];
+        if tab.diff_horizontal.offset().x.as_f32().abs() > 1. {
+            return Err("split long-line fixture did not begin at its left edge".to_owned());
+        }
+        let sentinels_are_side_specific = tab.diff_rows.iter().any(|row| {
+            let DiffRow::Split(row) = row else {
+                return false;
+            };
+            row.old
+                .as_ref()
+                .is_some_and(|line| line.text.starts_with(SMOKE_OLD_LINE_START))
+                && row
+                    .new
+                    .as_ref()
+                    .is_some_and(|line| line.text.starts_with(SMOKE_NEW_LINE_START))
+        });
+        if !sentinels_are_side_specific {
+            return Err("split long-line start sentinels lost OLD/NEW identity".to_owned());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn restore_real_diff_after_long_line(&mut self, cx: &mut Context<Root>) {
+        if let Some(index) = self.active_tab {
+            if let Some(session) = &mut self.tabs[index].session {
+                session.set_diff_mode(DiffMode::Unified);
+            }
+            self.rebuild_diff(index, self.wide);
+            cx.notify();
+        }
+    }
+
+    #[cfg(feature = "ui-smoke")]
     fn run_primary_smoke_actions(
         &mut self,
         second_pr: Option<u64>,
         expect_restore: bool,
+        auto_layout_verified: bool,
         window: &mut Window,
         cx: &mut Context<Root>,
     ) -> Result<SmokeActions, String> {
@@ -887,9 +1578,65 @@ impl ReviewWorkspace {
         let target_branch = tab.pull_request.target_branch.clone();
         let branches = format!("{} -> {}", source_branch, target_branch);
         let revision = session.revision().head_sha.clone();
+        let initial_mode = session.diff_mode();
+        let initial_rows_are_split = tab
+            .diff_rows
+            .iter()
+            .any(|row| matches!(row, DiffRow::Split(_)));
+        let actual_diff_width = effective_diff_viewport_width(&tab.diff_rows, &tab.diff_horizontal);
+        let calculated_diff_width = self.available_diff_width(window);
+        if actual_diff_width <= 0.
+            || (actual_diff_width - calculated_diff_width).abs() > SPLITTER_WIDTH + 2.
+        {
+            return Err(format!(
+                "actual diff viewport {actual_diff_width}px differs from pane calculation {calculated_diff_width}px"
+            ));
+        }
+        if !expect_restore
+            && (initial_mode != DiffMode::Auto || !self.wide || !initial_rows_are_split)
+        {
+            return Err(format!(
+                "initial wide Auto layout was not split (pane {actual_diff_width}px)"
+            ));
+        }
+        if expect_restore && initial_mode == DiffMode::Auto {
+            return Err("explicit diff mode did not restore with the tab".into());
+        }
+        if !auto_layout_verified {
+            return Err(
+                "native Auto layout did not switch wide split -> narrow unified -> wide split"
+                    .into(),
+            );
+        }
+        if number == 14130
+            && !tab
+                .details
+                .as_ref()
+                .is_some_and(|details| details.body.contains("Issue fields are not currently"))
+        {
+            return Err("cli/cli#14130 Markdown overlap probe text is absent".into());
+        }
+        let next_expected_key = session
+            .comparison()
+            .files
+            .iter()
+            .position(|file| file_key(file) == original_key)
+            .and_then(|position| session.comparison().files.get(position + 1))
+            .map(file_key)
+            .ok_or_else(|| "selected file has no next file for tree reveal smoke".to_owned())?;
         let saved_view_report =
             self.exercise_saved_view_smoke(&source_branch, &target_branch, expect_restore)?;
 
+        if self.tabs[index]
+            .file_tree
+            .collapse_ancestor_of(&next_expected_key)
+            .is_some()
+            && self.tabs[index]
+                .file_tree
+                .file_is_visible(&next_expected_key)
+        {
+            return Err("collapsed tree ancestor left its changed file visible".into());
+        }
         self.next_file(&NextFile, window, cx);
         let next_key = self.tabs[index]
             .session
@@ -899,6 +1646,9 @@ impl ReviewWorkspace {
             .ok_or_else(|| "next-file handler cleared selection".to_owned())?;
         if next_key == original_key {
             return Err("next-file handler did not advance selection".to_owned());
+        }
+        if next_key != next_expected_key || !self.tabs[index].file_tree.file_is_visible(&next_key) {
+            return Err("next-file navigation did not expand and reveal its tree ancestors".into());
         }
         self.previous_file(&PreviousFile, window, cx);
         let returned_key = self.tabs[index]
@@ -911,6 +1661,16 @@ impl ReviewWorkspace {
             return Err("previous-file handler did not restore selection".to_owned());
         }
 
+        let default_tree_width = self.panel_layout.file_tree_width;
+        self.adjust_panel(PanelKind::FileTree, PANEL_KEYBOARD_STEP, window, cx);
+        if self.panel_layout.file_tree_width <= default_tree_width {
+            return Err("programmatic file-tree splitter adjustment had no effect".into());
+        }
+        self.reset_layout(window, cx);
+        if self.panel_layout.file_tree_width != DEFAULT_FILE_TREE_WIDTH {
+            return Err("reset-layout action did not restore file-tree width".into());
+        }
+
         if self.tabs[index]
             .session
             .as_ref()
@@ -918,7 +1678,7 @@ impl ReviewWorkspace {
         {
             self.cycle_diff(&CycleDiffMode, window, cx);
         }
-        window.resize(size(px(980.), px(720.)));
+        window.resize(size(px(1040.), px(720.)));
         if self.tabs[index]
             .session
             .as_ref()
@@ -941,7 +1701,7 @@ impl ReviewWorkspace {
         Ok(SmokeActions {
             primary_number: number,
             report: format!(
-                "Real read complete\nRepository: {}\nPR: #{number} {title}\nBranches: {branches}\nRevision: {revision}\nFiles: {file_count}\nSelected: {}\nSidebar and details reads: settled\n{saved_view_report}\nRestart restore observed: {restored}\nNext/previous handlers: {original_key} -> {next_key} -> {returned_key}\nExplicit diff mode survived narrow resize\n",
+                "Real read complete\nRepository: {}\nPR: #{number} {title}\nBranches: {branches}\nRevision: {revision}\nFiles: {file_count}\nSelected: {}\nSidebar and details reads: settled\n{saved_view_report}\nRestart restore observed: {restored}\nInitial actual diff pane: {actual_diff_width}px ({initial_mode:?})\nInitial wide Auto split: {}\nNarrow Auto unified: {}\nCollapsed-directory next/previous reveal: {original_key} -> {next_key} -> {returned_key}\nProgrammatic splitter adjustment and Reset layout: passed\ncli/cli#14130 Markdown probe source: {}\nExplicit diff mode survived narrow resize\n",
                 repository.full_name(),
                 self.tabs[index]
                     .session
@@ -949,6 +1709,15 @@ impl ReviewWorkspace {
                     .and_then(ReviewSession::selected_file)
                     .map(|file| file.path.as_str())
                     .unwrap_or("none"),
+                !expect_restore,
+                if expect_restore {
+                    "covered by fresh light run"
+                } else if auto_layout_verified {
+                    "passed"
+                } else {
+                    "failed"
+                },
+                number == 14130,
             ),
             expectations: Vec::new(),
         })
@@ -1473,7 +2242,21 @@ impl ReviewWorkspace {
 
     fn activate_tab(&mut self, index: usize, cx: &mut Context<Root>) {
         if index < self.tabs.len() {
+            if let Some(previous) = self.active_tab {
+                self.capture_scroll(previous);
+            }
             self.active_tab = Some(index);
+            if let Some(key) = self.tabs[index]
+                .session
+                .as_ref()
+                .and_then(ReviewSession::selected_file)
+                .map(file_key)
+                && let Some(row) = self.tabs[index].file_tree.reveal_file(&key)
+            {
+                self.tabs[index]
+                    .file_tree_scroll
+                    .scroll_to_item(row, gpui::ScrollStrategy::Nearest);
+            }
             self.setup_open = false;
             cx.notify();
         }
@@ -1528,6 +2311,10 @@ impl ReviewWorkspace {
                     .iter()
                     .any(|file| file.patch.is_none())
             });
+        let file_tree = session
+            .as_ref()
+            .map(|session| FileTree::new(&session.comparison().files))
+            .unwrap_or_default();
         self.tabs.push(ReviewTab {
             repository,
             pull_request,
@@ -1537,6 +2324,11 @@ impl ReviewWorkspace {
             metadata_generation: 0,
             diff_rows: Vec::new(),
             diff_scroll: UniformListScrollHandle::new(),
+            diff_horizontal: ScrollHandle::new(),
+            horizontal_positions: HashMap::new(),
+            diff_content_width: 0.,
+            file_tree,
+            file_tree_scroll: UniformListScrollHandle::new(),
             inspector_section: InspectorSection::Overview,
             local_inventory,
             session_persistence_error,
@@ -1638,6 +2430,24 @@ impl ReviewWorkspace {
                             }
                         } else {
                             this.tabs[tab_index].session = Some(ReviewSession::new(comparison));
+                        }
+                        if let Some((files, selected)) =
+                            this.tabs[tab_index].session.as_ref().map(|session| {
+                                (
+                                    session.comparison().files.clone(),
+                                    session.selected_file().map(file_key),
+                                )
+                            })
+                        {
+                            this.tabs[tab_index].file_tree.sync(&files);
+                            if let Some(selected) = selected
+                                && let Some(row) =
+                                    this.tabs[tab_index].file_tree.reveal_file(&selected)
+                            {
+                                this.tabs[tab_index]
+                                    .file_tree_scroll
+                                    .scroll_to_item(row, ScrollStrategy::Nearest);
+                            }
                         }
                         this.tabs[tab_index].state = if cached {
                             LoadState::Cached("Offline · immutable comparison from cache".into())
@@ -1766,14 +2576,25 @@ impl ReviewWorkspace {
             tab.diff_rows.clear();
             return;
         };
+        let selected_key = file_key(file);
         let scroll_position = session.scroll_position();
-        tab.diff_rows = build_rows(parse_file(file), session.diff_mode().resolve(wide));
+        let horizontal_position = tab
+            .horizontal_positions
+            .get(&selected_key)
+            .copied()
+            .unwrap_or(0.);
+        let resolved_mode = session.diff_mode().resolve(wide);
+        tab.diff_rows = build_rows(parse_file(file), resolved_mode);
+        tab.diff_content_width = diff_content_width(&tab.diff_rows, resolved_mode);
         tab.diff_scroll = UniformListScrollHandle::new();
         tab.diff_scroll
             .0
             .borrow()
             .base_handle
             .set_offset(point(px(0.), px(-scroll_position)));
+        tab.diff_horizontal = ScrollHandle::new();
+        tab.diff_horizontal
+            .set_offset(point(px(-horizontal_position), px(0.)));
     }
 
     fn capture_scroll(&mut self, index: usize) {
@@ -1783,6 +2604,10 @@ impl ReviewWorkspace {
         let position = -tab.diff_scroll.0.borrow().base_handle.offset().y.as_f32();
         if let Some(session) = &mut tab.session {
             session.set_scroll_position(position);
+            if let Some(key) = session.selected_file().map(file_key) {
+                let horizontal = (-tab.diff_horizontal.offset().x.as_f32()).max(0.);
+                tab.horizontal_positions.insert(key, horizontal);
+            }
         }
     }
 
@@ -1794,6 +2619,11 @@ impl ReviewWorkspace {
             .as_mut()
             .is_some_and(|session| session.select_file(key))
         {
+            if let Some(row) = self.tabs[index].file_tree.reveal_file(key) {
+                self.tabs[index]
+                    .file_tree_scroll
+                    .scroll_to_item(row, ScrollStrategy::Nearest);
+            }
             self.rebuild_diff(index, wide);
             self.save_workspace();
             if self.tabs[index].local_inventory
@@ -1810,7 +2640,7 @@ impl ReviewWorkspace {
         }
     }
 
-    fn navigate_file(&mut self, next: bool, window: &mut Window, cx: &mut Context<Root>) {
+    fn navigate_file(&mut self, next: bool, _window: &mut Window, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         self.capture_scroll(index);
         let changed = self.tabs[index].session.as_mut().is_some_and(|session| {
@@ -1821,7 +2651,18 @@ impl ReviewWorkspace {
             }
         });
         if changed {
-            self.rebuild_diff(index, window.bounds().size.width > px(1180.));
+            if let Some(key) = self.tabs[index]
+                .session
+                .as_ref()
+                .and_then(ReviewSession::selected_file)
+                .map(file_key)
+                && let Some(row) = self.tabs[index].file_tree.reveal_file(&key)
+            {
+                self.tabs[index]
+                    .file_tree_scroll
+                    .scroll_to_item(row, ScrollStrategy::Nearest);
+            }
+            self.rebuild_diff(index, self.wide);
             self.save_workspace();
             if self.tabs[index].local_inventory
                 && self.tabs[index]
@@ -1862,7 +2703,7 @@ impl ReviewWorkspace {
         }
     }
 
-    fn cycle_diff(&mut self, _: &CycleDiffMode, window: &mut Window, cx: &mut Context<Root>) {
+    fn cycle_diff(&mut self, _: &CycleDiffMode, _window: &mut Window, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         self.capture_scroll(index);
         if let Some(session) = &mut self.tabs[index].session {
@@ -1871,7 +2712,7 @@ impl ReviewWorkspace {
                 DiffMode::Unified => DiffMode::SideBySide,
                 DiffMode::SideBySide => DiffMode::Auto,
             });
-            self.rebuild_diff(index, window.bounds().size.width > px(1180.));
+            self.rebuild_diff(index, self.wide);
             self.save_workspace();
             self.persist_session(index, cx);
             cx.notify();
@@ -1888,6 +2729,68 @@ impl ReviewWorkspace {
                 cx.notify();
             }
         }
+    }
+
+    fn move_file_tree_cursor(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if let Some(key) = self.tabs[index].file_tree.move_cursor(delta) {
+            self.select_file(&key, self.wide, cx);
+        }
+        if let Some(row) = self.tabs[index].file_tree.cursor_index() {
+            self.tabs[index]
+                .file_tree_scroll
+                .scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+        window.focus(&self.file_tree_focus, cx);
+        cx.notify();
+    }
+
+    fn file_tree_left(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        self.tabs[index].file_tree.left();
+        if let Some(row) = self.tabs[index].file_tree.cursor_index() {
+            self.tabs[index]
+                .file_tree_scroll
+                .scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+        window.focus(&self.file_tree_focus, cx);
+        cx.notify();
+    }
+
+    fn file_tree_right(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if let Some(key) = self.tabs[index].file_tree.right() {
+            self.select_file(&key, self.wide, cx);
+        }
+        if let Some(row) = self.tabs[index].file_tree.cursor_index() {
+            self.tabs[index]
+                .file_tree_scroll
+                .scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+        window.focus(&self.file_tree_focus, cx);
+        cx.notify();
+    }
+
+    fn activate_file_tree(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if let Some(key) = self.tabs[index].file_tree.activate_cursor() {
+            self.select_file(&key, self.wide, cx);
+        }
+        window.focus(&self.file_tree_focus, cx);
+        cx.notify();
+    }
+
+    fn scroll_diff_horizontally(&mut self, amount: Option<f32>, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        let handle = &self.tabs[index].diff_horizontal;
+        let current = handle.offset();
+        let maximum = handle.max_offset().x.as_f32();
+        let target = match amount {
+            Some(amount) => (current.x.as_f32() - amount).clamp(-maximum, 0.),
+            None => -maximum,
+        };
+        handle.set_offset(point(px(target), px(0.)));
+        cx.notify();
     }
 
     fn apply_filter(&mut self, personal: PersonalFilter, cx: &mut Context<Root>) {
@@ -2056,9 +2959,10 @@ impl ReviewWorkspace {
                     cx.notify();
                 }
             }))
-            .on_action(cx.listener(|root, _: &ToggleInspector, _, cx| {
+            .on_action(cx.listener(|root, _: &ToggleInspector, window, cx| {
                 if let Root::Review(this) = root {
                     this.inspector_open = !this.inspector_open;
+                    this.refresh_auto_layout(window);
                     cx.notify();
                 }
             }))
@@ -2072,6 +2976,105 @@ impl ReviewWorkspace {
                     this.setup_open = true;
                     this.command_palette = false;
                     cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|root, _: &FileTreeUp, window, cx| {
+                if let Root::Review(this) = root {
+                    this.move_file_tree_cursor(-1, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &FileTreeDown, window, cx| {
+                if let Root::Review(this) = root {
+                    this.move_file_tree_cursor(1, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &FileTreeLeft, window, cx| {
+                if let Root::Review(this) = root {
+                    this.file_tree_left(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &FileTreeRight, window, cx| {
+                if let Root::Review(this) = root {
+                    this.file_tree_right(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &FileTreeActivate, window, cx| {
+                if let Root::Review(this) = root {
+                    this.activate_file_tree(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &ToggleSidebar, window, cx| {
+                if let Root::Review(this) = root {
+                    this.panel_layout.sidebar_collapsed = !this.panel_layout.sidebar_collapsed;
+                    this.refresh_auto_layout(window);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|root, _: &ToggleFileTree, window, cx| {
+                if let Root::Review(this) = root {
+                    this.panel_layout.file_tree_collapsed = !this.panel_layout.file_tree_collapsed;
+                    this.refresh_auto_layout(window);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|root, _: &SidebarNarrower, window, cx| {
+                if let Root::Review(this) = root {
+                    this.adjust_panel(PanelKind::Sidebar, -PANEL_KEYBOARD_STEP, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &SidebarWider, window, cx| {
+                if let Root::Review(this) = root {
+                    this.adjust_panel(PanelKind::Sidebar, PANEL_KEYBOARD_STEP, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &FileTreeNarrower, window, cx| {
+                if let Root::Review(this) = root {
+                    this.adjust_panel(PanelKind::FileTree, -PANEL_KEYBOARD_STEP, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &FileTreeWider, window, cx| {
+                if let Root::Review(this) = root {
+                    this.adjust_panel(PanelKind::FileTree, PANEL_KEYBOARD_STEP, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &DetailsNarrower, window, cx| {
+                if let Root::Review(this) = root {
+                    this.adjust_panel(PanelKind::Details, -PANEL_KEYBOARD_STEP, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &DetailsWider, window, cx| {
+                if let Root::Review(this) = root {
+                    this.adjust_panel(PanelKind::Details, PANEL_KEYBOARD_STEP, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &ResetLayout, window, cx| {
+                if let Root::Review(this) = root {
+                    this.reset_layout(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &DiffScrollLeft, _, cx| {
+                if let Root::Review(this) = root {
+                    this.scroll_diff_horizontally(Some(-96.), cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &DiffScrollRight, _, cx| {
+                if let Root::Review(this) = root {
+                    this.scroll_diff_horizontally(Some(96.), cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &DiffScrollHome, _, cx| {
+                if let Root::Review(this) = root
+                    && let Some(index) = this.active_tab
+                {
+                    this.tabs[index]
+                        .diff_horizontal
+                        .set_offset(point(px(0.), px(0.)));
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|root, _: &DiffScrollEnd, _, cx| {
+                if let Root::Review(this) = root {
+                    this.scroll_diff_horizontally(None, cx);
                 }
             }))
             .on_key_down(cx.listener(|root, event: &KeyDownEvent, window, cx| {
@@ -2089,7 +3092,8 @@ impl ReviewWorkspace {
             .text_size(px(13.))
             .text_color(colors.text)
             .bg(rgba(0x00000000))
-            .child(self.render_sidebar(colors, cx))
+            .child(self.render_sidebar(colors, window, cx))
+            .child(self.render_splitter(PanelKind::Sidebar, colors, window, cx))
             .child(self.render_main(colors, window, cx))
             .when(self.command_palette, |root| {
                 root.child(self.render_palette(colors, cx))
@@ -2099,7 +3103,107 @@ impl ReviewWorkspace {
             })
     }
 
-    fn render_sidebar(&self, colors: Palette, cx: &mut Context<Root>) -> impl IntoElement {
+    fn render_splitter(
+        &self,
+        panel: PanelKind,
+        colors: Palette,
+        window: &Window,
+        cx: &mut Context<Root>,
+    ) -> impl IntoElement {
+        let (sidebar, tree, details) = self.resolved_panel_widths(window);
+        let start_width = match panel {
+            PanelKind::Sidebar => sidebar,
+            PanelKind::FileTree => tree,
+            PanelKind::Details => details,
+        };
+        let drag = PanelResizeDrag {
+            panel,
+            start_width,
+            start_x: Rc::new(Cell::new(None)),
+        };
+        div()
+            .id(SharedString::from(format!("splitter-{panel:?}")))
+            .w(px(SPLITTER_WIDTH))
+            .h_full()
+            .flex_none()
+            .cursor_move()
+            .bg(colors.canvas)
+            .border_l_1()
+            .border_r_1()
+            .border_color(colors.border)
+            .hover(|splitter| splitter.bg(colors.selected))
+            .on_drag(drag, |drag, position, _, cx| {
+                drag.start_x.set(Some(position.x.as_f32()));
+                cx.new(|_| SplitterDragPreview)
+            })
+            .on_drag_move(cx.listener(
+                |root, event: &DragMoveEvent<PanelResizeDrag>, window, cx| {
+                    let Root::Review(this) = root else { return };
+                    let drag = event.drag(cx);
+                    let Some(start_x) = drag.start_x.get() else {
+                        return;
+                    };
+                    let mut delta = event.event.position.x.as_f32() - start_x;
+                    if drag.panel == PanelKind::Details {
+                        delta = -delta;
+                    }
+                    let width = (drag.start_width + delta).clamp(
+                        match drag.panel {
+                            PanelKind::Sidebar => MIN_SIDEBAR_WIDTH,
+                            PanelKind::FileTree => MIN_FILE_TREE_WIDTH,
+                            PanelKind::Details => MIN_DETAILS_WIDTH,
+                        },
+                        MAX_PANEL_WIDTH,
+                    );
+                    match drag.panel {
+                        PanelKind::Sidebar => {
+                            this.panel_layout.sidebar_width = width;
+                            this.panel_layout.sidebar_collapsed = false;
+                        }
+                        PanelKind::FileTree => {
+                            this.panel_layout.file_tree_width = width;
+                            this.panel_layout.file_tree_collapsed = false;
+                        }
+                        PanelKind::Details => {
+                            this.panel_layout.details_width = width;
+                            this.inspector_open = true;
+                        }
+                    }
+                    this.refresh_auto_layout(window);
+                    cx.notify();
+                },
+            ))
+    }
+
+    fn render_sidebar(&self, colors: Palette, window: &Window, cx: &mut Context<Root>) -> Div {
+        let (sidebar_width, _, _) = self.resolved_panel_widths(window);
+        if self.panel_layout.sidebar_collapsed {
+            return div()
+                .w(px(sidebar_width))
+                .h_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .bg(colors.sidebar)
+                .child(
+                    div()
+                        .id("restore-sidebar")
+                        .mt_3()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_color(colors.accent)
+                        .child("›")
+                        .on_click(cx.listener(|root, _, window, cx| {
+                            if let Root::Review(this) = root {
+                                this.panel_layout.sidebar_collapsed = false;
+                                this.refresh_auto_layout(window);
+                                cx.notify();
+                            }
+                        })),
+                );
+        }
         let view = self.workspace.view();
         let saved_views = self
             .workspace
@@ -2246,8 +3350,8 @@ impl ReviewWorkspace {
             }
         }
         div()
-            .w(px(292.))
-            .min_w(px(250.))
+            .w(px(sidebar_width))
+            .min_w(px(sidebar_width))
             .h_full()
             .flex()
             .flex_col()
@@ -2262,7 +3366,27 @@ impl ReviewWorkspace {
                     .items_center()
                     .justify_between()
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("cibergit"))
-                    .child(div().text_xs().text_color(colors.faint).child("READ ONLY")),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_xs().text_color(colors.faint).child("READ ONLY"))
+                            .child(
+                                div()
+                                    .id("collapse-sidebar")
+                                    .cursor_pointer()
+                                    .text_color(colors.accent)
+                                    .child("‹")
+                                    .on_click(cx.listener(|root, _, window, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.panel_layout.sidebar_collapsed = true;
+                                            this.refresh_auto_layout(window);
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -3155,9 +4279,10 @@ impl ReviewWorkspace {
                                     } else {
                                         "Show details"
                                     })
-                                    .on_click(cx.listener(|root, _, _, cx| {
+                                    .on_click(cx.listener(|root, _, window, cx| {
                                         if let Root::Review(this) = root {
                                             this.inspector_open = !this.inspector_open;
+                                            this.refresh_auto_layout(window);
                                             cx.notify();
                                         }
                                     })),
@@ -3204,9 +4329,11 @@ impl ReviewWorkspace {
                     .min_h_0()
                     .flex()
                     .child(self.render_files(index, colors, window, cx))
-                    .child(self.render_diff(index, colors))
+                    .child(self.render_splitter(PanelKind::FileTree, colors, window, cx))
+                    .child(self.render_diff(index, colors, cx))
                     .when(self.inspector_open, |body| {
-                        body.child(self.render_inspector(index, colors, cx))
+                        body.child(self.render_splitter(PanelKind::Details, colors, window, cx))
+                            .child(self.render_inspector(index, colors, window, cx))
                     }),
             )
     }
@@ -3219,7 +4346,14 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) -> impl IntoElement {
         let tab = &self.tabs[index];
-        let items: Vec<_> = tab
+        let rows = tab.file_tree.rows();
+        let count = rows.len();
+        let selected_key = tab
+            .session
+            .as_ref()
+            .and_then(ReviewSession::selected_file)
+            .map(file_key);
+        let viewed = tab
             .session
             .as_ref()
             .map(|session| {
@@ -3229,28 +4363,48 @@ impl ReviewWorkspace {
                     .iter()
                     .map(|file| {
                         let key = file_key(file);
-                        let selected = session
-                            .selected_file()
-                            .is_some_and(|selected| file_key(selected) == key);
-                        let viewed = session.is_viewed(&key);
-                        (
-                            key,
-                            file.path.clone(),
-                            file.status.clone(),
-                            file.patch
-                                .as_ref()
-                                .map(|_| (file.additions, file.deletions)),
-                            selected,
-                            viewed,
-                        )
+                        (key.clone(), session.is_viewed(&key))
                     })
-                    .collect()
+                    .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
-        let wide = window.bounds().size.width > px(1180.);
+        let scroll = tab.file_tree_scroll.clone();
+        let cursor = tab.file_tree.cursor_index();
+        let local_inventory = tab.local_inventory;
+        let root = cx.entity();
+        let focus = self.file_tree_focus.clone();
+        let click_focus = focus.clone();
+        let (_, tree_width, _) = self.resolved_panel_widths(window);
+        if self.panel_layout.file_tree_collapsed {
+            return div()
+                .w(px(tree_width))
+                .h_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .bg(colors.canvas)
+                .child(
+                    div()
+                        .id("restore-file-tree")
+                        .mt_3()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_color(colors.accent)
+                        .child("›")
+                        .on_click(cx.listener(|root, _, window, cx| {
+                            if let Root::Review(this) = root {
+                                this.panel_layout.file_tree_collapsed = false;
+                                this.refresh_auto_layout(window);
+                                cx.notify();
+                            }
+                        })),
+                );
+        }
         div()
-            .w(px(250.))
-            .min_w(px(210.))
+            .w(px(tree_width))
+            .min_w(px(tree_width))
             .h_full()
             .flex()
             .flex_col()
@@ -3266,102 +4420,297 @@ impl ReviewWorkspace {
                     .justify_between()
                     .border_b_1()
                     .border_color(colors.border)
-                    .child(format!("Files  {}", items.len()))
-                    .child(div().text_xs().text_color(colors.muted).child("⌘[  ⌘]")),
+                    .child(format!(
+                        "Files  {}",
+                        tab.session
+                            .as_ref()
+                            .map(|session| session.comparison().files.len())
+                            .unwrap_or(0)
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(colors.muted)
+                            .child("⌘[  ⌘]")
+                            .child(
+                                div()
+                                    .id("collapse-file-tree")
+                                    .cursor_pointer()
+                                    .text_color(colors.accent)
+                                    .child("‹")
+                                    .on_click(cx.listener(|root, _, window, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.panel_layout.file_tree_collapsed = true;
+                                            this.refresh_auto_layout(window);
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    ),
             )
             .child(
                 div()
                     .id("changed-files-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .children(items.into_iter().map(
-                        |(key, path, status, stats, selected, viewed)| {
-                            let click_key = key.clone();
-                            let viewed_key = key.clone();
-                            div()
-                                .id(SharedString::from(format!("file-{key}")))
-                                .px_3()
-                                .py_2()
-                                .cursor_pointer()
-                                .when(selected, |row| row.bg(colors.selected))
-                                .hover(|row| row.bg(colors.selected))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .w(px(22.))
-                                                .flex_none()
-                                                .text_center()
-                                                .text_xs()
-                                                .text_color(colors.faint)
-                                                .child(file_status_badge(&status)),
-                                        )
-                                        .child(
-                                            div()
-                                                .id(SharedString::from(format!("viewed-{key}")))
-                                                .w(px(20.))
-                                                .flex_none()
-                                                .text_center()
-                                                .text_color(if viewed {
-                                                    colors.green
-                                                } else {
-                                                    colors.faint
-                                                })
-                                                .cursor_pointer()
-                                                .child(if viewed { "✓" } else { "○" })
-                                                .on_click(cx.listener(move |root, _, _, cx| {
-                                                    if let Root::Review(this) = root {
-                                                        this.toggle_viewed(&viewed_key, cx)
-                                                    }
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .child(path),
-                                        ),
-                                )
-                                .child(
-                                    div().pl_6().mt_1().flex().gap_2().text_xs().children(
-                                        stats
-                                            .map(|(additions, deletions)| {
-                                                vec![
-                                                    div()
-                                                        .text_color(colors.green)
-                                                        .child(format!("+{additions}")),
-                                                    div()
-                                                        .text_color(colors.red)
-                                                        .child(format!("−{deletions}")),
-                                                ]
+                    .relative()
+                    .track_focus(&focus)
+                    .key_context("FileTree")
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        window.focus(&click_focus, cx);
+                    })
+                    .child(
+                        uniform_list(
+                            SharedString::from(format!("changed-file-tree-{index}")),
+                            count,
+                            move |range: Range<usize>, _, _| {
+                                range
+                                    .map(|row_index| {
+                                        let row = rows[row_index].clone();
+                                        let row_identity = FileTree::row_identity(&row);
+                                        let row_root = root.clone();
+                                        let row_focus = focus.clone();
+                                        let selected = row.file_key().is_some_and(|key| {
+                                            selected_key.as_deref() == Some(key)
+                                        });
+                                        let is_cursor = cursor == Some(row_index);
+                                        let mut item = div()
+                                            .id(SharedString::from(format!("tree-{row_identity}")))
+                                            .h(px(28.))
+                                            .pl(px(8. + row.depth as f32 * 14.))
+                                            .pr_2()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .cursor_pointer()
+                                            .when(selected, |row| row.bg(colors.selected))
+                                            .when(is_cursor && !selected, |row| {
+                                                row.border_1().border_color(colors.accent)
                                             })
-                                            .unwrap_or_else(|| {
-                                                vec![
-                                                    div()
-                                                        .text_color(colors.faint)
-                                                        .child("stats on load"),
-                                                ]
-                                            }),
-                                    ),
-                                )
-                                .on_click(cx.listener(move |root, _, _, cx| {
-                                    if let Root::Review(this) = root {
-                                        this.select_file(&click_key, wide, cx);
-                                        cx.notify();
-                                    }
-                                }))
-                        },
-                    )),
+                                            .hover(|row| row.bg(colors.selected));
+                                        match row.kind {
+                                            TreeRowKind::Directory {
+                                                directory_key,
+                                                expanded,
+                                                raw,
+                                            } => {
+                                                let click_root = row_root.clone();
+                                                let click_identity = row_identity.clone();
+                                                item = item
+                                                    .child(
+                                                        div()
+                                                            .w(px(14.))
+                                                            .text_color(colors.faint)
+                                                            .child(if expanded {
+                                                                "▾"
+                                                            } else {
+                                                                "▸"
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .overflow_hidden()
+                                                            .text_ellipsis()
+                                                            .child(row.label),
+                                                    )
+                                                    .when(raw, |row| {
+                                                        row.child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(colors.amber)
+                                                                .child("RAW"),
+                                                        )
+                                                    })
+                                                    .on_click(move |_, window, cx| {
+                                                        window.focus(&row_focus, cx);
+                                                        click_root.update(cx, |root, cx| {
+                                                            if let Root::Review(this) = root
+                                                                && let Some(index) = this.active_tab
+                                                            {
+                                                                this.tabs[index]
+                                                                    .file_tree
+                                                                    .set_cursor(
+                                                                        click_identity.clone(),
+                                                                    );
+                                                                this.tabs[index]
+                                                                    .file_tree
+                                                                    .toggle_directory(
+                                                                        &directory_key,
+                                                                    );
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    });
+                                            }
+                                            TreeRowKind::File {
+                                                file_key,
+                                                status,
+                                                additions,
+                                                deletions,
+                                                patch_available,
+                                                rename_from,
+                                                raw,
+                                            } => {
+                                                let viewed_state =
+                                                    viewed.get(&file_key).copied().unwrap_or(false);
+                                                let viewed_key = file_key.clone();
+                                                let viewed_root = row_root.clone();
+                                                let click_key = file_key.clone();
+                                                let click_identity = row_identity.clone();
+                                                let display_label = rename_from
+                                                    .as_deref()
+                                                    .and_then(|previous| {
+                                                        previous.rsplit('/').next()
+                                                    })
+                                                    .filter(|previous| *previous != row.label)
+                                                    .map(|previous| {
+                                                        format!("{previous} → {}", row.label)
+                                                    })
+                                                    .unwrap_or(row.label);
+                                                item = item
+                                                    .child(
+                                                        div()
+                                                            .w(px(18.))
+                                                            .flex_none()
+                                                            .text_center()
+                                                            .text_xs()
+                                                            .text_color(colors.faint)
+                                                            .child(file_status_badge(&status)),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id(SharedString::from(format!(
+                                                                "viewed-{file_key}"
+                                                            )))
+                                                            .w(px(18.))
+                                                            .flex_none()
+                                                            .text_center()
+                                                            .text_color(if viewed_state {
+                                                                colors.green
+                                                            } else {
+                                                                colors.faint
+                                                            })
+                                                            .child(if viewed_state {
+                                                                "✓"
+                                                            } else {
+                                                                "○"
+                                                            })
+                                                            .on_click(move |_, _, cx| {
+                                                                viewed_root.update(
+                                                                    cx,
+                                                                    |root, cx| {
+                                                                        if let Root::Review(this) =
+                                                                            root
+                                                                        {
+                                                                            this.toggle_viewed(
+                                                                                &viewed_key,
+                                                                                cx,
+                                                                            );
+                                                                        }
+                                                                    },
+                                                                );
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .overflow_hidden()
+                                                            .text_ellipsis()
+                                                            .child(display_label),
+                                                    )
+                                                    .when(raw, |row| {
+                                                        row.child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(colors.amber)
+                                                                .child("RAW"),
+                                                        )
+                                                    })
+                                                    .child(
+                                                        div()
+                                                            .ml_1()
+                                                            .flex()
+                                                            .gap_1()
+                                                            .text_xs()
+                                                            .when(patch_available, |stats| {
+                                                                stats
+                                                                    .child(
+                                                                        div()
+                                                                            .text_color(
+                                                                                colors.green,
+                                                                            )
+                                                                            .child(format!(
+                                                                                "+{additions}"
+                                                                            )),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .text_color(colors.red)
+                                                                            .child(format!(
+                                                                                "−{deletions}"
+                                                                            )),
+                                                                    )
+                                                            })
+                                                            .when(!patch_available, |stats| {
+                                                                stats
+                                                                    .text_color(colors.faint)
+                                                                    .child(if local_inventory {
+                                                                        "on select"
+                                                                    } else {
+                                                                        "metadata"
+                                                                    })
+                                                            }),
+                                                    )
+                                                    .on_click(move |_, window, cx| {
+                                                        window.focus(&row_focus, cx);
+                                                        row_root.update(cx, |root, cx| {
+                                                            if let Root::Review(this) = root
+                                                                && let Some(index) = this.active_tab
+                                                            {
+                                                                this.tabs[index]
+                                                                    .file_tree
+                                                                    .set_cursor(
+                                                                        click_identity.clone(),
+                                                                    );
+                                                                this.select_file(
+                                                                    &click_key, this.wide, cx,
+                                                                );
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    });
+                                            }
+                                        }
+                                        item
+                                    })
+                                    .collect::<Vec<_>>()
+                            },
+                        )
+                        .track_scroll(&scroll)
+                        .w_full()
+                        .h_full(),
+                    )
+                    .child(
+                        div().absolute().inset_0().child(
+                            Scrollbar::vertical(&scroll)
+                                .id(SharedString::from(format!("file-tree-scrollbar-{index}")))
+                                .viewport_from_layout(),
+                        ),
+                    ),
             )
     }
 
-    fn render_diff(&self, index: usize, colors: Palette) -> impl IntoElement {
+    fn render_diff(
+        &self,
+        index: usize,
+        colors: Palette,
+        _cx: &mut Context<Root>,
+    ) -> impl IntoElement {
         let tab = &self.tabs[index];
         let header = tab
             .session
@@ -3377,7 +4726,12 @@ impl ReviewWorkspace {
             .unwrap_or_else(|| "Select a changed file".into());
         let rows = tab.diff_rows.clone();
         let count = rows.len();
+        let split_mode = rows.iter().any(|row| matches!(row, DiffRow::Split(_)));
         let scroll = tab.diff_scroll.clone();
+        let horizontal = tab.diff_horizontal.clone();
+        let content_width = tab.diff_content_width.max(1.);
+        let split_text_width = split_text_content_width(&rows);
+        let focus = self.diff_focus.clone();
         div()
             .flex_1()
             .min_w_0()
@@ -3397,6 +4751,28 @@ impl ReviewWorkspace {
                     .text_sm()
                     .child(header),
             )
+            .when(split_mode, |pane| {
+                pane.child(
+                    div()
+                        .h(px(24.))
+                        .flex()
+                        .font_family(CODE_FONT)
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .bg(colors.elevated)
+                        .border_b_1()
+                        .border_color(colors.border)
+                        .child(div().w_1_2().px_3().child("OLD"))
+                        .child(
+                            div()
+                                .w_1_2()
+                                .px_3()
+                                .border_l_1()
+                                .border_color(colors.border)
+                                .child("NEW"),
+                        ),
+                )
+            })
             .child(if count == 0 {
                 div()
                     .flex_1()
@@ -3407,15 +4783,62 @@ impl ReviewWorkspace {
                     .child("No text patch is available. Binary and media content is never loaded.")
                     .into_any_element()
             } else {
-                uniform_list("diff-rows", count, move |range: Range<usize>, _, _| {
-                    range
-                        .map(|index| render_diff_row(&rows[index], colors))
-                        .collect::<Vec<_>>()
-                })
-                .track_scroll(&scroll)
-                .flex_1()
-                .min_h_0()
-                .into_any_element()
+                let body = div()
+                    .id(SharedString::from(format!("diff-horizontal-{index}")))
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .track_focus(&focus)
+                    .key_context("DiffPane")
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        window.focus(&focus, cx);
+                    });
+                if split_mode {
+                    let row_horizontal = horizontal.clone();
+                    body.child(
+                        uniform_list(
+                            SharedString::from(format!("diff-rows-{index}")),
+                            count,
+                            move |range: Range<usize>, _, _| {
+                                range
+                                    .map(|index| {
+                                        render_split_diff_row(
+                                            &rows[index],
+                                            colors,
+                                            &row_horizontal,
+                                            split_text_width,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            },
+                        )
+                        .track_scroll(&scroll)
+                        .w_full()
+                        .h_full(),
+                    )
+                    .child(diff_horizontal_scrollbar(index, &horizontal))
+                    .into_any_element()
+                } else {
+                    body.overflow_x_scroll()
+                        .restrict_scroll_to_axis()
+                        .track_scroll(&horizontal)
+                        .child(
+                            uniform_list(
+                                SharedString::from(format!("diff-rows-{index}")),
+                                count,
+                                move |range: Range<usize>, _, _| {
+                                    range
+                                        .map(|index| render_diff_row(&rows[index], colors))
+                                        .collect::<Vec<_>>()
+                                },
+                            )
+                            .track_scroll(&scroll)
+                            .w(px(content_width))
+                            .h_full(),
+                        )
+                        .child(diff_horizontal_scrollbar(index, &horizontal))
+                        .into_any_element()
+                }
             })
     }
 
@@ -3423,6 +4846,7 @@ impl ReviewWorkspace {
         &self,
         index: usize,
         colors: Palette,
+        window: &Window,
         cx: &mut Context<Root>,
     ) -> impl IntoElement {
         let tab = &self.tabs[index];
@@ -3562,9 +4986,10 @@ impl ReviewWorkspace {
                 div().children(checks).into_any_element()
             }
         };
+        let (_, _, details_width) = self.resolved_panel_widths(window);
         div()
-            .w(px(274.))
-            .min_w(px(240.))
+            .w(px(details_width))
+            .min_w(px(details_width))
             .h_full()
             .flex()
             .flex_col()
@@ -3710,9 +5135,23 @@ impl ReviewWorkspace {
                             .id("command-details")
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
-                            .on_click(cx.listener(|root, _, _, cx| {
+                            .on_click(cx.listener(|root, _, window, cx| {
                                 if let Root::Review(this) = root {
                                     this.inspector_open = !this.inspector_open;
+                                    this.refresh_auto_layout(window);
+                                    this.command_palette = false;
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .child(
+                        command_row("Reset panel layout", "⌃⌥0", colors)
+                            .id("command-reset-layout")
+                            .cursor_pointer()
+                            .hover(|row| row.bg(colors.selected))
+                            .on_click(cx.listener(|root, _, window, cx| {
+                                if let Root::Review(this) = root {
+                                    this.reset_layout(window, cx);
                                     this.command_palette = false;
                                     cx.notify();
                                 }
@@ -3980,9 +5419,20 @@ fn markdown_text(id: String, source: &str, colors: Palette) -> TextView {
                 .with_link(colors.accent.into())
                 .with_code_background(colors.elevated.into())
                 .with_border(colors.border.into())
-                .with_heading_base_font_size(px(13.))
+                .with_heading_base_font_size(px(12.))
+                .with_heading_font_size(|level, base| match level {
+                    1 => base * 1.5,
+                    2 => base * 1.35,
+                    3 => base * 1.2,
+                    _ => base,
+                })
                 .with_dark(colors.dark),
         )
+        // gpui-base's inline flow measures each wrapped row from the inherited
+        // window line height. Own that metric here so a narrow panel cannot
+        // combine 12px body text and independently-sized headings on a 13px row.
+        .text_size(px(12.))
+        .line_height(px(20.))
         .selectable(true)
 }
 
@@ -4001,10 +5451,41 @@ fn media_free_markdown(source: &str) -> String {
         }
     }
     without_comments.push_str(remaining);
-    without_comments
+    let escaped_inline_code = escape_inline_code_delimiters(&without_comments);
+    escaped_inline_code
         .replace("![", "[Image: ")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// The pinned TextView switches an entire paragraph to its fragment-based
+/// InlineFlow whenever it contains inline-code marks. At narrow widths that
+/// flow advances some wrapped fragments from their pre-wrap origin, making
+/// adjacent words paint on top of each other. Preserve the literal backticks
+/// and selectable source text while keeping ordinary paragraphs on TextView's
+/// stable single-Inline layout. Fenced code blocks remain fenced.
+fn escape_inline_code_delimiters(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut characters = source.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '`' {
+            result.push(character);
+            continue;
+        }
+        let mut run = 1usize;
+        while characters.next_if_eq(&'`').is_some() {
+            run += 1;
+        }
+        if run >= 3 {
+            result.extend(std::iter::repeat_n('`', run));
+        } else {
+            for _ in 0..run {
+                result.push('\\');
+                result.push('`');
+            }
+        }
+    }
+    result
 }
 
 fn poll_due(tick: u64, delay: Duration) -> bool {
@@ -4051,10 +5532,128 @@ fn build_rows(diff: ParsedDiff, mode: DiffMode) -> Vec<DiffRow> {
     rows
 }
 
+fn display_columns(text: &str) -> usize {
+    let mut columns = 0usize;
+    for character in text.chars() {
+        columns += match character {
+            '\t' => 4 - columns % 4,
+            '\u{0000}'..='\u{001f}' | '\u{007f}' => 1,
+            character if character.is_ascii() => 1,
+            _ => 2,
+        };
+    }
+    columns
+}
+
+fn diff_content_width(rows: &[DiffRow], mode: DiffMode) -> f32 {
+    let maximum = rows
+        .iter()
+        .map(|row| match row {
+            DiffRow::Hunk(header) => 24. + display_columns(header) as f32 * DIFF_CELL_WIDTH,
+            DiffRow::Unified(line) => {
+                DIFF_FIXED_COLUMNS + display_columns(&line.text) as f32 * DIFF_CELL_WIDTH
+            }
+            DiffRow::Split(row) => {
+                let old = row
+                    .old
+                    .as_ref()
+                    .map(|line| display_columns(&line.text))
+                    .unwrap_or(0);
+                let new = row
+                    .new
+                    .as_ref()
+                    .map(|line| display_columns(&line.text))
+                    .unwrap_or(0);
+                2. * (76. + old.max(new) as f32 * DIFF_CELL_WIDTH)
+            }
+        })
+        .fold(0f32, f32::max);
+    let minimum = match mode {
+        DiffMode::SideBySide => MIN_SPLIT_DIFF_WIDTH,
+        DiffMode::Auto | DiffMode::Unified => 420.,
+    };
+    maximum.max(minimum)
+}
+
+fn split_text_content_width(rows: &[DiffRow]) -> f32 {
+    rows.iter()
+        .filter_map(|row| match row {
+            DiffRow::Split(row) => Some(
+                row.old
+                    .iter()
+                    .chain(row.new.iter())
+                    .map(|line| display_columns(&line.text) as f32 * DIFF_CELL_WIDTH)
+                    .fold(0f32, f32::max),
+            ),
+            DiffRow::Hunk(_) | DiffRow::Unified(_) => None,
+        })
+        .fold(1f32, f32::max)
+}
+
+#[cfg(feature = "ui-smoke")]
+fn effective_diff_viewport_width(rows: &[DiffRow], horizontal: &ScrollHandle) -> f32 {
+    let source_viewport = horizontal.bounds().size.width.as_f32();
+    if rows.iter().any(|row| matches!(row, DiffRow::Split(_))) {
+        2. * (source_viewport + SPLIT_GUTTER_WIDTH)
+    } else {
+        source_viewport
+    }
+}
+
+/// Tabs are expanded to stable four-column stops. Exceptionally long lines are
+/// split at UTF-8 boundaries so no single text shaping request grows without a
+/// bound; every chunk remains in the same horizontal row and stays reachable.
+fn line_text_chunks(text: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    let mut columns = 0usize;
+    for character in text.chars() {
+        let expansion = if character == '\t' {
+            " ".repeat(4 - columns % 4)
+        } else if character.is_control() {
+            "�".to_owned()
+        } else {
+            character.to_string()
+        };
+        let width = if character == '\t' {
+            expansion.len()
+        } else if character.is_ascii() {
+            1
+        } else {
+            2
+        };
+        if !chunk.is_empty()
+            && chunk.len().saturating_add(expansion.len()) > EXCEPTIONAL_LINE_CHUNK_BYTES
+        {
+            chunks.push(std::mem::take(&mut chunk));
+        }
+        chunk.push_str(&expansion);
+        columns += width;
+    }
+    if !chunk.is_empty() || chunks.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+fn line_text(text: &str, foreground: Rgba) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .whitespace_nowrap()
+        .text_color(foreground)
+        .children(
+            line_text_chunks(text)
+                .into_iter()
+                .map(|chunk| div().flex_none().whitespace_nowrap().child(chunk)),
+        )
+}
+
 fn render_diff_row(row: &DiffRow, colors: Palette) -> AnyElement {
     match row {
         DiffRow::Hunk(header) => div()
             .h(px(26.))
+            .w_full()
             .px_3()
             .flex()
             .items_center()
@@ -4068,6 +5667,7 @@ fn render_diff_row(row: &DiffRow, colors: Palette) -> AnyElement {
             let (background, foreground, marker) = line_colors(line.kind, colors);
             div()
                 .h(px(24.))
+                .w_full()
                 .flex()
                 .items_center()
                 .bg(background)
@@ -4076,23 +5676,78 @@ fn render_diff_row(row: &DiffRow, colors: Palette) -> AnyElement {
                 .child(line_number(line.old_line, colors))
                 .child(line_number(line.new_line, colors))
                 .child(div().w(px(18.)).text_color(foreground).child(marker))
-                .child(
-                    div()
-                        .flex_1()
-                        .whitespace_nowrap()
-                        .text_color(foreground)
-                        .child(line.text.clone()),
-                )
+                .child(line_text(&line.text, foreground))
                 .into_any_element()
         }
         DiffRow::Split(row) => div()
             .h(px(24.))
+            .w_full()
             .flex()
             .font_family(CODE_FONT)
             .text_xs()
             .child(split_cell(row.old.as_ref(), true, colors))
             .child(split_cell(row.new.as_ref(), false, colors))
             .into_any_element(),
+    }
+}
+
+fn diff_horizontal_scrollbar(index: usize, horizontal: &ScrollHandle) -> Div {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .h(px(12.))
+        .child(
+            Scrollbar::horizontal(horizontal)
+                .id(SharedString::from(format!("diff-scrollbar-{index}")))
+                .viewport_from_layout(),
+        )
+}
+
+fn render_split_diff_row(
+    row: &DiffRow,
+    colors: Palette,
+    horizontal: &ScrollHandle,
+    text_width: f32,
+) -> AnyElement {
+    match row {
+        DiffRow::Hunk(header) => div()
+            .h(px(26.))
+            .w_full()
+            .px_3()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .bg(colors.elevated)
+            .text_color(colors.accent)
+            .font_family(CODE_FONT)
+            .text_xs()
+            .child(header.clone())
+            .into_any_element(),
+        DiffRow::Split(row) => div()
+            .h(px(24.))
+            .w_full()
+            .flex()
+            .overflow_hidden()
+            .font_family(CODE_FONT)
+            .text_xs()
+            .child(split_cell_scrolled(
+                row.old.as_ref(),
+                true,
+                colors,
+                horizontal,
+                text_width,
+            ))
+            .child(split_cell_scrolled(
+                row.new.as_ref(),
+                false,
+                colors,
+                horizontal,
+                text_width,
+            ))
+            .into_any_element(),
+        DiffRow::Unified(_) => render_diff_row(row, colors),
     }
 }
 
@@ -4151,13 +5806,61 @@ fn split_cell(line: Option<&DiffLine>, old: bool, colors: Palette) -> Div {
         .border_color(colors.border)
         .child(line_number(number, colors))
         .child(div().w(px(18.)).text_color(foreground).child(marker))
+        .child(line_text(&line.text, foreground))
+}
+
+fn split_cell_scrolled(
+    line: Option<&DiffLine>,
+    old: bool,
+    colors: Palette,
+    horizontal: &ScrollHandle,
+    text_width: f32,
+) -> Div {
+    let (background, foreground, marker, number, text) = match line {
+        Some(line) => {
+            let (background, foreground, marker) = line_colors(line.kind, colors);
+            (
+                background,
+                foreground,
+                marker,
+                if old { line.old_line } else { line.new_line },
+                line.text.as_str(),
+            )
+        }
+        None => (colors.elevated, colors.muted, " ", None, ""),
+    };
+    div()
+        .w_1_2()
+        .h_full()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .bg(background)
+        .border_r_1()
+        .border_color(colors.border)
+        .child(line_number(number, colors))
         .child(
             div()
-                .flex_1()
-                .whitespace_nowrap()
-                .overflow_hidden()
+                .w(px(18.))
+                .flex_none()
                 .text_color(foreground)
-                .child(line.text.clone()),
+                .child(marker),
+        )
+        .child(
+            div()
+                .id(if old {
+                    "split-old-source"
+                } else {
+                    "split-new-source"
+                })
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .overflow_x_scroll()
+                .restrict_scroll_to_axis()
+                .track_scroll(horizontal)
+                .child(line_text(text, foreground).w(px(text_width)).h_full()),
         )
 }
 
@@ -4276,5 +5979,86 @@ impl EditorWorkspace {
                     .child(self.message.clone())
                     .child("Save  ⌘S"),
             )
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{
+        COLLAPSED_PANEL_WIDTH, DEFAULT_SIDEBAR_WIDTH, DiffLine, DiffLineKind, DiffMode, DiffRow,
+        EXCEPTIONAL_LINE_CHUNK_BYTES, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
+        MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, PanelKind, PanelLayout, available_diff_width_for,
+        diff_content_width, display_columns, line_text_chunks, media_free_markdown,
+        resolved_panel_widths_for,
+    };
+
+    #[test]
+    fn auto_uses_remaining_diff_pane_instead_of_whole_window() {
+        let layout = PanelLayout::default();
+        let wide_diff = available_diff_width_for(&layout, true, 1440.);
+        assert_eq!(wide_diff, 606.);
+        assert!(wide_diff >= MIN_SPLIT_DIFF_WIDTH);
+
+        let narrow_diff = available_diff_width_for(&layout, true, 1180.);
+        assert_eq!(narrow_diff, 360.);
+        assert!(narrow_diff < MIN_SPLIT_DIFF_WIDTH);
+        let (sidebar, tree, details) = resolved_panel_widths_for(&layout, true, 1040.);
+        assert!(sidebar >= MIN_SIDEBAR_WIDTH);
+        assert!(tree >= MIN_FILE_TREE_WIDTH);
+        assert!(details >= MIN_DETAILS_WIDTH);
+        assert_eq!(available_diff_width_for(&layout, true, 1040.), 360.);
+    }
+
+    #[test]
+    fn panel_keyboard_adjustment_collapse_and_reset_are_bounded() {
+        let mut layout = PanelLayout::default();
+        layout.adjust(PanelKind::Sidebar, -10_000.);
+        layout.adjust(PanelKind::FileTree, 10_000.);
+        layout.adjust(PanelKind::Details, -10_000.);
+        assert_eq!(layout.sidebar_width, MIN_SIDEBAR_WIDTH);
+        assert_eq!(layout.file_tree_width, MAX_PANEL_WIDTH);
+        assert_eq!(layout.details_width, MIN_DETAILS_WIDTH);
+        layout.sidebar_collapsed = true;
+        assert_eq!(
+            layout.width(PanelKind::Sidebar, true),
+            COLLAPSED_PANEL_WIDTH
+        );
+        layout = PanelLayout::default();
+        assert_eq!(layout.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
+        assert!(!layout.sidebar_collapsed);
+    }
+
+    #[test]
+    fn long_line_width_accounts_for_tabs_and_unicode_without_clipping() {
+        assert_eq!(display_columns("a\tb"), 5);
+        assert_eq!(display_columns("a界b"), 4);
+        let token = "CIBERGIT_LONG_LINE_END_7F3A";
+        let text = format!("{}\t界{token}", "x".repeat(20_000));
+        let chunks = line_text_chunks(&text);
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| { chunk.len() <= EXCEPTIONAL_LINE_CHUNK_BYTES + char::MAX_LEN_UTF8 })
+        );
+        assert!(chunks.last().is_some_and(|chunk| chunk.ends_with(token)));
+        let rows = vec![DiffRow::Unified(DiffLine {
+            kind: DiffLineKind::Addition,
+            old_line: None,
+            new_line: Some(1),
+            text,
+        })];
+        assert!(diff_content_width(&rows, DiffMode::Unified) > 140_000.);
+    }
+
+    #[test]
+    fn markdown_probe_preserves_text_and_disables_media_resolution() {
+        let source = "### Description\n\nIssue fields are not currently available through `gh`.\n\n```sh\ngh issue view\n```\n\n![unsafe](https://example.test/a.png)";
+        let safe = media_free_markdown(source);
+        assert!(safe.contains("Issue fields are not currently available"));
+        assert!(safe.contains("\\`gh\\`"));
+        assert!(safe.contains("```sh"));
+        assert!(safe.contains("[Image: unsafe]"));
+        assert!(!safe.contains("!["));
     }
 }
