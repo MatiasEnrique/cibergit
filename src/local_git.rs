@@ -496,6 +496,55 @@ impl LocalGit {
         self.run(action, args, None, mutation, accepted_exit_codes)
     }
 
+    /// Run one bounded Git command with controlled stdin and Git-specific
+    /// environment while a crate-internal caller holds the common-directory
+    /// lock. Inherited `GIT_*` variables are still removed by the runner.
+    #[allow(dead_code)] // Used by the separately owned rebase module before final lib export.
+    pub(crate) fn run_worktree_command_with_input_and_env(
+        &self,
+        action: &'static str,
+        args: Vec<OsString>,
+        input: Option<&[u8]>,
+        environment: &[(OsString, OsString)],
+        mutation: bool,
+        accepted_exit_codes: &[i32],
+    ) -> Result<Vec<u8>> {
+        self.run_with_environment(
+            action,
+            args,
+            input,
+            environment,
+            mutation,
+            accepted_exit_codes,
+        )
+    }
+
+    /// Revalidate a displayed snapshot while holding the existing canonical
+    /// common-Git-directory mutex, then execute one crate-internal transaction.
+    #[allow(dead_code)] // Used by the separately owned rebase module before final lib export.
+    pub(crate) fn with_guarded_worktree<T>(
+        &self,
+        expected: &SnapshotGuard,
+        operation: impl FnOnce(&LocalSnapshot) -> Result<T>,
+    ) -> Result<T> {
+        let _lock = self.lock_common_git()?;
+        if let Some(blocker) = &expected.blocker {
+            return Err(match blocker {
+                SnapshotGuardBlocker::ContentLimit { max_bytes } => {
+                    LocalGitError::SnapshotContentLimit {
+                        max_bytes: *max_bytes,
+                    }
+                }
+                SnapshotGuardBlocker::UnsupportedEntry => LocalGitError::UnsupportedSnapshotEntry,
+            });
+        }
+        let actual = self.snapshot()?;
+        if &actual.guard != expected {
+            return Err(LocalGitError::StaleSnapshot);
+        }
+        operation(&actual)
+    }
+
     pub fn snapshot(&self) -> Result<LocalSnapshot> {
         let status = self.run(
             "read status",
@@ -1163,6 +1212,18 @@ impl LocalGit {
         mutation: bool,
         accepted_exit_codes: &[i32],
     ) -> Result<Vec<u8>> {
+        self.run_with_environment(action, args, input, &[], mutation, accepted_exit_codes)
+    }
+
+    fn run_with_environment(
+        &self,
+        action: &'static str,
+        args: Vec<OsString>,
+        input: Option<&[u8]>,
+        environment: &[(OsString, OsString)],
+        mutation: bool,
+        accepted_exit_codes: &[i32],
+    ) -> Result<Vec<u8>> {
         if input.is_some_and(|bytes| bytes.len() > self.limits.max_input_bytes) {
             return Err(LocalGitError::InvalidInput(
                 "Git input exceeds configured bound",
@@ -1202,6 +1263,28 @@ impl LocalGit {
             // Transport and hook output can contain credentials or private URLs.
             .stderr(Stdio::null())
             .process_group(0);
+        for (name, value) in environment {
+            if !matches!(
+                name.as_bytes(),
+                b"GIT_SEQUENCE_EDITOR"
+                    | b"GIT_EDITOR"
+                    | b"CIBERGIT_OPERATION_ID"
+                    | b"CIBERGIT_TODO_FILE"
+                    | b"CIBERGIT_MESSAGES_DIR"
+                    | b"CIBERGIT_DISPATCH_PROOF"
+                    | b"CIBERGIT_GIT_DIR"
+            ) {
+                return Err(LocalGitError::InvalidInput(
+                    "command environment is outside the rebase-helper allowlist",
+                ));
+            }
+            if name.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
+                return Err(LocalGitError::InvalidInput(
+                    "command environment contains NUL",
+                ));
+            }
+            command.env(name, value);
+        }
         let mut child = command.spawn().map_err(|source| LocalGitError::Io {
             context: "start installed Git",
             source,
