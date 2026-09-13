@@ -2,6 +2,7 @@ pub mod comparisons;
 pub mod document;
 pub mod domain;
 pub mod local_git;
+pub mod notifications;
 pub mod participation;
 pub mod providers;
 pub mod rebase;
