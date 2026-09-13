@@ -1363,7 +1363,7 @@ impl LocalWorkspace {
                 edit_generation: 0,
                 persisted_generation: 0,
                 pending_checkout_operations: 0,
-                message: "Recovered/opened through DocumentStore".into(),
+                message: "File opened; any recovered edits are preserved".into(),
                 pending_programmatic_reload: None,
                 _subscription: subscription,
             },

@@ -1881,17 +1881,14 @@ impl LocalWorkspace {
                                     .text_xs()
                                     .child(view.conflict().path.display.clone()),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(colors.muted)
-                                    .child(format!(
-                                        "operation {} · {}px pane · {} layout",
-                                        view.operation_id(),
-                                        pane_width.round(),
-                                        if wide { "wide" } else { "narrow" }
-                                    )),
-                            ),
+                            .when(view.show_details(), |header| {
+                                header.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(colors.muted)
+                                        .child(format!("Operation {}", view.operation_id())),
+                                )
+                            }),
                     )
                     .child(
                         action_button(
@@ -2066,7 +2063,7 @@ impl LocalWorkspace {
                             rgba(0xf9e2e0ff)
                         })
                         .text_color(colors.red)
-                        .child("A separate external disk/base/buffer conflict is active. That DocumentStore reconciliation takes precedence; the Git stage sources above remain immutable and staging is blocked.")
+                        .child("This file also changed on disk. Reconcile that change in Local Changes before editing or staging the result. Your unsaved text is preserved.")
                         .child(
                             action_button(
                                 "Open disk reconciliation in Local Changes",
@@ -2124,7 +2121,7 @@ impl LocalWorkspace {
                         div()
                             .p_3()
                             .text_color(colors.muted)
-                            .child("Opening the same DocumentStore-backed result…"),
+                            .child("Opening the editable result…"),
                     ),
             );
         }
