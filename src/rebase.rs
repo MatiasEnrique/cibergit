@@ -659,6 +659,7 @@ impl RebaseStore {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // Called by the path-included integration test module.
     pub(crate) fn create_stash_with_post_command_hook(
         &self,
         preparation: &DirtyPreparation,
@@ -2351,6 +2352,7 @@ impl RebaseStore {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // Called by the path-included integration test module.
     pub(crate) fn hold_record_lock_for_test(&self, acquired: &Path, release: &Path) -> Result<()> {
         let _record_guard = self.lock_record()?;
         fs::write(acquired, b"acquired").map_err(io("write journal test marker"))?;
