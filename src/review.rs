@@ -88,6 +88,8 @@ pub struct ReviewSession {
     metadata: ComparisonMetadata,
     viewed: HashMap<String, ViewedFile>,
     scroll_positions: HashMap<String, f32>,
+    #[serde(default)]
+    horizontal_scroll_positions: HashMap<String, f32>,
 }
 impl ReviewSession {
     pub fn new(comparison: Comparison) -> Self {
@@ -100,6 +102,7 @@ impl ReviewSession {
             metadata: ComparisonMetadata::default(),
             viewed: HashMap::new(),
             scroll_positions: HashMap::new(),
+            horizontal_scroll_positions: HashMap::new(),
         }
     }
     pub fn comparison(&self) -> &Comparison {
@@ -182,6 +185,24 @@ impl ReviewSession {
             .as_ref()
             .and_then(|p| self.scroll_positions.get(p))
             .copied()
+            .unwrap_or(0.0)
+    }
+    /// Horizontal source position is scoped to this comparison and raw-safe file identity.
+    pub fn set_horizontal_scroll_position(&mut self, position: f32) {
+        if position.is_finite()
+            && position >= 0.0
+            && let Some(path) = &self.selected_file
+        {
+            self.horizontal_scroll_positions
+                .insert(path.clone(), position);
+        }
+    }
+    pub fn horizontal_scroll_position(&self) -> f32 {
+        self.selected_file
+            .as_ref()
+            .and_then(|path| self.horizontal_scroll_positions.get(path))
+            .copied()
+            .filter(|position| position.is_finite() && *position >= 0.0)
             .unwrap_or(0.0)
     }
     pub fn mark_viewed(&mut self, path: &str, viewed: bool) -> bool {
@@ -274,6 +295,8 @@ impl ReviewSession {
                 })
         });
         self.scroll_positions
+            .retain(|path, _| comparison.files.iter().any(|f| file_key(f) == *path));
+        self.horizontal_scroll_positions
             .retain(|path, _| comparison.files.iter().any(|f| file_key(f) == *path));
         if !comparison
             .files

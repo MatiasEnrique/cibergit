@@ -566,7 +566,6 @@ struct ReviewTab {
     diff_rows: Vec<DiffRow>,
     diff_scroll: ListState,
     diff_horizontal: ScrollHandle,
-    horizontal_positions: HashMap<String, f32>,
     diff_content_width: f32,
     file_tree: FileTree,
     file_tree_scroll: UniformListScrollHandle,
@@ -4748,7 +4747,6 @@ impl ReviewWorkspace {
             diff_rows: Vec::new(),
             diff_scroll: ListState::new(0, ListAlignment::Top, px(480.)),
             diff_horizontal: ScrollHandle::new(),
-            horizontal_positions: HashMap::new(),
             diff_content_width: 0.,
             file_tree,
             file_tree_scroll: UniformListScrollHandle::new(),
@@ -6283,11 +6281,7 @@ impl ReviewWorkspace {
         };
         let selected_key = file_key(file);
         let scroll_position = session.scroll_position();
-        let horizontal_position = tab
-            .horizontal_positions
-            .get(&selected_key)
-            .copied()
-            .unwrap_or(0.);
+        let horizontal_position = session.horizontal_scroll_position();
         let resolved_mode = session.diff_mode().resolve(wide);
         let base_rows = build_rows(parse_file(file), resolved_mode);
         let threads = tab
@@ -6321,10 +6315,8 @@ impl ReviewWorkspace {
         let position = tab.diff_scroll.scroll_px_offset_for_scrollbar().y.as_f32();
         if let Some(session) = &mut tab.session {
             session.set_scroll_position(position);
-            if let Some(key) = session.selected_file().map(file_key) {
-                let horizontal = (-tab.diff_horizontal.offset().x.as_f32()).max(0.);
-                tab.horizontal_positions.insert(key, horizontal);
-            }
+            let horizontal = (-tab.diff_horizontal.offset().x.as_f32()).max(0.);
+            session.set_horizontal_scroll_position(horizontal);
         }
     }
 

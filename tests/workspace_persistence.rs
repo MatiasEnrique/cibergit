@@ -121,6 +121,7 @@ fn comparison_context_restores_canonical_and_selected_identities_atomically() {
     let mut canonical_session = ReviewSession::new(full);
     canonical_session.mark_viewed("full.rs", true);
     canonical_session.set_diff_mode(DiffMode::SideBySide);
+    canonical_session.set_horizontal_scroll_position(20.0);
 
     let selected_revision = Revision {
         base_sha: "a".repeat(40),
@@ -151,6 +152,7 @@ fn comparison_context_restores_canonical_and_selected_identities_atomically() {
     );
     selected_session.mark_viewed("narrow.rs", true);
     selected_session.set_scroll_position(88.0);
+    selected_session.set_horizontal_scroll_position(300.0);
     selected_session.set_diff_mode(DiffMode::Unified);
 
     let context = PersistedComparisonContext {
@@ -196,10 +198,24 @@ fn comparison_context_restores_canonical_and_selected_identities_atomically() {
     assert!(!restored.canonical_session.is_viewed("narrow.rs"));
     assert!(restored.selected_session.is_viewed("narrow.rs"));
     assert_eq!(restored.selected_session.scroll_position(), 88.0);
+    assert_eq!(
+        restored.selected_session.horizontal_scroll_position(),
+        300.0
+    );
+    assert_eq!(
+        restored.canonical_session.horizontal_scroll_position(),
+        20.0
+    );
     assert_eq!(restored.selected_session.diff_mode(), DiffMode::Unified);
     assert_eq!(restored.request_sessions.len(), 1);
     assert!(restored.request_sessions[0].session.is_viewed("narrow.rs"));
     assert_eq!(restored.request_sessions[0].session.scroll_position(), 88.0);
+    assert_eq!(
+        restored.request_sessions[0]
+            .session
+            .horizontal_scroll_position(),
+        300.0
+    );
     assert_eq!(
         restored.local_file_load.unwrap().revision,
         selected_revision

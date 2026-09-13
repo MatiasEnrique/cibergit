@@ -449,6 +449,7 @@ mod tests {
         );
         session_a.mark_viewed("a.rs", true);
         session_a.set_scroll_position(41.0);
+        session_a.set_horizontal_scroll_position(123.0);
 
         let request_b = ComparisonRequest::CommitRange {
             first_sha: "a".repeat(40),
@@ -459,10 +460,11 @@ mod tests {
                 base_sha: "0".repeat(40),
                 head_sha: "b".repeat(40),
             },
-            "b.rs",
+            "a.rs",
             ComparisonMode::CommitRange,
         );
         session_b.set_scroll_position(92.0);
+        session_b.set_horizontal_scroll_position(456.0);
 
         let mut saved = Vec::new();
         remember_request_progress(&mut saved, request_a.clone(), session_a, None);
@@ -470,6 +472,7 @@ mod tests {
         let restored = saved_request_progress(&saved, &request_a).unwrap().session;
         assert!(restored.is_viewed("a.rs"));
         assert_eq!(restored.scroll_position(), 41.0);
+        assert_eq!(restored.horizontal_scroll_position(), 123.0);
         assert!(!restored.is_viewed("b.rs"));
     }
 }

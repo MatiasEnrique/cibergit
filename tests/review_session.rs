@@ -140,3 +140,29 @@ fn comparison_selection_and_empty_file_lists() {
     assert!(!tab.select_file("missing"));
     assert_eq!(tab.selected_file().unwrap().path, "new");
 }
+
+#[test]
+fn horizontal_scroll_is_file_scoped_and_old_records_restore_at_start() {
+    let mut session = ReviewSession::new(comparison(
+        revision('a', 'b'),
+        vec![file("one", "1"), file("two", "2")],
+    ));
+    session.set_horizontal_scroll_position(120.5);
+    session.select_file("two");
+    assert_eq!(session.horizontal_scroll_position(), 0.);
+    session.set_horizontal_scroll_position(640.);
+    session.set_horizontal_scroll_position(f32::NAN);
+    session.set_horizontal_scroll_position(-1.);
+    assert_eq!(session.horizontal_scroll_position(), 640.);
+    session.select_file("one");
+    let encoded = serde_json::to_value(&session).unwrap();
+    let restored: ReviewSession = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(restored.horizontal_scroll_position(), 120.5);
+    let mut legacy = encoded;
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("horizontal_scroll_positions");
+    let old: ReviewSession = serde_json::from_value(legacy).unwrap();
+    assert_eq!(old.horizontal_scroll_position(), 0.);
+}
