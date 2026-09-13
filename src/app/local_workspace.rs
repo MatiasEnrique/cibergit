@@ -193,15 +193,15 @@ impl LocalAction {
 
     fn summary(&self) -> String {
         match self {
-            Self::Stage(paths) => format!("Stage {} selected path(s)", paths.len()),
-            Self::Unstage(paths) => format!("Unstage {} selected path(s)", paths.len()),
+            Self::Stage(paths) => selected_paths_summary("Stage", paths),
+            Self::Unstage(paths) => selected_paths_summary("Unstage", paths),
             Self::Commit { message } => format!("Commit staged changes: {message}"),
             Self::Fetch { remote } => format!("Fetch remote {remote}"),
             Self::FastForwardPull { remote, branch } => {
                 format!("Fast-forward only pull {remote}/{branch}")
             }
             Self::Push { remote, branch } => {
-                format!("Push immutable local OID to {remote}/{branch}")
+                format!("Push the selected commit to {remote}/{branch}")
             }
             Self::ForcePushWithLease {
                 remote,
@@ -1314,7 +1314,8 @@ impl LocalWorkspace {
                         let current = tab.editor.read(cx).value();
                         let newer_edits_remain = current.as_ref() != saved_buffer;
                         tab.message = format!(
-                            "{outcome:?}{}",
+                            "{}{}",
+                            save_outcome_message(outcome),
                             if newer_edits_remain {
                                 " · newer edits remain dirty"
                             } else {
@@ -1327,7 +1328,7 @@ impl LocalWorkspace {
                         });
                     }
                     DocumentReplyKind::Refreshed(outcome) => {
-                        tab.message = format!("External state: {outcome:?}");
+                        tab.message = refresh_outcome_message(*outcome).into();
                         if matches!(outcome, RefreshOutcome::Reloaded)
                             && reply.generation == tab.generation
                         {
@@ -1348,7 +1349,12 @@ impl LocalWorkspace {
                         });
                     }
                     DocumentReplyKind::Reconciled(outcome) => {
-                        tab.message = format!("Reconcile result: {outcome:?}");
+                        tab.message = match outcome {
+                            cibergit::document::ReconcileOutcome::Applied =>
+                                "Merged changes are ready to save",
+                            cibergit::document::ReconcileOutcome::Stale =>
+                                "The file changed again. Your proposed merge is preserved; review the latest disk version",
+                        }.into();
                         tab.pending_programmatic_reload = Some(PendingProgrammaticReload {
                             generation: reply.generation,
                             expected_editor_value: tab.editor.read(cx).value().to_string(),
@@ -1438,6 +1444,41 @@ impl LocalWorkspace {
                 )
             })
         })
+    }
+}
+
+fn selected_paths_summary(action: &str, paths: &[GitPath]) -> String {
+    if let [path] = paths {
+        format!("{action} {}", path.display)
+    } else {
+        format!("{action} {} selected files", paths.len())
+    }
+}
+
+fn save_outcome_message(outcome: &SaveOutcome) -> &'static str {
+    match outcome {
+        SaveOutcome::Unchanged => "No changes to save",
+        SaveOutcome::Saved { .. } => "Saved · Previous version kept",
+        SaveOutcome::Blocked {
+            status: DocumentStatus::Conflict,
+        } => "Save paused · Resolve the disk conflict first",
+        SaveOutcome::Blocked { .. } => "Save paused · Your unsaved text is preserved",
+        SaveOutcome::ConflictRetained { .. } => {
+            "The file changed during save · Both versions are preserved"
+        }
+        SaveOutcome::CommittedButUncertain { .. } => {
+            "Save needs verification · Refresh and inspect the file before continuing"
+        }
+    }
+}
+
+fn refresh_outcome_message(outcome: RefreshOutcome) -> &'static str {
+    match outcome {
+        RefreshOutcome::Unchanged => "File checked · No disk changes",
+        RefreshOutcome::Reloaded => "Reloaded changes from disk",
+        RefreshOutcome::Conflict => "Disk conflict · Your unsaved text is preserved",
+        RefreshOutcome::Missing => "File missing · Your buffer is preserved",
+        RefreshOutcome::Unsafe => "File cannot be safely updated · Your buffer is preserved",
     }
 }
 
@@ -2678,7 +2719,25 @@ impl LocalWorkspace {
         let editor = tab.editor.clone();
         let status = tab.view.status;
         let message = tab.message.clone();
-        let recovery = format!("{:?}", tab.view.recovery);
+        let recovery = match &tab.view.recovery {
+            RecoveryStatus::None => "",
+            RecoveryStatus::Restored { .. } => " · Local draft recovered",
+            RecoveryStatus::Corrupt { .. } => {
+                " · Recovery needs attention; original copy preserved"
+            }
+            RecoveryStatus::Stale { .. } => " · Earlier recovery copy preserved",
+        };
+        let mut recovery_paths = tab.view.retained_paths.clone();
+        match &tab.view.recovery {
+            RecoveryStatus::Restored { path }
+            | RecoveryStatus::Corrupt { path, .. }
+            | RecoveryStatus::Stale { path, .. } => {
+                if !recovery_paths.contains(path) {
+                    recovery_paths.push(path.clone());
+                }
+            }
+            RecoveryStatus::None => {}
+        }
         let conflict = status == DocumentStatus::Conflict;
         let conflict_data = conflict.then(|| {
             let disk = match &tab.view.disk {
@@ -2761,10 +2820,12 @@ impl LocalWorkspace {
                         .py_2()
                         .bg(if colors.dark { rgba(0x452f18ff) } else { rgba(0xfff4d6ff) })
                         .text_color(colors.amber)
-                        .child(format!(
-                            "External conflict ({:?}). Undoing to the original base does not clear it; explicitly reload or reconcile.",
-                            tab.view.conflict_kind
-                        )),
+                        .child(match tab.view.conflict_kind {
+                            Some(ConflictKind::Missing) => "The file was removed. Your unsaved text is preserved.",
+                            Some(ConflictKind::Unsafe) => "The file cannot be safely updated. Your unsaved text is preserved.",
+                            Some(ConflictKind::SaveRace) => "The file changed during save. Review the preserved versions before continuing.",
+                            _ => "The file changed on disk. Review both versions, then reload or merge your changes.",
+                        }),
                 )
                 .child(
                     div()
@@ -2840,7 +2901,24 @@ impl LocalWorkspace {
                         | DocumentStatus::Unsafe
                         | DocumentStatus::RecoveryCorrupt => colors.red,
                     })
-                    .child(format!("{status:?} · {message} · recovery {recovery}")),
+                    .child(format!("{message}{recovery}"))
+                    .when(!recovery_paths.is_empty(), |footer| {
+                        let count = recovery_paths.len();
+                        let paths = recovery_paths
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        footer.child(action_button(
+                            format!("Copy recovery paths ({count})"),
+                            colors,
+                            cx.listener(move |_, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    paths.clone(),
+                                ));
+                            }),
+                        ))
+                    }),
             )
             .into_any_element()
     }
@@ -3143,7 +3221,7 @@ impl LocalWorkspace {
                     .child(
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Confirm material write"),
+                            .child("Confirm Git action"),
                     )
                     .child(div().mt_1().text_xs().child(pending.action.summary()))
                     .child(

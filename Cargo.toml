@@ -9,6 +9,10 @@ publish = false
 [features]
 ui-smoke = ["gpui/test-support", "gpui_platform/test-support"]
 
+[[example]]
+name = "local_workspace_demo"
+required-features = ["ui-smoke"]
+
 [dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.1" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.1", features = ["font-kit", "runtime_shaders"] }
