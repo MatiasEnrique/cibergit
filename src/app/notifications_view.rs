@@ -28,7 +28,10 @@ use std::{
         unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 const PAGE_SIZE: usize = 40;
@@ -252,7 +255,7 @@ impl AdmissionWork {
     pub(super) fn run(self) -> AdmissionCompletion {
         let result = self
             .registry
-            .reserve_new_events(&self.account, &self.events);
+            .reserve_for_delivery(&self.account, &self.events);
         match result {
             Ok(notifications) => AdmissionCompletion {
                 token: self.token,
@@ -270,6 +273,7 @@ impl AdmissionWork {
 
 #[derive(Clone, Debug)]
 struct QueuedNotification {
+    delivery_lease: Option<Arc<RegistryLock>>,
     account_key: String,
     consent_generation: u64,
     selection: String,
@@ -663,7 +667,7 @@ impl NotificationController {
         true
     }
 
-    pub(super) fn take_system_notifications(&mut self) -> Vec<SystemNotification> {
+    fn take_system_notifications(&mut self) -> Vec<QueuedNotification> {
         let queued = std::mem::take(&mut self.queued);
         queued
             .into_iter()
@@ -678,7 +682,7 @@ impl NotificationController {
                             && state.selection == queued.selection
                             && state.selection_generation == queued.selection_generation
                     })
-                    .map(|_| queued.notification)
+                    .map(|_| queued)
             })
             .collect()
     }
@@ -686,8 +690,17 @@ impl NotificationController {
     pub(super) fn dispatch_to(&mut self, sink: &mut impl NotificationSink) -> usize {
         let notifications = self.take_system_notifications();
         let count = notifications.len();
-        for notification in notifications {
+        for queued in notifications {
+            // Admission acquires this lease in the background. Keep it until
+            // the platform request returns so another process cannot complete
+            // a durable disable between the consent read and this request.
+            let QueuedNotification {
+                notification,
+                delivery_lease,
+                ..
+            } = queued;
             sink.request(notification);
+            drop(delivery_lease);
         }
         count
     }
@@ -1594,65 +1607,83 @@ impl NotificationRegistry {
         })
     }
 
+    fn reserve_for_delivery(
+        &self,
+        account: &Account,
+        events: &[ProviderNotificationEvent],
+    ) -> Result<Vec<QueuedNotification>> {
+        let delivery_lease = Arc::new(RegistryLock::acquire(&self.lock_path())?);
+        let mut file = self.load_unlocked()?;
+        let expected = file.revision;
+        let mut queued = Vec::new();
+        ensure!(
+            file.enabled
+                .get(&account_key(account))
+                .copied()
+                .unwrap_or(false),
+            "macOS consent is no longer enabled"
+        );
+        let mut known: HashSet<String> = file.delivered_tags.iter().cloned().collect();
+        for event in events {
+            ensure!(
+                event
+                    .identity
+                    .target
+                    .account
+                    .eq_ignore_ascii_case(&account.login),
+                "event account differs from notification consent account"
+            );
+            let tag = stable_event_tag(account, event);
+            if !known.insert(tag.clone()) {
+                continue;
+            }
+            file.delivered_tags.push(tag.clone());
+            file.routes.retain(|route| route.tag != tag);
+            file.routes.push(PersistedRoute {
+                tag: tag.clone(),
+                account: account.clone(),
+                target: event.identity.target.clone(),
+            });
+            queued.push(QueuedNotification {
+                delivery_lease: Some(delivery_lease.clone()),
+                account_key: account_key(account),
+                consent_generation: 0,
+                selection: String::new(),
+                selection_generation: 0,
+                notification: system_notification(account, event),
+                route: NotificationRoute {
+                    account: account.clone(),
+                    owner: event.identity.target.owner.clone(),
+                    repository: event.identity.target.repository.clone(),
+                    pull_request: event.identity.target.pull_request,
+                },
+            });
+        }
+        if file.delivered_tags.len() > MAX_RETAINED_TAGS {
+            let drain = file.delivered_tags.len() - MAX_RETAINED_TAGS;
+            file.delivered_tags.drain(0..drain);
+        }
+        if file.routes.len() > MAX_RETAINED_ROUTES {
+            let drain = file.routes.len() - MAX_RETAINED_ROUTES;
+            file.routes.drain(0..drain);
+        }
+        file.revision = expected
+            .checked_add(1)
+            .context("Notification registry revision exhausted")?;
+        self.save_cas_unlocked(expected, &file)?;
+        Ok(queued)
+    }
+
+    #[cfg(test)]
     fn reserve_new_events(
         &self,
         account: &Account,
         events: &[ProviderNotificationEvent],
     ) -> Result<Vec<QueuedNotification>> {
-        let mut queued = Vec::new();
-        self.update(|file| {
-            ensure!(
-                file.enabled
-                    .get(&account_key(account))
-                    .copied()
-                    .unwrap_or(false),
-                "macOS consent is no longer enabled"
-            );
-            let mut known: HashSet<String> = file.delivered_tags.iter().cloned().collect();
-            for event in events {
-                ensure!(
-                    event
-                        .identity
-                        .target
-                        .account
-                        .eq_ignore_ascii_case(&account.login),
-                    "event account differs from notification consent account"
-                );
-                let tag = stable_event_tag(account, event);
-                if !known.insert(tag.clone()) {
-                    continue;
-                }
-                file.delivered_tags.push(tag.clone());
-                file.routes.retain(|route| route.tag != tag);
-                file.routes.push(PersistedRoute {
-                    tag: tag.clone(),
-                    account: account.clone(),
-                    target: event.identity.target.clone(),
-                });
-                queued.push(QueuedNotification {
-                    account_key: account_key(account),
-                    consent_generation: 0,
-                    selection: String::new(),
-                    selection_generation: 0,
-                    notification: system_notification(account, event),
-                    route: NotificationRoute {
-                        account: account.clone(),
-                        owner: event.identity.target.owner.clone(),
-                        repository: event.identity.target.repository.clone(),
-                        pull_request: event.identity.target.pull_request,
-                    },
-                });
-            }
-            if file.delivered_tags.len() > MAX_RETAINED_TAGS {
-                let drain = file.delivered_tags.len() - MAX_RETAINED_TAGS;
-                file.delivered_tags.drain(0..drain);
-            }
-            if file.routes.len() > MAX_RETAINED_ROUTES {
-                let drain = file.routes.len() - MAX_RETAINED_ROUTES;
-                file.routes.drain(0..drain);
-            }
-            Ok(())
-        })?;
+        let mut queued = self.reserve_for_delivery(account, events)?;
+        for notification in &mut queued {
+            notification.delivery_lease = None;
+        }
         Ok(queued)
     }
 
@@ -1905,6 +1936,7 @@ fn validate_file_identity(file: &File, path: &Path, name: &str) -> Result<fs::Me
     Ok(descriptor)
 }
 
+#[derive(Debug)]
 struct RegistryLock(File);
 
 impl RegistryLock {
@@ -2319,12 +2351,94 @@ mod tests {
         assert_eq!(controller.routes.len(), MAX_RETAINED_ROUTES);
         assert!(controller.route_for_tag(&old_tag).is_none());
         assert_eq!(controller.route_for_tag(&last_tag).unwrap().pull_request, 7);
+        controller.dispatch_to(&mut |_| {});
         let mut restarted = NotificationController::new(dir.path().into());
         assert!(restarted.complete_bootstrap(restarted.begin_bootstrap().run()));
         assert!(restarted.route_for_tag(&old_tag).is_none());
         assert_eq!(
             restarted.route_for_tag(&last_tag),
             controller.route_for_tag(&last_tag)
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess probe for notification delivery authority"]
+    fn notification_consent_writer_probe() {
+        let root = std::env::var_os("CIBERGIT_TEST_NOTIFICATION_REGISTRY").expect("probe root");
+        let registry = NotificationRegistry {
+            root: PathBuf::from(root),
+        };
+        let result = registry.set_enabled(&account("alice"), false);
+        if std::env::var_os("CIBERGIT_TEST_EXPECT_NOTIFICATION_BUSY").is_some() {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("lock wait bound exhausted"),
+                "unexpected refusal: {error}"
+            );
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[test]
+    fn durable_disable_in_another_process_serializes_with_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = NotificationController::new(dir.path().into());
+        assert!(controller.complete_bootstrap(controller.begin_bootstrap().run()));
+        let alice = account("alice");
+        let enable = controller.begin_consent(&alice, true).unwrap();
+        assert!(controller.complete_consent(enable.run()));
+        let poll = controller.begin_polls(&[repo("alice", 0)]).pop().unwrap();
+        let exact = event("alice", "delivery", 7);
+        let admission = controller
+            .complete_poll(PollCompletion {
+                token: poll.token,
+                account: alice.clone(),
+                snapshot: empty_snapshot(String::new()),
+                newly_admitted: vec![exact.clone()],
+                error: None,
+            })
+            .unwrap();
+        assert!(controller.complete_admission(admission.run()));
+        let registry = controller.runtime.as_ref().unwrap().registry.clone();
+        let probe = |expect_busy: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "app::notifications_view::tests::notification_consent_writer_probe",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("CIBERGIT_TEST_NOTIFICATION_REGISTRY", &registry.root);
+            if expect_busy {
+                command.env("CIBERGIT_TEST_EXPECT_NOTIFICATION_BUSY", "1");
+            } else {
+                command.env_remove("CIBERGIT_TEST_EXPECT_NOTIFICATION_BUSY");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "probe failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        probe(true);
+        let mut calls = 0;
+        assert_eq!(
+            controller.dispatch_to(&mut |_| {
+                calls += 1;
+                probe(true);
+            }),
+            1,
+            "lease must span the sink request"
+        );
+        assert_eq!(calls, 1);
+        probe(false);
+        assert!(
+            registry.reserve_for_delivery(&alice, &[exact]).is_err(),
+            "successful external disable prevents a stale controller from reserving another request"
         );
     }
 
