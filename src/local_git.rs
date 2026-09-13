@@ -9,10 +9,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     ffi::{OsStr, OsString},
     fmt, fs,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
         process::CommandExt,
@@ -30,6 +30,9 @@ use std::{
 const DEFAULT_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_INPUT_LIMIT: usize = 4 * 1024 * 1024;
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
+/// Maximum aggregate bytes read from displayed worktree entries and Git
+/// operation-control files while constructing a mutation guard.
+pub const DEFAULT_SNAPSHOT_CONTENT_LIMIT: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandLimits {
@@ -72,6 +75,16 @@ pub enum LocalGitError {
         action: &'static str,
         exit_code: Option<i32>,
     },
+    MutationCommandFailed {
+        action: &'static str,
+        exit_code: Option<i32>,
+        certainty: OutcomeCertainty,
+    },
+    MutationIo {
+        action: &'static str,
+        certainty: OutcomeCertainty,
+        source: std::io::Error,
+    },
     TimedOut {
         action: &'static str,
         certainty: OutcomeCertainty,
@@ -80,6 +93,10 @@ pub enum LocalGitError {
         action: &'static str,
         certainty: OutcomeCertainty,
     },
+    SnapshotContentLimit {
+        max_bytes: usize,
+    },
+    UnsupportedSnapshotEntry,
     MalformedOutput(&'static str),
     PoisonedLock,
 }
@@ -102,12 +119,33 @@ impl fmt::Display for LocalGitError {
             Self::CommandFailed { action, exit_code } => {
                 write!(formatter, "Git {action} failed (exit {exit_code:?})")
             }
+            Self::MutationCommandFailed {
+                action,
+                exit_code,
+                certainty,
+            } => write!(
+                formatter,
+                "Git {action} failed (exit {exit_code:?}, {certainty:?} outcome)"
+            ),
+            Self::MutationIo {
+                action, certainty, ..
+            } => write!(
+                formatter,
+                "Git {action} I/O failed after start ({certainty:?} outcome)"
+            ),
             Self::TimedOut { action, certainty } => {
                 write!(formatter, "Git {action} timed out ({certainty:?} outcome)")
             }
             Self::OutputLimit { action, certainty } => write!(
                 formatter,
                 "Git {action} exceeded its output limit ({certainty:?} outcome)"
+            ),
+            Self::SnapshotContentLimit { max_bytes } => write!(
+                formatter,
+                "snapshot content exceeds the {max_bytes}-byte mutation-guard limit"
+            ),
+            Self::UnsupportedSnapshotEntry => formatter.write_str(
+                "snapshot contains a local entry whose content cannot be guarded safely",
             ),
             Self::MalformedOutput(reason) => write!(formatter, "malformed Git output: {reason}"),
             Self::PoisonedLock => formatter.write_str("local Git operation lock is unavailable"),
@@ -118,7 +156,7 @@ impl fmt::Display for LocalGitError {
 impl std::error::Error for LocalGitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
+            Self::Io { source, .. } | Self::MutationIo { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -191,8 +229,26 @@ pub struct OperationState {
     pub revert: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SnapshotGuardBlocker {
+    ContentLimit { max_bytes: usize },
+    UnsupportedEntry,
+}
+
+impl SnapshotGuardBlocker {
+    fn with_limit(self, max_bytes: usize) -> Self {
+        match self {
+            Self::ContentLimit { .. } => Self::ContentLimit { max_bytes },
+            Self::UnsupportedEntry => Self::UnsupportedEntry,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
-pub struct SnapshotGuard([u8; 32]);
+pub struct SnapshotGuard {
+    digest: [u8; 32],
+    blocker: Option<SnapshotGuardBlocker>,
+}
 
 impl fmt::Debug for SnapshotGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -203,6 +259,8 @@ impl fmt::Debug for SnapshotGuard {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalSnapshot {
     pub head: HeadState,
+    /// Full object IDs for local branches at the guarded snapshot generation.
+    pub local_branch_oids: BTreeMap<String, String>,
     pub upstream: Option<String>,
     pub upstream_oid: Option<String>,
     pub ahead: u64,
@@ -287,6 +345,7 @@ pub struct LocalGit {
     git_dir: PathBuf,
     common_git_dir: PathBuf,
     limits: CommandLimits,
+    snapshot_content_limit: usize,
     write_lock: Arc<Mutex<()>>,
 }
 
@@ -298,6 +357,7 @@ impl fmt::Debug for LocalGit {
             .field("git_dir", &self.git_dir)
             .field("common_git_dir", &self.common_git_dir)
             .field("limits", &self.limits)
+            .field("snapshot_content_limit", &self.snapshot_content_limit)
             .finish_non_exhaustive()
     }
 }
@@ -306,14 +366,35 @@ static COMMON_GIT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = Onc
 
 impl LocalGit {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_limits(path, CommandLimits::default())
+        Self::open_with_limits_and_snapshot_content_limit(
+            path,
+            CommandLimits::default(),
+            DEFAULT_SNAPSHOT_CONTENT_LIMIT,
+        )
     }
 
     pub fn open_with_limits(path: impl AsRef<Path>, limits: CommandLimits) -> Result<Self> {
+        Self::open_with_limits_and_snapshot_content_limit(
+            path,
+            limits,
+            DEFAULT_SNAPSHOT_CONTENT_LIMIT,
+        )
+    }
+
+    pub fn open_with_limits_and_snapshot_content_limit(
+        path: impl AsRef<Path>,
+        limits: CommandLimits,
+        snapshot_content_limit: usize,
+    ) -> Result<Self> {
         if limits.deadline.is_zero() || limits.max_output_bytes == 0 || limits.max_input_bytes == 0
         {
             return Err(LocalGitError::InvalidInput(
                 "command limits must be greater than zero",
+            ));
+        }
+        if snapshot_content_limit == 0 {
+            return Err(LocalGitError::InvalidInput(
+                "snapshot content limit must be greater than zero",
             ));
         }
         let start = fs::canonicalize(path).map_err(|source| LocalGitError::Io {
@@ -325,6 +406,7 @@ impl LocalGit {
             git_dir: start.clone(),
             common_git_dir: start,
             limits,
+            snapshot_content_limit,
             write_lock: Arc::new(Mutex::new(())),
         };
         let root = provisional
@@ -354,6 +436,7 @@ impl LocalGit {
             git_dir,
             common_git_dir,
             limits,
+            snapshot_content_limit,
             write_lock,
         })
     }
@@ -394,7 +477,7 @@ impl LocalGit {
             os_args(&[
                 "for-each-ref",
                 "--sort=refname",
-                "--format=%(refname)%00%(objectname)%00",
+                "--format=%(refname)%00%(objectname)",
                 "refs/heads",
                 "refs/remotes",
             ]),
@@ -412,6 +495,7 @@ impl LocalGit {
         hash.update(&status);
         hash.update([0]);
         hash.update(&shared_refs);
+        parsed.local_branch_oids = parse_local_branch_oids(&shared_refs)?;
         hash.update([
             operation.merge as u8,
             operation.cherry_pick as u8,
@@ -425,9 +509,13 @@ impl LocalGit {
         if let Some(oid) = &upstream_oid {
             hash.update(oid.as_bytes());
         }
+        let blocker = self.hash_snapshot_content(&parsed, &mut hash)?;
         parsed.upstream_oid = upstream_oid;
         parsed.operation = operation;
-        parsed.guard = SnapshotGuard(hash.finalize().into());
+        parsed.guard = SnapshotGuard {
+            digest: hash.finalize().into(),
+            blocker,
+        };
         Ok(parsed)
     }
 
@@ -742,8 +830,16 @@ impl LocalGit {
     ) -> Result<MutationReceipt> {
         self.validate_remote(remote)?;
         self.validate_branch(branch)?;
-        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-        self.guarded(guard, MutationAction::Push, None, |_| {
+        let remote_ref = format!("refs/heads/{branch}");
+        self.guarded(guard, MutationAction::Push, None, |snapshot| {
+            let local_oid =
+                snapshot
+                    .local_branch_oids
+                    .get(branch)
+                    .ok_or(LocalGitError::InvalidInput(
+                        "local branch does not exist in the guarded snapshot",
+                    ))?;
+            let refspec = format!("{local_oid}:{remote_ref}");
             self.run(
                 "push",
                 vec![
@@ -773,12 +869,19 @@ impl LocalGit {
         validate_oid(expected_remote_oid)?;
         let remote_ref = format!("refs/heads/{branch}");
         let lease = format!("--force-with-lease={remote_ref}:{expected_remote_oid}");
-        let refspec = format!("{remote_ref}:{remote_ref}");
         self.guarded(
             guard,
             MutationAction::ForcePushWithLease,
             Some(expected_remote_oid.to_owned()),
-            |_| {
+            |snapshot| {
+                let local_oid =
+                    snapshot
+                        .local_branch_oids
+                        .get(branch)
+                        .ok_or(LocalGitError::InvalidInput(
+                            "local branch does not exist in the guarded snapshot",
+                        ))?;
+                let refspec = format!("{local_oid}:{remote_ref}");
                 self.run(
                     "force push with lease",
                     vec![
@@ -809,12 +912,87 @@ impl LocalGit {
             .write_lock
             .lock()
             .map_err(|_| LocalGitError::PoisonedLock)?;
+        if let Some(blocker) = &expected.blocker {
+            return Err(match blocker {
+                SnapshotGuardBlocker::ContentLimit { max_bytes } => {
+                    LocalGitError::SnapshotContentLimit {
+                        max_bytes: *max_bytes,
+                    }
+                }
+                SnapshotGuardBlocker::UnsupportedEntry => LocalGitError::UnsupportedSnapshotEntry,
+            });
+        }
         let actual = self.snapshot()?;
         if &actual.guard != expected {
             return Err(LocalGitError::StaleSnapshot);
         }
         operation(&actual)?;
         Ok(MutationReceipt::new(action, expected, expected_remote_oid))
+    }
+
+    fn hash_snapshot_content(
+        &self,
+        snapshot: &LocalSnapshot,
+        hash: &mut Sha256,
+    ) -> Result<Option<SnapshotGuardBlocker>> {
+        let mut paths = BTreeSet::new();
+        for entry in snapshot
+            .staged
+            .iter()
+            .chain(&snapshot.unstaged)
+            .chain(&snapshot.conflicts)
+        {
+            paths.insert(entry.path.raw.clone());
+            if let Some(previous) = &entry.previous_path {
+                paths.insert(previous.raw.clone());
+            }
+        }
+        paths.extend(snapshot.untracked.iter().map(|path| path.raw.clone()));
+
+        let mut remaining = self.snapshot_content_limit;
+        for raw_path in paths {
+            hash.update(b"worktree\0");
+            hash.update(&raw_path);
+            hash.update([0]);
+            let full_path = self.root.join(OsStr::from_bytes(&raw_path));
+            if let Some(blocker) = hash_path_content(&full_path, hash, &mut remaining)? {
+                return Ok(Some(blocker.with_limit(self.snapshot_content_limit)));
+            }
+        }
+
+        const OPERATION_PATHS: &[&str] = &[
+            "MERGE_HEAD",
+            "MERGE_AUTOSTASH",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "rebase-apply/head-name",
+            "rebase-apply/onto",
+            "rebase-apply/orig-head",
+            "rebase-apply/next",
+            "rebase-apply/last",
+            "rebase-apply/patch",
+            "rebase-merge/head-name",
+            "rebase-merge/onto",
+            "rebase-merge/orig-head",
+            "rebase-merge/stopped-sha",
+            "rebase-merge/git-rebase-todo",
+            "rebase-merge/done",
+            "sequencer/head",
+            "sequencer/abort-safety",
+            "sequencer/todo",
+            "sequencer/opts",
+        ];
+        for relative in OPERATION_PATHS {
+            hash.update(b"git-operation\0");
+            hash.update(relative.as_bytes());
+            hash.update([0]);
+            if let Some(blocker) =
+                hash_path_content(&self.git_dir.join(relative), hash, &mut remaining)?
+            {
+                return Ok(Some(blocker.with_limit(self.snapshot_content_limit)));
+            }
+        }
+        Ok(None)
     }
 
     fn operation_state(&self) -> OperationState {
@@ -947,6 +1125,12 @@ impl LocalGit {
                 "Git input exceeds configured bound",
             ));
         }
+        // A lock observed before spawn is a certain refusal. A lock that only
+        // exists after a failed command does not prove that command made no
+        // partial change, so post-spawn failures remain uncertain.
+        if mutation && self.has_known_lock() {
+            return Err(LocalGitError::RepositoryLocked { action });
+        }
         let certainty = if mutation {
             OutcomeCertainty::Uncertain
         } else {
@@ -980,10 +1164,15 @@ impl LocalGit {
             source,
         })?;
         let input_receiver = if let Some(input) = input {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or(LocalGitError::MalformedOutput("missing Git input pipe"))?;
+            let Some(mut stdin) = child.stdin.take() else {
+                kill_process_group(&mut child);
+                return Err(started_io_error(
+                    action,
+                    mutation,
+                    "missing Git input pipe",
+                    std::io::Error::new(ErrorKind::BrokenPipe, "missing Git input pipe"),
+                ));
+            };
             let input = input.to_vec();
             let (sender, receiver) = mpsc::channel();
             std::thread::spawn(move || {
@@ -993,10 +1182,15 @@ impl LocalGit {
         } else {
             None
         };
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or(LocalGitError::MalformedOutput("missing Git output pipe"))?;
+        let Some(mut stdout) = child.stdout.take() else {
+            kill_process_group(&mut child);
+            return Err(started_io_error(
+                action,
+                mutation,
+                "missing Git output pipe",
+                std::io::Error::new(ErrorKind::BrokenPipe, "missing Git output pipe"),
+            ));
+        };
         let exceeded = Arc::new(AtomicBool::new(false));
         let reader_exceeded = exceeded.clone();
         let max_output = self.limits.max_output_bytes;
@@ -1036,14 +1230,21 @@ impl LocalGit {
                     Ok(Ok(bytes)) => output = Some(bytes),
                     Ok(Err(source)) => {
                         kill_process_group(&mut child);
-                        return Err(LocalGitError::Io {
-                            context: "read installed Git output",
+                        return Err(started_io_error(
+                            action,
+                            mutation,
+                            "read installed Git output",
                             source,
-                        });
+                        ));
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
                         kill_process_group(&mut child);
-                        return Err(LocalGitError::MalformedOutput("Git output reader stopped"));
+                        return Err(started_io_error(
+                            action,
+                            mutation,
+                            "Git output reader stopped",
+                            std::io::Error::new(ErrorKind::BrokenPipe, "Git output reader stopped"),
+                        ));
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                 }
@@ -1053,28 +1254,42 @@ impl LocalGit {
                     Ok(Ok(())) => input_finished = true,
                     Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
                         kill_process_group(&mut child);
-                        return Err(LocalGitError::CommandFailed {
-                            action,
-                            exit_code: None,
+                        return Err(if mutation {
+                            LocalGitError::MutationCommandFailed {
+                                action,
+                                exit_code: None,
+                                certainty: OutcomeCertainty::Uncertain,
+                            }
+                        } else {
+                            LocalGitError::CommandFailed {
+                                action,
+                                exit_code: None,
+                            }
                         });
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                 }
             }
-            if let Some(status) = child.try_wait().map_err(|source| LocalGitError::Io {
-                context: "wait for installed Git",
-                source,
-            })? && let Some(output) = output.take()
+            let status = child.try_wait().map_err(|source| {
+                started_io_error(action, mutation, "wait for installed Git", source)
+            })?;
+            if let Some(status) = status
+                && let Some(output) = output.take()
                 && input_finished
             {
                 let code = status.code();
                 if !code.is_some_and(|code| accepted_exit_codes.contains(&code)) {
-                    if mutation && self.has_known_lock() {
-                        return Err(LocalGitError::RepositoryLocked { action });
-                    }
-                    return Err(LocalGitError::CommandFailed {
-                        action,
-                        exit_code: code,
+                    return Err(if mutation {
+                        LocalGitError::MutationCommandFailed {
+                            action,
+                            exit_code: code,
+                            certainty: OutcomeCertainty::Uncertain,
+                        }
+                    } else {
+                        LocalGitError::CommandFailed {
+                            action,
+                            exit_code: code,
+                        }
                     });
                 }
                 return Ok(output);
@@ -1167,6 +1382,7 @@ fn parse_status(raw: &[u8]) -> Result<LocalSnapshot> {
     };
     Ok(LocalSnapshot {
         head,
+        local_branch_oids: BTreeMap::new(),
         upstream,
         upstream_oid: None,
         ahead,
@@ -1176,8 +1392,106 @@ fn parse_status(raw: &[u8]) -> Result<LocalSnapshot> {
         untracked,
         conflicts,
         operation: OperationState::default(),
-        guard: SnapshotGuard([0; 32]),
+        guard: SnapshotGuard {
+            digest: [0; 32],
+            blocker: None,
+        },
     })
+}
+
+fn parse_local_branch_oids(raw: &[u8]) -> Result<BTreeMap<String, String>> {
+    let mut branches = BTreeMap::new();
+    for record in raw.split(|byte| *byte == b'\n') {
+        if record.is_empty() {
+            continue;
+        }
+        let separator = record
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or(LocalGitError::MalformedOutput("invalid shared-ref record"))?;
+        let (refname, oid_with_separator) = record.split_at(separator);
+        let oid = &oid_with_separator[1..];
+        let Some(branch) = refname.strip_prefix(b"refs/heads/") else {
+            continue;
+        };
+        let Ok(branch) = std::str::from_utf8(branch) else {
+            // The public branch mutation API accepts UTF-8 names, so retain
+            // guard coverage through `raw` but omit an unaddressable map key.
+            continue;
+        };
+        let oid = text(oid, "non-UTF-8 local branch object ID")?;
+        validate_oid(oid)?;
+        branches.insert(branch.to_owned(), oid.to_owned());
+    }
+    Ok(branches)
+}
+
+fn hash_path_content(
+    path: &Path,
+    hash: &mut Sha256,
+    remaining: &mut usize,
+) -> Result<Option<SnapshotGuardBlocker>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == ErrorKind::NotFound => {
+            hash.update(b"missing\0");
+            return Ok(None);
+        }
+        Err(source) => {
+            return Err(LocalGitError::Io {
+                context: "inspect mutation-guard content",
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path).map_err(|source| LocalGitError::Io {
+            context: "read mutation-guard symlink",
+            source,
+        })?;
+        let bytes = target.as_os_str().as_bytes();
+        if bytes.len() > *remaining {
+            return Ok(Some(SnapshotGuardBlocker::ContentLimit { max_bytes: 0 }));
+        }
+        hash.update(b"symlink\0");
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(Sha256::digest(bytes));
+        *remaining -= bytes.len();
+        return Ok(None);
+    }
+    if !metadata.file_type().is_file() {
+        hash.update(b"unsupported\0");
+        return Ok(Some(SnapshotGuardBlocker::UnsupportedEntry));
+    }
+    if metadata.len() > *remaining as u64 {
+        return Ok(Some(SnapshotGuardBlocker::ContentLimit { max_bytes: 0 }));
+    }
+
+    hash.update(b"file\0");
+    let mut file = fs::File::open(path).map_err(|source| LocalGitError::Io {
+        context: "open mutation-guard content",
+        source,
+    })?;
+    let mut buffer = [0_u8; 8192];
+    let mut content_hash = Sha256::new();
+    let mut content_len = 0_u64;
+    loop {
+        let count = file.read(&mut buffer).map_err(|source| LocalGitError::Io {
+            context: "read mutation-guard content",
+            source,
+        })?;
+        if count == 0 {
+            hash.update(content_len.to_le_bytes());
+            hash.update(content_hash.finalize());
+            return Ok(None);
+        }
+        if count > *remaining {
+            return Ok(Some(SnapshotGuardBlocker::ContentLimit { max_bytes: 0 }));
+        }
+        content_hash.update(&buffer[..count]);
+        content_len += count as u64;
+        *remaining -= count;
+    }
 }
 
 fn split_fields(record: &[u8], expected: usize) -> Result<Vec<&[u8]>> {
@@ -1307,6 +1621,23 @@ fn os_args(args: &[&str]) -> Vec<OsString> {
 
 fn text<'a>(bytes: &'a [u8], reason: &'static str) -> Result<&'a str> {
     std::str::from_utf8(bytes).map_err(|_| LocalGitError::MalformedOutput(reason))
+}
+
+fn started_io_error(
+    action: &'static str,
+    mutation: bool,
+    context: &'static str,
+    source: std::io::Error,
+) -> LocalGitError {
+    if mutation {
+        LocalGitError::MutationIo {
+            action,
+            certainty: OutcomeCertainty::Uncertain,
+            source,
+        }
+    } else {
+        LocalGitError::Io { context, source }
+    }
 }
 
 fn kill_process_group(child: &mut std::process::Child) {

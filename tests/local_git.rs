@@ -1,7 +1,7 @@
 use cibergit::local_git::*;
 use std::{
     ffi::OsStr,
-    fs,
+    fs::{self, File, FileTimes},
     io::Write,
     os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::Path,
@@ -68,6 +68,11 @@ fn commit_all(path: &Path, message: &str) -> String {
     git(path, &["add", "--all"]);
     git(path, &["commit", "-qm", message, "--allow-empty"]);
     git(path, &["rev-parse", "HEAD"])
+}
+
+fn commit_tree(path: &Path, parent: &str, message: &str) -> String {
+    let tree = git(path, &["rev-parse", &format!("{parent}^{{tree}}")]);
+    git(path, &["commit-tree", &tree, "-p", parent, "-m", message])
 }
 
 fn path(raw: &[u8]) -> GitPath {
@@ -251,6 +256,64 @@ fn linked_worktrees_share_common_directory_and_stale_guards_reject_external_chan
 }
 
 #[test]
+fn stale_guard_rejects_same_length_worktree_edit_with_preserved_mtime_and_status() {
+    let directory = init();
+    let root = directory.path();
+    fs::write(root.join("file"), "original\n").unwrap();
+    commit_all(root, "base");
+    fs::write(root.join("file"), "version-b\n").unwrap();
+
+    let backend = LocalGit::open(root).unwrap();
+    let displayed_status = git(root, &["status", "--porcelain=v2"]);
+    let displayed = backend.snapshot().unwrap();
+    let metadata = fs::metadata(root.join("file")).unwrap();
+    fs::write(root.join("file"), "version-c\n").unwrap();
+    File::options()
+        .write(true)
+        .open(root.join("file"))
+        .unwrap()
+        .set_times(
+            FileTimes::new()
+                .set_accessed(metadata.accessed().unwrap())
+                .set_modified(metadata.modified().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(git(root, &["status", "--porcelain=v2"]), displayed_status);
+
+    let error = backend
+        .stage(&[path(b"file")], &displayed.guard)
+        .unwrap_err();
+    assert!(matches!(error, LocalGitError::StaleSnapshot));
+    assert_eq!(git(root, &["show", ":file"]), "original");
+    assert_eq!(
+        fs::read_to_string(root.join("file")).unwrap(),
+        "version-c\n"
+    );
+}
+
+#[test]
+fn oversized_snapshot_content_is_visible_but_cannot_authorize_a_mutation() {
+    let directory = init();
+    fs::write(directory.path().join("large"), b"12345").unwrap();
+    let backend = LocalGit::open_with_limits_and_snapshot_content_limit(
+        directory.path(),
+        CommandLimits::default(),
+        4,
+    )
+    .unwrap();
+    let snapshot = backend.snapshot().unwrap();
+    assert_eq!(snapshot.untracked[0].raw, b"large");
+    let error = backend
+        .stage(&[path(b"large")], &snapshot.guard)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        LocalGitError::SnapshotContentLimit { max_bytes: 4 }
+    ));
+    assert!(git(directory.path(), &["diff", "--cached"]).is_empty());
+}
+
+#[test]
 fn instances_for_one_common_git_directory_serialize_incompatible_writes() {
     let directory = init();
     let root = directory.path();
@@ -327,8 +390,9 @@ fn branch_actions_use_real_git_dirty_refusal_and_operation_state() {
     let error = backend.switch_branch("other", &dirty.guard).unwrap_err();
     assert!(matches!(
         error,
-        LocalGitError::CommandFailed {
+        LocalGitError::MutationCommandFailed {
             action: "switch branch",
+            certainty: OutcomeCertainty::Uncertain,
             ..
         }
     ));
@@ -346,6 +410,14 @@ fn branch_actions_use_real_git_dirty_refusal_and_operation_state() {
     assert!(conflicted.operation.merge);
     assert_eq!(conflicted.conflicts.len(), 1);
     assert_eq!(conflicted.conflicts[0].path.raw, b"file");
+    let merge_head_path = backend.git_dir().join("MERGE_HEAD");
+    let merge_head = fs::read(&merge_head_path).unwrap();
+    fs::write(&merge_head_path, format!("{base}\n")).unwrap();
+    let error = backend
+        .stage(&[path(b"file")], &conflicted.guard)
+        .unwrap_err();
+    assert!(matches!(error, LocalGitError::StaleSnapshot));
+    fs::write(merge_head_path, merge_head).unwrap();
 }
 
 #[test]
@@ -450,13 +522,134 @@ fn local_bare_remote_fetch_ff_pull_push_and_explicit_lease_rejection() {
         .unwrap_err();
     assert!(matches!(
         error,
-        LocalGitError::CommandFailed {
+        LocalGitError::MutationCommandFailed {
             action: "force push with lease",
+            certainty: OutcomeCertainty::Uncertain,
             ..
         }
     ));
     let observed = backend.observe_remote_branch("origin", "main").unwrap();
     assert_ne!(observed.oid.as_deref(), Some(remote_after_local.as_str()));
+}
+
+#[test]
+fn push_and_force_lease_pin_the_guarded_local_oid_across_a_pre_push_ref_move() {
+    let directory = init();
+    let root = directory.path();
+    fs::write(root.join("file"), "base\n").unwrap();
+    let base = commit_all(root, "base");
+    let bare = TempDir::new().unwrap();
+    git(bare.path(), &["init", "--bare", "-q"]);
+    git(
+        root,
+        &["remote", "add", "origin", bare.path().to_str().unwrap()],
+    );
+    let backend = LocalGit::open(root).unwrap();
+    let moved_after_guard = commit_tree(root, &base, "unreviewed ordinary push tip");
+    let hook = backend.git_dir().join("hooks/pre-push");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\ngit update-ref refs/heads/main {moved_after_guard} {base}\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let selected = backend.snapshot().unwrap();
+    assert_eq!(selected.local_branch_oids.get("main"), Some(&base));
+    backend.push("origin", "main", &selected.guard).unwrap();
+    assert_eq!(git(bare.path(), &["rev-parse", "refs/heads/main"]), base);
+    assert_eq!(
+        git(root, &["rev-parse", "refs/heads/main"]),
+        moved_after_guard
+    );
+
+    let force_selected = commit_tree(root, &base, "selected force-push tip");
+    git(
+        root,
+        &[
+            "update-ref",
+            "refs/heads/main",
+            &force_selected,
+            &moved_after_guard,
+        ],
+    );
+    let moved_during_force = commit_tree(root, &force_selected, "unreviewed force-push tip");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ngit update-ref refs/heads/main {moved_during_force} {force_selected}\n"
+        ),
+    )
+    .unwrap();
+    let selected = backend.snapshot().unwrap();
+    assert_eq!(
+        selected.local_branch_oids.get("main"),
+        Some(&force_selected)
+    );
+    backend
+        .force_push_with_lease("origin", "main", &base, &selected.guard)
+        .unwrap();
+    assert_eq!(
+        git(bare.path(), &["rev-parse", "refs/heads/main"]),
+        force_selected
+    );
+    assert_eq!(
+        git(root, &["rev-parse", "refs/heads/main"]),
+        moved_during_force
+    );
+}
+
+#[test]
+fn failed_ff_pull_reports_uncertainty_after_fetching_remote_state() {
+    let directory = init();
+    let root = directory.path();
+    fs::write(root.join("file"), "base\n").unwrap();
+    commit_all(root, "base");
+    let bare = TempDir::new().unwrap();
+    git(bare.path(), &["init", "--bare", "-q"]);
+    git(
+        root,
+        &["remote", "add", "origin", bare.path().to_str().unwrap()],
+    );
+    git(root, &["push", "-q", "-u", "origin", "main"]);
+
+    let peer_parent = TempDir::new().unwrap();
+    let peer = peer_parent.path().join("peer");
+    git(
+        peer_parent.path(),
+        &[
+            "clone",
+            "-q",
+            bare.path().to_str().unwrap(),
+            peer.to_str().unwrap(),
+        ],
+    );
+    configure_identity(&peer);
+    git(&peer, &["switch", "-q", "main"]);
+    fs::write(peer.join("remote"), "remote\n").unwrap();
+    let remote_oid = commit_all(&peer, "remote advance");
+    git(&peer, &["push", "-q", "origin", "main"]);
+
+    fs::write(root.join("local"), "local\n").unwrap();
+    commit_all(root, "local advance");
+    let backend = LocalGit::open(root).unwrap();
+    let selected = backend.snapshot().unwrap();
+    let error = backend
+        .fast_forward_pull("origin", "main", &selected.guard)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        LocalGitError::MutationCommandFailed {
+            action: "fast-forward pull",
+            certainty: OutcomeCertainty::Uncertain,
+            ..
+        }
+    ));
+    assert!(
+        fs::read_to_string(backend.git_dir().join("FETCH_HEAD"))
+            .unwrap()
+            .contains(&remote_oid)
+    );
 }
 
 #[test]
