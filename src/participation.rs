@@ -568,6 +568,7 @@ fn coordinate_has_valid_shape(coordinate: &DraftCoordinate) -> bool {
 pub enum DraftDisposition {
     Pending,
     PostedImmediately,
+    Submitted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -635,9 +636,20 @@ pub struct ReviewOperation {
     pub id: String,
     pub target: ReviewOperationTarget,
     pub status: ReviewOperationStatus,
+    /// Exact dispatched data survives later edits and restart. Legacy records
+    /// without a payload remain readable but cannot start an execution.
+    #[serde(default)]
+    pub payload: Option<ReviewOperationPayload>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewOperationPayload {
+    PendingComment(PendingCommentIntent),
+    ImmediateComment(ImmediateCommentIntent),
+    Submission(SubmissionIntent),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingCommentIntent {
     pub operation_id: String,
     pub key: ReviewKey,
@@ -648,7 +660,7 @@ pub struct PendingCommentIntent {
     pub existing_comment_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImmediateCommentIntent {
     pub operation_id: String,
     pub key: ReviewKey,
@@ -657,7 +669,7 @@ pub struct ImmediateCommentIntent {
     pub position: PublishedPosition,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmissionIntent {
     pub operation_id: String,
     pub key: ReviewKey,
@@ -773,15 +785,15 @@ impl ReviewComposition {
         draft_id: &str,
         canonical: CanonicalPublishedPatch<'_>,
     ) -> Result<PendingCommentIntent, ParticipationError> {
-        self.ensure_target_available(|target| {
-            matches!(target,
-                ReviewOperationTarget::SynchronizePendingComment { draft_id: id }
-                | ReviewOperationTarget::PostImmediateComment { draft_id: id } if id == draft_id
-            )
-        })?;
+        self.ensure_target_available(|_| true)?;
         let draft = self
             .draft(draft_id)
             .ok_or_else(|| ParticipationError::DraftNotFound(draft_id.into()))?;
+        if draft.disposition != DraftDisposition::Pending {
+            return Err(ParticipationError::OperationState(
+                "a completed comment is historical; create a new draft for another comment".into(),
+            ));
+        }
         validate_nonempty_text("draft text", &draft.body, MAX_DRAFT_TEXT_BYTES)?;
         let position = map_to_canonical_published(&draft.coordinate, canonical)
             .map_err(ParticipationError::Mapping)?;
@@ -800,7 +812,7 @@ impl ReviewComposition {
             self.push_operation(ReviewOperationTarget::SynchronizePendingComment {
                 draft_id: draft_id.into(),
             })?;
-        Ok(PendingCommentIntent {
+        let intent = PendingCommentIntent {
             operation_id,
             key: self.key.clone(),
             draft_id: draft_id.into(),
@@ -808,7 +820,10 @@ impl ReviewComposition {
             position,
             pending_review_id,
             existing_comment_id,
-        })
+        };
+        self.operation_mut(&intent.operation_id)?.payload =
+            Some(ReviewOperationPayload::PendingComment(intent.clone()));
+        Ok(intent)
     }
 
     pub fn prepare_immediate_comment(
@@ -816,12 +831,7 @@ impl ReviewComposition {
         draft_id: &str,
         canonical: CanonicalPublishedPatch<'_>,
     ) -> Result<ImmediateCommentIntent, ParticipationError> {
-        self.ensure_target_available(|target| {
-            matches!(target,
-                ReviewOperationTarget::SynchronizePendingComment { draft_id: id }
-                | ReviewOperationTarget::PostImmediateComment { draft_id: id } if id == draft_id
-            )
-        })?;
+        self.ensure_target_available(|_| true)?;
         let draft = self
             .draft(draft_id)
             .ok_or_else(|| ParticipationError::DraftNotFound(draft_id.into()))?;
@@ -831,6 +841,11 @@ impl ReviewComposition {
                     .into(),
             ));
         }
+        if draft.disposition != DraftDisposition::Pending {
+            return Err(ParticipationError::OperationState(
+                "a completed comment is historical; create a new draft for another comment".into(),
+            ));
+        }
         validate_nonempty_text("draft text", &draft.body, MAX_DRAFT_TEXT_BYTES)?;
         let position = map_to_canonical_published(&draft.coordinate, canonical)
             .map_err(ParticipationError::Mapping)?;
@@ -838,13 +853,16 @@ impl ReviewComposition {
         let operation_id = self.push_operation(ReviewOperationTarget::PostImmediateComment {
             draft_id: draft_id.into(),
         })?;
-        Ok(ImmediateCommentIntent {
+        let intent = ImmediateCommentIntent {
             operation_id,
             key: self.key.clone(),
             draft_id: draft_id.into(),
             body,
             position,
-        })
+        };
+        self.operation_mut(&intent.operation_id)?.payload =
+            Some(ReviewOperationPayload::ImmediateComment(intent.clone()));
+        Ok(intent)
     }
 
     pub fn prepare_submission(
@@ -853,9 +871,7 @@ impl ReviewComposition {
         body: impl Into<String>,
         currently_available_head: Option<&str>,
     ) -> Result<SubmissionIntent, ParticipationError> {
-        self.ensure_target_available(|target| {
-            matches!(target, ReviewOperationTarget::SubmitReview { .. })
-        })?;
+        self.ensure_target_available(|_| true)?;
         let unsynchronized = self
             .drafts
             .iter()
@@ -880,7 +896,7 @@ impl ReviewComposition {
         let operation_id = self.push_operation(ReviewOperationTarget::SubmitReview {
             event: event.clone(),
         })?;
-        Ok(SubmissionIntent {
+        let intent = SubmissionIntent {
             operation_id,
             key: self.key.clone(),
             reviewed_commit_sha: self.reviewed_revision.head_sha.clone(),
@@ -891,7 +907,10 @@ impl ReviewComposition {
             event,
             body,
             newer_head_warning: warning,
-        })
+        };
+        self.operation_mut(&intent.operation_id)?.payload =
+            Some(ReviewOperationPayload::Submission(intent.clone()));
+        Ok(intent)
     }
 
     fn ensure_target_available(
@@ -957,6 +976,7 @@ impl ReviewComposition {
             id: id.clone(),
             target,
             status: ReviewOperationStatus::Prepared,
+            payload: None,
         });
         Ok(id)
     }
@@ -969,9 +989,9 @@ impl ReviewComposition {
         let attempt_id = attempt_id.into();
         validate_nonempty_id("attempt_id", &attempt_id)?;
         let operation = self.operation_mut(operation_id)?;
-        if operation.status != ReviewOperationStatus::Prepared {
+        if operation.status != ReviewOperationStatus::Prepared || operation.payload.is_none() {
             return Err(ParticipationError::OperationState(format!(
-                "review operation `{operation_id}` is not prepared"
+                "review operation `{operation_id}` has no executable prepared payload"
             )));
         }
         operation.status = ReviewOperationStatus::InFlight { attempt_id };
@@ -1116,12 +1136,46 @@ impl ReviewComposition {
                 "review operation `{operation_id}` has no started attempt to reconcile"
             )));
         }
+        if let Some(ReviewOperationPayload::Submission(intent)) = &operation.payload
+            && let Some(expected) = &intent.pending_review_id
+            && expected != &remote_review_id
+        {
+            return Err(ParticipationError::RemoteState(
+                "submission acknowledgement identifies a different pending review".into(),
+            ));
+        }
         operation.status = ReviewOperationStatus::Acknowledged {
-            remote_review_id: Some(remote_review_id),
+            remote_review_id: Some(remote_review_id.clone()),
             remote_comment_id: None,
         };
-        // Drafts and pending IDs remain readable; refresh does not infer or erase them.
+        self.retire_pending_review(&remote_review_id);
         Ok(())
+    }
+
+    fn retire_pending_review(&mut self, remote_review_id: &str) {
+        for draft in &mut self.drafts {
+            if draft.disposition == DraftDisposition::Pending
+                && draft
+                    .remote
+                    .as_ref()
+                    .and_then(|remote| remote.review_id.as_deref())
+                    == Some(remote_review_id)
+            {
+                if draft.dirty {
+                    // Edits made while submission ran stay as a new local draft.
+                    draft.remote = None;
+                    draft.observed_remote_body = None;
+                } else {
+                    draft.disposition = DraftDisposition::Submitted;
+                }
+            }
+        }
+        if self.observed_pending_review_id.as_deref() == Some(remote_review_id) {
+            self.observed_pending_review_id = None;
+        }
+        if self.acknowledged_pending_review_id.as_deref() == Some(remote_review_id) {
+            self.acknowledged_pending_review_id = None;
+        }
     }
 
     fn operation_mut(&mut self, id: &str) -> Result<&mut ReviewOperation, ParticipationError> {
@@ -1160,10 +1214,33 @@ impl ReviewComposition {
                 "provider returned more than one pending review for the selected account".into(),
             ));
         }
+        let completed: Vec<_> = details
+            .reviews
+            .iter()
+            .filter(|review| {
+                matches!(
+                    review.state.as_str(),
+                    "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" | "DISMISSED"
+                ) && review
+                    .author
+                    .as_deref()
+                    .is_some_and(|author| author.eq_ignore_ascii_case(&self.key.account.login))
+                    && self.key.matches(&review.coordinates)
+            })
+            .map(|review| review.coordinates.remote_id.clone())
+            .collect();
+        for remote_id in completed {
+            self.retire_pending_review(&remote_id);
+        }
         let previous = self.observed_pending_review_id.clone();
         self.observed_pending_review_id = pending
             .first()
-            .map(|review| review.coordinates.remote_id.clone());
+            .map(|review| review.coordinates.remote_id.clone())
+            .or_else(|| {
+                (!details.activity_complete)
+                    .then(|| previous.clone())
+                    .flatten()
+            });
 
         let mut report = ReconcileReport {
             pending_review_changed: previous != self.observed_pending_review_id,
@@ -1248,6 +1325,68 @@ impl ReviewComposition {
         }
         let mut operation_ids = HashSet::new();
         for operation in &self.operations {
+            if let Some(payload) = &operation.payload {
+                let (id, key, target, body, head, position) = match payload {
+                    ReviewOperationPayload::PendingComment(intent) => (
+                        &intent.operation_id,
+                        &intent.key,
+                        ReviewOperationTarget::SynchronizePendingComment {
+                            draft_id: intent.draft_id.clone(),
+                        },
+                        &intent.body,
+                        &intent.position.commit_sha,
+                        Some(&intent.position),
+                    ),
+                    ReviewOperationPayload::ImmediateComment(intent) => (
+                        &intent.operation_id,
+                        &intent.key,
+                        ReviewOperationTarget::PostImmediateComment {
+                            draft_id: intent.draft_id.clone(),
+                        },
+                        &intent.body,
+                        &intent.position.commit_sha,
+                        Some(&intent.position),
+                    ),
+                    ReviewOperationPayload::Submission(intent) => (
+                        &intent.operation_id,
+                        &intent.key,
+                        ReviewOperationTarget::SubmitReview {
+                            event: intent.event.clone(),
+                        },
+                        &intent.body,
+                        &intent.reviewed_commit_sha,
+                        None,
+                    ),
+                };
+                if id != &operation.id
+                    || key != &self.key
+                    || target != operation.target
+                    || head != &self.reviewed_revision.head_sha
+                {
+                    return Err(ParticipationError::OperationState(
+                        "stored operation payload does not match its review identity or target"
+                            .into(),
+                    ));
+                }
+                validate_text("operation body", body, MAX_REVIEW_BODY_BYTES)?;
+                if let Some(position) = position {
+                    validate_nonempty_text("comment body", body, MAX_DRAFT_TEXT_BYTES)?;
+                    validate_nonempty_id("comment path", &position.path)?;
+                    validate_line_range(LineSelection {
+                        side: position.side,
+                        start_line: position.start_line.unwrap_or(position.line),
+                        line: position.line,
+                    })?;
+                    if position
+                        .start_side
+                        .is_some_and(|side| side != position.side)
+                    {
+                        return Err(ParticipationError::InvalidCoordinate(
+                            "stored operation range crosses diff sides".into(),
+                        ));
+                    }
+                }
+            }
             validate_nonempty_id("operation_id", &operation.id)?;
             operation
                 .id

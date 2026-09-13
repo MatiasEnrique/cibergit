@@ -575,3 +575,128 @@ fn text_draft_and_operation_bounds_return_specific_errors() {
         Err(ParticipationError::TooManyOperations { limit }) if limit == MAX_OPERATIONS
     ));
 }
+
+#[test]
+fn submitted_review_retires_pending_ids_and_preserves_edits_for_a_new_review() {
+    let canonical = comparison("base", "head", file("src/lib.rs"));
+    let coordinate = coordinate_for(canonical.clone(), DiffSide::New, 11, 11);
+    let mut state = ReviewComposition::new(key("alice"), revision("base", "head")).unwrap();
+    let first = state
+        .add_draft(coordinate.clone(), "first")
+        .unwrap()
+        .id
+        .clone();
+    let second = state.add_draft(coordinate, "second").unwrap().id.clone();
+    for (id, body) in [(&first, "first"), (&second, "second")] {
+        let intent = state
+            .prepare_pending_comment(id, published(&canonical))
+            .unwrap();
+        state.mark_in_flight(&intent.operation_id, "sync").unwrap();
+        state
+            .reconcile_observed_comment_success(
+                &intent.operation_id,
+                Some("pending-1".into()),
+                format!("remote-{id}"),
+                body.into(),
+            )
+            .unwrap();
+    }
+    state.observed_pending_review_id = Some("pending-1".into());
+    let submit = state
+        .prepare_submission(ReviewEvent::Approve, "review summary", None)
+        .unwrap();
+    state
+        .mark_in_flight(&submit.operation_id, "submit")
+        .unwrap();
+    state.edit_draft(&second, "a later thought").unwrap();
+    assert!(
+        state
+            .prepare_pending_comment(&second, published(&canonical))
+            .is_err()
+    );
+    assert!(
+        state
+            .reconcile_observed_submission_success(&submit.operation_id, "foreign-review".into())
+            .is_err()
+    );
+    state
+        .reconcile_observed_submission_success(&submit.operation_id, "pending-1".into())
+        .unwrap();
+    assert!(state.observed_pending_review_id.is_none());
+    assert!(state.acknowledged_pending_review_id.is_none());
+    assert_eq!(
+        state.draft(&first).unwrap().disposition,
+        DraftDisposition::Submitted
+    );
+    assert!(
+        state
+            .prepare_pending_comment(&first, published(&canonical))
+            .is_err()
+    );
+    assert_eq!(state.draft(&second).unwrap().body, "a later thought");
+    assert!(state.draft(&second).unwrap().remote.is_none());
+    let next = state
+        .prepare_pending_comment(&second, published(&canonical))
+        .unwrap();
+    assert!(next.pending_review_id.is_none());
+    assert!(next.existing_comment_id.is_none());
+}
+
+#[test]
+fn operation_payload_survives_draft_edit_timeout_and_restart() {
+    use cibergit::participation::ReviewOperationPayload;
+    let directory = tempdir().unwrap();
+    let store = DraftStore::open(directory.path()).unwrap();
+    let canonical = comparison("base", "head", file("src/lib.rs"));
+    let coordinate = coordinate_for(canonical.clone(), DiffSide::New, 11, 11);
+    let mut state = ReviewComposition::new(key("alice"), revision("base", "head")).unwrap();
+    let draft = state
+        .add_draft(coordinate, "actually sent")
+        .unwrap()
+        .id
+        .clone();
+    let intent = state
+        .prepare_immediate_comment(&draft, published(&canonical))
+        .unwrap();
+    state
+        .mark_in_flight(&intent.operation_id, "attempt-1")
+        .unwrap();
+    state.edit_draft(&draft, "unsent later edit").unwrap();
+    state
+        .mark_uncertain(&intent.operation_id, "lost reply")
+        .unwrap();
+    store.save(&state).unwrap();
+    let LoadOutcome::Loaded(mut restored) = store.load(&key("alice")).unwrap() else {
+        panic!("missing recovery")
+    };
+    assert_eq!(
+        restored.operations[0].payload,
+        Some(ReviewOperationPayload::ImmediateComment(intent.clone()))
+    );
+    assert_eq!(restored.draft(&draft).unwrap().body, "unsent later edit");
+    assert!(
+        restored
+            .prepare_submission(ReviewEvent::Comment, "summary", None)
+            .is_err()
+    );
+    restored
+        .reconcile_observed_comment_success(
+            &intent.operation_id,
+            None,
+            "posted-1".into(),
+            "actually sent".into(),
+        )
+        .unwrap();
+    assert_eq!(restored.draft(&draft).unwrap().body, "unsent later edit");
+    assert!(restored.draft(&draft).unwrap().dirty);
+    assert!(
+        restored
+            .prepare_pending_comment(&draft, published(&canonical))
+            .is_err()
+    );
+    assert!(
+        restored
+            .prepare_immediate_comment(&draft, published(&canonical))
+            .is_err()
+    );
+}
