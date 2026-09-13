@@ -3,13 +3,12 @@ use crate::{
     ComposeInlineComment, ConfirmPrMutation, CycleDiffMode, DetailsNarrower, DetailsWider,
     DiffScrollEnd, DiffScrollHome, DiffScrollLeft, DiffScrollRight, EditPrMetadata,
     FileTreeActivate, FileTreeDown, FileTreeLeft, FileTreeNarrower, FileTreeRight, FileTreeUp,
-    FileTreeWider, MergePullRequest, NewPrDiscussion, NextFile, OpenCreatedPullRequest,
-    OpenPullRequestCreation, OpenRepositorySetup, OpenStackView, PostImmediateComment,
-    PreviousFile, Refresh, RefreshStackView, ResetLayout, ReturnToPullRequest, Save,
-    SaveReviewDraft, SelectFullComparison, SelectNextComparisonCommit,
-    SelectPreviousComparisonCommit, SelectSinceLastReview, SidebarNarrower, SidebarWider,
-    SubmitReview, ToggleComparisonPicker, ToggleFileTree, ToggleInspector, TogglePalette,
-    ToggleSidebar, ToggleStackRelationships,
+    FileTreeWider, MergePullRequest, NewPrDiscussion, NextFile, OpenPullRequestCreation,
+    OpenRepositorySetup, OpenStackView, PostImmediateComment, PreviousFile, Refresh,
+    RefreshStackView, ResetLayout, ReturnToPullRequest, Save, SaveReviewDraft,
+    SelectFullComparison, SelectNextComparisonCommit, SelectPreviousComparisonCommit,
+    SelectSinceLastReview, SidebarNarrower, SidebarWider, SubmitReview, ToggleComparisonPicker,
+    ToggleFileTree, ToggleInspector, TogglePalette, ToggleSidebar, ToggleStackRelationships,
 };
 mod comparison_picker;
 mod file_tree;
@@ -733,6 +732,7 @@ pub struct ReviewWorkspace {
     setup_open: bool,
     command_palette: bool,
     creation_dialog: Option<Entity<pr_creation::PrCreationDialog>>,
+    creation_subscription: Option<Subscription>,
     inspector_open: bool,
     focused: bool,
     wide: bool,
@@ -981,6 +981,7 @@ impl ReviewWorkspace {
             setup_open: startup.repository.is_none(),
             command_palette: false,
             creation_dialog: None,
+            creation_subscription: None,
             inspector_open: true,
             focused: window.is_window_active(),
             wide: false,
@@ -1210,9 +1211,29 @@ impl ReviewWorkspace {
             .parent()
             .expect("interaction root has parent")
             .join("pr-creation");
-        self.creation_dialog = Some(cx.new(|cx| {
+        let dialog = cx.new(|cx| {
             pr_creation::PrCreationDialog::new(root, repositories, preferred, window, cx)
-        }));
+        });
+        self.creation_subscription = Some(cx.subscribe(
+            &dialog,
+            |root, dialog, event: &pr_creation::OpenAcknowledgedPr, cx| {
+                let Root::Review(this) = root else { return };
+                if this.creation_dialog.as_ref() != Some(&dialog) || !dialog.read(cx).is_closed() {
+                    return;
+                }
+                let acknowledgement = &event.0;
+                let key = acknowledgement.target_repository.cache_key();
+                if let Some(index) = this.repositories.iter().position(|runtime| runtime.repository.cache_key() == key) {
+                    this.open_pr(index, acknowledgement.pull_request.pull_request, cx);
+                    this.creation_dialog = None;
+                    this.creation_subscription = None;
+                } else {
+                    this.status = "The acknowledged PR belongs to a repository that is no longer explicitly selected. Exact coordinates remain in the durable creation record.".into();
+                    cx.notify();
+                }
+            },
+        ));
+        self.creation_dialog = Some(dialog);
         self.command_palette = false;
         cx.notify();
     }
@@ -8336,30 +8357,13 @@ impl ReviewWorkspace {
                     cx.notify();
                 }
             }))
-            .on_action(cx.listener(|root, _: &OpenPullRequestCreation, window, cx| {
-                if let Root::Review(this) = root {
-                    this.open_creation_dialog(window, cx);
-                }
-            }))
-            .on_action(cx.listener(|root, _: &OpenCreatedPullRequest, _, cx| {
-                if let Root::Review(this) = root
-                    && let Some(dialog) = this.creation_dialog.as_ref()
-                    && let Some(acknowledgement) = dialog.read(cx).acknowledgement()
-                {
-                    let key = acknowledgement.target_repository.cache_key();
-                    if let Some(index) = this
-                        .repositories
-                        .iter()
-                        .position(|runtime| runtime.repository.cache_key() == key)
-                    {
-                        this.open_pr(index, acknowledgement.pull_request.pull_request, cx);
-                        this.creation_dialog = None;
-                    } else {
-                        this.status = "The acknowledged PR belongs to a repository that is no longer explicitly selected. Exact coordinates remain in the durable creation record.".into();
-                        cx.notify();
+            .on_action(
+                cx.listener(|root, _: &OpenPullRequestCreation, window, cx| {
+                    if let Root::Review(this) = root {
+                        this.open_creation_dialog(window, cx);
                     }
-                }
-            }))
+                }),
+            )
             .on_action(cx.listener(|root, _: &ComposeInlineComment, window, cx| {
                 if let Root::Review(this) = root {
                     this.compose_first_selectable(window, cx);
@@ -8557,7 +8561,9 @@ impl ReviewWorkspace {
             .when(self.view_editor.is_open(), |root| {
                 root.child(self.render_view_editor(colors, cx))
             })
-            .when_some(self.creation_dialog.clone(), |root, dialog| root.child(dialog))
+            .when_some(self.creation_dialog.clone(), |root, dialog| {
+                root.child(dialog)
+            })
     }
 
     fn render_splitter(

@@ -65,7 +65,6 @@ actions!(
         CancelPullRequestCreation,
         ClosePullRequestCreation,
         TogglePullRequestCreationDraft,
-        OpenCreatedPullRequest,
     ]
 );
 actions!(

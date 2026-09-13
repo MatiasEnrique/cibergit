@@ -27,7 +27,7 @@ GitHub's create endpoint cannot atomically require the reviewed source OID. The 
 
 The form's controls are inert while its final save, preparation, or creation is pending. **Prepare creation** first drains the serialized draft-save lane and starts the provider read only when the exact visible form is durable. The full confirmation disclosure includes the exact Markdown body, not merely its length. A keyboard edit that nevertheless changes an input invalidates the pending witness. Confirm independently compares the current visible form with the frozen confirmation and sends zero writes on mismatch.
 
-An acknowledgement shows the actual GitHub head separately from the reviewed preparation head. If they differ, the actual head is never described as reviewed. **Open PR** uses the exact acknowledged repository and PR number and leaves unrelated review tabs intact.
+An acknowledgement shows the actual GitHub head separately from the reviewed preparation head. If they differ, the actual head is never described as reviewed. **Open PR** uses the exact acknowledged repository and PR number and leaves unrelated review tabs intact. Opening a historical recovery row first saves the latest editable form, then opens that row's PR even if another acknowledgement is displayed. A failed save keeps the form open, and navigation is disabled while creation is pending.
 
 ## Durable state and recovery
 

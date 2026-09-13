@@ -10,7 +10,7 @@ use super::Root;
 use super::{Palette, input_style, is_dark, palette};
 use crate::{
     CancelPullRequestCreation, ClosePullRequestCreation, ConfirmPullRequestCreation,
-    OpenCreatedPullRequest, PreparePullRequestCreation, TogglePullRequestCreationDraft,
+    PreparePullRequestCreation, TogglePullRequestCreationDraft,
 };
 use cibergit::{
     domain::{
@@ -21,7 +21,7 @@ use cibergit::{
     providers::{AdmittedMutationAttempt, GithubProvider, MutationAdmission},
 };
 use gpui::{
-    Action, AnyWindowHandle, App, Context, Div, ElementId, Entity, FocusHandle, FontWeight,
+    AnyWindowHandle, App, Context, Div, ElementId, Entity, EventEmitter, FocusHandle, FontWeight,
     IntoElement, Render, SharedString, Stateful, Subscription, Window, div, prelude::*, px,
     relative, rems, rgba,
 };
@@ -1162,6 +1162,10 @@ pub struct PrCreationDialog {
     _subscriptions: Vec<Subscription>,
 }
 
+pub struct OpenAcknowledgedPr(pub PullRequestCreationAcknowledgement);
+
+impl EventEmitter<OpenAcknowledgedPr> for PrCreationDialog {}
+
 impl PrCreationDialog {
     pub fn new(
         root: PathBuf,
@@ -1263,13 +1267,6 @@ impl PrCreationDialog {
         this._subscriptions.push(body_subscription);
         this.start_load(cx);
         this
-    }
-
-    pub fn acknowledgement(&self) -> Option<PullRequestCreationAcknowledgement> {
-        match &self.state {
-            DialogState::Acknowledged(value) => Some((**value).clone()),
-            _ => self.recovery_open_acknowledgement.clone(),
-        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -1491,7 +1488,7 @@ impl PrCreationDialog {
             match self.current_form(cx) {
                 Ok(form) if self.draft_lane.is_idle_durable(&form) => {
                     self.close_after_save = false;
-                    self.closed = true;
+                    self.finish_close(cx);
                 }
                 Ok(form) => {
                     self.draft_lane.queue(DraftSnapshot {
@@ -1665,6 +1662,36 @@ impl PrCreationDialog {
     }
 
     fn request_close(&mut self, cx: &mut Context<Self>) {
+        if self.close_after_save {
+            return;
+        }
+        self.recovery_open_acknowledgement = None;
+        self.begin_close(cx);
+    }
+
+    fn request_open_acknowledgement(
+        &mut self,
+        acknowledgement: PullRequestCreationAcknowledgement,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.busy() || self.close_after_save {
+            return;
+        }
+        self.recovery_open_acknowledgement = Some(acknowledgement);
+        self.begin_close(cx);
+        if !self.closed && !self.close_after_save {
+            self.recovery_open_acknowledgement = None;
+        }
+    }
+
+    fn finish_close(&mut self, cx: &mut Context<Self>) {
+        self.closed = true;
+        if let Some(acknowledgement) = self.recovery_open_acknowledgement.take() {
+            cx.emit(OpenAcknowledgedPr(acknowledgement));
+        }
+    }
+
+    fn begin_close(&mut self, cx: &mut Context<Self>) {
         if self.state.busy() {
             self.notice = Some(
                 "Close is disabled while creation work is pending; no background result was detached."
@@ -1692,7 +1719,7 @@ impl PrCreationDialog {
         };
         self.prepare_queued = None;
         if self.draft_lane.is_idle_durable(&form) {
-            self.closed = true;
+            self.finish_close(cx);
         } else {
             self.close_after_save = true;
             self.set_form_disabled(true, cx);
@@ -1983,7 +2010,11 @@ impl PrCreationDialog {
                 .child(div().mt_2().child(format!("Actual created head: {}", ack.actual_head_sha)))
                 .child(div().mt_1().text_color(if ack.actual_head_sha == ack.reviewed_head_sha { colors.muted } else { colors.amber }).child(format!("Reviewed preparation head: {}", ack.reviewed_head_sha)))
                 .when(ack.actual_head_sha != ack.reviewed_head_sha, |panel| panel.child(div().mt_1().text_color(colors.amber).child("The published head moved during GitHub creation. Actual is not relabeled as reviewed.")))
-                .child(clickable("open-created-pr", "Open PR", colors, true).on_click(cx.listener(|_, _, window, cx| window.dispatch_action(OpenCreatedPullRequest.boxed_clone(), cx)))),
+                .child(clickable("open-created-pr", "Open PR", colors, true).on_click(cx.listener(|this, _, _, cx| {
+                    if let DialogState::Acknowledged(acknowledgement) = &this.state {
+                        this.request_open_acknowledgement((**acknowledgement).clone(), cx);
+                    }
+                }))),
             DialogState::Uncertain(reason) => div()
                 .p_4().rounded_md().border_1().border_color(colors.red).bg(colors.elevated)
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("Creation outcome unresolved"))
@@ -2066,14 +2097,12 @@ impl PrCreationDialog {
                                                 )),
                                                 "Open this exact PR",
                                                 colors,
-                                                true,
+                                                !self.state.busy() && !self.close_after_save,
                                             )
                                             .on_click(
-                                                cx.listener(move |this, _, window, cx| {
-                                                    this.recovery_open_acknowledgement =
-                                                        Some(acknowledgement.clone());
-                                                    window.dispatch_action(
-                                                        OpenCreatedPullRequest.boxed_clone(),
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.request_open_acknowledgement(
+                                                        acknowledgement.clone(),
                                                         cx,
                                                     );
                                                 }),
@@ -2836,6 +2865,133 @@ mod tests {
         lane.complete_success(&saved).unwrap();
         assert!(lane.is_idle_durable(&form));
         assert_eq!(store.load_draft().unwrap().unwrap().form, form);
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn recovery_open_saves_latest_text_and_emits_clicked_historical_pr(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_base::init);
+        let directory = tempdir().unwrap();
+        let store = CreationStore::open(directory.path().join("creation")).unwrap();
+        let (dialog, cx) = cx.add_window_view(|window, cx| {
+            let mut dialog = PrCreationDialog::new(
+                store.root.clone(),
+                vec![repository("owner", "repo", "alice")],
+                None,
+                window,
+                cx,
+            );
+            // Keep this controller fixture offline: discard the initial load callback
+            // before it can start provider branch reads.
+            dialog.load_generation += 1;
+            dialog.state = DialogState::Editing;
+            dialog.set_form_disabled(false, cx);
+            dialog
+        });
+        let request = request("open-history", "attempt-history", "title", 'a');
+        let historical: PullRequestCreationAcknowledgement =
+            serde_json::from_value(acknowledgement(&request)).unwrap();
+        let mut latest = historical.clone();
+        latest.pull_request.pull_request += 1;
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let observations = opened.clone();
+        let durable = store.clone();
+        dialog.update(cx, |_, cx| {
+            cx.subscribe(&dialog, move |this, _, event: &OpenAcknowledgedPr, _| {
+                assert!(this.closed);
+                let saved = durable.load_draft().unwrap().unwrap();
+                assert_eq!(saved.form.body, "final keystroke before opening history");
+                observations.borrow_mut().push(event.0.clone());
+            })
+            .detach();
+        });
+        cx.update(|window, cx| {
+            dialog.update(cx, |this, cx| {
+                this.body.update(cx, |body, cx| {
+                    body.set_value("final keystroke before opening history", window, cx)
+                });
+                this.state = DialogState::Acknowledged(Box::new(latest));
+                this.request_open_acknowledgement(historical.clone(), cx);
+                assert!(!this.closed, "must await the latest durable save");
+                assert!(this.close_after_save);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(*opened.borrow(), vec![historical]);
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn recovery_open_refuses_busy_or_failed_save_without_detaching_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_base::init);
+        let directory = tempdir().unwrap();
+        let store = CreationStore::open(directory.path().join("creation")).unwrap();
+        let (dialog, cx) = cx.add_window_view(|window, cx| {
+            let mut dialog = PrCreationDialog::new(
+                store.root.clone(),
+                vec![repository("owner", "repo", "alice")],
+                None,
+                window,
+                cx,
+            );
+            dialog.load_generation += 1;
+            dialog.state = DialogState::Editing;
+            dialog.set_form_disabled(false, cx);
+            dialog
+        });
+        let request = request("open-history", "attempt-history", "title", 'a');
+        let historical: PullRequestCreationAcknowledgement =
+            serde_json::from_value(acknowledgement(&request)).unwrap();
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let observations = opened.clone();
+        dialog.update(cx, |_, cx| {
+            cx.subscribe(&dialog, move |_, _, event: &OpenAcknowledgedPr, _| {
+                observations.borrow_mut().push(event.0.clone());
+            })
+            .detach();
+        });
+        cx.update(|window, cx| {
+            dialog.update(cx, |this, cx| {
+                this.body.update(cx, |body, cx| {
+                    body.set_value("unsaved recovery draft", window, cx)
+                });
+                this.state = DialogState::Creating;
+                this.request_open_acknowledgement(historical.clone(), cx);
+                assert!(!this.closed);
+                assert!(!this.close_after_save);
+                assert!(this.recovery_open_acknowledgement.is_none());
+                this.state = DialogState::Editing;
+                // An invalid existing original must be preserved, and navigation refused.
+                fs::write(store.draft_path(), "corrupt original").unwrap();
+                this.request_open_acknowledgement(historical.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+        dialog.update(cx, |this, cx| {
+            assert!(!this.closed);
+            assert!(!this.close_after_save);
+            assert_eq!(
+                this.current_form(cx).unwrap().body,
+                "unsaved recovery draft"
+            );
+            assert!(
+                this.notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("could not be made durable")
+            );
+        });
+        assert!(opened.borrow().is_empty());
+        assert_eq!(
+            fs::read_to_string(store.draft_path()).unwrap(),
+            "corrupt original"
+        );
     }
 
     #[test]
