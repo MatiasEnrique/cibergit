@@ -332,6 +332,10 @@ fn start_smoke(
                 if ready || edit_at.elapsed() > std::time::Duration::from_secs(20) { break ready; }
             };
             let _ = window.update(|window, _| window.resize(size(px(1680.), px(900.))));
+            window
+                .background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
             let edit_capture = window.update(|window, _| {
                 window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-edit-dark-wide.png" } else { "rebase-edit-light-wide.png" })).map_err(Into::into)).is_ok()
             }).unwrap_or(false);
@@ -351,6 +355,10 @@ fn start_smoke(
                 if ready || completed_at.elapsed() > std::time::Duration::from_secs(20) { break ready; }
             };
             let _ = window.update(|window, _| window.resize(size(px(1440.), px(900.))));
+            window
+                .background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
             let result_capture = window.update(|window, _| {
                 window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-result-dark-normal.png" } else { "rebase-result-light-normal.png" })).map_err(Into::into)).is_ok()
             }).unwrap_or(false);
@@ -394,6 +402,10 @@ fn start_smoke(
                 if ready || conflict_at.elapsed() > std::time::Duration::from_secs(20) { break ready; }
             };
             let _ = window.update(|window, _| window.resize(size(px(1040.), px(760.))));
+            window
+                .background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
             let conflict_capture = window.update(|window, _| {
                 window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-conflict-dark-narrow.png" } else { "rebase-conflict-light-narrow.png" })).map_err(Into::into)).is_ok()
             }).unwrap_or(false);
@@ -411,13 +423,11 @@ fn start_smoke(
                 }).unwrap_or(false)).unwrap_or(false);
                 if done || abort_at.elapsed() > std::time::Duration::from_secs(20) { break; }
             }
-            window.background_executor().spawn({
-                let readme = checkout.join("README.md");
-                async move {
-                    fs::write(readme, "# Local workspace demo\n\nStaged only in the disposable smoke repository.\n")
-                        .expect("create local change for stage smoke");
-                }
-            }).await;
+            let _ = window.update(|window, _| window.resize(size(px(1440.), px(900.))));
+            window
+                .background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
             let post_rebase_guard = window.background_executor().spawn({
                 let checkout = checkout.clone();
                 async move {
@@ -534,6 +544,19 @@ fn start_smoke(
                 .spawn({
                     let path = checkout.join("src/lib.rs");
                     async move { fs::read_to_string(path).unwrap_or_default() }
+                })
+                .await;
+            window
+                .background_executor()
+                .spawn({
+                    let checkout = checkout.clone();
+                    async move {
+                        run_git(&checkout, &["add", "--", "src/lib.rs"]);
+                        run_git(
+                            &checkout,
+                            &["commit", "-m", "record editor smoke fixture"],
+                        );
+                    }
                 })
                 .await;
             let highlighted_capture = window
@@ -765,6 +788,50 @@ fn start_smoke(
                     })
                     .unwrap_or(false);
                 if conflict || conflict_at.elapsed() > std::time::Duration::from_secs(20) {
+                    break;
+                }
+            }
+            window.background_executor().spawn({
+                let readme = checkout.join("README.md");
+                async move {
+                    fs::write(readme, "# Local workspace demo\n\nStaged only in the disposable smoke repository.\n")
+                    .expect("create local change for stage smoke");
+                }
+            }).await;
+            let staged_fixture_guard = window
+                .background_executor()
+                .spawn({
+                    let checkout = checkout.clone();
+                    async move {
+                        LocalGit::open(checkout)
+                            .expect("open stage fixture checkout")
+                            .snapshot()
+                            .expect("read stage fixture guard")
+                            .guard
+                    }
+                })
+                .await;
+            let _ = window.update(|_, cx| {
+                let _ = workspace.update(cx, |workspace, cx| workspace.refresh_all(cx));
+            });
+            let stage_refresh_at = std::time::Instant::now();
+            loop {
+                window
+                    .background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let refreshed = window
+                    .update(|_, cx| {
+                        workspace
+                            .read_with(cx, |workspace, _| {
+                                workspace.local_snapshot().is_some_and(|snapshot| {
+                                    snapshot.guard == staged_fixture_guard
+                                })
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if refreshed || stage_refresh_at.elapsed() > std::time::Duration::from_secs(20) {
                     break;
                 }
             }

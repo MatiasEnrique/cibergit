@@ -1290,26 +1290,15 @@ impl LocalWorkspace {
                 div()
                     .text_xs()
                     .text_color(colors.muted)
-                    .whitespace_normal()
-                    .child(format!(
-                        "branch {} · base {} · operation {}",
-                        operation.original_branch, operation.base_oid, operation.operation_id
-                    )),
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(format!("branch {}", operation.original_branch))
+                    .child(format!("base {}", operation.base_oid))
+                    .child(format!("operation {}", operation.operation_id)),
             );
         if let Some(active) = &operation.active {
-            body = body.child(notice_box(
-                "Guard-bound active identity",
-                format!(
-                    "onto {} · original {} · stopped {} · todo {} · done {}",
-                    active.onto_oid,
-                    active.original_head_oid,
-                    active.stopped_oid.as_deref().unwrap_or("none"),
-                    active.todo_sha256,
-                    active.done_sha256
-                ),
-                colors.accent,
-                colors,
-            ));
+            body = body.child(active_identity_box(active, colors));
         }
         if let Some(split) = &operation.split {
             body = body.child(render_split(split, colors));
@@ -1744,6 +1733,36 @@ fn notice_box(
                 .text_xs()
                 .whitespace_normal()
                 .child(body.into()),
+        )
+}
+
+fn active_identity_box(active: &ActiveOperationIdentity, colors: LocalPalette) -> Div {
+    div()
+        .p_3()
+        .rounded_md()
+        .border_1()
+        .border_color(colors.accent)
+        .bg(colors.surface)
+        .child(
+            div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("Guard-bound active identity"),
+        )
+        .child(
+            div()
+                .mt_1()
+                .text_xs()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(format!("onto {}", active.onto_oid))
+                .child(format!("original {}", active.original_head_oid))
+                .child(format!(
+                    "stopped {}",
+                    active.stopped_oid.as_deref().unwrap_or("none")
+                ))
+                .child(format!("todo {}", active.todo_sha256))
+                .child(format!("done {}", active.done_sha256)),
         )
 }
 
