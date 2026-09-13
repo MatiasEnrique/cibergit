@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     os::unix::{fs::PermissionsExt, process::CommandExt},
+    path::Path,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -249,8 +250,12 @@ if [ ! -f "$root/count" ]; then
     exit 0
 fi
 printf '%s' 2 >"$root/count"
-printf '%s\n' $$ >"$CIBERGIT_PROVIDER_BLOCKED_PID_PATH"
+printf '%s\n' $$ >"$CIBERGIT_PROVIDER_NO_READ_GROUP_PATH"
 /bin/sleep 30 <&0 >&1 2>&2 &
+helper=$!
+printf '%s\n' "$helper" >"$CIBERGIT_PROVIDER_NO_READ_HELPER_PATH"
+kill -0 "$helper" || exit 22
+: >"$CIBERGIT_PROVIDER_NO_READ_STARTED_PATH"
 /bin/sleep 30
 "#,
     )
@@ -273,6 +278,48 @@ fn count(dir: &TempDir) -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
+}
+
+fn recorded_pid(path: &Path) -> u32 {
+    fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("missing process record {}: {error}", path.display()))
+        .trim()
+        .parse()
+        .unwrap_or_else(|error| panic!("invalid process record {}: {error}", path.display()))
+}
+
+fn process_state(pid: u32) -> Option<String> {
+    let output = Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    if !output.status.success() {
+        return None;
+    }
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!state.is_empty()).then_some(state)
+}
+
+fn assert_processes_not_live_after_grace(label: &str, pids: &[u32]) {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let live = pids
+            .iter()
+            .filter_map(|pid| {
+                process_state(*pid)
+                    .filter(|state| !state.starts_with('Z'))
+                    .map(|state| (*pid, state))
+            })
+            .collect::<Vec<_>>();
+        if live.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label} processes remained live after bounded grace: {live:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -858,9 +905,19 @@ fn lost_reply_persists_uncertainty_and_restart_never_replays() {
 #[ignore = "run in isolation; an outer subprocess enforces the 3-second regression deadline"]
 fn no_read_input_and_pipe_descendants_are_bounded_by_an_outer_deadline() {
     const CHILD_MARKER: &str = "CIBERGIT_PROVIDER_NO_READ_CHILD";
-    const PID_PATH: &str = "CIBERGIT_PROVIDER_BLOCKED_PID_PATH";
+    const NO_READ_GROUP_PATH: &str = "CIBERGIT_PROVIDER_NO_READ_GROUP_PATH";
+    const NO_READ_HELPER_PATH: &str = "CIBERGIT_PROVIDER_NO_READ_HELPER_PATH";
+    const NO_READ_STARTED_PATH: &str = "CIBERGIT_PROVIDER_NO_READ_STARTED_PATH";
+    const EARLY_EXIT_GROUP_PATH: &str = "CIBERGIT_PROVIDER_EARLY_EXIT_GROUP_PATH";
+    const EARLY_EXIT_HELPER_PATH: &str = "CIBERGIT_PROVIDER_EARLY_EXIT_HELPER_PATH";
+    const EARLY_EXIT_STARTED_PATH: &str = "CIBERGIT_PROVIDER_EARLY_EXIT_STARTED_PATH";
     if std::env::var_os(CHILD_MARKER).is_some() {
-        assert!(std::env::var_os(PID_PATH).is_some());
+        let no_read_group_path = std::env::var_os(NO_READ_GROUP_PATH).unwrap();
+        let no_read_helper_path = std::env::var_os(NO_READ_HELPER_PATH).unwrap();
+        let no_read_started_path = std::env::var_os(NO_READ_STARTED_PATH).unwrap();
+        let early_exit_group_path = std::env::var_os(EARLY_EXIT_GROUP_PATH).unwrap();
+        let early_exit_helper_path = std::env::var_os(EARLY_EXIT_HELPER_PATH).unwrap();
+        let early_exit_started_path = std::env::var_os(EARLY_EXIT_STARTED_PATH).unwrap();
         let (mut composition, comparison, draft_id) = composition_with_draft();
         composition
             .edit_draft(&draft_id, "x".repeat(64 * 1024))
@@ -891,6 +948,17 @@ fn no_read_input_and_pipe_descendants_are_bounded_by_an_outer_deadline() {
             }
         }
         assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            Path::new(&no_read_started_path).is_file(),
+            "no-read shell/helper did not report startup"
+        );
+        let no_read_group = recorded_pid(Path::new(&no_read_group_path));
+        let no_read_helper = recorded_pid(Path::new(&no_read_helper_path));
+        assert_ne!(no_read_group, no_read_helper);
+        assert_processes_not_live_after_grace(
+            "no-read shell/helper",
+            &[no_read_group, no_read_helper],
+        );
         let LoadOutcome::Loaded(mut restored) = store.load(&key("alice")).unwrap() else {
             panic!()
         };
@@ -917,11 +985,21 @@ fn no_read_input_and_pipe_descendants_are_bounded_by_an_outer_deadline() {
             input_timeout: Some(Duration::from_millis(200)),
             ..Runner::default()
         };
-        let mut command = Command::new("/usr/bin/python3");
-        command.env("BLOCKED_PID_PATH", std::env::var(PID_PATH).unwrap()).args([
-            "-c",
-            "import os,pathlib,subprocess,sys,time; pathlib.Path(os.environ['BLOCKED_PID_PATH']).write_text(str(os.getpid())); subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); sys.exit(7)",
-        ]);
+        let mut command = Command::new("/bin/sh");
+        command
+            .env("EARLY_EXIT_GROUP_PATH", &early_exit_group_path)
+            .env("EARLY_EXIT_HELPER_PATH", &early_exit_helper_path)
+            .env("EARLY_EXIT_STARTED_PATH", &early_exit_started_path)
+            .args([
+                "-c",
+                r#"printf '%s\n' $$ >"$EARLY_EXIT_GROUP_PATH"
+/bin/sleep 30 <&0 >&1 2>&2 &
+helper=$!
+printf '%s\n' "$helper" >"$EARLY_EXIT_HELPER_PATH"
+kill -0 "$helper" || exit 22
+: >"$EARLY_EXIT_STARTED_PATH"
+exit 7"#,
+            ]);
         let started = Instant::now();
         let sensitive_input = "do-not-expose-input".repeat(16 * 1024);
         let error = runner
@@ -934,11 +1012,28 @@ fn no_read_input_and_pipe_descendants_are_bounded_by_an_outer_deadline() {
             .to_string();
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(!error.contains("do-not-expose-input"));
+        assert!(
+            Path::new(&early_exit_started_path).is_file(),
+            "early-exit shell/helper did not report startup"
+        );
+        let early_exit_group = recorded_pid(Path::new(&early_exit_group_path));
+        let early_exit_helper = recorded_pid(Path::new(&early_exit_helper_path));
+        assert_ne!(early_exit_group, early_exit_helper);
+        assert_processes_not_live_after_grace(
+            "early-exit shell/helper",
+            &[early_exit_group, early_exit_helper],
+        );
         return;
     }
 
     let outer = tempfile::tempdir().unwrap();
-    let pid_path = outer.path().join("blocked-pgid");
+    let no_read_group_path = outer.path().join("no-read-group");
+    let no_read_helper_path = outer.path().join("no-read-helper");
+    let no_read_started_path = outer.path().join("no-read-started");
+    let early_exit_group_path = outer.path().join("early-exit-group");
+    let early_exit_helper_path = outer.path().join("early-exit-helper");
+    let early_exit_started_path = outer.path().join("early-exit-started");
+    let group_paths = [&no_read_group_path, &early_exit_group_path];
     let mut child = Command::new(std::env::current_exe().unwrap());
     child
         .arg("no_read_input_and_pipe_descendants_are_bounded_by_an_outer_deadline")
@@ -946,7 +1041,12 @@ fn no_read_input_and_pipe_descendants_are_bounded_by_an_outer_deadline() {
         .arg("--nocapture")
         .arg("--test-threads=1")
         .env(CHILD_MARKER, "1")
-        .env(PID_PATH, &pid_path)
+        .env(NO_READ_GROUP_PATH, &no_read_group_path)
+        .env(NO_READ_HELPER_PATH, &no_read_helper_path)
+        .env(NO_READ_STARTED_PATH, &no_read_started_path)
+        .env(EARLY_EXIT_GROUP_PATH, &early_exit_group_path)
+        .env(EARLY_EXIT_HELPER_PATH, &early_exit_helper_path)
+        .env(EARLY_EXIT_STARTED_PATH, &early_exit_started_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         // The nested test emits only local assertion diagnostics. Subprocess
@@ -957,14 +1057,21 @@ fn no_read_input_and_pipe_descendants_are_bounded_by_an_outer_deadline() {
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait().unwrap() {
+            if !status.success() {
+                for path in group_paths {
+                    if path.is_file() {
+                        terminate_process_group_id(recorded_pid(path));
+                    }
+                }
+            }
             assert!(status.success(), "bounded transport subprocess failed");
             break;
         }
         if started.elapsed() >= Duration::from_secs(3) {
-            if let Ok(pid) = fs::read_to_string(&pid_path)
-                && let Ok(pid) = pid.parse()
-            {
-                terminate_process_group_id(pid);
+            for path in group_paths {
+                if path.is_file() {
+                    terminate_process_group_id(recorded_pid(path));
+                }
             }
             terminate_process_group(&mut child);
             panic!("bounded transport subprocess exceeded its outer deadline");
