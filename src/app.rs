@@ -13167,7 +13167,11 @@ impl ReviewWorkspace {
                     })
                     .child(picker.inventory_reason()),
             );
-        if let Some(notice) = picker.notice.clone() {
+        if let Some(notice) = picker
+            .notice
+            .clone()
+            .filter(|notice| *notice != picker.inventory_reason())
+        {
             view = view.child(
                 div()
                     .mt_1()
