@@ -795,7 +795,7 @@ impl Document {
                 reason: error.to_string(),
             };
             return Ok(SaveOutcome::CommittedButUncertain {
-                retained_path: None,
+                retained_path: Some(retained_previous),
                 reason: error.to_string(),
             });
         }
