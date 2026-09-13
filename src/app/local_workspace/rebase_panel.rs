@@ -2213,6 +2213,7 @@ fn disk_label(disk: &cibergit::rebase::DiskGeneration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "ui-smoke")]
     use cibergit::{
         domain::{Account, Repository},
         local_git::OperationState,
@@ -2221,6 +2222,7 @@ mod tests {
             FilesystemIdentity,
         },
     };
+    #[cfg(feature = "ui-smoke")]
     use gpui::{Keystroke, Modifiers, TestApp, TestAppWindow};
     use std::process::Command;
     use tempfile::TempDir;
@@ -2308,6 +2310,7 @@ mod tests {
         (temporary, checkout, store, base)
     }
 
+    #[cfg(feature = "ui-smoke")]
     fn filesystem_identity(path: &Path) -> FilesystemIdentity {
         let metadata = fs::symlink_metadata(path).expect("fixture identity");
         FilesystemIdentity {
@@ -2316,6 +2319,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ui-smoke")]
     fn native_controller_fixture() -> (
         TempDir,
         PathBuf,
@@ -2410,6 +2414,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ui-smoke")]
     fn native_controller_start_confirmation_gates_inputs_and_retains_forced_drift() {
         let (_temporary, checkout, base, store, mut window) = native_controller_fixture();
         let original_head = git(&checkout, &["rev-parse", "HEAD"]);
@@ -2555,6 +2560,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ui-smoke")]
     fn native_controller_amend_and_split_messages_pause_on_drift_without_git_dispatch() {
         let (_temporary, checkout, _base, store, mut window) = native_controller_fixture();
         window.update(|workspace, _, cx| {
