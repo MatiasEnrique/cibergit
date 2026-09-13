@@ -743,6 +743,34 @@ impl LocalGit {
         })
     }
 
+    /// Resolve an explicit local reference once, then pass the returned full
+    /// immutable OID to preparation/confirmation. This does not fetch or move a
+    /// ref. Short ambiguous names and revision expressions are intentionally
+    /// excluded; callers may offer named branches from the displayed snapshot.
+    pub fn resolve_commit_reference(&self, reference: &str) -> Result<String> {
+        if reference.len() > 4096 || reference.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(LocalGitError::InvalidInput("invalid commit reference"));
+        }
+        if reference != "HEAD" && validate_oid(reference).is_err() {
+            if !reference.starts_with("refs/") {
+                return Err(LocalGitError::InvalidInput(
+                    "select HEAD, a full commit OID, or a fully-qualified refs/ reference",
+                ));
+            }
+            self.run(
+                "validate fully-qualified commit reference",
+                vec!["check-ref-format".into(), reference.into()],
+                None,
+                false,
+                &[0],
+            )?;
+        }
+        self.optional_commit_oid(reference)?
+            .ok_or(LocalGitError::InvalidInput(
+                "the selected reference does not resolve to an available commit",
+            ))
+    }
+
     pub fn observe_remote_branch(
         &self,
         remote: &str,

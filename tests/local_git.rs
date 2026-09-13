@@ -736,3 +736,49 @@ fn ref_remote_path_and_oid_validation_rejects_option_or_revision_injection() {
         Err(LocalGitError::InvalidInput(_))
     ));
 }
+
+#[test]
+fn explicit_commit_reference_resolution_pins_objects_without_moving_refs() {
+    let repo = init();
+    let backend = LocalGit::open(repo.path()).unwrap();
+    assert!(backend.resolve_commit_reference("HEAD").is_err());
+    let initial = commit_all(repo.path(), "initial");
+    git(repo.path(), &["tag", "-a", "v1", "-m", "tag", &initial]);
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/main", &initial],
+    );
+    for reference in [
+        "HEAD",
+        "refs/heads/main",
+        "refs/tags/v1",
+        "refs/remotes/origin/main",
+        &initial,
+    ] {
+        assert_eq!(
+            backend.resolve_commit_reference(reference).unwrap(),
+            initial
+        );
+    }
+    for invalid in [
+        "main",
+        "--help",
+        "HEAD~1",
+        "refs/heads/main^{tree}",
+        "refs/heads/missing",
+        "",
+        "refs/heads/a\nb",
+    ] {
+        assert!(
+            backend.resolve_commit_reference(invalid).is_err(),
+            "{invalid:?}"
+        );
+    }
+    let pinned = backend.resolve_commit_reference("refs/heads/main").unwrap();
+    let newer = commit_all(repo.path(), "newer");
+    assert_ne!(newer, pinned);
+    assert_eq!(backend.resolve_commit_reference(&pinned).unwrap(), initial);
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), newer);
+    let tree = git(repo.path(), &["rev-parse", "HEAD^{tree}"]);
+    assert!(backend.resolve_commit_reference(&tree).is_err());
+}
