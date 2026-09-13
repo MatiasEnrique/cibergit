@@ -25,9 +25,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet},
-    io::Read,
+    io::{Read, Write},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -253,6 +254,7 @@ impl GithubProvider {
                 "could not durably save the in-flight review operation; dispatched zero writes: {error}"
             ));
         }
+        let saved_in_flight = composition.clone();
         let transport = Session::new(self)
             .graphql_mutation::<ReviewMutationData>(prepared.query, prepared.variables);
         match transport {
@@ -300,6 +302,7 @@ impl GithubProvider {
                     let reason = format!(
                         "GitHub acknowledged the write but local reconciliation failed: {error}"
                     );
+                    *composition = saved_in_flight.clone();
                     let _ = composition.mark_uncertain(operation_id, reason.clone());
                     let _ = store.save(composition);
                     return ProviderMutationOutcome::Uncertain { context, reason };
@@ -310,6 +313,7 @@ impl GithubProvider {
                     comment_id: ack.comment_id,
                 };
                 if let Err(error) = store.save(composition) {
+                    *composition = saved_in_flight;
                     return ProviderMutationOutcome::Uncertain {
                         context,
                         reason: format!(
@@ -1667,16 +1671,27 @@ impl<'a> Session<'a> {
             "GitHub returned multiple pending reviews for the selected account"
         );
         let review_id = review.id.clone();
-        let comments_complete = !review.comments.page_info.has_next_page
+        let mut comments_complete = !review.comments.page_info.has_next_page
             && review.comments.nodes.iter().all(Option::is_some);
         let comments = review
             .comments
             .nodes
             .into_iter()
             .flatten()
-            .map(|comment| LinkedReviewComment {
-                pull_request_review_id: review_id.clone(),
-                comment: comment.into_domain(repo, number, None),
+            .filter_map(|comment| {
+                if comment
+                    .pull_request_review
+                    .as_ref()
+                    .map(|parent| parent.id.as_str())
+                    != Some(review_id.as_str())
+                {
+                    comments_complete = false;
+                    return None;
+                }
+                Some(LinkedReviewComment {
+                    pull_request_review_id: review_id.clone(),
+                    comment: comment.into_domain(repo, number, None),
+                })
             })
             .collect();
         Ok(Some(PendingReviewSnapshot {
@@ -1714,6 +1729,7 @@ struct Runner {
     gh: PathBuf,
     git: PathBuf,
     timeout: Duration,
+    input_timeout: Option<Duration>,
     output_limit: usize,
 }
 impl Default for Runner {
@@ -1722,6 +1738,7 @@ impl Default for Runner {
             gh: "gh".into(),
             git: "git".into(),
             timeout: Duration::from_secs(30),
+            input_timeout: None,
             output_limit: 16 * 1024 * 1024,
         }
     }
@@ -1780,6 +1797,7 @@ impl Runner {
         action: &'static str,
         input: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
+        let input = input.map(<[u8]>::to_vec);
         command
             .stdin(if input.is_some() {
                 Stdio::piped()
@@ -1787,75 +1805,158 @@ impl Runner {
                 Stdio::null()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let started = Instant::now();
         let mut child = command.spawn().map_err(|_| {
             anyhow::anyhow!("Cannot start subprocess to {action}; check installed gh/Git")
         })?;
-        if let Some(input) = input {
-            use std::io::Write;
-            let mut stdin = child.stdin.take().expect("piped stdin");
-            stdin
-                .write_all(input)
-                .map_err(|_| anyhow::anyhow!("Cannot send bounded input to {action}"))?;
-        }
         let (tx, rx) = mpsc::channel();
+        let mut input_done = input.is_none();
+        if let Some(input) = input {
+            let Some(mut stdin) = child.stdin.take() else {
+                terminate_process_group(&mut child);
+                bail!("Cannot open bounded input pipe to {action}");
+            };
+            let tx = tx.clone();
+            if thread::Builder::new()
+                .name("provider-input".into())
+                .spawn(move || {
+                    let _ = tx.send(PipeEvent::Input(stdin.write_all(&input)));
+                })
+                .is_err()
+            {
+                terminate_process_group(&mut child);
+                bail!("Cannot start bounded input writer for {action}");
+            }
+        }
         let limit = self.output_limit;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
+        let Some(stdout) = child.stdout.take() else {
+            terminate_process_group(&mut child);
+            bail!("Cannot open subprocess output pipe while attempting to {action}");
+        };
+        let Some(stderr) = child.stderr.take() else {
+            terminate_process_group(&mut child);
+            bail!("Cannot open subprocess output pipe while attempting to {action}");
+        };
         for (is_stdout, pipe) in [
             (true, Box::new(stdout) as Box<dyn Read + Send>),
             (false, Box::new(stderr) as Box<dyn Read + Send>),
         ] {
             let tx = tx.clone();
-            thread::spawn(move || {
-                let mut bytes = Vec::new();
-                let result = pipe.take(limit as u64 + 1).read_to_end(&mut bytes);
-                let _ = tx.send((is_stdout, result, bytes));
-            });
+            if thread::Builder::new()
+                .name("provider-output".into())
+                .spawn(move || {
+                    let mut bytes = Vec::new();
+                    let result = pipe
+                        .take(limit as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .map(|_| bytes);
+                    let _ = tx.send(PipeEvent::Output(is_stdout, result));
+                })
+                .is_err()
+            {
+                terminate_process_group(&mut child);
+                bail!("Cannot start bounded output reader while attempting to {action}");
+            }
         }
         drop(tx);
-        let start = Instant::now();
         let mut output = None;
-        let mut pipes_done = 0;
-        let result = loop {
-            for (is_stdout, read, bytes) in rx.try_iter() {
-                if read.is_err() || bytes.len() > limit {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!(
-                        "Subprocess output failed or exceeded limit while attempting to {action}"
-                    );
-                }
-                pipes_done += 1;
-                if is_stdout {
-                    output = Some(bytes);
-                }
-            }
-            match child.try_wait() {
-                Ok(Some(status)) if pipes_done == 2 => {
-                    if status.success() {
-                        break Ok(output.unwrap_or_default());
+        let mut stdout_done = false;
+        let mut stderr_done = false;
+        let mut status = None;
+        loop {
+            loop {
+                match rx.try_recv() {
+                    Ok(PipeEvent::Input(result)) => {
+                        if result.is_err() {
+                            terminate_process_group(&mut child);
+                            bail!("Cannot send bounded input to {action}");
+                        }
+                        input_done = true;
                     }
-                    break Err(anyhow::anyhow!(
-                        "Failed to {action} (exit {}). Check authentication, permissions, rate limits, and connectivity; subprocess output withheld.",
-                        status
-                            .code()
-                            .map_or_else(|| "signal".into(), |code| code.to_string())
-                    ));
+                    Ok(PipeEvent::Output(is_stdout, result)) => {
+                        let bytes = match result {
+                            Ok(bytes) if bytes.len() <= limit => bytes,
+                            _ => {
+                                terminate_process_group(&mut child);
+                                bail!(
+                                    "Subprocess output failed or exceeded limit while attempting to {action}"
+                                );
+                            }
+                        };
+                        if is_stdout {
+                            output = Some(bytes);
+                            stdout_done = true;
+                        } else {
+                            stderr_done = true;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if !input_done || !stdout_done || !stderr_done {
+                            terminate_process_group(&mut child);
+                            bail!("Subprocess I/O stopped while attempting to {action}");
+                        }
+                        break;
+                    }
                 }
-                Err(_) => break Err(anyhow::anyhow!("Cannot wait for subprocess to {action}")),
-                _ => {}
             }
-            if start.elapsed() >= self.timeout {
-                break Err(anyhow::anyhow!("Timed out attempting to {action}"));
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(Some(current)) if !current.success() => {
+                        terminate_process_group(&mut child);
+                        bail!(
+                            "Failed to {action} (exit {}). Check authentication, permissions, rate limits, and connectivity; subprocess output withheld.",
+                            current
+                                .code()
+                                .map_or_else(|| "signal".into(), |code| code.to_string())
+                        );
+                    }
+                    Ok(Some(current)) => status = Some(current),
+                    Ok(None) => {}
+                    Err(_) => {
+                        terminate_process_group(&mut child);
+                        bail!("Cannot wait for subprocess to {action}");
+                    }
+                }
+            }
+            if status.is_some() && input_done && stdout_done && stderr_done {
+                return Ok(output.unwrap_or_default());
+            }
+            if !input_done && started.elapsed() >= self.input_timeout.unwrap_or(self.timeout) {
+                terminate_process_group(&mut child);
+                bail!("Timed out sending bounded input to {action}");
+            }
+            if started.elapsed() >= self.timeout {
+                terminate_process_group(&mut child);
+                bail!("Timed out attempting to {action}");
             }
             thread::sleep(Duration::from_millis(5));
-        };
-        if result.is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
         }
-        result
+    }
+}
+
+enum PipeEvent {
+    Input(std::io::Result<()>),
+    Output(bool, std::io::Result<Vec<u8>>),
+}
+
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
+
+fn terminate_process_group(child: &mut Child) {
+    terminate_process_group_id(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn terminate_process_group_id(id: u32) {
+    if let Ok(pid) = i32::try_from(id) {
+        // Children are spawned as process-group leaders. Signal the negative
+        // PGID so helpers holding pipes cannot outlive the deadline.
+        let _ = unsafe { kill(-pid, 9) };
     }
 }
 
@@ -2508,6 +2609,7 @@ const PENDING_REVIEW_QUERY: &str = r#"query PendingReview(
             nodes {
               id author { login } body createdAt updatedAt url path line originalLine
               startLine originalStartLine diffHunk outdated commit { oid } originalCommit { oid }
+              pullRequestReview { id }
             }
             pageInfo { hasNextPage endCursor }
           }
@@ -2791,9 +2893,16 @@ impl PreparedReviewMutation {
 
 enum ReviewMutationKind {
     AddReviewWithComment,
-    AddThread,
-    UpdateComment,
-    SubmitReview,
+    AddThread {
+        review_id: String,
+    },
+    UpdateComment {
+        review_id: String,
+        comment_id: String,
+    },
+    SubmitReview {
+        review_id: String,
+    },
     AddSubmittedReview,
 }
 
@@ -2818,6 +2927,12 @@ impl ReviewMutationKind {
                     .ok_or_else(|| {
                         "GitHub omitted the created review comment acknowledgement".to_owned()
                     })?;
+                validate_acknowledgement_id(&review.id, "created review")?;
+                validate_acknowledgement_id(&comment.id, "created review comment")?;
+                validate_acknowledgement_id(
+                    &comment.pull_request_review.id,
+                    "created comment parent review",
+                )?;
                 if comment.pull_request_review.id != review.id {
                     return Err("GitHub acknowledged a comment linked to another review".into());
                 }
@@ -2826,7 +2941,7 @@ impl ReviewMutationKind {
                     comment_id: Some(comment.id),
                 })
             }
-            Self::AddThread => {
+            Self::AddThread { review_id } => {
                 let comment = data
                     .add_pull_request_review_thread
                     .and_then(|payload| payload.thread)
@@ -2834,30 +2949,61 @@ impl ReviewMutationKind {
                     .ok_or_else(|| {
                         "GitHub omitted the created review thread acknowledgement".to_owned()
                     })?;
+                validate_acknowledgement_id(&comment.id, "created review comment")?;
+                validate_acknowledgement_id(
+                    &comment.pull_request_review.id,
+                    "created comment parent review",
+                )?;
+                if comment.pull_request_review.id != review_id {
+                    return Err(
+                        "GitHub acknowledged a comment linked to another pending review".into(),
+                    );
+                }
                 Ok(ReviewAck {
                     review_id: Some(comment.pull_request_review.id),
                     comment_id: Some(comment.id),
                 })
             }
-            Self::UpdateComment => {
+            Self::UpdateComment {
+                review_id,
+                comment_id,
+            } => {
                 let comment = data
                     .update_pull_request_review_comment
                     .and_then(|payload| payload.pull_request_review_comment)
                     .ok_or_else(|| {
                         "GitHub omitted the updated review comment acknowledgement".to_owned()
                     })?;
+                validate_acknowledgement_id(&comment.id, "updated review comment")?;
+                validate_acknowledgement_id(
+                    &comment.pull_request_review.id,
+                    "updated comment parent review",
+                )?;
+                if comment.id != comment_id {
+                    return Err("GitHub acknowledged a different updated review comment".into());
+                }
+                if comment.pull_request_review.id != review_id {
+                    return Err(
+                        "GitHub acknowledged an updated comment linked to another pending review"
+                            .into(),
+                    );
+                }
                 Ok(ReviewAck {
                     review_id: Some(comment.pull_request_review.id),
                     comment_id: Some(comment.id),
                 })
             }
-            Self::SubmitReview => {
+            Self::SubmitReview { review_id } => {
                 let review = data
                     .submit_pull_request_review
                     .and_then(|payload| payload.pull_request_review)
                     .ok_or_else(|| {
                         "GitHub omitted the submitted review acknowledgement".to_owned()
                     })?;
+                validate_acknowledgement_id(&review.id, "submitted review")?;
+                if review.id != review_id {
+                    return Err("GitHub acknowledged a different submitted review".into());
+                }
                 Ok(ReviewAck {
                     review_id: Some(review.id),
                     comment_id: None,
@@ -2870,6 +3016,7 @@ impl ReviewMutationKind {
                     .ok_or_else(|| {
                         "GitHub omitted the submitted review acknowledgement".to_owned()
                     })?;
+                validate_acknowledgement_id(&review.id, "submitted review")?;
                 Ok(ReviewAck {
                     review_id: Some(review.id),
                     comment_id: None,
@@ -2877,6 +3024,11 @@ impl ReviewMutationKind {
             }
         }
     }
+}
+
+fn validate_acknowledgement_id(id: &str, kind: &str) -> std::result::Result<(), String> {
+    validate_node_id(id)
+        .map_err(|_| format!("GitHub returned an invalid {kind} acknowledgement ID"))
 }
 
 #[derive(Deserialize)]
@@ -3088,7 +3240,10 @@ fn prepare_pending_comment_mutation(
                 "edit-pending-comment",
                 UPDATE_REVIEW_COMMENT_MUTATION,
                 json!({"commentId": comment_id, "body": intent.body, "clientMutationId": intent.operation_id}),
-                ReviewMutationKind::UpdateComment,
+                ReviewMutationKind::UpdateComment {
+                    review_id: review_id.clone(),
+                    comment_id: comment_id.clone(),
+                },
             ));
         }
         let mut variables = thread_input(&intent.body, &intent.position);
@@ -3099,7 +3254,9 @@ fn prepare_pending_comment_mutation(
             "add-pending-comment",
             ADD_REVIEW_THREAD_MUTATION,
             variables,
-            ReviewMutationKind::AddThread,
+            ReviewMutationKind::AddThread {
+                review_id: review_id.clone(),
+            },
         ));
     }
     if intent.existing_comment_id.is_some() {
@@ -3143,7 +3300,9 @@ fn prepare_submission_mutation(
             "submit-pending-review",
             SUBMIT_REVIEW_MUTATION,
             json!({"reviewId": review_id, "event": event, "body": intent.body, "clientMutationId": intent.operation_id}),
-            ReviewMutationKind::SubmitReview,
+            ReviewMutationKind::SubmitReview {
+                review_id: review_id.clone(),
+            },
         ));
     }
     Ok(PreparedReviewMutation::new(
@@ -3530,6 +3689,7 @@ struct DetailsReviewComment {
     outdated: bool,
     commit: Option<GraphqlOid>,
     original_commit: Option<GraphqlOid>,
+    pull_request_review: Option<GraphqlNodeId>,
 }
 
 #[derive(Deserialize)]

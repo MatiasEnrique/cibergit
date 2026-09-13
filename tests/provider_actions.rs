@@ -15,7 +15,13 @@ use $crate::{
     review::{ComparisonMetadata, ReviewSession, file_key},
 };
 use serde_json::{Value, json};
-use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+use std::{
+    fs,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
 
 const OLD: &str = "1111111111111111111111111111111111111111";
@@ -147,7 +153,7 @@ fn fixture(login: &str, steps: Vec<Value>, timeout: Duration) -> (TempDir, Githu
     .unwrap();
     let executable = dir.path().join("gh");
     fs::write(&executable, r#"#!/usr/bin/python3
-import json, os, pathlib, sys, time
+import json, os, pathlib, stat, sys, time
 root = pathlib.Path(__file__).parent
 config = json.loads((root / 'steps.json').read_text())
 args = sys.argv[1:]
@@ -167,12 +173,33 @@ step = config['steps'][index]
 if step.get('transport') == 'rest':
     assert args == ['api','--hostname','github.com','--method','PUT','--header','Accept: application/vnd.github+json','--header','X-GitHub-Api-Version: 2026-03-10',step['endpoint'],'--input','-']
     payload = json.load(sys.stdin)
-    assert payload == step['variables'], (payload, step['variables'])
+    assert payload == step['variables']
 else:
     assert args == ['api','--hostname','github.com','--method','POST','--header','Accept: application/vnd.github+json','--header','X-GitHub-Api-Version: 2026-03-10','graphql','--input','-']
     payload = json.load(sys.stdin)
     assert step['marker'] in payload['query']
-    query = payload['query']
+    query = ' '.join(payload['query'].split())
+    if 'mutation AddReview(' in query:
+        assert 'addPullRequestReview(input: { pullRequestId: $pullRequestId, commitOID: $commitOID, event: $event, body: $body, threads: $threads, clientMutationId: $clientMutationId })' in query
+    if 'mutation AddReviewThread(' in query:
+        assert 'addPullRequestReviewThread(input: { pullRequestReviewId: $pullRequestReviewId, body: $body, path: $path, line: $line, side: $side, startLine: $startLine, startSide: $startSide, clientMutationId: $clientMutationId })' in query
+    if 'mutation UpdateReviewComment(' in query:
+        assert 'updatePullRequestReviewComment(input: { pullRequestReviewCommentId: $commentId, body: $body, clientMutationId: $clientMutationId })' in query
+    if 'mutation SubmitReview(' in query:
+        assert 'submitPullRequestReview(input: { pullRequestReviewId: $reviewId, event: $event, body: $body, clientMutationId: $clientMutationId })' in query
+    if 'mutation UpdatePendingReview(' in query:
+        assert 'updatePullRequestReview(input: { pullRequestReviewId: $reviewId, body: $body, clientMutationId: $clientMutationId })' in query
+    if 'mutation DeletePendingReviewComment(' in query:
+        assert 'deletePullRequestReviewComment(input: { id: $commentId, clientMutationId: $clientMutationId })' in query
+        assert 'pullRequestReviewCommentId: $commentId' not in query
+    if 'mutation CancelPendingReview(' in query:
+        assert 'deletePullRequestReview(input: { pullRequestReviewId: $reviewId, clientMutationId: $clientMutationId })' in query
+    if 'mutation ReplyReviewThread(' in query:
+        assert 'addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, pullRequestReviewId: $reviewId, body: $body, clientMutationId: $clientMutationId })' in query
+    if 'mutation ResolveReviewThread(' in query:
+        assert 'resolveReviewThread(input: { threadId: $threadId, clientMutationId: $clientMutationId })' in query
+    if 'mutation UnresolveReviewThread(' in query:
+        assert 'unresolveReviewThread(input: { threadId: $threadId, clientMutationId: $clientMutationId })' in query
     if 'mutation EnableAutoMerge' in query:
         assert 'pullRequestId: $pullRequestId, expectedHeadOid: $expectedHeadOid' in query
     if 'mutation EnqueuePull' in query:
@@ -180,8 +207,12 @@ else:
     if 'mutation DequeuePull' in query:
         assert 'id: $pullRequestId, clientMutationId: $clientMutationId' in query
         assert 'pullRequestId: $pullRequestId, clientMutationId: $clientMutationId' not in query
-    assert payload['variables'] == step['variables'], (payload['variables'], step['variables'])
+    if 'query PendingReview' in query:
+        assert 'pullRequestReview { id }' in query
+    assert payload['variables'] == step['variables']
 count.write_text(str(index + 1))
+if step.get('immutable_path'):
+    os.chflags(step['immutable_path'], stat.UF_IMMUTABLE)
 if step.get('delay_ms'): time.sleep(step['delay_ms'] / 1000)
 if step.get('fail'): sys.exit(1)
 print(json.dumps(step['response']))
@@ -192,6 +223,45 @@ print(json.dumps(step['response']))
         runner: Runner {
             gh: executable,
             timeout,
+            ..Runner::default()
+        },
+    };
+    (dir, provider)
+}
+
+fn no_read_fixture(timeout: Duration) -> (TempDir, GithubProvider) {
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("gh");
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+root=${0%/*}
+if [ "$1" = "auth" ] && [ "$2" = "token" ]; then
+    [ -z "$GH_TOKEN" ] || exit 20
+    printf '%s\n' 'private-alice'
+    exit 0
+fi
+[ "$GH_TOKEN" = "private-alice" ] || exit 21
+if [ ! -f "$root/count" ]; then
+    /bin/cat >/dev/null
+    printf '%s' 1 >"$root/count"
+    printf '%s\n' '{"data":{"viewer":{"login":"alice"},"repository":{"nameWithOwner":"owner/repo","pullRequest":{"id":"PR_node","number":7,"url":"https://github.com/owner/repo/pull/7","headRefOid":"2222222222222222222222222222222222222222","state":"OPEN"}}}}'
+    exit 0
+fi
+printf '%s' 2 >"$root/count"
+printf '%s\n' $$ >"$CIBERGIT_PROVIDER_BLOCKED_PID_PATH"
+/bin/sleep 30 <&0 >&1 2>&2 &
+/bin/sleep 30
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let provider = GithubProvider {
+        account: account("alice"),
+        runner: Runner {
+            gh: executable,
+            timeout: Duration::from_secs(30),
+            input_timeout: Some(timeout),
             ..Runner::default()
         },
     };
@@ -352,6 +422,212 @@ fn existing_pending_comment_edits_the_exact_provider_comment() {
 }
 
 #[test]
+fn reused_pending_acknowledgement_must_match_requested_review() {
+    let (mut composition, comparison, draft_id) = composition_with_draft();
+    composition.observed_pending_review_id = Some("REVIEW_1".into());
+    let intent = composition
+        .prepare_pending_comment(
+            &draft_id,
+            CanonicalPublishedPatch::new(&comparison, &ComparisonMetadata::default()).unwrap(),
+        )
+        .unwrap();
+    let steps = vec![
+        step(
+            "query ReviewActionContext",
+            json!({"owner":"owner","name":"repo","number":7}),
+            context(HEAD, "OPEN"),
+        ),
+        step(
+            "query ReviewIdentity",
+            json!({"id":"REVIEW_1"}),
+            review_node("REVIEW_1", "alice", HEAD, "PENDING"),
+        ),
+        step(
+            "mutation AddReviewThread",
+            json!({"pullRequestReviewId":"REVIEW_1","body":"frozen comment","path":"src/lib.rs","line":10,"side":"RIGHT","clientMutationId":intent.operation_id}),
+            json!({"data":{"addPullRequestReviewThread":{"thread":{"comments":{"nodes":[{"id":"COMMENT_2","pullRequestReview":{"id":"REVIEW_OTHER"}}]}}}}}),
+        ),
+    ];
+    let (dir, provider) = fixture("alice", steps, Duration::from_secs(30));
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = DraftStore::open(store_dir.path()).unwrap();
+    assert!(matches!(
+        provider.execute_review_operation(
+            &repo("alice"),
+            &mut composition,
+            &store,
+            &intent.operation_id,
+            "attempt-wrong-parent"
+        ),
+        ProviderMutationOutcome::Uncertain { .. }
+    ));
+    assert!(matches!(
+        composition.operations[0].status,
+        ReviewOperationStatus::Uncertain { .. }
+    ));
+    assert!(composition.acknowledged_pending_review_id.is_none());
+    assert_eq!(
+        composition.observed_pending_review_id.as_deref(),
+        Some("REVIEW_1")
+    );
+    assert_eq!(count(&dir), 3);
+}
+
+#[test]
+fn updated_comment_acknowledgement_binds_comment_and_review_ids() {
+    for (ack_comment, ack_review) in [
+        ("COMMENT_OTHER", "REVIEW_pending"),
+        ("COMMENT_existing", "REVIEW_OTHER"),
+    ] {
+        let (mut composition, comparison, draft_id) = composition_with_draft();
+        let mut intent = composition
+            .prepare_pending_comment(
+                &draft_id,
+                CanonicalPublishedPatch::new(&comparison, &ComparisonMetadata::default()).unwrap(),
+            )
+            .unwrap();
+        intent.pending_review_id = Some("REVIEW_pending".into());
+        intent.existing_comment_id = Some("COMMENT_existing".into());
+        composition.operations[0].payload =
+            Some(ReviewOperationPayload::PendingComment(intent.clone()));
+        let steps = vec![
+            step(
+                "query ReviewActionContext",
+                json!({"owner":"owner","name":"repo","number":7}),
+                context(HEAD, "OPEN"),
+            ),
+            step(
+                "query ReviewIdentity",
+                json!({"id":"REVIEW_pending"}),
+                review_node("REVIEW_pending", "alice", HEAD, "PENDING"),
+            ),
+            step(
+                "query ReviewCommentIdentity",
+                json!({"id":"COMMENT_existing"}),
+                json!({"data":{"node":{"id":"COMMENT_existing","author":{"login":"alice"},"pullRequestReview":{"id":"REVIEW_pending","state":"PENDING","author":{"login":"alice"},"commit":{"oid":HEAD},"pullRequest":{"id":"PR_node","number":7,"repository":{"nameWithOwner":"owner/repo"}}}}}}),
+            ),
+            step(
+                "mutation UpdateReviewComment",
+                json!({"commentId":"COMMENT_existing","body":"frozen comment","clientMutationId":intent.operation_id}),
+                json!({"data":{"updatePullRequestReviewComment":{"pullRequestReviewComment":{"id":ack_comment,"pullRequestReview":{"id":ack_review}}}}}),
+            ),
+        ];
+        let (dir, provider) = fixture("alice", steps, Duration::from_secs(30));
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(store_dir.path()).unwrap();
+        assert!(matches!(
+            provider.execute_review_operation(
+                &repo("alice"),
+                &mut composition,
+                &store,
+                &intent.operation_id,
+                "attempt-mismatched-edit"
+            ),
+            ProviderMutationOutcome::Uncertain { .. }
+        ));
+        assert!(composition.acknowledged_pending_review_id.is_none());
+        assert_eq!(count(&dir), 4);
+    }
+}
+
+#[test]
+fn submitted_review_acknowledgement_binds_existing_review_id() {
+    let mut composition = ReviewComposition::new(
+        key("alice"),
+        Revision {
+            base_sha: OLD.into(),
+            head_sha: HEAD.into(),
+        },
+    )
+    .unwrap();
+    composition.observed_pending_review_id = Some("REVIEW_1".into());
+    let intent = composition
+        .prepare_submission(ReviewEvent::Approve, "ship", None)
+        .unwrap();
+    let steps = vec![
+        step(
+            "query ReviewActionContext",
+            json!({"owner":"owner","name":"repo","number":7}),
+            context(HEAD, "OPEN"),
+        ),
+        step(
+            "query ReviewIdentity",
+            json!({"id":"REVIEW_1"}),
+            review_node("REVIEW_1", "alice", HEAD, "PENDING"),
+        ),
+        step(
+            "mutation SubmitReview",
+            json!({"reviewId":"REVIEW_1","event":"APPROVE","body":"ship","clientMutationId":intent.operation_id}),
+            json!({"data":{"submitPullRequestReview":{"pullRequestReview":{"id":"REVIEW_OTHER"}}}}),
+        ),
+    ];
+    let (dir, provider) = fixture("alice", steps, Duration::from_secs(30));
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = DraftStore::open(store_dir.path()).unwrap();
+    assert!(matches!(
+        provider.execute_review_operation(
+            &repo("alice"),
+            &mut composition,
+            &store,
+            &intent.operation_id,
+            "attempt-wrong-submit"
+        ),
+        ProviderMutationOutcome::Uncertain { .. }
+    ));
+    assert_eq!(
+        composition.observed_pending_review_id.as_deref(),
+        Some("REVIEW_1")
+    );
+    assert_eq!(count(&dir), 3);
+}
+
+#[test]
+fn new_review_acknowledgement_requires_valid_consistent_nodes() {
+    let responses = [
+        json!({"data":{"addPullRequestReview":{"pullRequestReview":null}}}),
+        json!({"data":{"addPullRequestReview":{"pullRequestReview":{"id":"","comments":{"nodes":[{"id":"COMMENT_1","pullRequestReview":{"id":""}}]}}}}}),
+        json!({"data":{"addPullRequestReview":{"pullRequestReview":{"id":"REVIEW_1","comments":{"nodes":[{"id":"","pullRequestReview":{"id":"REVIEW_1"}}]}}}}}),
+        json!({"data":{"addPullRequestReview":{"pullRequestReview":{"id":"REVIEW_1","comments":{"nodes":[{"id":"COMMENT_1","pullRequestReview":{"id":"REVIEW_OTHER"}}]}}}}}),
+    ];
+    for response in responses {
+        let (mut composition, comparison, draft_id) = composition_with_draft();
+        let intent = composition
+            .prepare_pending_comment(
+                &draft_id,
+                CanonicalPublishedPatch::new(&comparison, &ComparisonMetadata::default()).unwrap(),
+            )
+            .unwrap();
+        let steps = vec![
+            step(
+                "query ReviewActionContext",
+                json!({"owner":"owner","name":"repo","number":7}),
+                context(HEAD, "OPEN"),
+            ),
+            step(
+                "mutation AddReview",
+                json!({"pullRequestId":"PR_node","commitOID":HEAD,"event":Value::Null,"body":Value::Null,"threads":[{"body":"frozen comment","path":"src/lib.rs","line":10,"side":"RIGHT"}],"clientMutationId":intent.operation_id}),
+                response,
+            ),
+        ];
+        let (dir, provider) = fixture("alice", steps, Duration::from_secs(30));
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(store_dir.path()).unwrap();
+        assert!(matches!(
+            provider.execute_review_operation(
+                &repo("alice"),
+                &mut composition,
+                &store,
+                &intent.operation_id,
+                "attempt-invalid-new-review"
+            ),
+            ProviderMutationOutcome::Uncertain { .. }
+        ));
+        assert!(composition.acknowledged_pending_review_id.is_none());
+        assert_eq!(count(&dir), 2);
+    }
+}
+
+#[test]
 fn immediate_comment_does_not_submit_or_replace_pending_review() {
     let (mut composition, comparison, draft_id) = composition_with_draft();
     composition.observed_pending_review_id = Some("REVIEW_PENDING".into());
@@ -435,6 +711,86 @@ fn failed_initial_save_dispatches_zero_mutations() {
 }
 
 #[test]
+fn acknowledgement_save_failure_restores_in_flight_memory_and_refuses_replay() {
+    let (mut composition, comparison, draft_id) = composition_with_draft();
+    let intent = composition
+        .prepare_pending_comment(
+            &draft_id,
+            CanonicalPublishedPatch::new(&comparison, &ComparisonMetadata::default()).unwrap(),
+        )
+        .unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = DraftStore::open(store_dir.path()).unwrap();
+    let record = store.record_path(&key("alice")).unwrap();
+    let mut mutation = step(
+        "mutation AddReview",
+        json!({
+            "pullRequestId":"PR_node","commitOID":HEAD,"event":Value::Null,"body":Value::Null,
+            "threads":[{"body":"frozen comment","path":"src/lib.rs","line":10,"side":"RIGHT"}],
+            "clientMutationId":intent.operation_id,
+        }),
+        json!({"data":{"addPullRequestReview":{"pullRequestReview":{"id":"REVIEW_1","comments":{"nodes":[{"id":"COMMENT_1","pullRequestReview":{"id":"REVIEW_1"}}]}}}}}),
+    );
+    mutation["immutable_path"] = json!(record.clone());
+    let (dir, provider) = fixture(
+        "alice",
+        vec![
+            step(
+                "query ReviewActionContext",
+                json!({"owner":"owner","name":"repo","number":7}),
+                context(HEAD, "OPEN"),
+            ),
+            mutation,
+        ],
+        Duration::from_secs(30),
+    );
+    let result = provider.execute_review_operation(
+        &repo("alice"),
+        &mut composition,
+        &store,
+        &intent.operation_id,
+        "attempt-ack-save-fails",
+    );
+    assert!(
+        Command::new("/usr/bin/chflags")
+            .args(["nouchg", record.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(matches!(result, ProviderMutationOutcome::Uncertain { .. }));
+    assert!(matches!(
+        composition.operations[0].status,
+        ReviewOperationStatus::InFlight { .. }
+    ));
+    assert_eq!(composition.drafts[0].body, "frozen comment");
+    assert!(composition.acknowledged_pending_review_id.is_none());
+    assert!(
+        composition
+            .prepare_submission(ReviewEvent::Comment, "new operation", None)
+            .is_err()
+    );
+    let LoadOutcome::Loaded(mut restored) = store.load(&key("alice")).unwrap() else {
+        panic!()
+    };
+    assert!(matches!(
+        restored.operations[0].status,
+        ReviewOperationStatus::InFlight { .. }
+    ));
+    assert!(matches!(
+        provider.execute_review_operation(
+            &repo("alice"),
+            &mut restored,
+            &store,
+            &intent.operation_id,
+            "attempt-must-not-replay"
+        ),
+        ProviderMutationOutcome::PreflightRejected { .. }
+    ));
+    assert_eq!(count(&dir), 2);
+}
+
+#[test]
 fn lost_reply_persists_uncertainty_and_restart_never_replays() {
     let (mut composition, comparison, draft_id) = composition_with_draft();
     let intent = composition
@@ -496,6 +852,125 @@ fn lost_reply_persists_uncertainty_and_restart_never_replays() {
         ProviderMutationOutcome::PreflightRejected { .. }
     ));
     assert_eq!(count(&dir), 2);
+}
+
+#[test]
+#[ignore = "run in isolation; an outer subprocess enforces the 3-second regression deadline"]
+fn no_read_input_and_pipe_descendants_are_bounded_by_an_outer_deadline() {
+    const CHILD_MARKER: &str = "CIBERGIT_PROVIDER_NO_READ_CHILD";
+    const PID_PATH: &str = "CIBERGIT_PROVIDER_BLOCKED_PID_PATH";
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        assert!(std::env::var_os(PID_PATH).is_some());
+        let (mut composition, comparison, draft_id) = composition_with_draft();
+        composition
+            .edit_draft(&draft_id, "x".repeat(64 * 1024))
+            .unwrap();
+        let intent = composition
+            .prepare_pending_comment(
+                &draft_id,
+                CanonicalPublishedPatch::new(&comparison, &ComparisonMetadata::default()).unwrap(),
+            )
+            .unwrap();
+        let (dir, provider) = no_read_fixture(Duration::from_millis(200));
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(store_dir.path()).unwrap();
+        let started = Instant::now();
+        match provider.execute_review_operation(
+            &repo("alice"),
+            &mut composition,
+            &store,
+            &intent.operation_id,
+            "attempt-no-read",
+        ) {
+            ProviderMutationOutcome::Uncertain { .. } => {}
+            ProviderMutationOutcome::PreflightRejected { reason } => {
+                panic!("large bounded mutation was rejected before dispatch: {reason}")
+            }
+            ProviderMutationOutcome::Acknowledged(_) => {
+                panic!("blocked mutation unexpectedly returned an acknowledgement")
+            }
+        }
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let LoadOutcome::Loaded(mut restored) = store.load(&key("alice")).unwrap() else {
+            panic!()
+        };
+        assert!(matches!(
+            restored.operations[0].status,
+            ReviewOperationStatus::Uncertain { .. }
+        ));
+        let dispatch_count = count(&dir);
+        assert!((1..=2).contains(&dispatch_count));
+        assert!(matches!(
+            provider.execute_review_operation(
+                &repo("alice"),
+                &mut restored,
+                &store,
+                &intent.operation_id,
+                "attempt-no-read-replay"
+            ),
+            ProviderMutationOutcome::PreflightRejected { .. }
+        ));
+        assert_eq!(count(&dir), dispatch_count);
+
+        let runner = Runner {
+            timeout: Duration::from_secs(2),
+            input_timeout: Some(Duration::from_millis(200)),
+            ..Runner::default()
+        };
+        let mut command = Command::new("/usr/bin/python3");
+        command.env("BLOCKED_PID_PATH", std::env::var(PID_PATH).unwrap()).args([
+            "-c",
+            "import os,pathlib,subprocess,sys,time; pathlib.Path(os.environ['BLOCKED_PID_PATH']).write_text(str(os.getpid())); subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); sys.exit(7)",
+        ]);
+        let started = Instant::now();
+        let sensitive_input = "do-not-expose-input".repeat(16 * 1024);
+        let error = runner
+            .run_with_input(
+                command,
+                "test early input failure",
+                sensitive_input.as_bytes(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!error.contains("do-not-expose-input"));
+        return;
+    }
+
+    let outer = tempfile::tempdir().unwrap();
+    let pid_path = outer.path().join("blocked-pgid");
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .arg("no_read_input_and_pipe_descendants_are_bounded_by_an_outer_deadline")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env(CHILD_MARKER, "1")
+        .env(PID_PATH, &pid_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // The nested test emits only local assertion diagnostics. Subprocess
+        // stderr from gh remains captured and withheld by Runner.
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = child.spawn().unwrap();
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "bounded transport subprocess failed");
+            break;
+        }
+        if started.elapsed() >= Duration::from_secs(3) {
+            if let Ok(pid) = fs::read_to_string(&pid_path)
+                && let Ok(pid) = pid.parse()
+            {
+                terminate_process_group_id(pid);
+            }
+            terminate_process_group(&mut child);
+            panic!("bounded transport subprocess exceeded its outer deadline");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -637,7 +1112,7 @@ fn submitted_pending_id_is_stale_and_rejected_before_write() {
 fn pending_import_links_only_provider_reported_review_comments_and_reports_cap() {
     let response = json!({"data":{"repository":{"nameWithOwner":"owner/repo","pullRequest":{"number":7,"reviews":{
         "nodes":[{"id":"REVIEW_1","author":{"login":"alice"},"body":"draft summary","state":"PENDING","submittedAt":null,"commit":{"oid":HEAD},"url":"https://github.com/owner/repo/pull/7#review",
-            "comments":{"nodes":[{"id":"COMMENT_1","author":{"login":"alice"},"body":"draft","createdAt":"a","updatedAt":"b","url":"u","path":"src/lib.rs","line":10,"originalLine":null,"startLine":null,"originalStartLine":null,"diffHunk":"@@","outdated":false,"commit":{"oid":HEAD},"originalCommit":{"oid":HEAD}}],"pageInfo":{"hasNextPage":true,"endCursor":"next"}}}],
+            "comments":{"nodes":[{"id":"COMMENT_1","author":{"login":"alice"},"body":"draft","createdAt":"a","updatedAt":"b","url":"u","path":"src/lib.rs","line":10,"originalLine":null,"startLine":null,"originalStartLine":null,"diffHunk":"@@","outdated":false,"commit":{"oid":HEAD},"originalCommit":{"oid":HEAD},"pullRequestReview":{"id":"REVIEW_1"}}],"pageInfo":{"hasNextPage":true,"endCursor":"next"}}}],
         "pageInfo":{"hasNextPage":false,"endCursor":null}}}}}});
     let (dir, provider) = fixture(
         "alice",
@@ -651,6 +1126,44 @@ fn pending_import_links_only_provider_reported_review_comments_and_reports_cap()
     let pending = provider.pending_review(&repo("alice"), 7).unwrap().unwrap();
     assert_eq!(pending.review.coordinates.remote_id, "REVIEW_1");
     assert_eq!(pending.comments[0].pull_request_review_id, "REVIEW_1");
+    assert!(!pending.comments_complete);
+    assert_eq!(count(&dir), 1);
+}
+
+#[test]
+fn pending_import_excludes_missing_or_mismatched_comment_parents() {
+    let comment = |id: &str, parent: Value| {
+        json!({
+            "id":id,"author":{"login":"alice"},"body":"draft","createdAt":"a",
+            "updatedAt":"b","url":"u","path":"src/lib.rs","line":10,
+            "originalLine":null,"startLine":null,"originalStartLine":null,
+            "diffHunk":"@@","outdated":false,"commit":{"oid":HEAD},
+            "originalCommit":{"oid":HEAD},"pullRequestReview":parent
+        })
+    };
+    let response = json!({"data":{"repository":{"nameWithOwner":"owner/repo","pullRequest":{"number":7,"reviews":{
+        "nodes":[{"id":"REVIEW_1","author":{"login":"alice"},"body":"draft summary","state":"PENDING","submittedAt":null,"commit":{"oid":HEAD},"url":"u",
+            "comments":{"nodes":[
+                comment("COMMENT_OK", json!({"id":"REVIEW_1"})),
+                comment("COMMENT_OTHER", json!({"id":"REVIEW_OTHER"})),
+                comment("COMMENT_MISSING", Value::Null)
+            ],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],
+        "pageInfo":{"hasNextPage":false,"endCursor":null}}}}}});
+    let (dir, provider) = fixture(
+        "alice",
+        vec![step(
+            "query PendingReview",
+            json!({"owner":"owner","name":"repo","number":7}),
+            response,
+        )],
+        Duration::from_secs(30),
+    );
+    let pending = provider.pending_review(&repo("alice"), 7).unwrap().unwrap();
+    assert_eq!(pending.comments.len(), 1);
+    assert_eq!(
+        pending.comments[0].comment.coordinates.remote_id,
+        "COMMENT_OK"
+    );
     assert!(!pending.comments_complete);
     assert_eq!(count(&dir), 1);
 }
