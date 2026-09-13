@@ -407,6 +407,9 @@ fn start_smoke(
                 }
             };
             let _ = window.update(|window, _| window.resize(size(px(1440.), px(900.))));
+            window.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            let publish_wide_size = window.update(|window, _| window.viewport_size()).unwrap();
+            assert_eq!(publish_wide_size, size(px(1440.), px(900.)), "publish wide viewport did not resize");
             let publish_ready_wide_capture = window
                 .update(|window, _| {
                     window
@@ -464,6 +467,10 @@ fn start_smoke(
                 })
                 .unwrap_or(false);
             let _ = window.update(|window, _| window.resize(size(px(1040.), px(820.))));
+            window.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            let publish_narrow_size = window.update(|window, _| window.viewport_size()).unwrap();
+            assert_eq!(publish_narrow_size, size(px(1040.), px(820.)), "publish narrow viewport did not resize");
+            fs::write(output.join("publish-viewport-proof.txt"), format!("wide: {publish_wide_size:?}\nnarrow: {publish_narrow_size:?}\nactual viewport sizes asserted before capture\n")).unwrap();
             let publish_confirmation_narrow_capture = window
                 .update(|window, _| {
                     window
@@ -480,6 +487,29 @@ fn start_smoke(
                         .is_ok()
                 })
                 .unwrap_or(false);
+            let _ = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
+                workspace.toggle_pr_publish_details(cx);
+            }));
+            window.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            let actions_scroll_max = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
+                let maximum = workspace.smoke_scroll_local_actions_to_end();
+                cx.notify();
+                maximum
+            })).unwrap().unwrap();
+            assert!(actions_scroll_max > 0., "expanded details must expose a scrollable confirmation");
+            fs::write(output.join("publish-expanded-scroll-proof.txt"), format!("maximum vertical offset: {actions_scroll_max}\nscrolled to end before expanded capture\n")).unwrap();
+            window.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            let publish_details_capture = window.update(|window, _| {
+                window.render_to_image().and_then(|image| image.save(output.join(if dark {
+                    "pr-publish-details-dark-narrow.png"
+                } else {
+                    "pr-publish-details-light-narrow.png"
+                })).map_err(Into::into)).is_ok()
+            }).unwrap_or(false);
+            assert!(publish_details_capture, "expanded exact publish details capture failed");
+            let _ = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
+                workspace.toggle_pr_publish_details(cx);
+            }));
             let publish_dispatched = window
                 .update(|_, cx| {
                     let Some(request_id) = publish_request else {

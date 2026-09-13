@@ -566,6 +566,8 @@ pub struct LocalWorkspace {
     pr_publish_generation: u64,
     pr_publish_loading: bool,
     pr_publish_notice: String,
+    pr_publish_details_expanded: bool,
+    local_actions_scroll: gpui::ScrollHandle,
     quick_open: Entity<InputState>,
     commit_message: Entity<InputState>,
     branch_name: Entity<InputState>,
@@ -619,6 +621,8 @@ impl LocalWorkspace {
             pr_publish_generation: 0,
             pr_publish_loading: false,
             pr_publish_notice: String::new(),
+            pr_publish_details_expanded: false,
+            local_actions_scroll: gpui::ScrollHandle::new(),
             quick_open,
             commit_message,
             branch_name,
@@ -701,8 +705,7 @@ impl LocalWorkspace {
         self.pr_publish_preparation = None;
         self.pr_publish_loading = false;
         self.pr_publish_notice = if self.pr_publish_context.is_some() {
-            "Prepare reads the fresh provider source and installed Git push destination; it never changes Review."
-                .into()
+            "Check the PR’s source branch before publishing local commits.".into()
         } else {
             String::new()
         };
@@ -711,6 +714,19 @@ impl LocalWorkspace {
 
     pub fn pr_publish_preparation(&self) -> Option<&PrPublishPreparation> {
         self.pr_publish_preparation.as_ref()
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    pub fn smoke_scroll_local_actions_to_end(&self) -> f32 {
+        let maximum = self.local_actions_scroll.max_offset().y;
+        self.local_actions_scroll
+            .set_offset(gpui::point(px(0.), -maximum));
+        maximum.as_f32()
+    }
+
+    pub fn toggle_pr_publish_details(&mut self, cx: &mut Context<Self>) {
+        self.pr_publish_details_expanded = !self.pr_publish_details_expanded;
+        cx.notify();
     }
 
     pub fn pr_publish_notice(&self) -> &str {
@@ -753,8 +769,7 @@ impl LocalWorkspace {
         let generation = self.pr_publish_generation;
         self.pr_publish_loading = true;
         self.pr_publish_preparation = None;
-        self.pr_publish_notice =
-            "Reading fresh PR source and effective installed-Git push destination…".into();
+        self.pr_publish_notice = "Checking the PR source and Git destination…".into();
         let checkout = self.context.checkout.clone();
         let git = backend.git.clone();
         let task =
@@ -769,7 +784,7 @@ impl LocalWorkspace {
                 match result {
                     Ok(preparation) => {
                         this.pr_publish_notice = format!(
-                            "{} preparation ready; target and OIDs are frozen until confirmation or refresh.",
+                            "{} is ready. Review the local and remote branches below.",
                             preparation.mode.label()
                         );
                         this.pr_publish_preparation = Some(preparation);
@@ -3824,9 +3839,8 @@ impl LocalWorkspace {
         let unresolved = self.unresolved_started_action.clone();
         let remote_observation = self.remote_observation.clone();
         let mut panel = div()
-            .w(px(360.))
-            .min_w(px(300.))
-            .h_full()
+            .w_full()
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .bg(colors.sidebar)
@@ -4057,7 +4071,7 @@ impl LocalWorkspace {
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("PR SOURCE PUBLISH"),
+                        .child("Publish to PR"),
                 )
                 .child(
                     div()
@@ -4068,69 +4082,50 @@ impl LocalWorkspace {
                 );
             if let Some(preparation) = preparation.clone() {
                 publish = publish
-                    .child(
-                        div()
-                            .mt_1()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(preparation.mode.label()),
-                    )
-                    .child(div().text_xs().whitespace_normal().child(format!(
-                        "selected {} · account {} · PR #{}",
-                        preparation.selected_repository,
+                    .child(div().mt_1().text_xs().whitespace_normal().child(format!(
+                        "{} #{} · {}",
+                        preparation.selected_repository, preparation.pull_request_number,
                         preparation.selected_account,
-                        preparation.pull_request_number
                     )))
                     .child(div().text_xs().whitespace_normal().child(format!(
-                        "target {}/{}/{}",
-                        preparation.source_host,
-                        preparation.source_repository,
-                        preparation.remote_branch
+                        "Local: {} ({})", preparation.local_branch,
+                        &preparation.local_oid[..12.min(preparation.local_oid.len())],
                     )))
-                    .child(
+                    .child(div().text_xs().whitespace_normal().child(format!(
+                        "To: {} · {}", preparation.source_repository, preparation.remote_branch,
+                    )))
+                    .child(div().text_xs().text_color(colors.muted).whitespace_normal().child(
+                        match preparation.mode {
+                            PrPublishMode::UpToDate => "These commits are already published.",
+                            PrPublishMode::Publish => "Adds local commits without forcing the remote branch.",
+                            PrPublishMode::RepublishWithLease => "Replaces rewritten history only if the remote branch still matches the checked commit.",
+                        },
+                    ))
+                    .child(action_button(
+                        if self.pr_publish_details_expanded { "Hide commit details" } else { "Show commit details" },
+                        colors,
+                        cx.listener(|this, _, _, cx| {
+                            this.toggle_pr_publish_details(cx);
+                        }),
+                    ));
+                if self.pr_publish_details_expanded {
+                    publish = publish.child(
                         div()
-                            .font_family(CODE_FONT)
                             .text_xs()
+                            .font_family(CODE_FONT)
                             .whitespace_normal()
                             .child(format!(
-                                "local {} @ {}",
-                                preparation.local_branch, preparation.local_oid
-                            )),
-                    )
-                    .child(
-                        div()
-                            .font_family(CODE_FONT)
-                            .text_xs()
-                            .whitespace_normal()
-                            .child(format!(
-                                "push {}/{} · observed {}",
+                                "Source: {}/{}\nLocal commit: {}\nPR head: {}\nRemote {}/{}: {}",
+                                preparation.source_host,
+                                preparation.source_repository,
+                                preparation.local_oid,
+                                preparation.provider_head_oid,
                                 preparation.destination.remote,
                                 preparation.remote_branch,
-                                preparation.expected_remote_oid
+                                preparation.expected_remote_oid,
                             )),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(if preparation.mode
-                                == PrPublishMode::RepublishWithLease
-                            {
-                                colors.amber
-                            } else {
-                                colors.muted
-                            })
-                            .whitespace_normal()
-                            .child(match preparation.mode {
-                                PrPublishMode::UpToDate => {
-                                    "Installed Git and the fresh provider source agree: already published."
-                                }
-                                PrPublishMode::Publish => {
-                                    "Non-force publish. Git server fast-forward rules remain authoritative."
-                                }
-                                PrPublishMode::RepublishWithLease => {
-                                    "Rewritten history: force only with the exact displayed remote-ref lease."
-                                }
-                            }),
                     );
+                }
             }
             let mut buttons = div().mt_2().flex().flex_wrap().gap_2();
             if !controls_locked {
@@ -4244,7 +4239,15 @@ impl LocalWorkspace {
             ));
             panel = panel.child(reconciliation);
         }
-        panel.into_any_element()
+        div()
+            .id("local-actions-scroll")
+            .w(px(360.))
+            .min_w(px(300.))
+            .h_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.local_actions_scroll)
+            .child(panel)
+            .into_any_element()
     }
 }
 
