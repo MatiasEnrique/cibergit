@@ -15,6 +15,7 @@ use std::{
     io::{ErrorKind, Read, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
+        fs::OpenOptionsExt,
         process::CommandExt,
     },
     path::{Component, Path, PathBuf},
@@ -1431,6 +1432,15 @@ fn hash_path_content(
     hash: &mut Sha256,
     remaining: &mut usize,
 ) -> Result<Option<SnapshotGuardBlocker>> {
+    hash_path_content_with_hook(path, hash, remaining, || {})
+}
+
+fn hash_path_content_with_hook(
+    path: &Path,
+    hash: &mut Sha256,
+    remaining: &mut usize,
+    before_open: impl FnOnce(),
+) -> Result<Option<SnapshotGuardBlocker>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == ErrorKind::NotFound => {
@@ -1468,10 +1478,30 @@ fn hash_path_content(
     }
 
     hash.update(b"file\0");
-    let mut file = fs::File::open(path).map_err(|source| LocalGitError::Io {
-        context: "open mutation-guard content",
+    before_open();
+    // Darwin flags: a regular file can be replaced after lstat. Never block
+    // opening a replacement FIFO or follow a replacement symlink (including
+    // an ancestor). Inspect the opened descriptor before reading any content.
+    const O_NONBLOCK: i32 = 0x0000_0004;
+    const O_NOFOLLOW_ANY: i32 = 0x2000_0000;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK | O_NOFOLLOW_ANY)
+        .open(path)
+        .map_err(|source| LocalGitError::Io {
+            context: "open mutation-guard content without following symlinks",
+            source,
+        })?;
+    let opened = file.metadata().map_err(|source| LocalGitError::Io {
+        context: "inspect opened mutation-guard content",
         source,
     })?;
+    if !opened.file_type().is_file() {
+        return Ok(Some(SnapshotGuardBlocker::UnsupportedEntry));
+    }
+    if opened.len() > *remaining as u64 {
+        return Ok(Some(SnapshotGuardBlocker::ContentLimit { max_bytes: 0 }));
+    }
     let mut buffer = [0_u8; 8192];
     let mut content_hash = Sha256::new();
     let mut content_len = 0_u64;
@@ -1649,4 +1679,60 @@ fn kill_process_group(child: &mut std::process::Child) {
         .status();
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod snapshot_open_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn replacement_fifo_cannot_block_snapshot_content_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let path = root.join("changed.txt");
+        fs::write(&path, "visible content").unwrap();
+        let started = Instant::now();
+        let result = hash_path_content_with_hook(&path, &mut Sha256::new(), &mut 1024, || {
+            fs::remove_file(&path).unwrap();
+            assert!(
+                Command::new("/usr/bin/mkfifo")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        })
+        .unwrap();
+        assert_eq!(result, Some(SnapshotGuardBlocker::UnsupportedEntry));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn replacement_leaf_and_ancestor_symlinks_cannot_escape_content_scan() {
+        for ancestor in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temp.path()).unwrap();
+            let directory = root.join("displayed");
+            let outside = root.join("outside");
+            fs::create_dir(&directory).unwrap();
+            fs::create_dir(&outside).unwrap();
+            let path = directory.join("changed.txt");
+            fs::write(&path, "visible content").unwrap();
+            fs::write(outside.join("changed.txt"), "must not be read").unwrap();
+            let mut budget = 1024;
+            let result =
+                hash_path_content_with_hook(&path, &mut Sha256::new(), &mut budget, || {
+                    if ancestor {
+                        fs::rename(&directory, root.join("original")).unwrap();
+                        symlink(&outside, &directory).unwrap();
+                    } else {
+                        fs::remove_file(&path).unwrap();
+                        symlink(outside.join("changed.txt"), &path).unwrap();
+                    }
+                });
+            assert!(matches!(result, Err(LocalGitError::Io { .. })));
+            assert_eq!(budget, 1024);
+        }
+    }
 }
