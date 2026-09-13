@@ -63,6 +63,7 @@ pub struct ReviewInteractionController {
 pub struct ReviewReconciliationItem {
     pub operation_id: String,
     pub attempt_id: String,
+    pub concise_request: String,
     pub frozen_request: String,
     pub outcome: ReviewReconciliationOutcome,
 }
@@ -383,6 +384,35 @@ impl ReviewInteractionController {
             .collect()
     }
 
+    pub fn unresolved_operation_details(&self) -> Vec<(String, String)> {
+        self.composition
+            .operations_requiring_reconciliation()
+            .zip(self.unresolved_operation_descriptions())
+            .map(|(operation, description)| (operation.id.clone(), description))
+            .collect()
+    }
+
+    pub fn unresolved_operation_summaries(&self) -> Vec<(String, String)> {
+        self.composition
+            .operations_requiring_reconciliation()
+            .map(|operation| {
+                let reason = match &operation.status {
+                    ReviewOperationStatus::Uncertain { .. } => {
+                        "Outcome unknown; use read-only reconciliation before retry."
+                    }
+                    ReviewOperationStatus::InFlight { .. } => {
+                        "Outcome was not recorded; use read-only reconciliation before retry."
+                    }
+                    _ => unreachable!("iterator only returns unresolved operations"),
+                };
+                (
+                    operation.id.clone(),
+                    format!("{} · {reason}", concise_request_summary(operation)),
+                )
+            })
+            .collect()
+    }
+
     fn saved_composer_id(&self) -> Result<String, String> {
         let composer = self
             .composer
@@ -543,6 +573,7 @@ fn reconcile_review_operations(
         let attempt_id = operation_attempt(&operation)
             .unwrap_or("missing-attempt-id")
             .to_owned();
+        let concise_request = concise_request_summary(&operation);
         let frozen_request = frozen_request_summary(&operation);
         let observation = observe_review_operation(
             current,
@@ -584,6 +615,7 @@ fn reconcile_review_operations(
         items.push(ReviewReconciliationItem {
             operation_id: operation.id,
             attempt_id,
+            concise_request,
             frozen_request,
             outcome,
         });
@@ -921,34 +953,50 @@ fn operation_attempt(operation: &ReviewOperation) -> Option<&str> {
     }
 }
 
+fn concise_request_summary(operation: &ReviewOperation) -> String {
+    match operation.payload.as_ref() {
+        Some(ReviewOperationPayload::PendingComment(intent)) => format!(
+            "Update pending comment · {}:{}",
+            intent.position.path, intent.position.line
+        ),
+        Some(ReviewOperationPayload::ImmediateComment(intent)) => format!(
+            "Publish comment · {}:{}",
+            intent.position.path, intent.position.line
+        ),
+        Some(ReviewOperationPayload::Submission(_)) => "Submit pending review".into(),
+        None => "Recover earlier review action".into(),
+    }
+}
+
+fn frozen_position_summary(position: &cibergit::participation::PublishedPosition) -> String {
+    let side = match position.side {
+        cibergit::participation::DiffSide::Old => "LEFT",
+        cibergit::participation::DiffSide::New => "RIGHT",
+    };
+    match position.start_line {
+        Some(start) if start != position.line => {
+            format!("{} {side} lines {start}–{}", position.path, position.line)
+        }
+        _ => format!("{} {side} line {}", position.path, position.line),
+    }
+}
+
 fn frozen_request_summary(operation: &ReviewOperation) -> String {
     match operation.payload.as_ref() {
         Some(ReviewOperationPayload::PendingComment(intent)) => format!(
-            "pending comment draft {} · review {} · comment {} · head {} · {} {} {:?}–{} · body {:?}",
+            "pending comment draft {} · review {} · comment {} · head {} · {} · body {:?}",
             intent.draft_id,
             intent.pending_review_id.as_deref().unwrap_or("unknown"),
             intent.existing_comment_id.as_deref().unwrap_or("unknown"),
             intent.position.commit_sha,
-            intent.position.path,
-            match intent.position.side {
-                cibergit::participation::DiffSide::Old => "LEFT",
-                cibergit::participation::DiffSide::New => "RIGHT",
-            },
-            intent.position.start_line,
-            intent.position.line,
+            frozen_position_summary(&intent.position),
             intent.body
         ),
         Some(ReviewOperationPayload::ImmediateComment(intent)) => format!(
-            "immediate comment draft {} · remote comment unknown · head {} · {} {} {:?}–{} · body {:?}",
+            "immediate comment draft {} · remote comment unknown · head {} · {} · body {:?}",
             intent.draft_id,
             intent.position.commit_sha,
-            intent.position.path,
-            match intent.position.side {
-                cibergit::participation::DiffSide::Old => "LEFT",
-                cibergit::participation::DiffSide::New => "RIGHT",
-            },
-            intent.position.start_line,
-            intent.position.line,
+            frozen_position_summary(&intent.position),
             intent.body
         ),
         Some(ReviewOperationPayload::Submission(intent)) => format!(

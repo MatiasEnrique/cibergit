@@ -98,6 +98,11 @@ files; it opens a compatibility screen directing you to the PR workspace.
   possible external deletion remain visibly frozen. Similar or identical body/position is never a
   correlation key, and absence alone is never recorded as NotApplied. A later retry is a separate
   explicit prepare after a durable resolution; restart never replays a write.
+- Recovery rows default to a compact action, file/line when applicable, and short outcome reason.
+  `Show recovery details` discloses the full frozen operation/attempt IDs, request payload, and
+  provider evidence; `Hide recovery details` returns to the compact presentation. Exact recovery
+  data remains available without overwhelming the normal Activity view, and optional ranges are
+  rendered as human-readable line or line-range labels rather than debug values.
 - Uncertain auxiliary replies disclose the exact frozen operation/attempt, thread, pending-review
   ID (when present), body, and the limitation: GitHub does not expose a returned reply ID or retain
   the local attempt ID after a lost acknowledgement, so no safe automatic observation is claimed.
@@ -180,7 +185,8 @@ launches retain the standard foreground activation behavior.
 
 Each evidence directory receives `native-pr-review.png`,
 `native-review-interactions-unified.png`, `native-review-interactions-split.png`,
-`native-review-reconciliation-ambiguous.png`, `native-review-reconciliation-resolved.png`,
+`native-review-reconciliation-ambiguous.png`, `native-review-reconciliation-details.png`,
+`native-review-reconciliation-resolved.png`,
 `native-submit-confirmation.png`, `native-merge-confirmation.png`,
 `native-merge-confirmation-controls.png`, `native-long-line-end*.png`
 captures, `native-long-line-start-split.png`, `native-view-editor-filters.png`,
