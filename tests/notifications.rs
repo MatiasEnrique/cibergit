@@ -3,6 +3,7 @@ macro_rules! notification_provider_tests {
     () => {
         use super::*;
         use $crate::domain::{Account, Repository};
+        use $crate::notifications::{NotificationStore, NotificationStoreLimits};
         use serde_json::{Value, json};
         use std::{
             collections::HashMap,
@@ -17,22 +18,51 @@ macro_rules! notification_provider_tests {
         }
 
         fn provider_repo(login: &str) -> Repository {
+            provider_repo_named(login, "repo")
+        }
+
+        fn provider_repo_named(login: &str, name: &str) -> Repository {
             Repository {
-                host: "github.com".into(), owner: "owner".into(), name: "repo".into(),
+                host: "github.com".into(), owner: "owner".into(), name: name.into(),
                 account: provider_account(login), local_path: None,
             }
         }
 
         fn notification(id: &str, reason: &str, number: u64) -> Value {
+            notification_for(
+                id,
+                reason,
+                "repo",
+                "PullRequest",
+                &format!("https://api.github.com/repos/owner/repo/pulls/{number}"),
+            )
+        }
+
+        fn notification_for(
+            id: &str,
+            reason: &str,
+            repository: &str,
+            kind: &str,
+            subject_url: &str,
+        ) -> Value {
             json!({
                 "id": id, "reason": reason, "updated_at": "2026-09-13T12:00:00Z",
                 "subject": {
-                    "title": "ignored", "type": "PullRequest",
-                    "url": format!("https://api.github.com/repos/owner/repo/pulls/{number}"),
+                    "title": "production-shaped subject", "type": kind,
+                    "url": subject_url,
                     "latest_comment_url": null
                 },
-                "repository": {"full_name": "owner/repo", "html_url": "https://github.com/owner/repo"}
+                "repository": {
+                    "full_name": format!("owner/{repository}"),
+                    "html_url": format!("https://github.com/owner/{repository}")
+                }
             })
+        }
+
+        fn notifications_endpoint(repository: &str, page: usize) -> String {
+            format!(
+                "repos/owner/{repository}/notifications?all=true&participating=false&per_page=100&page={page}"
+            )
         }
 
         fn provider_fixture(login: &str, responses: HashMap<String, Value>) -> (TempDir, GithubProvider) {
@@ -69,7 +99,7 @@ print(json.dumps(responses[endpoint]))
                 account: provider_account(login),
                 runner: $crate::providers::Runner {
                     gh: executable,
-                    timeout: Duration::from_secs(3),
+                    timeout: Duration::from_secs(10),
                     ..$crate::providers::Runner::default()
                 },
             };
@@ -78,7 +108,7 @@ print(json.dumps(responses[endpoint]))
 
         fn complete_responses(reason: &str, conclusion: &str) -> HashMap<String, Value> {
             HashMap::from([
-                ("notifications?all=true&participating=true&per_page=100&page=1".into(), json!([notification("thread-1", reason, 7)])),
+                (notifications_endpoint("repo", 1), json!([notification("thread-1", reason, 7)])),
                 ("repos/owner/repo/pulls/7".into(), json!({
                     "number": 7, "url": "https://api.github.com/repos/owner/repo/pulls/7",
                     "html_url": "https://github.com/owner/repo/pull/7",
@@ -103,6 +133,91 @@ print(json.dumps(responses[endpoint]))
             ])
         }
 
+        fn known_non_pull_notifications() -> Vec<Value> {
+            [
+                ("thread-issue", "Issue", "https://api.github.com/repos/owner/repo/issues/23"),
+                ("thread-check-suite", "CheckSuite", "https://api.github.com/repos/owner/repo/check-suites/24"),
+                ("thread-commit", "Commit", "https://api.github.com/repos/owner/repo/commits/1111111111111111111111111111111111111111"),
+                ("thread-release", "Release", "https://api.github.com/repos/owner/repo/releases/25"),
+                ("thread-discussion", "Discussion", "https://api.github.com/repos/owner/repo/discussions/26"),
+                ("thread-invitation", "RepositoryInvitation", "https://api.github.com/repositories/27/invitations/28"),
+                ("thread-vulnerability", "RepositoryVulnerabilityAlert", "https://api.github.com/repos/owner/repo/dependabot/alerts/29"),
+            ]
+            .into_iter()
+            .map(|(id, kind, url)| notification_for(id, "subscribed", "repo", kind, url))
+            .collect()
+        }
+
+        fn assert_incomplete_repository_did_not_baseline(
+            initial: &ProviderNotificationBatch,
+            repository: &str,
+        ) {
+            let account = provider_account("alice");
+            let dir = tempfile::tempdir().unwrap();
+            let store = NotificationStore::open(dir.path(), NotificationStoreLimits::default())
+                .unwrap();
+            store.reconcile(&account, initial).unwrap();
+
+            let target = NotificationPullRequest {
+                provider: "github".into(),
+                host: "github.com".into(),
+                account: "alice".into(),
+                owner: "owner".into(),
+                repository: repository.into(),
+                pull_request: 7,
+            };
+            let event = ProviderNotificationEvent {
+                identity: NotificationEventIdentity {
+                    target: target.clone(),
+                    source: NotificationEventSource::Timeline,
+                    remote_event_id: "historical-review-request".into(),
+                },
+                occurred_at: "2026-09-13T10:00:00Z".into(),
+                actor: Some("bob".into()),
+                alert_kind: NotificationAlertKind::ReviewRequest,
+                summary: "Review requested".into(),
+                url: format!("https://github.com/owner/{repository}/pull/7"),
+                evidence: NotificationEvidence::ReviewRequested {
+                    timeline_event_id: "historical-review-request".into(),
+                    requested_reviewer: "alice".into(),
+                },
+            };
+            let later = ProviderNotificationBatch {
+                account: account.clone(),
+                observed_at_unix_ms: 2,
+                observations: vec![ProviderNotificationObservation {
+                    provider_notification_id: "thread-historical".into(),
+                    provider_reason: "review_requested".into(),
+                    notification_updated_at: "2026-09-13T12:00:00Z".into(),
+                    target,
+                    events: vec![event],
+                }],
+                incomplete_candidates: vec![],
+                full_snapshot: true,
+                repositories: vec![RepositoryNotificationCompleteness {
+                    target: NotificationRepositoryScope {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        account: "alice".into(),
+                        owner: "owner".into(),
+                        repository: repository.into(),
+                    },
+                    complete: true,
+                    reasons: vec![],
+                }],
+                complete: true,
+                notices: vec![],
+            };
+            assert!(
+                store
+                    .reconcile(&account, &later)
+                    .unwrap()
+                    .newly_admitted_alerts
+                    .is_empty(),
+                "an incomplete repository must wait for a later complete baseline"
+            );
+        }
+
         #[test]
         fn provider_uses_exact_read_only_queries_and_authoritative_event_evidence() {
             let (dir, provider) = provider_fixture("alice", complete_responses("mention", "failure"));
@@ -121,6 +236,81 @@ print(json.dumps(responses[endpoint]))
         }
 
         #[test]
+        fn known_non_pull_subjects_preserve_pr_baseline_and_do_not_consume_hydration() {
+            let mut baseline_responses = complete_responses("review_requested", "success");
+            let mut notification_page = known_non_pull_notifications();
+            notification_page.push(notification("thread-pr", "review_requested", 7));
+            baseline_responses.insert(
+                notifications_endpoint("repo", 1),
+                Value::Array(notification_page.clone()),
+            );
+            let (_baseline_dir, baseline_provider) =
+                provider_fixture("alice", baseline_responses);
+            let limits = NotificationReadLimits {
+                max_candidate_hydrations: 1,
+                ..NotificationReadLimits::default()
+            };
+            let baseline = baseline_provider
+                .notification_observations(&[provider_repo("alice")], None, limits.clone())
+                .unwrap();
+            assert!(baseline.complete);
+            assert!(baseline.repositories[0].complete);
+            assert_eq!(baseline.observations.len(), 1);
+
+            let store_dir = tempfile::tempdir().unwrap();
+            let store = NotificationStore::open(
+                store_dir.path(),
+                NotificationStoreLimits::default(),
+            )
+            .unwrap();
+            assert!(store
+                .reconcile(&provider_account("alice"), &baseline)
+                .unwrap()
+                .newly_admitted_alerts
+                .is_empty());
+
+            let mut later_responses = complete_responses("review_requested", "success");
+            later_responses.insert(
+                notifications_endpoint("repo", 1),
+                Value::Array(notification_page),
+            );
+            later_responses.insert(
+                "repos/owner/repo/issues/7/timeline?per_page=100&page=1".into(),
+                json!([
+                    {
+                        "id": 41, "node_id": "timeline-node", "event": "review_requested",
+                        "actor": {"login": "bob"}, "requested_reviewer": {"login": "alice"},
+                        "created_at": "2026-09-13T10:00:00Z"
+                    },
+                    {
+                        "id": 42, "node_id": "timeline-node-later", "event": "review_requested",
+                        "actor": {"login": "carol"}, "requested_reviewer": {"login": "alice"},
+                        "created_at": "2026-09-13T10:04:00Z"
+                    }
+                ]),
+            );
+            let (_later_dir, later_provider) = provider_fixture("alice", later_responses);
+            let later = later_provider
+                .notification_observations(&[provider_repo("alice")], None, limits)
+                .unwrap();
+            assert!(
+                later.complete,
+                "later provider read was incomplete: {:?}; notices: {:?}",
+                later.incomplete_candidates, later.notices
+            );
+            let reconciled = store
+                .reconcile(&provider_account("alice"), &later)
+                .unwrap();
+            assert_eq!(reconciled.newly_admitted_alerts.len(), 1);
+            assert_eq!(
+                reconciled.newly_admitted_alerts[0]
+                    .identity
+                    .remote_event_id,
+                "42"
+            );
+        }
+
+        #[test]
         fn sticky_reason_and_action_required_never_claim_exact_alerts() {
             let (_dir, provider) = provider_fixture("alice", complete_responses("mention", "action_required"));
             let batch = provider.notification_observations(&[provider_repo("alice")], None, NotificationReadLimits::default()).unwrap();
@@ -134,28 +324,252 @@ print(json.dumps(responses[endpoint]))
         fn foreign_or_malformed_subject_is_visible_and_never_hydrated() {
             let mut item = notification("thread-1", "mention", 7);
             item["subject"]["url"] = json!("https://api.github.com/repos/other/repo/pulls/7");
-            let responses = HashMap::from([("notifications?all=true&participating=true&per_page=100&page=1".into(), json!([item]))]);
+            let responses = HashMap::from([(notifications_endpoint("repo", 1), json!([item]))]);
             let (dir, provider) = provider_fixture("alice", responses);
             let batch = provider.notification_observations(&[provider_repo("alice")], None, NotificationReadLimits::default()).unwrap();
             assert!(!batch.complete);
+            assert!(!batch.repositories[0].complete);
             assert!(batch.observations.is_empty());
             assert_eq!(batch.incomplete_candidates.len(), 1);
+            assert!(batch.incomplete_candidates[0]
+                .reason
+                .contains("does not match the selected repository"));
             assert_eq!(fs::read_to_string(dir.path().join("calls")).unwrap().lines().count(), 1);
         }
 
         #[test]
-        fn duplicate_moving_notification_page_fails_without_absence_claim() {
-            let item = notification("thread-1", "author", 7);
-            let responses = HashMap::from([("notifications?all=true&participating=true&per_page=100&page=1".into(), json!([item.clone(), item]))]);
+        fn unknown_subject_type_is_visible_incomplete_and_never_hydrated() {
+            let item = notification_for(
+                "thread-unknown",
+                "subscribed",
+                "repo",
+                "FutureSubjectType",
+                "https://api.github.com/repos/owner/repo/future/7",
+            );
+            let responses = HashMap::from([(notifications_endpoint("repo", 1), json!([item]))]);
+            let (dir, provider) = provider_fixture("alice", responses);
+            let batch = provider
+                .notification_observations(
+                    &[provider_repo("alice")],
+                    None,
+                    NotificationReadLimits::default(),
+                )
+                .unwrap();
+            assert!(!batch.complete);
+            assert!(!batch.repositories[0].complete);
+            assert!(batch.observations.is_empty());
+            assert_eq!(batch.incomplete_candidates.len(), 1);
+            assert!(batch.incomplete_candidates[0]
+                .reason
+                .contains("Unknown notification subject type"));
+            assert_eq!(
+                fs::read_to_string(dir.path().join("calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn exactly_full_notification_page_reads_the_next_page() {
+            let first_page: Vec<_> = (0..100)
+                .map(|index| {
+                    notification_for(
+                        &format!("thread-{index}"),
+                        "subscribed",
+                        "repo",
+                        "Issue",
+                        &format!("https://api.github.com/repos/owner/repo/issues/{index}"),
+                    )
+                })
+                .collect();
+            let responses = HashMap::from([
+                (notifications_endpoint("repo", 1), Value::Array(first_page)),
+                (notifications_endpoint("repo", 2), json!([])),
+            ]);
+            let (dir, provider) = provider_fixture("alice", responses);
+            let batch = provider
+                .notification_observations(
+                    &[provider_repo("alice")],
+                    None,
+                    NotificationReadLimits::default(),
+                )
+                .unwrap();
+            assert!(batch.complete);
+            assert!(batch.repositories[0].complete);
+            assert!(batch.observations.is_empty());
+            assert_eq!(
+                fs::read_to_string(dir.path().join("calls"))
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                [notifications_endpoint("repo", 1), notifications_endpoint("repo", 2)]
+            );
+        }
+
+        #[test]
+        fn duplicate_across_moving_notification_pages_fails_without_absence_claim() {
+            let first_page: Vec<_> = (0..100)
+                .map(|index| {
+                    notification_for(
+                        &format!("thread-{index}"),
+                        "subscribed",
+                        "repo",
+                        "Issue",
+                        &format!("https://api.github.com/repos/owner/repo/issues/{index}"),
+                    )
+                })
+                .collect();
+            let duplicate = first_page[0].clone();
+            let responses = HashMap::from([
+                (notifications_endpoint("repo", 1), Value::Array(first_page)),
+                (notifications_endpoint("repo", 2), json!([duplicate])),
+            ]);
             let (_dir, provider) = provider_fixture("alice", responses);
             assert!(provider.notification_observations(&[provider_repo("alice")], None, NotificationReadLimits::default()).unwrap_err().to_string().contains("changed during pagination"));
+        }
+
+        #[test]
+        fn global_page_budget_leaves_not_yet_enumerated_repository_incomplete() {
+            let responses = HashMap::from([(
+                notifications_endpoint("one", 1),
+                json!([]),
+            )]);
+            let (dir, provider) = provider_fixture("alice", responses);
+            let repositories = [
+                provider_repo_named("alice", "one"),
+                provider_repo_named("alice", "two"),
+            ];
+            let limits = NotificationReadLimits {
+                max_notification_pages: 1,
+                ..NotificationReadLimits::default()
+            };
+            let batch = provider
+                .notification_observations(&repositories, None, limits)
+                .unwrap();
+            assert!(!batch.complete);
+            assert!(batch.repositories.iter().find(|value| value.target.repository == "one").unwrap().complete);
+            let second = batch.repositories.iter().find(|value| value.target.repository == "two").unwrap();
+            assert!(!second.complete);
+            assert!(second.reasons.iter().any(|reason| reason.contains("page bound")));
+            assert_incomplete_repository_did_not_baseline(&batch, "two");
+            assert_eq!(fs::read_to_string(dir.path().join("calls")).unwrap(), format!("{}\n", notifications_endpoint("one", 1)));
+        }
+
+        #[test]
+        fn global_item_budget_leaves_not_yet_enumerated_repository_incomplete() {
+            let issue = notification_for(
+                "thread-one",
+                "subscribed",
+                "one",
+                "Issue",
+                "https://api.github.com/repos/owner/one/issues/1",
+            );
+            let responses = HashMap::from([(
+                notifications_endpoint("one", 1),
+                json!([issue]),
+            )]);
+            let (dir, provider) = provider_fixture("alice", responses);
+            let repositories = [
+                provider_repo_named("alice", "one"),
+                provider_repo_named("alice", "two"),
+            ];
+            let limits = NotificationReadLimits {
+                max_notifications: 1,
+                ..NotificationReadLimits::default()
+            };
+            let batch = provider
+                .notification_observations(&repositories, None, limits)
+                .unwrap();
+            assert!(!batch.complete);
+            assert!(batch.repositories.iter().find(|value| value.target.repository == "one").unwrap().complete);
+            let second = batch.repositories.iter().find(|value| value.target.repository == "two").unwrap();
+            assert!(!second.complete);
+            assert!(second.reasons.iter().any(|reason| reason.contains("item bound")));
+            assert_incomplete_repository_did_not_baseline(&batch, "two");
+            assert_eq!(fs::read_to_string(dir.path().join("calls")).unwrap(), format!("{}\n", notifications_endpoint("one", 1)));
+        }
+
+        #[test]
+        fn repository_endpoint_failure_is_partial_and_does_not_poison_another_repo() {
+            let responses = HashMap::from([(
+                notifications_endpoint("two", 1),
+                json!([]),
+            )]);
+            let (_dir, provider) = provider_fixture("alice", responses);
+            let repositories = [
+                provider_repo_named("alice", "one"),
+                provider_repo_named("alice", "two"),
+            ];
+            let batch = provider
+                .notification_observations(
+                    &repositories,
+                    None,
+                    NotificationReadLimits::default(),
+                )
+                .unwrap();
+            assert!(!batch.complete);
+            assert!(!batch.repositories.iter().find(|value| value.target.repository == "one").unwrap().complete);
+            assert!(batch.repositories.iter().find(|value| value.target.repository == "two").unwrap().complete);
+            assert!(batch.incomplete_candidates.iter().any(|candidate| candidate
+                .reason
+                .contains("notification enumeration read failed for owner/one")));
+        }
+
+        #[test]
+        fn repository_endpoint_cannot_return_another_selected_repository_identity() {
+            let foreign_item = notification_for(
+                "thread-two",
+                "subscribed",
+                "two",
+                "Issue",
+                "https://api.github.com/repos/owner/two/issues/1",
+            );
+            let responses = HashMap::from([
+                (
+                    notifications_endpoint("one", 1),
+                    json!([foreign_item]),
+                ),
+                (notifications_endpoint("two", 1), json!([])),
+            ]);
+            let (_dir, provider) = provider_fixture("alice", responses);
+            let repositories = [
+                provider_repo_named("alice", "one"),
+                provider_repo_named("alice", "two"),
+            ];
+            let batch = provider
+                .notification_observations(
+                    &repositories,
+                    None,
+                    NotificationReadLimits::default(),
+                )
+                .unwrap();
+            assert!(!batch.complete);
+            let first = batch
+                .repositories
+                .iter()
+                .find(|value| value.target.repository == "one")
+                .unwrap();
+            assert!(!first.complete);
+            assert!(first
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("identity validation")));
+            assert!(batch
+                .repositories
+                .iter()
+                .find(|value| value.target.repository == "two")
+                .unwrap()
+                .complete);
+            assert!(batch.observations.is_empty());
         }
 
         #[test]
         fn notification_cap_marks_every_selected_repository_incomplete() {
             let mut responses = complete_responses("author", "success");
             responses.insert(
-                "notifications?all=true&participating=true&per_page=100&page=1".into(),
+                notifications_endpoint("repo", 1),
                 json!([
                     notification("thread-1", "author", 7),
                     notification("thread-2", "author", 8)

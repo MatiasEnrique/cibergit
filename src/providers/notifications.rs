@@ -228,75 +228,149 @@ impl GithubProvider {
         let mut raw = Vec::new();
         let mut complete = true;
         let mut notices = Vec::new();
+        let mut incomplete = Vec::new();
         let mut seen_notifications = HashSet::new();
-        for page in 1..=limits.max_notification_pages {
-            let suffix = since.map_or_else(String::new, |value| format!("&since={value}"));
-            let endpoint = format!(
-                "notifications?all=true&participating=true&per_page={PAGE_SIZE}&page={page}{suffix}"
-            );
-            let page_items: Vec<ApiNotification> = session.get(&endpoint)?;
-            ensure!(
-                page_items.len() <= PAGE_SIZE,
-                "Invalid notification page size"
-            );
-            let last = page_items.len() < PAGE_SIZE;
-            for item in page_items {
-                ensure!(
-                    seen_notifications.insert(item.id.clone()),
-                    "Notifications changed during pagination; refresh to retry"
-                );
-                if raw.len() == limits.max_notifications {
-                    complete = false;
-                    notice(
-                        &mut notices,
-                        "Notification item bound reached; omitted candidates are unknown.",
-                    );
-                    mark_all_incomplete(
-                        &mut repository_completeness,
-                        "global notification item bound reached",
-                    );
-                    break;
-                }
-                raw.push(item);
-            }
-            if raw.len() == limits.max_notifications {
-                if !last {
-                    complete = false;
-                    notice(
-                        &mut notices,
-                        "Notification item bound reached; omitted candidates are unknown.",
-                    );
-                    mark_all_incomplete(
-                        &mut repository_completeness,
-                        "global notification item bound reached",
-                    );
-                }
-                break;
-            }
-            if last {
-                break;
-            }
-            if page == limits.max_notification_pages {
+        let mut pages_read = 0usize;
+        'repositories: for (repository_index, repository) in repositories.iter().enumerate() {
+            if pages_read == limits.max_notification_pages {
                 complete = false;
                 notice(
                     &mut notices,
                     "Notification page bound reached; omitted candidates are unknown.",
                 );
-                mark_all_incomplete(
+                mark_selected_incomplete(
                     &mut repository_completeness,
+                    &repositories[repository_index..],
                     "global notification page bound reached",
                 );
+                break;
+            }
+            if raw.len() == limits.max_notifications {
+                complete = false;
+                notice(
+                    &mut notices,
+                    "Notification item bound reached; omitted candidates are unknown.",
+                );
+                mark_selected_incomplete(
+                    &mut repository_completeness,
+                    &repositories[repository_index..],
+                    "global notification item bound reached",
+                );
+                break;
+            }
+
+            let key = repository.full_name().to_ascii_lowercase();
+            let mut repository_page = 1usize;
+            loop {
+                pages_read += 1;
+                let suffix = since.map_or_else(String::new, |value| format!("&since={value}"));
+                let endpoint = format!(
+                    "repos/{}/notifications?all=true&participating=false&per_page={PAGE_SIZE}&page={repository_page}{suffix}",
+                    repository.full_name()
+                );
+                let page_items: Vec<ApiNotification> = match session.get(&endpoint) {
+                    Ok(items) => items,
+                    Err(error) => {
+                        complete = false;
+                        mark_repo_incomplete(
+                            &mut repository_completeness,
+                            &key,
+                            "notification enumeration read failed",
+                        );
+                        notice(
+                            &mut notices,
+                            "A repository notification read failed; its candidate set is unknown.",
+                        );
+                        incomplete.push(IncompleteNotificationCandidate {
+                            target: None,
+                            provider_notification_id: None,
+                            kind: IncompleteCandidateKind::PullRequestNotification,
+                            reason: format!(
+                                "notification enumeration read failed for {}: {error}",
+                                repository.full_name()
+                            ),
+                        });
+                        continue 'repositories;
+                    }
+                };
+                if page_items.len() > PAGE_SIZE {
+                    complete = false;
+                    mark_repo_incomplete(
+                        &mut repository_completeness,
+                        &key,
+                        "notification enumeration returned an invalid page",
+                    );
+                    incomplete.push(IncompleteNotificationCandidate {
+                        target: None,
+                        provider_notification_id: None,
+                        kind: IncompleteCandidateKind::PullRequestNotification,
+                        reason: format!(
+                            "notification enumeration returned more than {PAGE_SIZE} items for {}",
+                            repository.full_name()
+                        ),
+                    });
+                    continue 'repositories;
+                }
+                let last = page_items.len() < PAGE_SIZE;
+                let mut omitted_from_page = false;
+                for item in page_items {
+                    ensure!(
+                        seen_notifications.insert(item.id.clone()),
+                        "Notifications changed during pagination; refresh to retry"
+                    );
+                    if raw.len() == limits.max_notifications {
+                        omitted_from_page = true;
+                        break;
+                    }
+                    raw.push((key.clone(), item));
+                }
+                if raw.len() == limits.max_notifications {
+                    let incomplete_from = if omitted_from_page || !last {
+                        repository_index
+                    } else {
+                        repository_index + 1
+                    };
+                    if incomplete_from < repositories.len() {
+                        complete = false;
+                        notice(
+                            &mut notices,
+                            "Notification item bound reached; omitted candidates are unknown.",
+                        );
+                        mark_selected_incomplete(
+                            &mut repository_completeness,
+                            &repositories[incomplete_from..],
+                            "global notification item bound reached",
+                        );
+                    }
+                    break 'repositories;
+                }
+                if last {
+                    break;
+                }
+                if pages_read == limits.max_notification_pages {
+                    complete = false;
+                    notice(
+                        &mut notices,
+                        "Notification page bound reached; omitted candidates are unknown.",
+                    );
+                    mark_selected_incomplete(
+                        &mut repository_completeness,
+                        &repositories[repository_index..],
+                        "global notification page bound reached",
+                    );
+                    break 'repositories;
+                }
+                repository_page += 1;
             }
         }
 
         let mut observations = Vec::new();
-        let mut incomplete = Vec::new();
         let mut hydrated = 0usize;
-        for notification in raw {
-            let key = notification.repository.full_name.to_ascii_lowercase();
-            let Some(repository) = selected.get(&key).copied() else {
-                continue;
-            };
+        for (key, notification) in raw {
+            let repository = selected
+                .get(&key)
+                .copied()
+                .expect("enumerated repository was selected");
             if let Err(reason) = notification.validate(repository) {
                 complete = false;
                 mark_repo_incomplete(
@@ -308,6 +382,24 @@ impl GithubProvider {
                     &notification,
                     None,
                     reason.to_string(),
+                ));
+                continue;
+            }
+            if notification.subject.kind != "PullRequest" {
+                if known_non_pull_subject(&notification.subject.kind) {
+                    continue;
+                }
+                complete = false;
+                mark_repo_incomplete(
+                    &mut repository_completeness,
+                    &key,
+                    "notification subject type was unknown",
+                );
+                incomplete.push(incomplete_notification(
+                    &notification,
+                    None,
+                    "Unknown notification subject type; PR candidate completeness is unknown"
+                        .into(),
                 ));
                 continue;
             }
@@ -829,15 +921,13 @@ fn mark_repo_incomplete(
     }
 }
 
-fn mark_all_incomplete(
+fn mark_selected_incomplete(
     values: &mut HashMap<String, RepositoryNotificationCompleteness>,
+    repositories: &[Repository],
     reason: &str,
 ) {
-    for value in values.values_mut() {
-        value.complete = false;
-        if !value.reasons.iter().any(|known| known == reason) {
-            value.reasons.push(reason.into());
-        }
+    for repository in repositories {
+        mark_repo_incomplete(values, &repository.full_name().to_ascii_lowercase(), reason);
     }
 }
 
@@ -910,6 +1000,19 @@ fn validate_timestamp(value: &str) -> Result<()> {
         "Invalid notification timestamp"
     );
     Ok(())
+}
+
+fn known_non_pull_subject(kind: &str) -> bool {
+    matches!(
+        kind,
+        "Issue"
+            | "CheckSuite"
+            | "Commit"
+            | "Release"
+            | "Discussion"
+            | "RepositoryInvitation"
+            | "RepositoryVulnerabilityAlert"
+    )
 }
 
 fn parse_pull_subject_url(repo: &Repository, subject: &ApiNotificationSubject) -> Result<u64> {
