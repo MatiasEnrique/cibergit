@@ -1032,10 +1032,17 @@ impl NotificationController {
             },
         };
         let key = account_key(&account);
-        let selection = selection_key(std::slice::from_ref(&repository));
+        let partial_repository = Repository {
+            name: "partial-repository".into(),
+            ..repository.clone()
+        };
+        let selected = [repository.clone(), partial_repository];
+        let selection = selection_key(&selected);
         let state = self.accounts.entry(key.clone()).or_default();
         state.account = Some(account.clone());
         state.selection = selection.clone();
+        state.selected_repositories = selected.iter().map(repository_scope).collect();
+        state.selection_generation = state.selection_generation.saturating_add(1);
         state.generation = state.generation.saturating_add(1);
         state.in_flight = true;
         let token = ControllerToken {
@@ -1089,6 +1096,20 @@ impl NotificationController {
         let dispatched = self.dispatch_to(&mut |notification| calls.push(notification));
         if dispatched != 0 || !calls.is_empty() {
             return Err("default-off smoke reached its test sink".into());
+        }
+        let state = self
+            .accounts
+            .get(&account_key(&Account {
+                host: "github.com".into(),
+                login: "smoke-reader".into(),
+            }))
+            .ok_or("smoke account disappeared")?;
+        let snapshot = state.snapshot.as_ref().ok_or("smoke snapshot missing")?;
+        if unread_count(snapshot) != 1
+            || snapshot.incomplete_candidates.len() != 1
+            || snapshot.repository_completeness.len() != 2
+        {
+            return Err("smoke projection lost expected event or partial evidence".into());
         }
         if !self.open {
             self.toggle_open();
