@@ -181,101 +181,20 @@ pub(crate) fn parse_included_response(
     output: &[u8],
     process_success: bool,
 ) -> Result<ConditionalGet<Vec<u8>>, RestReadError> {
-    let (header_end, delimiter_len) = find_header_end(output).ok_or_else(|| {
-        RestReadError::new(
-            RestReadErrorKind::InvalidFraming,
-            RestPollDirective::default(),
-        )
-    })?;
+    let Some((header_end, delimiter_len)) = find_header_end(output) else {
+        let poll = rejected_header_poll(&output[..output.len().min(MAX_HEADER_BYTES)]);
+        return Err(RestReadError::new(RestReadErrorKind::InvalidFraming, poll));
+    };
     if header_end > MAX_HEADER_BYTES {
-        return Err(RestReadError::new(
-            RestReadErrorKind::InvalidHeaders,
-            RestPollDirective::default(),
-        ));
+        let poll = rejected_header_poll(&output[..MAX_HEADER_BYTES]);
+        return Err(RestReadError::new(RestReadErrorKind::InvalidHeaders, poll));
     }
     let header = &output[..header_end];
-    if header.contains(&0)
-        || header
-            .iter()
-            .enumerate()
-            .any(|(index, byte)| *byte == b'\r' && header.get(index + 1) != Some(&b'\n'))
-    {
-        return Err(RestReadError::new(
-            RestReadErrorKind::InvalidFraming,
-            RestPollDirective::default(),
-        ));
-    }
-    let header_text = std::str::from_utf8(header).map_err(|_| {
-        RestReadError::new(
-            RestReadErrorKind::InvalidHeaders,
-            RestPollDirective::default(),
-        )
-    })?;
-    let mut lines = header_text.lines();
-    let status_line = lines.next().ok_or_else(|| {
-        RestReadError::new(
-            RestReadErrorKind::InvalidFraming,
-            RestPollDirective::default(),
-        )
-    })?;
-    let status = parse_status(status_line)?;
-    let mut fields: Vec<(String, String)> = Vec::new();
-    for line in lines {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if fields.len() == MAX_HEADER_FIELDS
-            || line.starts_with(' ')
-            || line.starts_with('\t')
-            || line.starts_with("HTTP/")
-        {
-            return Err(RestReadError::new(
-                RestReadErrorKind::InvalidHeaders,
-                RestPollDirective::default(),
-            ));
-        }
-        let (name, value) = line.split_once(':').ok_or_else(|| {
-            RestReadError::new(
-                RestReadErrorKind::InvalidHeaders,
-                RestPollDirective::default(),
-            )
-        })?;
-        if name.is_empty()
-            || !name.bytes().all(is_token)
-            || value
-                .bytes()
-                .any(|byte| byte == 0 || byte == b'\r' || byte == b'\n')
-        {
-            return Err(RestReadError::new(
-                RestReadErrorKind::InvalidHeaders,
-                RestPollDirective::default(),
-            ));
-        }
-        fields.push((name.to_ascii_lowercase(), value.trim().to_owned()));
-    }
-    let (retry_after, retry_error) = capture_decimal(&fields, "retry-after");
-    let (remaining, remaining_error) = capture_single(&fields, "x-ratelimit-remaining");
-    let (reset, reset_error) = capture_decimal(&fields, "x-ratelimit-reset");
-    let rate_limit = match status {
-        429 if retry_error.is_some() => Some(BoundedDelay::Suspend),
-        429 => Some(rate_delay(&retry_after, remaining, &reset)),
-        403 if retry_after.is_present() || remaining == Some("0") => {
-            Some(rate_delay(&retry_after, remaining, &reset))
-        }
-        _ => None,
-    };
-    let mut poll = RestPollDirective {
-        x_poll_interval: None,
-        rate_limit,
-    };
-    if let Some(error) = retry_error.or(remaining_error).or(reset_error) {
+    let (status, fields, structural_error) = collect_header_fields(header)?;
+    let (poll, directive_error) = parse_poll_directive(status, &fields, structural_error.is_some());
+    if let Some(error) = structural_error.or(directive_error) {
         return Err(error.with_poll(poll));
     }
-    poll.x_poll_interval = match delay_header(&fields, "x-poll-interval") {
-        Ok(delay) => delay,
-        Err(error) => {
-            poll.x_poll_interval = Some(BoundedDelay::Suspend);
-            return Err(error.with_poll(poll));
-        }
-    };
     let validators = parse_validators(&fields).map_err(|error| error.with_poll(poll.clone()))?;
     let link = single(&fields, "link")
         .and_then(|value| {
@@ -301,6 +220,119 @@ pub(crate) fn parse_included_response(
         200 | 304 => Err(RestReadError::new(RestReadErrorKind::InvalidFraming, poll)),
         _ => Err(RestReadError::new(RestReadErrorKind::HttpFailure, poll)),
     }
+}
+
+fn collect_header_fields(
+    header: &[u8],
+) -> Result<(u16, Vec<(String, String)>, Option<RestReadError>), RestReadError> {
+    let mut lines = header.split(|byte| *byte == b'\n');
+    let status_bytes = lines.next().ok_or_else(|| {
+        RestReadError::new(
+            RestReadErrorKind::InvalidFraming,
+            RestPollDirective::default(),
+        )
+    })?;
+    let status_bytes = status_bytes.strip_suffix(b"\r").unwrap_or(status_bytes);
+    if status_bytes.contains(&0) || status_bytes.contains(&b'\r') {
+        return Err(RestReadError::new(
+            RestReadErrorKind::InvalidFraming,
+            RestPollDirective::default(),
+        ));
+    }
+    let status_text = std::str::from_utf8(status_bytes).map_err(|_| {
+        RestReadError::new(
+            RestReadErrorKind::InvalidHeaders,
+            RestPollDirective::default(),
+        )
+    })?;
+    let status = parse_status(status_text)?;
+    let mut fields = Vec::new();
+    let mut error = None;
+    for raw_line in lines {
+        let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if raw_line.contains(&0) || raw_line.contains(&b'\r') {
+            error = Some(RestReadError::new(
+                RestReadErrorKind::InvalidFraming,
+                RestPollDirective::default(),
+            ));
+            break;
+        }
+        let Ok(line) = std::str::from_utf8(raw_line) else {
+            error = Some(RestReadError::new(
+                RestReadErrorKind::InvalidHeaders,
+                RestPollDirective::default(),
+            ));
+            break;
+        };
+        if fields.len() == MAX_HEADER_FIELDS
+            || line.starts_with(' ')
+            || line.starts_with('\t')
+            || line.starts_with("HTTP/")
+        {
+            error = Some(RestReadError::new(
+                RestReadErrorKind::InvalidHeaders,
+                RestPollDirective::default(),
+            ));
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            error = Some(RestReadError::new(
+                RestReadErrorKind::InvalidHeaders,
+                RestPollDirective::default(),
+            ));
+            break;
+        };
+        if name.is_empty() || !name.bytes().all(is_token) || value.bytes().any(|byte| byte == b'\n')
+        {
+            error = Some(RestReadError::new(
+                RestReadErrorKind::InvalidHeaders,
+                RestPollDirective::default(),
+            ));
+            break;
+        }
+        fields.push((name.to_ascii_lowercase(), value.trim().to_owned()));
+    }
+    Ok((status, fields, error))
+}
+
+fn rejected_header_poll(prefix: &[u8]) -> RestPollDirective {
+    let Ok((status, fields, _)) = collect_header_fields(prefix) else {
+        return RestPollDirective::default();
+    };
+    parse_poll_directive(status, &fields, true).0
+}
+
+fn parse_poll_directive(
+    status: u16,
+    fields: &[(String, String)],
+    structural_error: bool,
+) -> (RestPollDirective, Option<RestReadError>) {
+    let (retry_after, retry_error) = capture_decimal(fields, "retry-after");
+    let (remaining, remaining_error) = capture_single(fields, "x-ratelimit-remaining");
+    let (reset, reset_error) = capture_decimal(fields, "x-ratelimit-reset");
+    let (x_poll_interval, x_poll_error) = capture_decimal(fields, "x-poll-interval");
+    let rate_limit = rate_limit_delay(
+        status,
+        &retry_after,
+        retry_error.is_some(),
+        remaining,
+        remaining_error.is_some(),
+        &reset,
+        reset_error.is_some(),
+        structural_error,
+    );
+    let mut poll = RestPollDirective {
+        x_poll_interval: bounded_delay(&x_poll_interval),
+        rate_limit,
+    };
+    if x_poll_error.is_some() {
+        poll.x_poll_interval = Some(BoundedDelay::Suspend);
+    }
+    let error = retry_error
+        .or(remaining_error)
+        .or(reset_error)
+        .or(x_poll_error);
+    (poll, error)
 }
 
 fn find_header_end(output: &[u8]) -> Option<(usize, usize)> {
@@ -411,12 +443,6 @@ fn capture_single<'a>(
     }
 }
 
-impl ParsedDecimal {
-    fn is_present(self) -> bool {
-        !matches!(self, Self::Missing | Self::Malformed)
-    }
-}
-
 fn parsed_decimal_header(
     fields: &[(String, String)],
     name: &str,
@@ -436,15 +462,37 @@ fn parsed_decimal_header(
         .unwrap_or(ParsedDecimal::Overflow))
 }
 
-fn delay_header(
-    fields: &[(String, String)],
-    name: &str,
-) -> Result<Option<BoundedDelay>, RestReadError> {
-    Ok(match parsed_decimal_header(fields, name)? {
-        ParsedDecimal::Value(seconds) => Some(BoundedDelay::Seconds(seconds)),
+fn bounded_delay(value: &ParsedDecimal) -> Option<BoundedDelay> {
+    match value {
+        ParsedDecimal::Value(seconds) => Some(BoundedDelay::Seconds(*seconds)),
         ParsedDecimal::Overflow => Some(BoundedDelay::Suspend),
         ParsedDecimal::Missing | ParsedDecimal::Malformed => None,
-    })
+    }
+}
+
+fn rate_limit_delay(
+    status: u16,
+    retry_after: &ParsedDecimal,
+    retry_error: bool,
+    remaining: Option<&str>,
+    remaining_error: bool,
+    reset: &ParsedDecimal,
+    reset_error: bool,
+    structural_error: bool,
+) -> Option<BoundedDelay> {
+    if matches!(status, 403 | 429) {
+        if let Some(delay) = bounded_delay(retry_after) {
+            return Some(delay);
+        }
+        if retry_error || remaining_error || reset_error || (status == 429 && structural_error) {
+            return Some(BoundedDelay::Suspend);
+        }
+    }
+    match status {
+        429 => Some(rate_delay(retry_after, remaining, reset)),
+        403 if remaining == Some("0") => Some(rate_delay(retry_after, remaining, reset)),
+        _ => None,
+    }
 }
 
 fn rate_delay(
@@ -631,5 +679,70 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Suspend));
+
+        let error = parse_included_response(
+            b"HTTP/2 403 Forbidden\r\nRetry-After: 90\r\nRetry-After: 91\r\n\r\nprivate",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Suspend));
+        for status in [403, 429] {
+            let response = format!(
+                "HTTP/2 {status} limited\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 9999999998\r\nX-RateLimit-Reset: 9999999999\r\n\r\nprivate"
+            );
+            let error = parse_included_response(response.as_bytes(), false).unwrap_err();
+            assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Suspend));
+        }
+        let error = parse_included_response(
+            b"HTTP/2 429 Too Many Requests\r\nRetry-After: 90\r\nX-RateLimit-Reset: 9999999998\r\nX-RateLimit-Reset: 9999999999\r\n\r\nprivate",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Seconds(90)));
+        let error = parse_included_response(
+            b"HTTP/2 200 OK\r\nX-Poll-Interval: 90\r\nX-RateLimit-Reset: 9999999998\r\nX-RateLimit-Reset: 9999999999\r\n\r\n[]",
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.poll().x_poll_interval,
+            Some(BoundedDelay::Seconds(90))
+        );
+        assert_eq!(error.poll().rate_limit, None);
+    }
+
+    #[test]
+    fn post_status_structural_errors_keep_safe_independent_floors() {
+        let error = parse_included_response(
+            b"HTTP/2 429 Too Many Requests\r\nRetry-After: 90\r\n continuation\r\n\r\nprivate",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Seconds(90)));
+
+        let error = parse_included_response(
+            b"HTTP/2 429 Too Many Requests\r\nX-Unrelated: ok\r\nbroken\r\n\r\nprivate",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Suspend));
+
+        let mut too_many = String::from("HTTP/2 200 OK\r\nX-Poll-Interval: 90\r\n");
+        for index in 0..MAX_HEADER_FIELDS {
+            too_many.push_str(&format!("X-Fill-{index}: ok\r\n"));
+        }
+        too_many.push_str("\r\n[]");
+        let error = parse_included_response(too_many.as_bytes(), true).unwrap_err();
+        assert_eq!(
+            error.poll().x_poll_interval,
+            Some(BoundedDelay::Seconds(90))
+        );
+
+        let oversized = format!(
+            "HTTP/2 429 Too Many Requests\r\nRetry-After: 90\r\nX-Fill: {}\r\n\r\nprivate",
+            "x".repeat(MAX_HEADER_BYTES)
+        );
+        let error = parse_included_response(oversized.as_bytes(), false).unwrap_err();
+        assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Seconds(90)));
     }
 }
