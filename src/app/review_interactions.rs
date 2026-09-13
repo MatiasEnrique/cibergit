@@ -1531,6 +1531,9 @@ impl JournalRequest {
                 cibergit::domain::ReviewAuxiliaryAction::UpdatePendingSummary { .. } => {
                     "update pending review summary"
                 }
+                cibergit::domain::ReviewAuxiliaryAction::UpdateSubmittedSummary { .. } => {
+                    "update submitted review summary"
+                }
                 cibergit::domain::ReviewAuxiliaryAction::DeletePendingComment { .. } => {
                     "delete pending review comment"
                 }
@@ -2455,6 +2458,58 @@ mod tests {
         }
     }
 
+    fn submitted_edit_request() -> ReviewAuxiliaryRequest {
+        ReviewAuxiliaryRequest {
+            operation_id: "submitted-edit-1".into(),
+            attempt_id: "submitted-edit-attempt-1".into(),
+            action: cibergit::domain::ReviewAuxiliaryAction::UpdateSubmittedSummary {
+                review: coordinates("REVIEW_owned"),
+                selected_author: "reader".into(),
+                submitted_state: "APPROVED".into(),
+                submitted_commit_sha: "1".repeat(40),
+                expected_body: "historical body before edit".into(),
+                body: "requested body after edit".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn submitted_edit_journal_freezes_distinct_historical_request() {
+        let directory = tempdir().unwrap();
+        let journal = ActionJournal::open(directory.path(), review_key()).unwrap();
+        let request = submitted_edit_request();
+        let frozen = JournalRequest::Auxiliary(Box::new(request.clone()));
+        let context = frozen.mutation_context();
+        assert_eq!(context.action, "update submitted review summary");
+        let encoded = serde_json::to_string(&context.payload).unwrap();
+        assert!(encoded.contains("historical body before edit"));
+        assert!(encoded.contains("requested body after edit"));
+        assert!(encoded.contains("REVIEW_owned"));
+
+        let outcome = journal.dispatch(
+            frozen,
+            || ProviderMutationOutcome::<()>::Uncertain {
+                context,
+                reason: "provider acknowledgement was malformed".into(),
+            },
+            |_| (true, true, "unexpected".into()),
+        );
+        assert!(matches!(outcome, ProviderMutationOutcome::Uncertain { .. }));
+        let restored = ActionJournal::open(directory.path(), review_key())
+            .unwrap()
+            .operations()
+            .unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored[0].request,
+            JournalRequest::Auxiliary(Box::new(request))
+        );
+        assert!(matches!(
+            restored[0].status,
+            JournalStatus::Uncertain { .. }
+        ));
+    }
+
     fn lifecycle_request() -> PullRequestLifecycleRequest {
         PullRequestLifecycleRequest {
             operation_id: "lifecycle-1".into(),
@@ -2525,6 +2580,7 @@ mod tests {
                 state: "PENDING".into(),
                 submitted_at: None,
                 commit_sha: Some("2222222".into()),
+                edit_summary_capability: None,
                 url: String::new(),
             },
             comments: vec![LinkedReviewComment {
@@ -2684,6 +2740,7 @@ mod tests {
             state: "APPROVED".into(),
             submitted_at: Some("now".into()),
             commit_sha: Some("2222222".into()),
+            edit_summary_capability: None,
             url: String::new(),
         }
     }
@@ -3975,6 +4032,7 @@ mod tests {
                 state: "PENDING".into(),
                 submitted_at: None,
                 commit_sha: Some("2222222".into()),
+                edit_summary_capability: None,
                 url: String::new(),
             }],
             review_threads: Vec::new(),

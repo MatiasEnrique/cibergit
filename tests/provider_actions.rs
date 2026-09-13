@@ -109,6 +109,63 @@ fn review_node(id: &str, login: &str, commit: &str, state: &str) -> Value {
     }}})
 }
 
+fn submitted_review_node(
+    id: &str,
+    login: &str,
+    commit: &str,
+    state: &str,
+    body: &str,
+) -> Value {
+    json!({"data": {"node": {
+        "id": id, "body": body, "state": state,
+        "submittedAt": "2026-09-13T12:00:00Z",
+        "author": {"login": login}, "commit": {"oid": commit},
+        "viewerDidAuthor": true, "viewerCanUpdate": true,
+        "viewerCannotUpdateReasons": [],
+        "pullRequest": {"id": "PR_node", "number": 7, "repository": {"nameWithOwner": "owner/repo"}}
+    }}})
+}
+
+fn submitted_edit_request() -> ReviewAuxiliaryRequest {
+    ReviewAuxiliaryRequest {
+        operation_id: "submitted-edit-1".into(),
+        attempt_id: "submitted-edit-attempt-1".into(),
+        action: ReviewAuxiliaryAction::UpdateSubmittedSummary {
+            review: ProviderCoordinates {
+                provider: "github".into(),
+                host: "github.com".into(),
+                owner: "owner".into(),
+                repository: "repo".into(),
+                pull_request: 7,
+                remote_id: "REVIEW_submitted".into(),
+            },
+            selected_author: "alice".into(),
+            submitted_state: "APPROVED".into(),
+            submitted_commit_sha: OLD.into(),
+            expected_body: "before".into(),
+            body: String::new(),
+        },
+    }
+}
+
+fn submitted_edit_ack(
+    operation_id: &str,
+    id: &str,
+    login: &str,
+    commit: &str,
+    state: &str,
+    body: &str,
+) -> Value {
+    json!({"data": {"updateSubmittedPullRequestReview": {
+        "clientMutationId": operation_id,
+        "pullRequestReview": {
+            "id": id, "body": body, "state": state,
+            "author": {"login": login}, "commit": {"oid": commit},
+            "pullRequest": {"id": "PR_node", "number": 7, "repository": {"nameWithOwner": "owner/repo"}}
+        }
+    }}})
+}
+
 fn merge_response(head: &str, ref_target: &str, state: &str, queued: bool, auto: bool) -> Value {
     json!({"data": {
         "viewer": {"login": "alice"},
@@ -190,6 +247,12 @@ else:
         assert 'submitPullRequestReview(input: { pullRequestReviewId: $reviewId, event: $event, body: $body, clientMutationId: $clientMutationId })' in query
     if 'mutation UpdatePendingReview(' in query:
         assert 'updatePullRequestReview(input: { pullRequestReviewId: $reviewId, body: $body, clientMutationId: $clientMutationId })' in query
+    if 'mutation UpdateSubmittedReviewSummary(' in query:
+        assert 'updateSubmittedPullRequestReview: updatePullRequestReview(input: { pullRequestReviewId: $reviewId, body: $body, clientMutationId: $clientMutationId })' in query
+        assert 'clientMutationId pullRequestReview { id body state author { login } commit { oid } pullRequest { id number repository { nameWithOwner } } }' in query
+        assert 'event:' not in query
+    if 'query ReviewIdentity(' in query:
+        assert 'id body state submittedAt author { login } commit { oid } viewerDidAuthor viewerCanUpdate viewerCannotUpdateReasons' in query
     if 'mutation DeletePendingReviewComment(' in query:
         assert 'deletePullRequestReviewComment(input: { id: $commentId, clientMutationId: $clientMutationId })' in query
         assert 'pullRequestReviewCommentId: $commentId' not in query
@@ -1614,6 +1677,300 @@ fn sample_preparation() -> $crate::domain::MergePreparation {
         viewer_can_delete_head_ref: true,
         preferred_headlines: vec![],
         preferred_bodies: vec![],
+    }
+}
+
+#[test]
+fn submitted_summary_edit_sends_one_exact_mutation_for_older_review_commit() {
+    let request = submitted_edit_request();
+    let steps = vec![
+        step(
+            "query ReviewActionContext",
+            json!({"owner":"owner","name":"repo","number":7}),
+            context(HEAD, "CLOSED"),
+        ),
+        step(
+            "query ReviewIdentity",
+            json!({"id":"REVIEW_submitted"}),
+            submitted_review_node("REVIEW_submitted", "alice", OLD, "APPROVED", "before"),
+        ),
+        step(
+            "mutation UpdateSubmittedReviewSummary",
+            json!({"reviewId":"REVIEW_submitted","body":"","clientMutationId":"submitted-edit-1"}),
+            submitted_edit_ack(
+                "submitted-edit-1",
+                "REVIEW_submitted",
+                "alice",
+                OLD,
+                "APPROVED",
+                "",
+            ),
+        ),
+    ];
+    let (dir, provider) = fixture("alice", steps, Duration::from_secs(30));
+    let ProviderMutationOutcome::Acknowledged(ack) =
+        provider.execute_review_auxiliary(&repo("alice"), 7, &request)
+    else {
+        panic!("exact submitted edit must be acknowledged")
+    };
+    assert_eq!(ack.operation_id, "submitted-edit-1");
+    assert_eq!(ack.review_id.as_deref(), Some("REVIEW_submitted"));
+    assert_eq!(count(&dir), 3);
+}
+
+#[test]
+fn submitted_summary_edit_rejects_stale_or_unproven_targets_before_mutation() {
+    let base = submitted_review_node(
+        "REVIEW_submitted",
+        "alice",
+        OLD,
+        "APPROVED",
+        "before",
+    );
+    let mut cases = Vec::new();
+
+    let mut foreign_author = base.clone();
+    foreign_author["data"]["node"]["author"]["login"] = json!("bob");
+    cases.push(("foreign author", context(HEAD, "OPEN"), foreign_author));
+
+    let mut incapable = base.clone();
+    incapable["data"]["node"]["viewerCanUpdate"] = json!(false);
+    incapable["data"]["node"]["viewerCannotUpdateReasons"] = json!(["DENIED"]);
+    cases.push(("capability false", context(HEAD, "MERGED"), incapable));
+
+    let mut missing_capability = base.clone();
+    missing_capability["data"]["node"]
+        .as_object_mut()
+        .unwrap()
+        .remove("viewerCanUpdate");
+    cases.push((
+        "capability missing",
+        context(HEAD, "OPEN"),
+        missing_capability,
+    ));
+
+    let mut viewer_not_author = base.clone();
+    viewer_not_author["data"]["node"]["viewerDidAuthor"] = json!(false);
+    cases.push((
+        "viewer did not author",
+        context(HEAD, "OPEN"),
+        viewer_not_author,
+    ));
+
+    let mut wrong_parent = base.clone();
+    wrong_parent["data"]["node"]["pullRequest"]["id"] = json!("PR_other");
+    cases.push(("wrong parent", context(HEAD, "OPEN"), wrong_parent));
+
+    let mut pending = base.clone();
+    pending["data"]["node"]["state"] = json!("PENDING");
+    pending["data"]["node"]["submittedAt"] = Value::Null;
+    cases.push(("pending state", context(HEAD, "OPEN"), pending));
+
+    let mut dismissed = base.clone();
+    dismissed["data"]["node"]["state"] = json!("DISMISSED");
+    cases.push(("dismissed state", context(HEAD, "OPEN"), dismissed));
+
+    let mut changed_body = base.clone();
+    changed_body["data"]["node"]["body"] = json!("changed elsewhere");
+    cases.push(("changed prior body", context(HEAD, "OPEN"), changed_body));
+
+    let mut changed_commit = base.clone();
+    changed_commit["data"]["node"]["commit"]["oid"] = json!(NEW);
+    cases.push(("changed review commit", context(HEAD, "OPEN"), changed_commit));
+
+    let mut missing_submission = base.clone();
+    missing_submission["data"]["node"]["submittedAt"] = Value::Null;
+    cases.push((
+        "missing submitted time",
+        context(HEAD, "OPEN"),
+        missing_submission,
+    ));
+
+    let mut partial = base;
+    partial["errors"] = json!([{"message":"capability unavailable"}]);
+    cases.push(("partial review read", context(HEAD, "OPEN"), partial));
+
+    for (name, action_context, review) in cases {
+        let steps = vec![
+            step(
+                "query ReviewActionContext",
+                json!({"owner":"owner","name":"repo","number":7}),
+                action_context,
+            ),
+            step(
+                "query ReviewIdentity",
+                json!({"id":"REVIEW_submitted"}),
+                review,
+            ),
+        ];
+        let (dir, provider) = fixture("alice", steps, Duration::from_secs(30));
+        let outcome = provider.execute_review_auxiliary(
+            &repo("alice"),
+            7,
+            &submitted_edit_request(),
+        );
+        assert!(
+            matches!(outcome, ProviderMutationOutcome::PreflightRejected { .. }),
+            "{name}: {outcome:?}"
+        );
+        assert_eq!(count(&dir), 2, "{name}");
+    }
+
+    let mut viewer_mismatch = context(HEAD, "OPEN");
+    viewer_mismatch["data"]["viewer"]["login"] = json!("bob");
+    let (dir, provider) = fixture(
+        "alice",
+        vec![step(
+            "query ReviewActionContext",
+            json!({"owner":"owner","name":"repo","number":7}),
+            viewer_mismatch,
+        )],
+        Duration::from_secs(30),
+    );
+    assert!(matches!(
+        provider.execute_review_auxiliary(&repo("alice"), 7, &submitted_edit_request()),
+        ProviderMutationOutcome::PreflightRejected { .. }
+    ));
+    assert_eq!(count(&dir), 1);
+
+    let mut wrong_selected_author = submitted_edit_request();
+    let ReviewAuxiliaryAction::UpdateSubmittedSummary {
+        selected_author, ..
+    } = &mut wrong_selected_author.action
+    else {
+        unreachable!()
+    };
+    *selected_author = "bob".into();
+    let (dir, provider) = fixture(
+        "alice",
+        vec![
+            step(
+                "query ReviewActionContext",
+                json!({"owner":"owner","name":"repo","number":7}),
+                context(HEAD, "OPEN"),
+            ),
+            step(
+                "query ReviewIdentity",
+                json!({"id":"REVIEW_submitted"}),
+                submitted_review_node(
+                    "REVIEW_submitted",
+                    "alice",
+                    OLD,
+                    "APPROVED",
+                    "before",
+                ),
+            ),
+        ],
+        Duration::from_secs(30),
+    );
+    assert!(matches!(
+        provider.execute_review_auxiliary(&repo("alice"), 7, &wrong_selected_author),
+        ProviderMutationOutcome::PreflightRejected { .. }
+    ));
+    assert_eq!(count(&dir), 2);
+
+    let mut wrong_coordinates = submitted_edit_request();
+    let ReviewAuxiliaryAction::UpdateSubmittedSummary { review, .. } =
+        &mut wrong_coordinates.action
+    else {
+        unreachable!()
+    };
+    review.repository = "other".into();
+    let (dir, provider) = fixture(
+        "alice",
+        vec![step(
+            "query ReviewActionContext",
+            json!({"owner":"owner","name":"repo","number":7}),
+            context(HEAD, "OPEN"),
+        )],
+        Duration::from_secs(30),
+    );
+    assert!(matches!(
+        provider.execute_review_auxiliary(&repo("alice"), 7, &wrong_coordinates),
+        ProviderMutationOutcome::PreflightRejected { .. }
+    ));
+    assert_eq!(count(&dir), 1);
+}
+
+#[test]
+fn submitted_summary_edit_requires_exact_acknowledgement_tuple() {
+    let exact = submitted_edit_ack(
+        "submitted-edit-1",
+        "REVIEW_submitted",
+        "alice",
+        OLD,
+        "APPROVED",
+        "",
+    );
+    let mut cases = Vec::new();
+    let mut wrong_operation = exact.clone();
+    wrong_operation["data"]["updateSubmittedPullRequestReview"]["clientMutationId"] =
+        json!("other-operation");
+    cases.push(("operation", wrong_operation));
+    let mut wrong_id = exact.clone();
+    wrong_id["data"]["updateSubmittedPullRequestReview"]["pullRequestReview"]["id"] =
+        json!("REVIEW_other");
+    cases.push(("review ID", wrong_id));
+    let mut wrong_body = exact.clone();
+    wrong_body["data"]["updateSubmittedPullRequestReview"]["pullRequestReview"]["body"] =
+        json!("not empty");
+    cases.push(("body", wrong_body));
+    let mut wrong_state = exact.clone();
+    wrong_state["data"]["updateSubmittedPullRequestReview"]["pullRequestReview"]["state"] =
+        json!("COMMENTED");
+    cases.push(("state", wrong_state));
+    let mut wrong_author = exact.clone();
+    wrong_author["data"]["updateSubmittedPullRequestReview"]["pullRequestReview"]["author"]
+        ["login"] = json!("bob");
+    cases.push(("author", wrong_author));
+    let mut wrong_commit = exact.clone();
+    wrong_commit["data"]["updateSubmittedPullRequestReview"]["pullRequestReview"]["commit"]
+        ["oid"] = json!(NEW);
+    cases.push(("commit", wrong_commit));
+    let mut wrong_parent = exact.clone();
+    wrong_parent["data"]["updateSubmittedPullRequestReview"]["pullRequestReview"]
+        ["pullRequest"]["repository"]["nameWithOwner"] = json!("owner/other");
+    cases.push(("parent", wrong_parent));
+    let mut malformed = exact;
+    malformed["data"]["updateSubmittedPullRequestReview"]["pullRequestReview"]
+        .as_object_mut()
+        .unwrap()
+        .remove("body");
+    cases.push(("malformed", malformed));
+
+    for (name, acknowledgement) in cases {
+        let steps = vec![
+            step(
+                "query ReviewActionContext",
+                json!({"owner":"owner","name":"repo","number":7}),
+                context(HEAD, "OPEN"),
+            ),
+            step(
+                "query ReviewIdentity",
+                json!({"id":"REVIEW_submitted"}),
+                submitted_review_node(
+                    "REVIEW_submitted",
+                    "alice",
+                    OLD,
+                    "APPROVED",
+                    "before",
+                ),
+            ),
+            step(
+                "mutation UpdateSubmittedReviewSummary",
+                json!({"reviewId":"REVIEW_submitted","body":"","clientMutationId":"submitted-edit-1"}),
+                acknowledgement,
+            ),
+        ];
+        let (dir, provider) = fixture("alice", steps, Duration::from_secs(30));
+        assert!(
+            matches!(
+                provider.execute_review_auxiliary(&repo("alice"), 7, &submitted_edit_request()),
+                ProviderMutationOutcome::Uncertain { .. }
+            ),
+            "{name} acknowledgement must remain uncertain"
+        );
+        assert_eq!(count(&dir), 3, "{name}");
     }
 }
 

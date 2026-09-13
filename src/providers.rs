@@ -17,7 +17,7 @@ use crate::domain::{
     PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome, PullRequest,
     PullRequestCheck, PullRequestCheckoutSource, PullRequestDetails, PullRequestReview, Repository,
     ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewComment,
-    ReviewThread, ReviewWriteAcknowledgement, Revision,
+    ReviewThread, ReviewWriteAcknowledgement, Revision, SubmittedReviewEditCapability,
 };
 use crate::participation::{
     DraftStore, PendingCommentIntent, ReviewComposition, ReviewEvent, ReviewOperationPayload,
@@ -495,7 +495,11 @@ impl GithubProvider {
         {
             return Err("selected GitHub credential resolved to another account".into());
         }
-        if context.pull.state != "OPEN" {
+        if !matches!(
+            &request.action,
+            ReviewAuxiliaryAction::UpdateSubmittedSummary { .. }
+        ) && context.pull.state != "OPEN"
+        {
             return Err("pull request is not open for review actions".into());
         }
         match &request.action {
@@ -516,6 +520,48 @@ impl GithubProvider {
                     UPDATE_REVIEW_MUTATION,
                     json!({"reviewId": review.remote_id, "body": body, "clientMutationId": request.operation_id}),
                     AuxiliaryMutationKind::Review,
+                ))
+            }
+            ReviewAuxiliaryAction::UpdateSubmittedSummary {
+                review,
+                selected_author,
+                submitted_state,
+                submitted_commit_sha,
+                expected_body,
+                body,
+            } => {
+                validate_action_text(body, true)?;
+                validate_action_text(expected_body, true)?;
+                validate_coordinates(repo, number, review)?;
+                validate_sha(submitted_commit_sha).map_err(|error| error.to_string())?;
+                let remote = session
+                    .review_node(&review.remote_id)
+                    .map_err(|error| error.to_string())?;
+                validate_submitted_review(
+                    &remote,
+                    &context,
+                    self,
+                    &review.remote_id,
+                    selected_author,
+                    submitted_state,
+                    submitted_commit_sha,
+                    expected_body,
+                )?;
+                Ok(PreparedAuxiliaryMutation::new(
+                    "update-submitted-summary",
+                    UPDATE_SUBMITTED_REVIEW_MUTATION,
+                    json!({"reviewId": review.remote_id, "body": body, "clientMutationId": request.operation_id}),
+                    AuxiliaryMutationKind::SubmittedSummary {
+                        operation_id: request.operation_id.clone(),
+                        review_id: review.remote_id.clone(),
+                        body: body.clone(),
+                        state: submitted_state.clone(),
+                        author: selected_author.clone(),
+                        commit_sha: submitted_commit_sha.clone(),
+                        pull_request_id: context.pull.id.clone(),
+                        pull_request_number: context.pull.number,
+                        repository: context.repository.clone(),
+                    },
                 ))
             }
             ReviewAuxiliaryAction::DeletePendingComment { review, comment } => {
@@ -2015,6 +2061,7 @@ impl<'a> Session<'a> {
                 state: review.state,
                 submitted_at: review.submitted_at,
                 commit_sha: review.commit.map(|commit| commit.oid),
+                edit_summary_capability: None,
                 url: review.url,
             },
             comments,
@@ -3026,7 +3073,8 @@ const REVIEW_ACTION_CONTEXT_QUERY: &str = r#"query ReviewActionContext(
 const REVIEW_NODE_QUERY: &str = r#"query ReviewIdentity($id: ID!) {
   node(id: $id) {
     ... on PullRequestReview {
-      id state author { login } commit { oid }
+      id body state submittedAt author { login } commit { oid }
+      viewerDidAuthor viewerCanUpdate viewerCannotUpdateReasons
       pullRequest { id number repository { nameWithOwner } }
     }
   }
@@ -3100,6 +3148,20 @@ const UPDATE_REVIEW_MUTATION: &str = r#"mutation UpdatePendingReview(
   updatePullRequestReview(input: {
     pullRequestReviewId: $reviewId, body: $body, clientMutationId: $clientMutationId
   }) { pullRequestReview { id } }
+}"#;
+
+const UPDATE_SUBMITTED_REVIEW_MUTATION: &str = r#"mutation UpdateSubmittedReviewSummary(
+  $reviewId: ID!, $body: String!, $clientMutationId: String!
+) {
+  updateSubmittedPullRequestReview: updatePullRequestReview(input: {
+    pullRequestReviewId: $reviewId, body: $body, clientMutationId: $clientMutationId
+  }) {
+    clientMutationId
+    pullRequestReview {
+      id body state author { login } commit { oid }
+      pullRequest { id number repository { nameWithOwner } }
+    }
+  }
 }"#;
 
 const DELETE_REVIEW_COMMENT_MUTATION: &str = r#"mutation DeletePendingReviewComment(
@@ -3213,9 +3275,14 @@ struct ActionReviewNodeData {
 #[serde(rename_all = "camelCase")]
 struct ActionReviewNode {
     id: String,
+    body: Option<String>,
     state: String,
+    submitted_at: Option<String>,
     author: Option<GraphqlActor>,
     commit: Option<GraphqlOid>,
+    viewer_did_author: Option<bool>,
+    viewer_can_update: Option<bool>,
+    viewer_cannot_update_reasons: Option<Vec<String>>,
     pull_request: ActionReviewPull,
 }
 
@@ -3497,6 +3564,17 @@ impl PreparedAuxiliaryMutation {
 
 enum AuxiliaryMutationKind {
     Review,
+    SubmittedSummary {
+        operation_id: String,
+        review_id: String,
+        body: String,
+        state: String,
+        author: String,
+        commit_sha: String,
+        pull_request_id: String,
+        pull_request_number: u64,
+        repository: String,
+    },
     DeletedComment,
     DeletedReview,
     Reply,
@@ -3525,6 +3603,51 @@ impl AuxiliaryMutationKind {
                         })?
                         .id,
                 );
+            }
+            Self::SubmittedSummary {
+                operation_id,
+                review_id,
+                body,
+                state,
+                author,
+                commit_sha,
+                pull_request_id,
+                pull_request_number,
+                repository,
+            } => {
+                let payload = data.update_submitted_pull_request_review.ok_or_else(|| {
+                    "GitHub omitted the submitted review update acknowledgement".to_owned()
+                })?;
+                if payload.client_mutation_id.as_deref() != Some(operation_id.as_str()) {
+                    return Err("GitHub echoed another submitted review update operation ID".into());
+                }
+                let review = payload
+                    .pull_request_review
+                    .ok_or_else(|| "GitHub omitted the updated submitted review".to_owned())?;
+                validate_acknowledgement_id(&review.id, "updated submitted review")?;
+                if review.id != review_id
+                    || review.body != body
+                    || review.state != state
+                    || !review
+                        .author
+                        .as_ref()
+                        .is_some_and(|candidate| candidate.login.eq_ignore_ascii_case(&author))
+                    || review.commit.as_ref().map(|commit| commit.oid.as_str())
+                        != Some(commit_sha.as_str())
+                    || review.pull_request.id != pull_request_id
+                    || review.pull_request.number != pull_request_number
+                    || !review
+                        .pull_request
+                        .repository
+                        .name_with_owner
+                        .eq_ignore_ascii_case(&repository)
+                {
+                    return Err(
+                        "GitHub submitted review update acknowledgement did not match the exact frozen final state"
+                            .into(),
+                    );
+                }
+                ack.review_id = Some(review.id);
             }
             Self::DeletedComment => {
                 let payload = data.delete_pull_request_review_comment.ok_or_else(|| {
@@ -3574,6 +3697,7 @@ impl AuxiliaryMutationKind {
 #[serde(rename_all = "camelCase")]
 struct AuxiliaryMutationData {
     update_pull_request_review: Option<AuxReviewPayload>,
+    update_submitted_pull_request_review: Option<AuxSubmittedReviewPayload>,
     delete_pull_request_review_comment: Option<AuxDeleteCommentPayload>,
     delete_pull_request_review: Option<AuxReviewPayload>,
     add_pull_request_review_thread_reply: Option<AuxReplyPayload>,
@@ -3584,6 +3708,22 @@ struct AuxiliaryMutationData {
 #[serde(rename_all = "camelCase")]
 struct AuxReviewPayload {
     pull_request_review: Option<GraphqlNodeId>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuxSubmittedReviewPayload {
+    client_mutation_id: Option<String>,
+    pull_request_review: Option<AuxSubmittedReview>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuxSubmittedReview {
+    id: String,
+    body: String,
+    state: String,
+    author: Option<GraphqlActor>,
+    commit: Option<GraphqlOid>,
+    pull_request: ActionReviewPull,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3767,6 +3907,80 @@ fn validate_pending_review(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_submitted_review(
+    review: &ActionReviewNode,
+    context: &ReviewActionContext,
+    provider: &GithubProvider,
+    expected_review_id: &str,
+    selected_author: &str,
+    expected_state: &str,
+    expected_commit: &str,
+    expected_body: &str,
+) -> std::result::Result<(), String> {
+    if !selected_author.eq_ignore_ascii_case(&provider.account.login) {
+        return Err("submitted review selected author changed before dispatch".into());
+    }
+    if review.id != expected_review_id
+        || review.pull_request.id != context.pull.id
+        || review.pull_request.number != context.pull.number
+        || !review
+            .pull_request
+            .repository
+            .name_with_owner
+            .eq_ignore_ascii_case(&context.repository)
+    {
+        return Err("submitted review belongs to another repository or pull request".into());
+    }
+    if !matches!(
+        expected_state,
+        "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED"
+    ) || review.state != expected_state
+        || review.submitted_at.as_deref().is_none_or(str::is_empty)
+    {
+        return Err("review is no longer in the frozen submitted state".into());
+    }
+    if review.body.as_deref() != Some(expected_body) {
+        return Err("submitted review body changed before dispatch".into());
+    }
+    if review.commit.as_ref().map(|commit| commit.oid.as_str()) != Some(expected_commit) {
+        return Err("submitted review commit changed or is unavailable".into());
+    }
+    if !review
+        .author
+        .as_ref()
+        .is_some_and(|author| author.login.eq_ignore_ascii_case(selected_author))
+    {
+        return Err("submitted review is not authored by the selected account".into());
+    }
+    let Some(viewer_did_author) = review.viewer_did_author else {
+        return Err("GitHub omitted submitted-review author capability evidence".into());
+    };
+    let Some(viewer_can_update) = review.viewer_can_update else {
+        return Err("GitHub omitted submitted-review update capability evidence".into());
+    };
+    let Some(reasons) = review.viewer_cannot_update_reasons.as_ref() else {
+        return Err("GitHub omitted submitted-review capability reasons".into());
+    };
+    if !viewer_did_author {
+        return Err("GitHub says the selected viewer did not author this review".into());
+    }
+    if !viewer_can_update {
+        let reason = reasons
+            .iter()
+            .take(3)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(if reason.is_empty() {
+            "GitHub says the selected author cannot update this submitted review".into()
+        } else {
+            format!("GitHub says the selected author cannot update this submitted review: {reason}")
+        });
+    }
+    Ok(())
+}
+
 fn validate_owned_comment(
     comment: &ActionCommentNode,
     review: &ActionReviewNode,
@@ -3851,7 +4065,10 @@ const DETAILS_QUERY: &str = r#"query PullRequestDetails(
         pageInfo { hasNextPage endCursor }
       }
       reviews(first: 50, after: $reviewsCursor) @include(if: $includeReviews) {
-        nodes { id author { login } body state submittedAt commit { oid } url }
+        nodes {
+          id author { login } body state submittedAt commit { oid } url
+          viewerDidAuthor viewerCanUpdate viewerCannotUpdateReasons
+        }
         pageInfo { hasNextPage endCursor }
       }
       reviewThreads(first: 50, after: $threadsCursor) @include(if: $includeThreads) {
@@ -4035,6 +4252,9 @@ struct DetailsReview {
     state: String,
     submitted_at: Option<String>,
     commit: Option<GraphqlOid>,
+    viewer_did_author: bool,
+    viewer_can_update: bool,
+    viewer_cannot_update_reasons: Vec<String>,
     url: String,
 }
 
@@ -4288,7 +4508,8 @@ impl DetailsBuilder {
                     self.activity_ids.insert(review.id.clone()),
                     "PR activity changed during pagination; refresh to retry"
                 );
-                self.reviews.push(review.into_domain(repo, number));
+                self.reviews
+                    .push(review.into_domain(repo, number, !partial));
             }
         }
         if let Some(connection) = pull.review_threads {
@@ -4407,7 +4628,12 @@ impl DetailsIssueComment {
 }
 
 impl DetailsReview {
-    fn into_domain(self, repo: &Repository, number: u64) -> PullRequestReview {
+    fn into_domain(
+        self,
+        repo: &Repository,
+        number: u64,
+        capabilities_complete: bool,
+    ) -> PullRequestReview {
         PullRequestReview {
             coordinates: coordinates(repo, number, self.id),
             author: self.author.map(|author| author.login),
@@ -4415,6 +4641,13 @@ impl DetailsReview {
             state: self.state,
             submitted_at: self.submitted_at,
             commit_sha: self.commit.map(|commit| commit.oid),
+            edit_summary_capability: capabilities_complete.then_some(
+                SubmittedReviewEditCapability {
+                    viewer_did_author: self.viewer_did_author,
+                    viewer_can_update: self.viewer_can_update,
+                    viewer_cannot_update_reasons: self.viewer_cannot_update_reasons,
+                },
+            ),
             url: self.url,
         }
     }
@@ -5365,6 +5598,34 @@ else:
     }
 
     #[test]
+    fn complete_details_read_preserves_submitted_review_edit_capability() {
+        let mut pull = details_overview();
+        pull["reviews"] = json!({
+            "nodes": [{
+                "id": "R-owned", "author": {"login": "alice"}, "body": "before",
+                "state": "COMMENTED", "submittedAt": "2026-09-12T11:00:00Z",
+                "commit": {"oid": "a".repeat(40)},
+                "viewerDidAuthor": true, "viewerCanUpdate": true,
+                "viewerCannotUpdateReasons": [],
+                "url": "https://github.com/owner/repo/pull/1#pullrequestreview-owned"
+            }],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        });
+        let response =
+            json!({"data":{"repository":{"nameWithOwner":"owner/repo","pullRequest":pull}}});
+        let (dir, provider) = fixture("alice", vec![details_step(response, json!({"number": 1}))]);
+        let details = provider.details(&repo("alice"), 1).unwrap();
+        let capability = details.reviews[0]
+            .edit_summary_capability
+            .as_ref()
+            .expect("complete fresh details must retain capability evidence");
+        assert!(capability.viewer_did_author);
+        assert!(capability.viewer_can_update);
+        assert!(capability.viewer_cannot_update_reasons.is_empty());
+        exhausted(&dir, 1);
+    }
+
+    #[test]
     fn details_pages_activity_and_checks_and_marks_partial_history() {
         let overview = details_overview();
         let mut first = overview.clone();
@@ -5373,7 +5634,7 @@ else:
             "pageInfo": {"hasNextPage": true, "endCursor": "comments-1"}
         });
         first["reviews"] = json!({
-            "nodes": [{"id": "R1", "author": {"login": "reviewer"}, "body": "approved", "state": "APPROVED", "submittedAt": "2026-09-12T11:00:00Z", "commit": null, "url": "https://github.com/owner/repo/pull/1#pullrequestreview-1"}],
+            "nodes": [{"id": "R1", "author": {"login": "reviewer"}, "body": "approved", "state": "APPROVED", "submittedAt": "2026-09-12T11:00:00Z", "commit": null, "viewerDidAuthor": false, "viewerCanUpdate": false, "viewerCannotUpdateReasons": ["NOT_AUTHOR"], "url": "https://github.com/owner/repo/pull/1#pullrequestreview-1"}],
             "pageInfo": {"hasNextPage": false, "endCursor": null}
         });
         first["reviewThreads"] = json!({
@@ -5442,6 +5703,7 @@ else:
         assert_eq!(details.issue_comments.len(), 2);
         assert_eq!(details.reviews.len(), 1);
         assert_eq!(details.reviews[0].commit_sha, None);
+        assert_eq!(details.reviews[0].edit_summary_capability, None);
         assert_eq!(details.review_threads.len(), 1);
         assert!(details.review_threads[0].resolved);
         assert!(details.review_threads[0].outdated);

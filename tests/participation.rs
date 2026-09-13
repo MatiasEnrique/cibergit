@@ -108,6 +108,7 @@ fn details(
             state: "PENDING".into(),
             submitted_at: None,
             commit_sha: Some("head".into()),
+            edit_summary_capability: None,
             url: String::new(),
         })
         .into_iter()

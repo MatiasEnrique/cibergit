@@ -123,7 +123,20 @@ pub struct PullRequestReview {
     pub submitted_at: Option<String>,
     /// May be unavailable after history is removed or becomes inaccessible.
     pub commit_sha: Option<String>,
+    /// Present only when a fresh provider details read returned every field
+    /// needed to decide whether the selected viewer may edit this summary.
+    /// Old cached records deserialize to `None` and remain read-only.
+    #[serde(default)]
+    pub edit_summary_capability: Option<SubmittedReviewEditCapability>,
     pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmittedReviewEditCapability {
+    pub viewer_did_author: bool,
+    pub viewer_can_update: bool,
+    #[serde(default)]
+    pub viewer_cannot_update_reasons: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +444,17 @@ pub struct ReviewWriteAcknowledgement {
 pub enum ReviewAuxiliaryAction {
     UpdatePendingSummary {
         review: ProviderCoordinates,
+        body: String,
+    },
+    /// An author-owned submitted review summary edit. Every observed target
+    /// property is frozen so confirmation, durable recovery, and provider
+    /// preflight all refer to the same historical review object.
+    UpdateSubmittedSummary {
+        review: ProviderCoordinates,
+        selected_author: String,
+        submitted_state: String,
+        submitted_commit_sha: String,
+        expected_body: String,
         body: String,
     },
     DeletePendingComment {

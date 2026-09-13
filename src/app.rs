@@ -761,6 +761,71 @@ fn issue_comment_is_editable(tab: &ReviewTab, comment: &cibergit::domain::IssueC
     tab.details.is_some() && tab.lifecycle.current_user_comment(comment)
 }
 
+fn submitted_review_edit_action(
+    repository: &Repository,
+    pull_request: u64,
+    review: &cibergit::domain::PullRequestReview,
+    body: String,
+) -> Result<ReviewAuxiliaryAction, String> {
+    let coordinates = &review.coordinates;
+    if coordinates.provider != "github"
+        || !coordinates.host.eq_ignore_ascii_case(&repository.host)
+        || !coordinates.owner.eq_ignore_ascii_case(&repository.owner)
+        || !coordinates
+            .repository
+            .eq_ignore_ascii_case(&repository.name)
+        || coordinates.pull_request != pull_request
+        || coordinates.remote_id.is_empty()
+    {
+        return Err("Review identity does not match this repository and pull request.".into());
+    }
+    if !matches!(
+        review.state.as_str(),
+        "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED"
+    ) || review.submitted_at.as_deref().is_none_or(str::is_empty)
+    {
+        return Err("Review is not in an editable submitted state.".into());
+    }
+    let selected_author = review
+        .author
+        .as_deref()
+        .filter(|author| author.eq_ignore_ascii_case(&repository.account.login))
+        .ok_or_else(|| "Review is not authored by the selected account.".to_owned())?;
+    let submitted_commit_sha = review
+        .commit_sha
+        .as_ref()
+        .filter(|sha| !sha.is_empty())
+        .ok_or_else(|| "GitHub did not provide the submitted review commit.".to_owned())?;
+    let capability = review.edit_summary_capability.as_ref().ok_or_else(|| {
+        "GitHub did not provide complete fresh edit capability evidence.".to_owned()
+    })?;
+    if !capability.viewer_did_author {
+        return Err("GitHub says the selected viewer did not author this review.".into());
+    }
+    if !capability.viewer_can_update {
+        let reasons = capability
+            .viewer_cannot_update_reasons
+            .iter()
+            .take(3)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(if reasons.is_empty() {
+            "GitHub says this submitted review cannot be updated.".into()
+        } else {
+            format!("GitHub says this submitted review cannot be updated: {reasons}")
+        });
+    }
+    Ok(ReviewAuxiliaryAction::UpdateSubmittedSummary {
+        review: coordinates.clone(),
+        selected_author: selected_author.to_owned(),
+        submitted_state: review.state.clone(),
+        submitted_commit_sha: submitted_commit_sha.clone(),
+        expected_body: review.body.clone(),
+        body,
+    })
+}
+
 struct ReviewTab {
     instance_generation: u64,
     repository: Repository,
@@ -807,11 +872,13 @@ struct ReviewTab {
     write_in_flight: bool,
     reply_thread: Option<cibergit::domain::ProviderCoordinates>,
     editing_pending_summary: bool,
+    editing_submitted_review: Option<SubmittedSummaryDraft>,
     recovery_details_expanded: bool,
     lifecycle_details_expanded: bool,
     lifecycle_choice_pages: [usize; 3],
     lifecycle_confirmation_details: bool,
     issue_comment_page: usize,
+    review_page: usize,
     #[allow(dead_code)] // Reserved opaque presentation slot; this slice does not provision it.
     local_workspace: Option<AnyView>,
     local_visible: bool,
@@ -829,11 +896,50 @@ enum NativeConfirmation {
     Submit {
         event: ReviewEvent,
     },
+    UpdateSubmittedSummary {
+        action: Box<ReviewAuxiliaryAction>,
+    },
     Merge {
         preparation: Box<MergePreparation>,
         method: MergeMethod,
         action: MergeConfirmationAction,
     },
+}
+
+#[derive(Clone)]
+struct SubmittedSummaryDraft {
+    review: cibergit::domain::PullRequestReview,
+    body: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SubmittedConfirmationToken {
+    workspace_instance: u64,
+    tab_instance: u64,
+    repository_key: String,
+    pull_request: u64,
+    action: ReviewAuxiliaryAction,
+}
+
+impl SubmittedConfirmationToken {
+    fn matches_values(
+        &self,
+        workspace_instance: u64,
+        tab_instance: u64,
+        repository_key: &str,
+        pull_request: u64,
+        confirmation: Option<&NativeConfirmation>,
+    ) -> bool {
+        workspace_instance == self.workspace_instance
+            && tab_instance == self.tab_instance
+            && repository_key == self.repository_key
+            && pull_request == self.pull_request
+            && matches!(
+                confirmation,
+                Some(NativeConfirmation::UpdateSubmittedSummary { action })
+                    if action.as_ref() == &self.action
+            )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -911,6 +1017,7 @@ pub struct ReviewWorkspace {
     query: Entity<InputState>,
     composer_input: Entity<TextareaState>,
     review_summary_input: Entity<TextareaState>,
+    submitted_summary_input: Entity<TextareaState>,
     merge_title_input: Entity<InputState>,
     merge_body_input: Entity<TextareaState>,
     reply_input: Entity<TextareaState>,
@@ -1101,6 +1208,8 @@ impl ReviewWorkspace {
         );
         let composer_input = new_textarea("", "Write a revision-bound review comment…", window, cx);
         let review_summary_input = new_textarea("", "Review summary (optional)", window, cx);
+        let submitted_summary_input =
+            new_textarea("", "Edit this submitted review summary…", window, cx);
         let merge_title_input = new_input("", "Merge headline", window, cx);
         let merge_body_input = new_textarea("", "Merge message", window, cx);
         let reply_input = new_textarea("", "Reply to this review thread…", window, cx);
@@ -1180,6 +1289,7 @@ impl ReviewWorkspace {
             query,
             composer_input,
             review_summary_input,
+            submitted_summary_input,
             merge_title_input,
             merge_body_input,
             reply_input,
@@ -1248,6 +1358,7 @@ impl ReviewWorkspace {
             for editor in [
                 &this.composer_input,
                 &this.review_summary_input,
+                &this.submitted_summary_input,
                 &this.merge_body_input,
                 &this.reply_input,
                 &this.metadata_body_input,
@@ -1348,6 +1459,20 @@ impl ReviewWorkspace {
                     this.tabs[index].lifecycle.stage_discussion_body(body);
                 }
             });
+        let submitted_summary_changes = cx.subscribe(
+            &this.submitted_summary_input,
+            |root, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Root::Review(this) = root
+                    && let Some(index) = this.active_tab
+                {
+                    let body = this.submitted_summary_input.read(cx).value().to_string();
+                    if let Some(draft) = &mut this.tabs[index].editing_submitted_review {
+                        draft.body = body;
+                    }
+                }
+            },
+        );
         this._subscriptions.extend([
             activation,
             appearance,
@@ -1357,6 +1482,7 @@ impl ReviewWorkspace {
             lifecycle_body_changes,
             lifecycle_base_changes,
             discussion_changes,
+            submitted_summary_changes,
         ]);
         this.start_workspace_restore(cx);
         this.start_notifications(cx);
@@ -1918,7 +2044,7 @@ impl ReviewWorkspace {
             return;
         }
         if std::env::var_os("CIBERGIT_SMOKE_LIFECYCLE").is_some() {
-            self.start_lifecycle_smoke(window, cx, output);
+            self.start_lifecycle_smoke(window, cx, output, second_pr);
             return;
         }
         if std::env::var_os("CIBERGIT_SMOKE_PR_CREATION").is_some() {
@@ -4296,6 +4422,7 @@ impl ReviewWorkspace {
                 state: "PENDING".into(),
                 submitted_at: None,
                 commit_sha: Some(intent.position.commit_sha.clone()),
+                edit_summary_capability: None,
                 url: String::new(),
             },
             comments: vec![cibergit::domain::LinkedReviewComment {
@@ -5014,7 +5141,21 @@ impl ReviewWorkspace {
         window: &mut Window,
         cx: &mut Context<Root>,
         output: PathBuf,
+        second_pr: Option<u64>,
     ) {
+        let primary_number = self
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.pull_request.number)
+            .unwrap_or_default();
+        if let Some(second) = second_pr.filter(|second| *second != primary_number)
+            && let Some(active) = self.active_tab
+            && let Some(repository_index) = self.repositories.iter().position(|runtime| {
+                runtime.repository.cache_key() == self.tabs[active].repository.cache_key()
+            })
+        {
+            self.open_pr(repository_index, second, cx);
+        }
         let weak = cx.weak_entity();
         window
             .spawn(cx, async move |window| {
@@ -5028,11 +5169,16 @@ impl ReviewWorkspace {
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
                                 matches!(root, Root::Review(this) if this.smoke_ready()
-                                    && this.active_tab.is_some_and(|index| {
-                                        this.tabs[index].lifecycle.snapshot.is_some()
-                                            && this.tabs[index].lifecycle.choices.is_some()
-                                            && !matches!(this.tabs[index].lifecycle_state, LoadState::Loading(_))
-                                    }))
+                                    && [Some(primary_number), second_pr]
+                                        .into_iter()
+                                        .flatten()
+                                        .all(|number| this.tabs.iter().any(|tab| {
+                                            tab.pull_request.number == number
+                                                && tab.lifecycle.snapshot.is_some()
+                                                && tab.lifecycle.choices.is_some()
+                                                && tab.details.is_some()
+                                                && !matches!(tab.lifecycle_state, LoadState::Loading(_))
+                                        })))
                             })
                             .unwrap_or(false)
                         })
@@ -5042,6 +5188,17 @@ impl ReviewWorkspace {
                     }
                 }
                 let _ = std::fs::create_dir_all(&output);
+                let _ = window.update(|window, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root
+                            && let Some(primary) = this.tabs.iter().position(|tab| {
+                                tab.pull_request.number == primary_number
+                            })
+                        {
+                            this.activate_tab(primary, window, cx);
+                        }
+                    });
+                });
                 let before = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
@@ -5256,6 +5413,212 @@ impl ReviewWorkspace {
                         })
                         .unwrap_or(false);
 
+                let submitted_scene = window
+                    .update(|window, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err("submitted-review smoke left review workspace".to_owned());
+                            };
+                            let index = this.active_tab.ok_or_else(|| "no active tab".to_owned())?;
+                            this.tabs[index].lifecycle.cancel_confirmation();
+                            let repository = this.tabs[index].repository.clone();
+                            let number = this.tabs[index].pull_request.number;
+                            let viewer = this.tabs[index]
+                                .lifecycle
+                                .snapshot
+                                .as_ref()
+                                .ok_or_else(|| "no lifecycle snapshot".to_owned())?
+                                .viewer_login
+                                .clone();
+                            let reviewed_commit = this.tabs[index]
+                                .canonical_session
+                                .as_ref()
+                                .ok_or_else(|| "no canonical review session".to_owned())?
+                                .revision()
+                                .head_sha
+                                .clone();
+                            let review = cibergit::domain::PullRequestReview {
+                                coordinates: cibergit::domain::ProviderCoordinates {
+                                    provider: "github".into(),
+                                    host: repository.host.clone(),
+                                    owner: repository.owner.clone(),
+                                    repository: repository.name.clone(),
+                                    pull_request: number,
+                                    remote_id: "SYNTHETIC_OWNED_SUBMITTED_REVIEW_NO_DISPATCH".into(),
+                                },
+                                author: Some(viewer),
+                                body: "Synthetic original submitted summary. No provider write is permitted by this scene."
+                                    .into(),
+                                state: "COMMENTED".into(),
+                                submitted_at: Some("2026-09-13T12:00:00Z".into()),
+                                commit_sha: Some(reviewed_commit),
+                                edit_summary_capability: Some(
+                                    cibergit::domain::SubmittedReviewEditCapability {
+                                        viewer_did_author: true,
+                                        viewer_can_update: true,
+                                        viewer_cannot_update_reasons: Vec::new(),
+                                    },
+                                ),
+                                url: String::new(),
+                            };
+                            this.tabs[index]
+                                .details
+                                .as_mut()
+                                .ok_or_else(|| "real details read unavailable".to_owned())?
+                                .reviews
+                                .insert(0, review.clone());
+                            this.tabs[index].inspector_section = InspectorSection::Activity;
+                            this.tabs[index].review_page = 0;
+                            this.begin_submitted_summary_edit(review, window, cx);
+                            this.submitted_summary_input.update(cx, |input, cx| {
+                                input.set_value(
+                                    "Synthetic requested submitted summary. Confirmation and cancellation only; zero update mutation transport.",
+                                    window,
+                                    cx,
+                                )
+                            });
+                            let mut multi_tab_routing = second_pr.is_none();
+                            if let Some(second) = second_pr
+                                && let Some(second_index) = this
+                                    .tabs
+                                    .iter()
+                                    .position(|tab| tab.pull_request.number == second)
+                            {
+                                this.activate_tab(second_index, window, cx);
+                                let secondary_empty = this
+                                    .submitted_summary_input
+                                    .read(cx)
+                                    .value()
+                                    .is_empty();
+                                this.activate_tab(index, window, cx);
+                                let primary_restored = this
+                                    .submitted_summary_input
+                                    .read(cx)
+                                    .value()
+                                    .contains("zero update mutation transport");
+                                multi_tab_routing = secondary_empty && primary_restored;
+                            }
+                            this.prepare_submitted_summary_confirmation(cx);
+                            let Some(NativeConfirmation::UpdateSubmittedSummary { action }) =
+                                this.tabs[index].confirmation.as_ref()
+                            else {
+                                return Err(this.status.clone());
+                            };
+                            let token = SubmittedConfirmationToken {
+                                workspace_instance: this.workspace_instance,
+                                tab_instance: this.tabs[index].instance_generation,
+                                repository_key: repository.cache_key(),
+                                pull_request: number,
+                                action: action.as_ref().clone(),
+                            };
+                            if let Some(second) = second_pr
+                                && let Some(second_index) = this
+                                    .tabs
+                                    .iter()
+                                    .position(|tab| tab.pull_request.number == second)
+                            {
+                                this.activate_tab(second_index, window, cx);
+                                let stale_cancel_rejected =
+                                    !this.cancel_submitted_summary_confirmation(&token, cx);
+                                let primary_confirmation_retained = this.tabs[index]
+                                    .confirmation
+                                    .as_ref()
+                                    .is_some_and(|confirmation| {
+                                        token.matches_values(
+                                            this.workspace_instance,
+                                            this.tabs[index].instance_generation,
+                                            &this.tabs[index].repository.cache_key(),
+                                            this.tabs[index].pull_request.number,
+                                            Some(confirmation),
+                                        )
+                                    });
+                                this.activate_tab(index, window, cx);
+                                multi_tab_routing &=
+                                    stale_cancel_rejected && primary_confirmation_retained;
+                            }
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                            Ok((token, multi_tab_routing))
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke entity unavailable: {error:#}")))
+                    })
+                    .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")));
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
+                let submitted_captured = submitted_scene.is_ok()
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join("native-submitted-summary-confirmation.png"))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let submitted_cancelled = if let Ok((token, _)) = &submitted_scene {
+                    window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else { return false };
+                                this.cancel_submitted_summary_confirmation(token, cx)
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                let multi_tab_routing = submitted_scene
+                    .as_ref()
+                    .is_ok_and(|(_, routed)| *routed);
+                let submitted_draft_retained = window
+                    .update(|_, cx| {
+                        weak.read_with(cx, |root, _| {
+                            let Root::Review(this) = root else { return false };
+                            let Some(index) = this.active_tab else { return false };
+                            this.tabs[index].confirmation.is_none()
+                                && this.tabs[index]
+                                    .editing_submitted_review
+                                    .as_ref()
+                                    .is_some_and(|draft| {
+                                        draft.body.contains("zero update mutation transport")
+                                    })
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                let changed_source_draft_retained = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return false };
+                            let Some(index) = this.active_tab else { return false };
+                            let Some(details) = this.tabs[index].details.as_mut() else {
+                                return false;
+                            };
+                            let Some(review) = details.reviews.iter_mut().find(|review| {
+                                review.coordinates.remote_id
+                                    == "SYNTHETIC_OWNED_SUBMITTED_REVIEW_NO_DISPATCH"
+                            }) else {
+                                return false;
+                            };
+                            review.body = "Synthetic source changed after editing began.".into();
+                            this.prepare_submitted_summary_confirmation(cx);
+                            this.tabs[index].confirmation.is_none()
+                                && this.tabs[index]
+                                    .editing_submitted_review
+                                    .as_ref()
+                                    .is_some_and(|draft| {
+                                        draft.body.contains("zero update mutation transport")
+                                    })
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+
                 let unchanged = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
@@ -5284,9 +5647,14 @@ impl ReviewWorkspace {
                 let passed = real_read_captured
                     && metadata_captured
                     && activity_captured
+                    && submitted_captured
+                    && submitted_cancelled
+                    && submitted_draft_retained
+                    && changed_source_draft_retained
+                    && multi_tab_routing
                     && unchanged;
                 let report = format!(
-                    "Native PR lifecycle smoke: {}\nReal provider read: cli/cli snapshot title {:?}, selected account {}, values_complete={}, capabilities_complete={}\nSynthetic metadata confirmation capture: {}\nSynthetic exact-ID discussion confirmation capture: {}\nCanonical and selected comparison identities unchanged: {}\nMutation transport: not invoked; zero live metadata/comment/review/merge writes\nWindow focus requested: false when CIBERGIT_SMOKE_BACKGROUND=1\n",
+                    "Native PR lifecycle and submitted-summary smoke: {}\nReal read-only provider preparation: cli/cli snapshot title {:?}, selected account {}, values_complete={}, capabilities_complete={}\nSynthetic metadata confirmation capture: {}\nSynthetic exact-ID discussion confirmation capture: {}\nClearly labelled synthetic owned-review summary confirmation capture: {}\nSubmitted-summary cancellation through exact native handler: {}\nPer-target typed submitted-summary draft retained after cancellation: {}\nChanged-source confirmation rejection retained typed draft: {}\nMulti-tab editor restore and stale confirmation rejection through native handlers: {}\nCanonical and selected comparison identities unchanged: {}\nMutation transport: not invoked; ZERO updatePullRequestReview and zero live metadata/comment/review/merge writes\nWindow focus requested: false when CIBERGIT_SMOKE_BACKGROUND=1\nPhysical input is not implied by an in-process scene render.\n",
                     if passed { "passed" } else { "failed" },
                     real_title,
                     viewer,
@@ -5294,12 +5662,17 @@ impl ReviewWorkspace {
                     capabilities_complete,
                     metadata_captured,
                     activity_captured,
+                    submitted_captured,
+                    submitted_cancelled,
+                    submitted_draft_retained,
+                    changed_source_draft_retained,
+                    multi_tab_routing,
                     unchanged,
                 );
                 let _ = std::fs::write(output.join("native-lifecycle-smoke.txt"), report);
                 if !passed {
                     panic!(
-                        "native lifecycle smoke failed: before={before:?}, metadata={metadata_scene:?}, activity={activity_scene:?}"
+                        "native lifecycle smoke failed: before={before:?}, metadata={metadata_scene:?}, activity={activity_scene:?}, submitted={submitted_scene:?}"
                     );
                 }
                 let _ = window.update(|_, cx| cx.quit());
@@ -6723,6 +7096,10 @@ impl ReviewWorkspace {
             if let Some(previous) = self.active_tab {
                 let body = self.discussion_input.read(cx).value().to_string();
                 self.tabs[previous].lifecycle.stage_discussion_body(body);
+                let submitted_body = self.submitted_summary_input.read(cx).value().to_string();
+                if let Some(draft) = &mut self.tabs[previous].editing_submitted_review {
+                    draft.body = submitted_body;
+                }
             }
             if let Some(previous) = self.active_tab {
                 self.capture_scroll(previous);
@@ -6754,6 +7131,15 @@ impl ReviewWorkspace {
                 .update(cx, |input, cx| input.set_disabled(disabled, cx));
             self.review_summary_input
                 .update(cx, |input, cx| input.set_disabled(disabled, cx));
+            let submitted_body = self.tabs[index]
+                .editing_submitted_review
+                .as_ref()
+                .map(|draft| draft.body.clone())
+                .unwrap_or_default();
+            self.submitted_summary_input.update(cx, |input, cx| {
+                input.set_value(submitted_body, window, cx);
+                input.set_disabled(disabled, cx);
+            });
             if let Some(form) = self.tabs[index]
                 .lifecycle
                 .metadata_form
@@ -6942,11 +7328,13 @@ impl ReviewWorkspace {
             write_in_flight: false,
             reply_thread: None,
             editing_pending_summary: false,
+            editing_submitted_review: None,
             recovery_details_expanded: false,
             lifecycle_details_expanded: false,
             lifecycle_choice_pages: [0; 3],
             lifecycle_confirmation_details: false,
             issue_comment_page: 0,
+            review_page: 0,
             local_workspace: None,
             local_visible: false,
         });
@@ -7816,14 +8204,169 @@ impl ReviewWorkspace {
         .detach();
     }
 
+    fn begin_submitted_summary_edit(
+        &mut self,
+        review: cibergit::domain::PullRequestReview,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.active_tab else { return };
+        let tab = &self.tabs[index];
+        let fresh = tab.details.as_ref().and_then(|details| {
+            details
+                .reviews
+                .iter()
+                .find(|candidate| **candidate == review)
+        });
+        let Some(fresh) = fresh.cloned() else {
+            self.status =
+                "Fresh submitted-review evidence changed; refresh Activity before editing.".into();
+            cx.notify();
+            return;
+        };
+        if let Err(reason) = submitted_review_edit_action(
+            &tab.repository,
+            tab.pull_request.number,
+            &fresh,
+            fresh.body.clone(),
+        ) {
+            self.status = format!("Submitted review edit unavailable: {reason}");
+            cx.notify();
+            return;
+        }
+        let body = fresh.body.clone();
+        self.tabs[index].editing_pending_summary = false;
+        self.tabs[index].editing_submitted_review = Some(SubmittedSummaryDraft {
+            review: fresh,
+            body: body.clone(),
+        });
+        self.submitted_summary_input.update(cx, |input, cx| {
+            input.set_value(body, window, cx);
+            input.focus(window, cx);
+        });
+        self.status = "Editing a fresh author-owned submitted review summary.".into();
+        cx.notify();
+    }
+
+    fn prepare_submitted_summary_confirmation(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status = "Another mutation is still in progress.".into();
+            return;
+        }
+        let Some(draft) = self.tabs[index].editing_submitted_review.clone() else {
+            self.status = "Choose an author-owned submitted review first.".into();
+            return;
+        };
+        let frozen_review = draft.review;
+        let current = self.tabs[index]
+            .details
+            .as_ref()
+            .and_then(|details| {
+                details
+                    .reviews
+                    .iter()
+                    .find(|candidate| **candidate == frozen_review)
+            })
+            .cloned();
+        let Some(current) = current else {
+            self.status =
+                "Fresh submitted-review evidence changed; zero writes sent. Refresh Activity."
+                    .into();
+            return;
+        };
+        let body = self.submitted_summary_input.read(cx).value().to_string();
+        if let Some(draft) = &mut self.tabs[index].editing_submitted_review {
+            draft.body = body.clone();
+        }
+        match submitted_review_edit_action(
+            &self.tabs[index].repository,
+            self.tabs[index].pull_request.number,
+            &current,
+            body,
+        ) {
+            Ok(action) => {
+                self.tabs[index].confirmation = Some(NativeConfirmation::UpdateSubmittedSummary {
+                    action: Box::new(action),
+                });
+                self.inspector_open = true;
+                self.status =
+                    "Submitted review summary frozen; explicit confirmation is required.".into();
+            }
+            Err(reason) => {
+                self.status = format!("Submitted review edit unavailable: {reason}");
+            }
+        }
+        cx.notify();
+    }
+
+    fn submitted_confirmation_index(&self, token: &SubmittedConfirmationToken) -> Option<usize> {
+        let index = self.active_tab?;
+        let tab = self.tabs.get(index)?;
+        token
+            .matches_values(
+                self.workspace_instance,
+                tab.instance_generation,
+                &tab.repository.cache_key(),
+                tab.pull_request.number,
+                tab.confirmation.as_ref(),
+            )
+            .then_some(index)
+    }
+
+    fn confirm_submitted_summary(
+        &mut self,
+        token: SubmittedConfirmationToken,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.submitted_confirmation_index(&token) else {
+            self.status =
+                "That submitted-review confirmation is no longer current; zero writes sent.".into();
+            cx.notify();
+            return;
+        };
+        if self.tabs[index].write_in_flight {
+            return;
+        }
+        self.tabs[index].confirmation = None;
+        self.dispatch_auxiliary_action(token.action, cx);
+    }
+
+    fn cancel_submitted_summary_confirmation(
+        &mut self,
+        token: &SubmittedConfirmationToken,
+        cx: &mut Context<Root>,
+    ) -> bool {
+        let Some(index) = self.submitted_confirmation_index(token) else {
+            self.status =
+                "That submitted-review confirmation is no longer current; zero writes sent.".into();
+            cx.notify();
+            return false;
+        };
+        if self.tabs[index].write_in_flight {
+            return false;
+        }
+        self.tabs[index].confirmation = None;
+        self.status =
+            "Submitted review edit cancelled; draft retained and zero writes sent.".into();
+        cx.notify();
+        true
+    }
+
     fn dispatch_auxiliary_action(&mut self, action: ReviewAuxiliaryAction, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         if self.tabs[index].write_in_flight {
             self.status = "Another mutation is still in progress.".into();
             return;
         }
+        let submitted_summary_edit = matches!(
+            &action,
+            ReviewAuxiliaryAction::UpdateSubmittedSummary { .. }
+        );
         let repository = self.tabs[index].repository.clone();
         let number = self.tabs[index].pull_request.number;
+        let tab_instance = self.tabs[index].instance_generation;
+        let workspace_instance = self.workspace_instance;
         let identity = repository.cache_key();
         let operation_id = next_attempt_id("review-auxiliary");
         let request = ReviewAuxiliaryRequest {
@@ -7840,6 +8383,10 @@ impl ReviewWorkspace {
         };
         self.tabs[index].details_generation += 1;
         self.tabs[index].write_in_flight = true;
+        if submitted_summary_edit && self.active_tab == Some(index) {
+            self.submitted_summary_input
+                .update(cx, |input, cx| input.set_disabled(true, cx));
+        }
         let journal_root = self.interaction_root.clone();
         let provider = GithubProvider::new(repository.account.clone());
         let task = cx.background_spawn(async move {
@@ -7862,17 +8409,32 @@ impl ReviewWorkspace {
             let outcome = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
+                if this.workspace_instance != workspace_instance {
+                    return;
+                }
                 let Some(index) = this.tabs.iter().position(|tab| {
-                    tab.repository.cache_key() == identity && tab.pull_request.number == number
+                    tab.repository.cache_key() == identity
+                        && tab.pull_request.number == number
+                        && tab.instance_generation == tab_instance
                 }) else {
                     return;
                 };
                 this.tabs[index].write_in_flight = false;
+                if submitted_summary_edit && this.active_tab == Some(index) {
+                    this.submitted_summary_input
+                        .update(cx, |input, cx| input.set_disabled(false, cx));
+                }
                 this.status = match outcome {
                     ProviderMutationOutcome::Acknowledged(_) => {
                         this.tabs[index].editing_pending_summary = false;
+                        this.tabs[index].editing_submitted_review = None;
                         this.tabs[index].reply_thread = None;
-                        "Review action acknowledged; refreshing authoritative activity.".into()
+                        if submitted_summary_edit {
+                            "Submitted review summary edit acknowledged exactly; refreshing authoritative activity."
+                                .into()
+                        } else {
+                            "Review action acknowledged; refreshing authoritative activity.".into()
+                        }
                     }
                     ProviderMutationOutcome::PreflightRejected { reason } => {
                         format!("Review action was not sent: {reason}")
@@ -14270,36 +14832,199 @@ impl ReviewWorkspace {
                             }),
                         );
                     }
-                    for (position, review) in details.reviews.iter().take(20).enumerate() {
+                    let review_count = details.reviews.len();
+                    let (review_page, review_pages, review_range) =
+                        bounded_page(review_count, tab.review_page, 20);
+                    if review_pages > 1 {
                         activity.push(
-                            activity_item(
-                                format!("review-{position}"),
-                                review.author.as_deref().unwrap_or("Unknown reviewer"),
-                                if review.body.is_empty() {
-                                    &review.state
-                                } else {
-                                    &review.body
-                                },
-                                review.submitted_at.as_deref().unwrap_or("Pending"),
-                                colors,
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(colors.faint)
-                                    .child(format!(
-                                        "{} · Remote ID {}",
-                                        review.state, review.coordinates.remote_id
-                                    )),
-                            ),
+                            div()
+                                .mb_3()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .when(review_page > 0, |row| {
+                                    row.child(action_link("Previous reviews", colors).on_click(
+                                        cx.listener(move |root, _, _, cx| {
+                                            if let Root::Review(this) = root
+                                                && let Some(index) = this.active_tab
+                                            {
+                                                this.tabs[index].review_page = review_page - 1;
+                                                cx.notify();
+                                            }
+                                        }),
+                                    ))
+                                })
+                                .child(div().text_xs().text_color(colors.muted).child(format!(
+                                    "Reviews {}–{} of {review_count}",
+                                    review_range.start + 1,
+                                    review_range.end
+                                )))
+                                .when(review_page + 1 < review_pages, |row| {
+                                    row.child(action_link("Next reviews", colors).on_click(
+                                        cx.listener(move |root, _, _, cx| {
+                                            if let Root::Review(this) = root
+                                                && let Some(index) = this.active_tab
+                                            {
+                                                this.tabs[index].review_page = review_page + 1;
+                                                cx.notify();
+                                            }
+                                        }),
+                                    ))
+                                }),
                         );
                     }
-                    if cached_observation.is_some() && details.reviews.len() > 20 {
-                        activity.push(div().text_color(colors.amber).child(format!(
-                            "Cached snapshot contains {} reviews; this view displays the first 20.",
-                            details.reviews.len()
-                        )));
+                    if let Some(draft) = &tab.editing_submitted_review {
+                        match details
+                            .reviews
+                            .iter()
+                            .position(|review| review.coordinates == draft.review.coordinates)
+                        {
+                            Some(position) if position / 20 != review_page => activity.push(
+                                div()
+                                    .mb_2()
+                                    .text_xs()
+                                    .text_color(colors.amber)
+                                    .child(format!(
+                                        "Submitted-review edit draft retained on review page {}.",
+                                        position / 20 + 1
+                                    )),
+                            ),
+                            None => activity.push(
+                                div()
+                                    .mb_2()
+                                    .text_xs()
+                                    .text_color(colors.amber)
+                                    .child("The edited review is absent from the fresh activity read. Your typed draft is retained; no confirmation is available."),
+                            ),
+                            _ => {}
+                        }
+                    }
+                    for (position, review) in details
+                        .reviews
+                        .iter()
+                        .enumerate()
+                        .skip(review_range.start)
+                        .take(review_range.len())
+                    {
+                        let mut card = activity_item(
+                            format!("review-{position}"),
+                            review.author.as_deref().unwrap_or("Unknown reviewer"),
+                            if review.body.is_empty() {
+                                &review.state
+                            } else {
+                                &review.body
+                            },
+                            review.submitted_at.as_deref().unwrap_or("Pending"),
+                            colors,
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(colors.faint)
+                                .child(format!(
+                                    "{} · Remote ID {}",
+                                    review.state, review.coordinates.remote_id
+                                )),
+                        );
+                        let selected_author = review.author.as_deref().is_some_and(|author| {
+                            author.eq_ignore_ascii_case(&tab.repository.account.login)
+                        });
+                        let submitted = matches!(
+                            review.state.as_str(),
+                            "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED"
+                        ) && review.submitted_at.is_some();
+                        if selected_author && submitted {
+                            let availability = if tab.details.is_none() {
+                                Err(
+                                    "Cached collaboration is read-only; refresh for current edit capability."
+                                        .to_owned(),
+                                )
+                            } else {
+                                submitted_review_edit_action(
+                                    &tab.repository,
+                                    tab.pull_request.number,
+                                    review,
+                                    review.body.clone(),
+                                )
+                            };
+                            match availability {
+                                Ok(_) => {
+                                    let root = cx.entity();
+                                    let review = review.clone();
+                                    card =
+                                        card.child(
+                                            div().mt_2().child(
+                                                action_link_with_id(
+                                                    format!(
+                                                        "edit-submitted-review-{}",
+                                                        review.coordinates.remote_id
+                                                    ),
+                                                    "Edit submitted summary…",
+                                                    colors,
+                                                )
+                                                .on_click(move |_, window, cx| {
+                                                    root.update(cx, |root, cx| {
+                                                        if let Root::Review(this) = root {
+                                                            this.begin_submitted_summary_edit(
+                                                                review.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }
+                                                    });
+                                                }),
+                                            ),
+                                        );
+                                }
+                                Err(reason) => {
+                                    card = card.child(
+                                        div()
+                                            .mt_1()
+                                            .text_xs()
+                                            .text_color(colors.amber)
+                                            .child(format!("Edit unavailable: {reason}")),
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(draft) = tab
+                            .editing_submitted_review
+                            .as_ref()
+                            .filter(|draft| draft.review.coordinates == review.coordinates)
+                        {
+                            let source_changed = draft.review != *review;
+                            card = card
+                                .when(source_changed, |card| {
+                                    card.child(
+                                        div()
+                                            .mt_2()
+                                            .text_xs()
+                                            .text_color(colors.amber)
+                                            .child("The fresh review changed after editing began. Your typed draft is retained; refresh and restart from the new source before confirmation."),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .mt_2()
+                                        .h(px(84.))
+                                        .border_1()
+                                        .border_color(colors.border)
+                                        .rounded_md()
+                                        .overflow_hidden()
+                                        .child(Textarea::new(&self.submitted_summary_input)),
+                                )
+                                .child(div().mt_2().child(
+                                    action_link("Review exact edit…", colors).on_click(
+                                        cx.listener(|root, _, _, cx| {
+                                            if let Root::Review(this) = root {
+                                                this.prepare_submitted_summary_confirmation(cx);
+                                            }
+                                        }),
+                                    ),
+                                ));
+                        }
+                        activity.push(card);
                     }
                     let placed = tab
                         .session
@@ -14653,6 +15378,96 @@ impl ReviewWorkspace {
                         .into_any_element(),
                 )
             }
+            NativeConfirmation::UpdateSubmittedSummary { action } => {
+                let ReviewAuxiliaryAction::UpdateSubmittedSummary {
+                    review,
+                    selected_author,
+                    submitted_state,
+                    submitted_commit_sha,
+                    expected_body,
+                    body,
+                } = action.as_ref()
+                else {
+                    return None;
+                };
+                let token = SubmittedConfirmationToken {
+                    workspace_instance: self.workspace_instance,
+                    tab_instance: tab.instance_generation,
+                    repository_key: tab.repository.cache_key(),
+                    pull_request: tab.pull_request.number,
+                    action: action.as_ref().clone(),
+                };
+                Some(
+                    div()
+                        .mb_5()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.accent)
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Edit submitted review summary?"),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child(format!(
+                                    "{} · #{} · review {}",
+                                    tab.repository.full_name(),
+                                    tab.pull_request.number,
+                                    review.remote_id
+                                )),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .child(format!(
+                                    "Author {selected_author} · state {submitted_state} · reviewed commit {submitted_commit_sha}"
+                                )),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.faint)
+                                .child("Frozen previous body (exact quoted text)"),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .font_family(CODE_FONT)
+                                .child(format!("{expected_body:?}")),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.faint)
+                                .child("Requested new body (exact quoted text)"),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .font_family(CODE_FONT)
+                                .child(format!("{body:?}")),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.amber)
+                                .child("GitHub rechecks this exact review before saving, but another edit could happen between that check and the save. The review may refer to an older commit; this action does not change the displayed comparison."),
+                        )
+                        .child(self.submitted_summary_confirmation_controls(token, colors, cx))
+                        .into_any_element(),
+                )
+            }
             NativeConfirmation::Merge {
                 preparation,
                 method,
@@ -14892,6 +15707,38 @@ impl ReviewWorkspace {
                         this.tabs[index].confirmation = None;
                         this.status = "Confirmation cancelled; zero writes sent.".into();
                         cx.notify();
+                    }
+                })),
+            )
+    }
+
+    fn submitted_summary_confirmation_controls(
+        &self,
+        token: SubmittedConfirmationToken,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> Div {
+        let confirm_token = token.clone();
+        let cancel_token = token;
+        div()
+            .mt_3()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_3()
+            .child(
+                action_link("Confirm exact edit", colors).on_click(cx.listener(
+                    move |root, _, _, cx| {
+                        if let Root::Review(this) = root {
+                            this.confirm_submitted_summary(confirm_token.clone(), cx);
+                        }
+                    },
+                )),
+            )
+            .child(
+                action_link("Cancel", colors).on_click(cx.listener(move |root, _, _, cx| {
+                    if let Root::Review(this) = root {
+                        this.cancel_submitted_summary_confirmation(&cancel_token, cx);
                     }
                 })),
             )
@@ -15290,6 +16137,18 @@ fn nonempty_option(value: String) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.trim().to_owned())
 }
 
+fn bounded_page(
+    total: usize,
+    requested_page: usize,
+    page_size: usize,
+) -> (usize, usize, std::ops::Range<usize>) {
+    let pages = total.div_ceil(page_size).max(1);
+    let page = requested_page.min(pages - 1);
+    let start = page.saturating_mul(page_size).min(total);
+    let end = start.saturating_add(page_size).min(total);
+    (page, pages, start..end)
+}
+
 fn journal_identity(request: &JournalRequest) -> (&str, &str) {
     match request {
         JournalRequest::Auxiliary(request) => (&request.operation_id, &request.attempt_id),
@@ -15351,6 +16210,7 @@ fn journal_operation_summary(operation: &JournalOperation) -> String {
     let action = match &operation.request {
         JournalRequest::Auxiliary(request) => match &request.action {
             ReviewAuxiliaryAction::UpdatePendingSummary { .. } => "Update pending summary",
+            ReviewAuxiliaryAction::UpdateSubmittedSummary { .. } => "Edit submitted summary",
             ReviewAuxiliaryAction::DeletePendingComment { .. } => "Delete pending comment",
             ReviewAuxiliaryAction::CancelPendingReview { .. } => "Cancel pending review",
             ReviewAuxiliaryAction::Reply { .. } => "Reply to review thread",
@@ -15417,6 +16277,22 @@ fn journal_operation_description(operation: &JournalOperation) -> String {
             ReviewAuxiliaryAction::UpdatePendingSummary { review, body } => format!(
                 "pending-summary review {} · body {:?}",
                 review.remote_id, body
+            ),
+            ReviewAuxiliaryAction::UpdateSubmittedSummary {
+                review,
+                selected_author,
+                submitted_state,
+                submitted_commit_sha,
+                expected_body,
+                body,
+            } => format!(
+                "submitted-summary review {} · author {} · state {} · commit {} · old body {:?} · new body {:?}",
+                review.remote_id,
+                selected_author,
+                submitted_state,
+                submitted_commit_sha,
+                expected_body,
+                body
             ),
             ReviewAuxiliaryAction::DeletePendingComment { review, comment } => format!(
                 "delete-pending-comment review {} · comment {}",
@@ -15498,6 +16374,33 @@ fn observe_auxiliary(
                     "Authoritative pending-review body matched the exact request payload.".into(),
                 )
             })
+        }
+        ReviewAuxiliaryAction::UpdateSubmittedSummary {
+            review,
+            selected_author,
+            submitted_state,
+            submitted_commit_sha,
+            body,
+            ..
+        } => {
+            let observed = details.reviews.iter().find(|candidate| {
+                candidate.coordinates == *review
+                    && candidate.body == *body
+                    && candidate.state == *submitted_state
+                    && candidate.submitted_at.is_some()
+                    && candidate.commit_sha.as_deref() == Some(submitted_commit_sha.as_str())
+                    && candidate
+                        .author
+                        .as_deref()
+                        .is_some_and(|author| author.eq_ignore_ascii_case(selected_author))
+            })?;
+            let _ = observed;
+            Some((
+                true,
+                true,
+                "Fresh exact review identity, parent coordinates, body, submitted state, author, and commit match the frozen requested final state. This establishes current convergence, not local causation."
+                    .into(),
+            ))
         }
         ReviewAuxiliaryAction::DeletePendingComment { review, comment } => {
             let _observed = pending.filter(|snapshot| {
@@ -16857,12 +17760,176 @@ mod layout_tests {
         COLLAPSED_PANEL_WIDTH, CollaborationReadToken, DEFAULT_SIDEBAR_WIDTH, DiffLine,
         DiffLineKind, DiffMode, DiffRow, EXCEPTIONAL_LINE_CHUNK_BYTES, JournalOperation,
         JournalRequest, JournalStatus, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
-        MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, PanelKind, PanelLayout, available_diff_width_for,
+        MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
+        SubmittedConfirmationToken, available_diff_width_for, bounded_page,
         collaboration_completion_matches, diff_content_width, display_columns,
         journal_operation_description, journal_operation_summary, line_text_chunks,
-        media_free_markdown, resolved_panel_widths_for,
+        media_free_markdown, observe_auxiliary, resolved_panel_widths_for,
+        submitted_review_edit_action,
     };
-    use cibergit::domain::{ProviderCoordinates, ReviewAuxiliaryAction, ReviewAuxiliaryRequest};
+    use cibergit::domain::{
+        Account, MergeEligibility, ProviderCoordinates, PullRequestDetails, PullRequestReview,
+        Repository, ReviewAuxiliaryAction, ReviewAuxiliaryRequest, SubmittedReviewEditCapability,
+    };
+
+    fn submitted_review_fixture() -> (Repository, PullRequestReview) {
+        let repository = Repository {
+            host: "github.com".into(),
+            owner: "octo".into(),
+            name: "repo".into(),
+            account: Account {
+                host: "github.com".into(),
+                login: "alice".into(),
+            },
+            local_path: None,
+        };
+        let review = PullRequestReview {
+            coordinates: ProviderCoordinates {
+                provider: "github".into(),
+                host: "github.com".into(),
+                owner: "octo".into(),
+                repository: "repo".into(),
+                pull_request: 7,
+                remote_id: "REVIEW_owned".into(),
+            },
+            author: Some("alice".into()),
+            body: "before".into(),
+            state: "COMMENTED".into(),
+            submitted_at: Some("2026-09-13T12:00:00Z".into()),
+            commit_sha: Some("1".repeat(40)),
+            edit_summary_capability: Some(SubmittedReviewEditCapability {
+                viewer_did_author: true,
+                viewer_can_update: true,
+                viewer_cannot_update_reasons: Vec::new(),
+            }),
+            url: String::new(),
+        };
+        (repository, review)
+    }
+
+    fn details_with_reviews(reviews: Vec<PullRequestReview>) -> PullRequestDetails {
+        PullRequestDetails {
+            number: 7,
+            body: String::new(),
+            requested_reviewers: Vec::new(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+            merge_eligibility: MergeEligibility {
+                state: "OPEN".into(),
+                draft: false,
+                mergeable: "UNKNOWN".into(),
+                merge_state_status: "UNKNOWN".into(),
+                review_status: "UNKNOWN".into(),
+                check_status: "UNKNOWN".into(),
+                maintainer_can_modify: false,
+                can_rebase: false,
+                can_update_branch: false,
+                auto_merge_enabled: false,
+                in_merge_queue: false,
+            },
+            issue_comments: Vec::new(),
+            reviews,
+            review_threads: Vec::new(),
+            checks: Vec::new(),
+            activity_complete: true,
+            checks_complete: true,
+            notice: None,
+        }
+    }
+
+    #[test]
+    fn submitted_edit_freezes_fresh_capability_and_old_cached_data_fails_closed() {
+        let (repository, review) = submitted_review_fixture();
+        let action = submitted_review_edit_action(&repository, 7, &review, String::new()).unwrap();
+        let ReviewAuxiliaryAction::UpdateSubmittedSummary {
+            review: target,
+            selected_author,
+            submitted_state,
+            submitted_commit_sha,
+            expected_body,
+            body,
+        } = action
+        else {
+            panic!("submitted edit must use its distinct action")
+        };
+        assert_eq!(target, review.coordinates);
+        assert_eq!(selected_author, "alice");
+        assert_eq!(submitted_state, "COMMENTED");
+        assert_eq!(submitted_commit_sha, "1".repeat(40));
+        assert_eq!(expected_body, "before");
+        assert!(body.is_empty(), "upstream-compatible empty body is allowed");
+
+        let mut cached_json = serde_json::to_value(&review).unwrap();
+        cached_json
+            .as_object_mut()
+            .unwrap()
+            .remove("edit_summary_capability");
+        let cached: PullRequestReview = serde_json::from_value(cached_json).unwrap();
+        assert!(cached.edit_summary_capability.is_none());
+        assert!(
+            submitted_review_edit_action(&repository, 7, &cached, "after".into())
+                .unwrap_err()
+                .contains("complete fresh")
+        );
+    }
+
+    #[test]
+    fn submitted_confirmation_token_rejects_tab_workspace_account_and_payload_changes() {
+        let (repository, review) = submitted_review_fixture();
+        let action = submitted_review_edit_action(&repository, 7, &review, "after".into()).unwrap();
+        let confirmation = NativeConfirmation::UpdateSubmittedSummary {
+            action: Box::new(action.clone()),
+        };
+        let token = SubmittedConfirmationToken {
+            workspace_instance: 10,
+            tab_instance: 20,
+            repository_key: repository.cache_key(),
+            pull_request: 7,
+            action: action.clone(),
+        };
+        assert!(token.matches_values(10, 20, &repository.cache_key(), 7, Some(&confirmation)));
+        assert!(!token.matches_values(11, 20, &repository.cache_key(), 7, Some(&confirmation)));
+        assert!(!token.matches_values(10, 21, &repository.cache_key(), 7, Some(&confirmation)));
+        assert!(!token.matches_values(10, 20, "other-account", 7, Some(&confirmation)));
+        assert!(!token.matches_values(10, 20, &repository.cache_key(), 8, Some(&confirmation)));
+        let changed = NativeConfirmation::UpdateSubmittedSummary {
+            action: Box::new(
+                submitted_review_edit_action(&repository, 7, &review, "changed".into()).unwrap(),
+            ),
+        };
+        assert!(!token.matches_values(10, 20, &repository.cache_key(), 7, Some(&changed)));
+        assert!(!token.matches_values(10, 20, &repository.cache_key(), 7, None));
+    }
+
+    #[test]
+    fn submitted_edit_observation_requires_the_full_frozen_final_tuple() {
+        let (repository, mut review) = submitted_review_fixture();
+        let action = submitted_review_edit_action(&repository, 7, &review, "after".into()).unwrap();
+        review.body = "after".into();
+        let exact = observe_auxiliary(&action, &details_with_reviews(vec![review.clone()]), None)
+            .expect("exact final state should converge");
+        assert!(exact.0 && exact.1);
+        assert!(exact.2.contains("not local causation"));
+
+        let mut wrong_author = review.clone();
+        wrong_author.author = Some("bob".into());
+        assert!(
+            observe_auxiliary(&action, &details_with_reviews(vec![wrong_author]), None).is_none()
+        );
+        let mut wrong_parent = review;
+        wrong_parent.coordinates.repository = "other".into();
+        assert!(
+            observe_auxiliary(&action, &details_with_reviews(vec![wrong_parent]), None).is_none()
+        );
+    }
+
+    #[test]
+    fn submitted_review_paging_reaches_eligible_reviews_after_the_first_twenty() {
+        assert_eq!(bounded_page(45, 0, 20), (0, 3, 0..20));
+        assert_eq!(bounded_page(45, 1, 20), (1, 3, 20..40));
+        assert_eq!(bounded_page(45, 2, 20), (2, 3, 40..45));
+        assert_eq!(bounded_page(45, usize::MAX, 20), (2, 3, 40..45));
+    }
 
     #[test]
     fn slow_reads_finish_despite_repeated_periodic_polls() {
