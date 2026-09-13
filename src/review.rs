@@ -207,6 +207,44 @@ impl ReviewSession {
     pub fn is_viewed(&self, path: &str) -> bool {
         self.viewed.contains_key(path)
     }
+    /// Install one lazily loaded file without changing the published snapshot or
+    /// navigation. A load for a replaced snapshot, or for different metadata, is
+    /// rejected instead of being applied to whichever file is currently selected.
+    pub fn install_file_patch(
+        &mut self,
+        expected_revision: &Revision,
+        file: ChangedFile,
+    ) -> Result<()> {
+        ensure!(
+            expected_revision == &self.comparison.revision,
+            "file patch does not match the displayed revision"
+        );
+        let key = file_key(&file);
+        let index = self
+            .comparison
+            .files
+            .iter()
+            .position(|existing| file_key(existing) == key)
+            .context("file patch does not match a file in the displayed comparison")?;
+        let existing = &self.comparison.files[index];
+        ensure!(
+            existing.path == file.path
+                && existing.previous_path == file.previous_path
+                && existing.raw_path == file.raw_path
+                && existing.raw_previous_path == file.raw_previous_path
+                && existing.status == file.status,
+            "file patch identity differs from the displayed file"
+        );
+        if self
+            .viewed
+            .get(&key)
+            .is_some_and(|viewed| viewed.fingerprint != file_fingerprint(&file))
+        {
+            self.viewed.remove(&key);
+        }
+        self.comparison.files[index] = file;
+        Ok(())
+    }
     /// Reject an outdated background load if another revision was observed meanwhile.
     pub fn advance(&mut self, comparison: Comparison) -> Result<()> {
         ensure!(
@@ -737,10 +775,7 @@ fn parse_raw(raw: &[u8]) -> Result<Vec<RawFile>> {
     Ok(files)
 }
 
-/// Enumeration and statistics use NUL records. Media, binary files and gitlinks
-/// stay listed without content. Unsupported encodings are explicit, never lossy.
-/// Missing objects fail instead of falling through to moving branches/worktree data.
-pub fn local_comparison(path: &Path, revision: &Revision) -> Result<Comparison> {
+fn enumerate_local_files(path: &Path, revision: &Revision) -> Result<Vec<RawFile>> {
     validate_commit(path, &revision.base_sha)?;
     validate_commit(path, &revision.head_sha)?;
     let common = [
@@ -764,174 +799,222 @@ pub fn local_comparison(path: &Path, revision: &Revision) -> Result<Comparison> 
         &revision.head_sha,
         "--",
     ]);
-    let files = parse_raw(&git(path, &args)?)?;
+    parse_raw(&git(path, &args)?)
+}
+
+fn changed_file_metadata(file: &RawFile) -> ChangedFile {
+    let status = match file.status.as_bytes()[0] {
+        b'A' => "added",
+        b'D' => "removed",
+        b'M' => "modified",
+        b'R' => "renamed",
+        b'C' => "copied",
+        b'T' => "changed",
+        _ => "unsupported",
+    };
+    ChangedFile {
+        path: file.path.clone(),
+        raw_path: file.raw_path.clone(),
+        raw_previous_path: file.raw_previous_path.clone(),
+        previous_path: file.previous_path.clone(),
+        status: status.into(),
+        additions: 0,
+        deletions: 0,
+        patch: None,
+        patch_complete: false,
+    }
+}
+
+struct LoadedLocalFile {
+    file: ChangedFile,
+    complete: bool,
+}
+
+fn is_regular_mode(mode: &str) -> bool {
+    mode == "000000" || mode.starts_with("100")
+}
+
+/// Read statistics and a patch for exactly one already-enumerated raw record.
+/// A metadata-only result for media, binary or non-regular files is intentional.
+fn hydrate_local_file(path: &Path, revision: &Revision, raw: &RawFile) -> Result<LoadedLocalFile> {
+    let mut changed = changed_file_metadata(raw);
+    let metadata_only = is_media_path(&String::from_utf8_lossy(&raw.path_bytes))
+        || raw.previous_path.as_deref().is_some_and(is_media_path)
+        || !is_regular_mode(&raw.old_mode)
+        || !is_regular_mode(&raw.new_mode);
+    if metadata_only {
+        return Ok(LoadedLocalFile {
+            file: changed,
+            complete: true,
+        });
+    }
+
+    let mut oversized = false;
+    for oid in [&raw.old_oid, &raw.new_oid] {
+        if oid.bytes().all(|c| c == b'0') {
+            continue;
+        }
+        match git(path, &["cat-file", "-s", oid]) {
+            Ok(size) => {
+                let size: u64 = std::str::from_utf8(&size)?
+                    .trim()
+                    .parse()
+                    .context("Invalid Git object size")?;
+                oversized |= size > MAX_TEXT_BLOB_BYTES;
+            }
+            Err(error) if error.is::<GitReadBound>() => oversized = true,
+            Err(error) => return Err(error),
+        }
+    }
+    if oversized {
+        return Ok(LoadedLocalFile {
+            file: changed,
+            complete: false,
+        });
+    }
+
+    // Two existing blobs provide an unambiguous per-file diff even when a
+    // rename source was reused by another changed file in this comparison.
+    let both_exist =
+        !raw.old_oid.bytes().all(|c| c == b'0') && !raw.new_oid.bytes().all(|c| c == b'0');
+    let mut literal_bytes = b":(literal)".to_vec();
+    literal_bytes.extend(&raw.path_bytes);
+    let literal = OsString::from_vec(literal_bytes);
+    let endpoints: Vec<OsString> = if both_exist {
+        vec![
+            raw.old_oid.as_str().into(),
+            raw.new_oid.as_str().into(),
+            "--".into(),
+        ]
+    } else {
+        vec![
+            revision.base_sha.as_str().into(),
+            revision.head_sha.as_str().into(),
+            "--".into(),
+            literal,
+        ]
+    };
+    let common = [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--no-relative",
+        "--no-renames",
+        "--ignore-submodules=none",
+        "--diff-algorithm=myers",
+        "--no-indent-heuristic",
+        "--unified=3",
+        "--inter-hunk-context=0",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ];
+    // Numstat detects binary data without capturing any blob/media bytes.
+    let mut diff_args: Vec<OsString> = common.into_iter().map(OsString::from).collect();
+    diff_args.push("--numstat".into());
+    diff_args.push("-z".into());
+    diff_args.extend(endpoints.iter().cloned());
+    let stats = match git(path, &diff_args) {
+        Ok(stats) => stats,
+        Err(error) if error.is::<GitReadBound>() => {
+            return Ok(LoadedLocalFile {
+                file: changed,
+                complete: false,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let stats = stats.split(|b| *b == 0).next().unwrap_or_default();
+    let mut counts = stats.splitn(3, |b| *b == b'\t');
+    let added = counts.next().unwrap_or_default();
+    let removed = counts.next().unwrap_or_default();
+    if added == b"-" || removed == b"-" {
+        return Ok(LoadedLocalFile {
+            file: changed,
+            complete: true,
+        });
+    }
+    if !stats.is_empty() {
+        changed.additions = std::str::from_utf8(added)?
+            .parse()
+            .context("Invalid Git additions")?;
+        changed.deletions = std::str::from_utf8(removed)?
+            .parse()
+            .context("Invalid Git deletions")?;
+    }
+
+    diff_args.truncate(diff_args.len() - endpoints.len() - 2);
+    diff_args.push("--patch".into());
+    diff_args.extend(endpoints);
+    let patch = match git_bounded(path, &diff_args, MAX_PATCH_BYTES) {
+        Ok(patch) => patch,
+        Err(error) if error.is::<GitReadBound>() => {
+            return Ok(LoadedLocalFile {
+                file: changed,
+                complete: false,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    match String::from_utf8(patch) {
+        Ok(mut patch) => {
+            // Blob diffs lack file mode metadata. Preserve it for viewed fingerprints.
+            if both_exist && raw.old_mode != raw.new_mode {
+                patch = format!(
+                    "old mode {}\nnew mode {}\n{patch}",
+                    raw.old_mode, raw.new_mode
+                );
+            }
+            changed.patch_complete = parse_patch(&patch).is_complete();
+            let complete = changed.patch_complete;
+            changed.patch = Some(patch);
+            Ok(LoadedLocalFile {
+                file: changed,
+                complete,
+            })
+        }
+        Err(_) => Ok(LoadedLocalFile {
+            file: changed,
+            complete: false,
+        }),
+    }
+}
+
+/// Enumerate direct-tree metadata without reading text statistics or patches.
+/// Zero counts in this snapshot are placeholders; the notice makes that explicit.
+pub fn local_inventory(path: &Path, revision: &Revision) -> Result<Comparison> {
+    let files = enumerate_local_files(path, revision)?;
+    Ok(Comparison {
+        revision: revision.clone(),
+        files: files.iter().map(changed_file_metadata).collect(),
+        complete: true,
+        notice: Some("All changed files are listed. Text patches and diff statistics are not loaded; select a file to load its diff.".into()),
+    })
+}
+
+/// Enumeration and statistics use NUL records. Media, binary files and gitlinks
+/// stay listed without content. Unsupported encodings are explicit, never lossy.
+/// Missing objects fail instead of falling through to moving branches/worktree data.
+pub fn local_comparison(path: &Path, revision: &Revision) -> Result<Comparison> {
+    let files = enumerate_local_files(path, revision)?;
     let mut comparison = Comparison {
         revision: revision.clone(),
-        files: Vec::new(),
+        files: Vec::with_capacity(files.len()),
         complete: true,
         notice: None,
     };
-    for file in files {
-        let status = match file.status.as_bytes()[0] {
-            b'A' => "added",
-            b'D' => "removed",
-            b'M' => "modified",
-            b'R' => "renamed",
-            b'C' => "copied",
-            b'T' => "changed",
-            _ => "unsupported",
-        }
-        .to_owned();
-        let mut changed = ChangedFile {
-            path: file.path.clone(),
-            raw_path: file.raw_path.clone(),
-            raw_previous_path: file.raw_previous_path.clone(),
-            previous_path: file.previous_path.clone(),
-            status,
-            additions: 0,
-            deletions: 0,
-            patch: None,
-            patch_complete: false,
-        };
-        let is_regular = |mode: &str| mode == "000000" || mode.starts_with("100");
-        if is_media_path(&String::from_utf8_lossy(&file.path_bytes))
-            || file.previous_path.as_deref().is_some_and(is_media_path)
-            || !is_regular(&file.old_mode)
-            || !is_regular(&file.new_mode)
-        {
-            comparison.files.push(changed);
-            continue;
-        }
-        let mut oversized = false;
-        for oid in [&file.old_oid, &file.new_oid] {
-            if oid.bytes().all(|c| c == b'0') {
-                continue;
-            }
-            match git(path, &["cat-file", "-s", oid]) {
-                Ok(size) => {
-                    let size: u64 = std::str::from_utf8(&size)?
-                        .trim()
-                        .parse()
-                        .context("Invalid Git object size")?;
-                    oversized |= size > MAX_TEXT_BLOB_BYTES;
-                }
-                Err(error) if error.is::<GitReadBound>() => oversized = true,
-                Err(error) => return Err(error),
-            }
-        }
-        if oversized {
-            comparison.complete = false;
-            comparison.files.push(changed);
-            continue;
-        }
-        // Two existing blobs provide an unambiguous per-file diff even when a
-        // rename source was reused by another changed file in this comparison.
-        let both_exist =
-            !file.old_oid.bytes().all(|c| c == b'0') && !file.new_oid.bytes().all(|c| c == b'0');
-        let mut literal_bytes = b":(literal)".to_vec();
-        literal_bytes.extend(&file.path_bytes);
-        let literal = OsString::from_vec(literal_bytes);
-        let endpoints: Vec<OsString> = if both_exist {
-            vec![
-                file.old_oid.as_str().into(),
-                file.new_oid.as_str().into(),
-                "--".into(),
-            ]
-        } else {
-            vec![
-                revision.base_sha.as_str().into(),
-                revision.head_sha.as_str().into(),
-                "--".into(),
-                literal,
-            ]
-        };
-        let mut diff_args = vec![
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "--no-relative",
-            "--no-renames",
-            "--ignore-submodules=none",
-            "--diff-algorithm=myers",
-            "--no-indent-heuristic",
-            "--unified=3",
-            "--inter-hunk-context=0",
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-        ];
-        // Numstat detects binary data without capturing any blob/media bytes.
-        let mut diff_args: Vec<OsString> = diff_args.drain(..).map(OsString::from).collect();
-        diff_args.push("--numstat".into());
-        diff_args.push("-z".into());
-        diff_args.extend(endpoints.iter().cloned());
-        let stats = match git(path, &diff_args) {
-            Ok(stats) => stats,
-            Err(error) if error.is::<GitReadBound>() => {
-                comparison.complete = false;
-                comparison.files.push(changed);
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        let stats = stats.split(|b| *b == 0).next().unwrap_or_default();
-        let mut counts = stats.splitn(3, |b| *b == b'\t');
-        let added = counts.next().unwrap_or_default();
-        let removed = counts.next().unwrap_or_default();
-        if added == b"-" || removed == b"-" {
-            comparison.files.push(changed);
-            continue;
-        }
-        if !stats.is_empty() {
-            changed.additions = std::str::from_utf8(added)?
-                .parse()
-                .context("Invalid Git additions")?;
-            changed.deletions = std::str::from_utf8(removed)?
-                .parse()
-                .context("Invalid Git deletions")?;
-        }
-        diff_args.truncate(diff_args.len() - endpoints.len() - 2);
-        diff_args.push("--patch".into());
-        diff_args.extend(endpoints.iter().cloned());
-        let patch = match git_bounded(path, &diff_args, MAX_PATCH_BYTES) {
-            Ok(patch) => patch,
-            Err(error) if error.is::<GitReadBound>() => {
-                comparison.complete = false;
-                comparison.files.push(changed);
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        match String::from_utf8(patch) {
-            Ok(mut patch) => {
-                // Blob diffs lack file mode metadata. Preserve it for viewed fingerprints.
-                if both_exist && file.old_mode != file.new_mode {
-                    patch = format!(
-                        "old mode {}\nnew mode {}\n{patch}",
-                        file.old_mode, file.new_mode
-                    );
-                }
-                changed.patch_complete = parse_patch(&patch).is_complete();
-                if !changed.patch_complete {
-                    comparison.complete = false;
-                }
-                changed.patch = Some(patch);
-            }
-            Err(_) => {
-                comparison.complete = false;
-            }
-        }
-        comparison.files.push(changed);
+    for raw in &files {
+        let loaded = hydrate_local_file(path, revision, raw)?;
+        comparison.complete &= loaded.complete;
+        comparison.files.push(loaded.file);
     }
-    if comparison.files.iter().any(|f| !f.patch_complete) {
+    if comparison.files.iter().any(|file| !file.patch_complete) {
         comparison.notice = Some("All changed files are listed. Text patches are unavailable for media, binary, non-regular files, unsupported encodings, size/time limits or incomplete diffs.".into());
     }
     Ok(comparison)
 }
 
-/// Full-PR semantics match a three-dot comparison: effective merge-base to head.
-/// The selected published base/head identity remains the caller's pinned revision.
-pub fn local_pr_comparison(path: &Path, revision: &Revision) -> Result<Comparison> {
+fn local_pr_effective_revision(path: &Path, revision: &Revision) -> Result<Revision> {
     validate_commit(path, &revision.base_sha)?;
     validate_commit(path, &revision.head_sha)?;
     let bases = git(
@@ -950,13 +1033,14 @@ pub fn local_pr_comparison(path: &Path, revision: &Revision) -> Result<Compariso
     );
     let effective_base = bases[0];
     validate_object_id(effective_base)?;
-    let mut comparison = local_comparison(
-        path,
-        &Revision {
-            base_sha: effective_base.into(),
-            head_sha: revision.head_sha.clone(),
-        },
-    )?;
+    Ok(Revision {
+        base_sha: effective_base.into(),
+        head_sha: revision.head_sha.clone(),
+    })
+}
+
+fn publish_pr_revision(mut comparison: Comparison, revision: &Revision) -> Comparison {
+    let effective_base = comparison.revision.base_sha.clone();
     comparison.revision = revision.clone();
     if effective_base != revision.base_sha {
         let notice = format!("Full pull request diff uses effective merge-base {effective_base}.");
@@ -965,7 +1049,48 @@ pub fn local_pr_comparison(path: &Path, revision: &Revision) -> Result<Compariso
             None => notice,
         });
     }
-    Ok(comparison)
+    comparison
+}
+
+/// Full-PR metadata inventory using the effective merge-base to head, while
+/// preserving the caller's selected base/head identity in the published snapshot.
+pub fn local_pr_inventory(path: &Path, revision: &Revision) -> Result<Comparison> {
+    let effective = local_pr_effective_revision(path, revision)?;
+    Ok(publish_pr_revision(
+        local_inventory(path, &effective)?,
+        revision,
+    ))
+}
+
+/// Full-PR semantics match a three-dot comparison: effective merge-base to head.
+/// The selected published base/head identity remains the caller's pinned revision.
+pub fn local_pr_comparison(path: &Path, revision: &Revision) -> Result<Comparison> {
+    let effective = local_pr_effective_revision(path, revision)?;
+    Ok(publish_pr_revision(
+        local_comparison(path, &effective)?,
+        revision,
+    ))
+}
+
+/// Load only the selected file from the caller's pinned revision. The raw file key
+/// is matched against NUL-delimited Git metadata; it is never used as a path.
+pub fn load_local_file(
+    path: &Path,
+    revision: &Revision,
+    requested_file_key: &str,
+    full_pr: bool,
+) -> Result<ChangedFile> {
+    let effective = if full_pr {
+        local_pr_effective_revision(path, revision)?
+    } else {
+        revision.clone()
+    };
+    let files = enumerate_local_files(path, &effective)?;
+    let raw = files
+        .iter()
+        .find(|raw| file_key(&changed_file_metadata(raw)) == requested_file_key)
+        .context("Selected file is not present in the requested comparison")?;
+    Ok(hydrate_local_file(path, &effective, raw)?.file)
 }
 
 /// Extension exclusion is deliberately conservative, including text-based images.
