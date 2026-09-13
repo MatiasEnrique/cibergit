@@ -6,6 +6,7 @@ bundle=target/package/cibergit.app
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp target/aarch64-apple-darwin/debug/cibergit "$bundle/Contents/MacOS/cibergit"
 cp LICENSE THIRD_PARTY_NOTICES.md "$bundle/Contents/Resources/"
+cp assets/fonts/IBM-Plex-LICENSE.txt "$bundle/Contents/Resources/"
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

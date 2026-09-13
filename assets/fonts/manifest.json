@@ -1,0 +1,30 @@
+{
+  "repository": "https://github.com/IBM/plex",
+  "revision": "bf260093582f04622aacc1e9f9ca604d7ccd0c42",
+  "files": [
+    {
+      "path": "IBMPlexSans-Regular.ttf",
+      "source": "https://raw.githubusercontent.com/IBM/plex/bf260093582f04622aacc1e9f9ca604d7ccd0c42/packages/plex-sans/fonts/complete/ttf/IBMPlexSans-Regular.ttf",
+      "size": 200500,
+      "sha256": "975dcda37d80f038dcd143c22e33ca2d97a0cc5a929aace1c749153b0fe1afa5"
+    },
+    {
+      "path": "IBMPlexSans-Medium.ttf",
+      "source": "https://raw.githubusercontent.com/IBM/plex/bf260093582f04622aacc1e9f9ca604d7ccd0c42/packages/plex-sans/fonts/complete/ttf/IBMPlexSans-Medium.ttf",
+      "size": 202460,
+      "sha256": "331c8639d7598b2cde62a911a71db195e30cb655cd6bdf2e324a7e984955f907"
+    },
+    {
+      "path": "IBMPlexSans-SemiBold.ttf",
+      "source": "https://raw.githubusercontent.com/IBM/plex/bf260093582f04622aacc1e9f9ca604d7ccd0c42/packages/plex-sans/fonts/complete/ttf/IBMPlexSans-SemiBold.ttf",
+      "size": 202632,
+      "sha256": "a20caf8286023a6a7a85e40b1d2a4ae9fc3e3b1f9eda8f4c542dd4986af67bb1"
+    },
+    {
+      "path": "IBM-Plex-LICENSE.txt",
+      "source": "https://raw.githubusercontent.com/IBM/plex/bf260093582f04622aacc1e9f9ca604d7ccd0c42/LICENSE.txt",
+      "size": 4456,
+      "sha256": "7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da"
+    }
+  ]
+}
