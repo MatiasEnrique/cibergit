@@ -390,6 +390,18 @@ pub struct DestinationBranchObservation {
     pub oid: Option<String>,
 }
 
+/// Read-only observation of a destination recovered from a durable operation
+/// record. The effective URL remains private; the frozen configuration
+/// fingerprint proves that the named remote still resolves to the exact bytes
+/// accepted before dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrozenDestinationBranchObservation {
+    pub remote: String,
+    pub repository: GitRepositoryIdentity,
+    pub branch: String,
+    pub oid: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MutationAction {
     Stage,
@@ -1008,6 +1020,91 @@ impl LocalGit {
         let oid = self.observe_branch_at_repository(&destination.effective_push_url, branch)?;
         Ok(DestinationBranchObservation {
             destination: destination.clone(),
+            branch: branch.to_owned(),
+            oid,
+        })
+    }
+
+    /// Re-observe an exact effective push destination from the safe fields in
+    /// a durable attempt. This never recreates or exposes the effective URL and
+    /// never mutates Git configuration or refs.
+    pub fn observe_frozen_push_destination_branch(
+        &self,
+        remote: &str,
+        repository: &GitRepositoryIdentity,
+        configuration_fingerprint: &str,
+        branch: &str,
+    ) -> Result<FrozenDestinationBranchObservation> {
+        self.validate_remote(remote)?;
+        self.validate_branch(branch)?;
+        if configuration_fingerprint.len() != 64
+            || !configuration_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(LocalGitError::InvalidInput(
+                "invalid frozen push configuration fingerprint",
+            ));
+        }
+        let fetch = self.run(
+            "read frozen effective fetch destinations",
+            vec![
+                "remote".into(),
+                "get-url".into(),
+                "--all".into(),
+                remote.into(),
+            ],
+            None,
+            false,
+            &[0],
+        )?;
+        let push = self.run(
+            "read frozen effective push destinations",
+            vec![
+                "remote".into(),
+                "get-url".into(),
+                "--push".into(),
+                "--all".into(),
+                remote.into(),
+            ],
+            None,
+            false,
+            &[0],
+        )?;
+        let push_urls = bounded_lines(&push, "invalid frozen effective push destination")?;
+        if push_urls.len() != 1 {
+            return Err(LocalGitError::StalePushDestination);
+        }
+        match parse_git_destination(push_urls[0], &self.root)
+            .map_err(|_| LocalGitError::UnsafePushDestination)?
+        {
+            ParsedGitDestination::Network(current)
+                if !current.host.eq_ignore_ascii_case(&repository.host)
+                    || !current.owner.eq_ignore_ascii_case(&repository.owner)
+                    || !current.name.eq_ignore_ascii_case(&repository.name) =>
+            {
+                return Err(LocalGitError::StalePushDestination);
+            }
+            ParsedGitDestination::Network(_) | ParsedGitDestination::Local(_) => {}
+        }
+        let mut hash = Sha256::new();
+        hash.update(remote.as_bytes());
+        hash.update([0]);
+        hash.update(&fetch);
+        hash.update([0]);
+        hash.update(&push);
+        let current_fingerprint = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if !current_fingerprint.eq_ignore_ascii_case(configuration_fingerprint) {
+            return Err(LocalGitError::StalePushDestination);
+        }
+        let oid = self.observe_branch_at_repository(push_urls[0], branch)?;
+        Ok(FrozenDestinationBranchObservation {
+            remote: remote.to_owned(),
+            repository: repository.clone(),
             branch: branch.to_owned(),
             oid,
         })

@@ -777,6 +777,16 @@ fn observes_distinct_effective_fetch_and_push_destinations_after_git_rewriting()
         .observe_destination_branch(&destination, "feature/published")
         .unwrap();
     assert_eq!(branch.oid.as_deref(), Some(base.as_str()));
+    let recovered = backend
+        .observe_frozen_push_destination_branch(
+            &destination.remote,
+            &destination.repository,
+            &destination.configuration_fingerprint(),
+            "feature/published",
+        )
+        .unwrap();
+    assert_eq!(recovered.oid.as_deref(), Some(base.as_str()));
+    assert_eq!(recovered.repository, destination.repository);
 }
 
 #[test]
@@ -987,6 +997,177 @@ fn destination_change_after_confirmation_is_a_certain_pre_dispatch_refusal() {
         .status
         .code()
         .is_some_and(|code| code != 0)
+    );
+}
+
+#[test]
+fn nonforce_destination_change_after_confirmation_is_a_certain_refusal() {
+    let directory = init();
+    let root = directory.path();
+    fs::write(root.join("file"), "base\n").unwrap();
+    let base = commit_all(root, "base");
+    let source = TempDir::new().unwrap();
+    let other = TempDir::new().unwrap();
+    git(source.path(), &["init", "--bare", "-q"]);
+    git(other.path(), &["init", "--bare", "-q"]);
+    git(
+        root,
+        &["remote", "add", "source", source.path().to_str().unwrap()],
+    );
+    git(
+        root,
+        &["push", "-q", "source", "main:refs/heads/feature/published"],
+    );
+    fs::write(root.join("file"), "next\n").unwrap();
+    let local_oid = commit_all(root, "next");
+    let backend = LocalGit::open(root).unwrap();
+    let destination = backend
+        .observe_push_destination(&local_repository(source.path()))
+        .unwrap();
+    let selected = backend.snapshot().unwrap();
+    git(
+        root,
+        &[
+            "remote",
+            "set-url",
+            "--push",
+            "source",
+            other.path().to_str().unwrap(),
+        ],
+    );
+    let error = backend
+        .push_branch_to_destination(
+            &destination,
+            "main",
+            &local_oid,
+            "feature/published",
+            &base,
+            &selected.guard,
+        )
+        .unwrap_err();
+    assert!(matches!(error, LocalGitError::StalePushDestination));
+    assert_eq!(
+        git(
+            source.path(),
+            &["rev-parse", "refs/heads/feature/published"]
+        ),
+        base
+    );
+    assert!(
+        !git_output(
+            other.path(),
+            &["show-ref", "--verify", "refs/heads/feature/published"]
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn nonforce_destination_publish_pins_attempted_oid_across_pre_push_ref_move() {
+    let directory = init();
+    let root = directory.path();
+    fs::write(root.join("file"), "base\n").unwrap();
+    let base = commit_all(root, "base");
+    let source = TempDir::new().unwrap();
+    git(source.path(), &["init", "--bare", "-q"]);
+    git(
+        root,
+        &["remote", "add", "source", source.path().to_str().unwrap()],
+    );
+    git(
+        root,
+        &["push", "-q", "source", "main:refs/heads/feature/published"],
+    );
+    fs::write(root.join("file"), "selected\n").unwrap();
+    let selected_oid = commit_all(root, "selected");
+    let moved_oid = commit_tree(root, &selected_oid, "later unreviewed local tip");
+    let backend = LocalGit::open(root).unwrap();
+    let destination = backend
+        .observe_push_destination(&local_repository(source.path()))
+        .unwrap();
+    let hook = backend.git_dir().join("hooks/pre-push");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\ngit update-ref refs/heads/main {moved_oid} {selected_oid}\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let selected = backend.snapshot().unwrap();
+    backend
+        .push_branch_to_destination(
+            &destination,
+            "main",
+            &selected_oid,
+            "feature/published",
+            &base,
+            &selected.guard,
+        )
+        .unwrap();
+    assert_eq!(
+        git(
+            source.path(),
+            &["rev-parse", "refs/heads/feature/published"]
+        ),
+        selected_oid
+    );
+    assert_eq!(git(root, &["rev-parse", "refs/heads/main"]), moved_oid);
+}
+
+#[test]
+fn moved_destination_branch_returns_stale_remote_branch_before_nonforce_push() {
+    let directory = init();
+    let root = directory.path();
+    fs::write(root.join("file"), "base\n").unwrap();
+    let base = commit_all(root, "base");
+    let source = TempDir::new().unwrap();
+    git(source.path(), &["init", "--bare", "-q"]);
+    git(
+        root,
+        &["remote", "add", "source", source.path().to_str().unwrap()],
+    );
+    git(
+        root,
+        &["push", "-q", "source", "main:refs/heads/feature/published"],
+    );
+    fs::write(root.join("file"), "selected\n").unwrap();
+    let selected_oid = commit_all(root, "selected");
+    let backend = LocalGit::open(root).unwrap();
+    let destination = backend
+        .observe_push_destination(&local_repository(source.path()))
+        .unwrap();
+    let selected = backend.snapshot().unwrap();
+    configure_identity(source.path());
+    let remote_oid = commit_tree(source.path(), &base, "competing remote tip");
+    git(
+        source.path(),
+        &[
+            "update-ref",
+            "refs/heads/feature/published",
+            &remote_oid,
+            &base,
+        ],
+    );
+    let error = backend
+        .push_branch_to_destination(
+            &destination,
+            "main",
+            &selected_oid,
+            "feature/published",
+            &base,
+            &selected.guard,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, LocalGitError::StaleRemoteBranch),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(
+        git(
+            source.path(),
+            &["rev-parse", "refs/heads/feature/published"]
+        ),
+        remote_oid
     );
 }
 

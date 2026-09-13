@@ -305,6 +305,19 @@ struct PendingAction {
     checkout_generation: u64,
 }
 
+#[derive(Clone, Debug)]
+struct PrPublishReconciliationEvidence {
+    generation: u64,
+    attempt: PrPublishAttempt,
+    reconciliation: pr_publish::PrPublishReconciliation,
+}
+
+impl PrPublishReconciliationEvidence {
+    fn matches(&self, generation: u64, started: &StartedAction) -> bool {
+        self.generation == generation && started.pr_publish.as_ref() == Some(&self.attempt)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct StartedAction {
     schema_version: u32,
@@ -560,6 +573,7 @@ pub struct LocalWorkspace {
     unresolved_started_action: Option<StartedAction>,
     unresolved_refresh_required: bool,
     unresolved_publish_refresh_required: bool,
+    pr_publish_reconciliation: Option<PrPublishReconciliationEvidence>,
     remote_observation: Option<RemoteBranchObservation>,
     pr_publish_context: Option<PrPublishContext>,
     pr_publish_preparation: Option<PrPublishPreparation>,
@@ -615,6 +629,7 @@ impl LocalWorkspace {
             unresolved_started_action: None,
             unresolved_refresh_required: false,
             unresolved_publish_refresh_required: false,
+            pr_publish_reconciliation: None,
             remote_observation: None,
             pr_publish_context: None,
             pr_publish_preparation: None,
@@ -701,6 +716,7 @@ impl LocalWorkspace {
             return;
         }
         self.pr_publish_generation = self.pr_publish_generation.wrapping_add(1);
+        self.pr_publish_reconciliation = None;
         self.pr_publish_context = context;
         self.pr_publish_preparation = None;
         self.pr_publish_loading = false;
@@ -767,6 +783,7 @@ impl LocalWorkspace {
         }
         self.pr_publish_generation = self.pr_publish_generation.wrapping_add(1);
         let generation = self.pr_publish_generation;
+        self.pr_publish_reconciliation = None;
         self.pr_publish_loading = true;
         self.pr_publish_preparation = None;
         self.pr_publish_notice = "Checking the PR source and Git destination…".into();
@@ -828,38 +845,63 @@ impl LocalWorkspace {
     }
 
     fn refresh_pr_publish_after_attempt(&mut self, cx: &mut Context<Self>) {
-        let (Some(context), BackendState::Ready(backend)) =
-            (self.pr_publish_context.clone(), &self.backend)
-        else {
+        let (Some(context), BackendState::Ready(backend), Some(attempt)) = (
+            self.pr_publish_context.clone(),
+            &self.backend,
+            self.unresolved_started_action
+                .as_ref()
+                .and_then(|started| started.pr_publish.clone()),
+        ) else {
             return;
         };
         self.pr_publish_generation = self.pr_publish_generation.wrapping_add(1);
         let generation = self.pr_publish_generation;
+        self.pr_publish_reconciliation = None;
         self.pr_publish_loading = true;
         self.pr_publish_preparation = None;
         self.pr_publish_notice =
             "Reconciling fresh provider source and effective push endpoint read-only…".into();
         let checkout = self.context.checkout.clone();
         let git = backend.git.clone();
-        let task =
-            cx.background_spawn(async move { pr_publish::prepare(&context, &checkout, &git) });
+        let expected_attempt = attempt.clone();
+        let task = cx.background_spawn(async move {
+            pr_publish::reconcile_attempt(&context, &checkout, &git, &attempt)
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 if this.pr_publish_generation != generation {
                     return;
                 }
+                if this
+                    .unresolved_started_action
+                    .as_ref()
+                    .and_then(|started| started.pr_publish.as_ref())
+                    != Some(&expected_attempt)
+                {
+                    this.pr_publish_loading = false;
+                    this.pr_publish_notice =
+                        "A newer durable PR publication attempt replaced this reconciliation; the stale read was ignored"
+                            .into();
+                    cx.notify();
+                    return;
+                }
                 this.pr_publish_loading = false;
                 match result {
-                    Ok(preparation) => {
+                    Ok(reconciliation) => {
                         this.unresolved_publish_refresh_required = false;
                         this.pr_publish_notice = format!(
-                            "Read-only reconciliation: {}. No action was replayed.",
-                            preparation.summary()
+                            "Read-only reconciliation: {}",
+                            reconciliation.summary(&expected_attempt)
                         );
-                        this.pr_publish_preparation = Some(preparation);
+                        this.pr_publish_reconciliation = Some(PrPublishReconciliationEvidence {
+                            generation,
+                            attempt: expected_attempt,
+                            reconciliation,
+                        });
                     }
                     Err(error) => {
+                        this.pr_publish_reconciliation = None;
                         this.pr_publish_notice = format!(
                             "Read-only PR publication reconciliation is incomplete: {error}. No action was replayed."
                         );
@@ -1245,6 +1287,7 @@ impl LocalWorkspace {
         self.in_flight_action = Some(request_id);
         self.unresolved_refresh_required = false;
         self.unresolved_publish_refresh_required = false;
+        self.pr_publish_reconciliation = None;
         self.status = format!("Checking and recording {}…", started.summary);
         let retry = pending.clone();
         let action = pending.action;
@@ -1267,6 +1310,7 @@ impl LocalWorkspace {
                         this.unresolved_started_action = None;
                         this.unresolved_refresh_required = false;
                         this.unresolved_publish_refresh_required = false;
+                        this.pr_publish_reconciliation = None;
                         this.status = format!(
                             "Completed {:?}; refreshed authoritative Git state",
                             receipt.action
@@ -1278,7 +1322,7 @@ impl LocalWorkspace {
                         cx.emit(LocalWorkspaceEvent::LocalSnapshotChanged);
                         cx.notify();
                         if started.pr_publish.is_some() {
-                            this.refresh_pr_publish_after_attempt(cx);
+                            this.prepare_pr_publish(cx);
                         }
                     }
                     Err(LocalActionRunError::NotDispatched {
@@ -1288,6 +1332,7 @@ impl LocalWorkspace {
                         this.unresolved_started_action = None;
                         this.unresolved_refresh_required = false;
                         this.unresolved_publish_refresh_required = false;
+                        this.pr_publish_reconciliation = None;
                         if this.pending_action.is_none() {
                             this.pending_action = Some(retry);
                         }
@@ -1301,13 +1346,18 @@ impl LocalWorkspace {
                         error,
                         journal_preserved: true,
                     }) => {
+                        let is_pr_publish = started.pr_publish.is_some();
                         this.unresolved_started_action = Some(started);
                         this.unresolved_refresh_required = false;
-                        this.unresolved_publish_refresh_required = false;
+                        this.unresolved_publish_refresh_required = is_pr_publish;
+                        this.pr_publish_reconciliation = None;
                         this.status = format!(
                             "Git was not started, but its durable intent record was preserved: {error}. Reconcile that exact record before retrying."
                         );
                         cx.emit(LocalWorkspaceEvent::Error(this.status.clone()));
+                        if is_pr_publish {
+                            this.refresh_pr_publish_after_attempt(cx);
+                        }
                         cx.notify();
                     }
                     Err(LocalActionRunError::StartedOrUncertain(error)) => {
@@ -1315,6 +1365,7 @@ impl LocalWorkspace {
                         this.unresolved_started_action = Some(started);
                         this.unresolved_refresh_required = true;
                         this.unresolved_publish_refresh_required = is_pr_publish;
+                        this.pr_publish_reconciliation = None;
                         this.status = format!(
                             "Action may have started: {error}. Authoritative refresh and explicit reconciliation are required before retry."
                         );
@@ -1373,6 +1424,31 @@ impl LocalWorkspace {
             );
             return;
         }
+        if let Some(attempt) = self
+            .unresolved_started_action
+            .as_ref()
+            .and_then(|started| started.pr_publish.as_ref())
+        {
+            let evidence_matches =
+                self.pr_publish_reconciliation
+                    .as_ref()
+                    .is_some_and(|evidence| {
+                        self.unresolved_started_action
+                            .as_ref()
+                            .is_some_and(|started| {
+                                evidence.matches(self.pr_publish_generation, started)
+                                    && started.pr_publish.as_ref() == Some(attempt)
+                            })
+                    });
+            if !evidence_matches {
+                self.report_error(
+                    "The exact durable PR publication attempt lacks current read-only reconciliation evidence"
+                        .into(),
+                    cx,
+                );
+                return;
+            }
+        }
         let Some(_) = self.snapshot else {
             self.report_error(
                 "Refresh authoritative Git state before reconciling".into(),
@@ -1388,9 +1464,15 @@ impl LocalWorkspace {
             return;
         };
         let request_id = expected.request_id;
+        let reconciliation_summary = self
+            .pr_publish_reconciliation
+            .as_ref()
+            .map(|evidence| evidence.reconciliation.summary(&evidence.attempt));
         self.reconciliation_clear_in_flight = Some(request_id);
         let journal = backend.journal_path.clone();
-        let task = cx.background_spawn(async move { clear_started_action(&journal, &expected) });
+        let expected_for_clear = expected.clone();
+        let task =
+            cx.background_spawn(async move { clear_started_action(&journal, &expected_for_clear) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -1403,7 +1485,7 @@ impl LocalWorkspace {
                     if this
                         .unresolved_started_action
                         .as_ref()
-                        .is_none_or(|started| started.request_id != request_id)
+                        != Some(&expected)
                     {
                         this.report_error(
                             "A newer action record appeared; the delayed acknowledgement was ignored"
@@ -1414,7 +1496,15 @@ impl LocalWorkspace {
                     }
                     this.unresolved_started_action = None;
                     this.unresolved_publish_refresh_required = false;
-                    this.status = "Local action reconciled; no action was retried".into();
+                    this.pr_publish_reconciliation = None;
+                    this.status = reconciliation_summary.as_ref().map_or_else(
+                        || "Local action reconciled; no action was retried".into(),
+                        |summary| {
+                            format!(
+                                "Observed current state acknowledged; no action was retried. {summary}"
+                            )
+                        },
+                    );
                     cx.notify();
                 }
                 Ok(false) => this.report_error(
@@ -1550,6 +1640,7 @@ impl LocalWorkspace {
                                 .as_ref()
                                 .is_some_and(|started| started.pr_publish.is_some());
                             this.unresolved_started_action = started;
+                            this.pr_publish_reconciliation = None;
                             this.unresolved_refresh_required = false;
                             this.status = if this.unresolved_started_action.is_some() {
                                 "A previously started local action requires authoritative reconciliation"
@@ -4233,7 +4324,7 @@ impl LocalWorkspace {
                     )));
             }
             reconciliation = reconciliation.child(action_button(
-                "Acknowledge refreshed state",
+                "Acknowledge observed current state",
                 colors,
                 cx.listener(|this, _, _, cx| this.acknowledge_action_reconciliation(cx)),
             ));
@@ -5438,6 +5529,28 @@ mod tests {
             .expect("read durable PR publish attempt")
             .expect("preserved PR publish attempt");
         assert_eq!(readback, started);
+        let evidence = PrPublishReconciliationEvidence {
+            generation: 9,
+            attempt: readback
+                .pr_publish
+                .clone()
+                .expect("persisted attempt evidence"),
+            reconciliation: pr_publish::PrPublishReconciliation {
+                outcome: pr_publish::PrPublishReconciliationOutcome::MatchesExpected,
+            },
+        };
+        assert!(evidence.matches(9, &readback));
+        assert!(!evidence.matches(10, &readback), "stale generation refuses");
+        let mut replacement = readback.clone();
+        replacement
+            .pr_publish
+            .as_mut()
+            .expect("replacement attempt")
+            .attempt_id += 1;
+        assert!(
+            !evidence.matches(9, &replacement),
+            "same request with replacement attempt refuses"
+        );
         assert_eq!(
             readback
                 .pr_publish

@@ -147,6 +147,7 @@ pub struct PrPublishPreparation {
     pub pull_request_number: u64,
     pub source_host: String,
     pub source_repository: String,
+    pub target_branch: String,
     pub local_branch: String,
     pub local_oid: String,
     pub remote_branch: String,
@@ -171,6 +172,7 @@ impl fmt::Debug for PrPublishPreparation {
             .field("pull_request_number", &self.pull_request_number)
             .field("source_host", &self.source_host)
             .field("source_repository", &self.source_repository)
+            .field("target_branch", &self.target_branch)
             .field("local_branch", &self.local_branch)
             .field("local_oid", &self.local_oid)
             .field("remote_branch", &self.remote_branch)
@@ -231,6 +233,7 @@ impl PrPublishPreparation {
             pull_request_number: self.pull_request_number,
             source_host: self.source_host.clone(),
             source_repository: self.source_repository.clone(),
+            target_branch: self.target_branch.clone(),
             local_branch: self.local_branch.clone(),
             local_oid: self.local_oid.clone(),
             destination_remote: self.destination.remote.clone(),
@@ -301,6 +304,8 @@ pub struct PrPublishAttempt {
     pub pull_request_number: u64,
     pub source_host: String,
     pub source_repository: String,
+    #[serde(default)]
+    pub target_branch: String,
     pub local_branch: String,
     pub local_oid: String,
     pub destination_remote: String,
@@ -311,6 +316,168 @@ pub struct PrPublishAttempt {
     pub expected_remote_oid: String,
     pub filesystem: PrPublishFilesystemIdentity,
     pub mode: PrPublishMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PrPublishReconciliationOutcome {
+    MatchesAttempted,
+    MatchesExpected,
+    Diverged(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PrPublishReconciliation {
+    pub outcome: PrPublishReconciliationOutcome,
+}
+
+impl PrPublishReconciliation {
+    pub fn summary(&self, attempt: &PrPublishAttempt) -> String {
+        match &self.outcome {
+            PrPublishReconciliationOutcome::MatchesAttempted => format!(
+                "Exact frozen destination {}/{} currently has attempted OID {}. This is positive current-state evidence only; no writer is inferred.",
+                attempt.destination_remote, attempt.remote_branch, attempt.local_oid
+            ),
+            PrPublishReconciliationOutcome::MatchesExpected => format!(
+                "Exact frozen destination {}/{} currently still has pre-dispatch OID {}. The attempt outcome remains inconclusive; no action was replayed.",
+                attempt.destination_remote, attempt.remote_branch, attempt.expected_remote_oid
+            ),
+            PrPublishReconciliationOutcome::Diverged(oid) => format!(
+                "Exact frozen destination {}/{} currently has different OID {oid}. The attempt outcome remains inconclusive; no action was replayed.",
+                attempt.destination_remote, attempt.remote_branch
+            ),
+        }
+    }
+}
+
+/// Reconcile only the immutable safe fields persisted before Git dispatch.
+/// This never substitutes a new preparation and never replays the push.
+pub(super) fn reconcile_attempt(
+    context: &PrPublishContext,
+    checkout: &CheckoutView,
+    git: &LocalGit,
+    attempt: &PrPublishAttempt,
+) -> Result<PrPublishReconciliation, String> {
+    if attempt.request_id == 0
+        || attempt.attempt_id != attempt.request_id
+        || attempt.mode == PrPublishMode::UpToDate
+        || attempt.provider_head_oid != attempt.expected_remote_oid
+    {
+        return Err("Persisted PR publication attempt identity is invalid".into());
+    }
+    if !context
+        .selected_repository
+        .host
+        .eq_ignore_ascii_case(&attempt.selected_host)
+        || !context
+            .selected_repository
+            .account
+            .host
+            .eq_ignore_ascii_case(&attempt.selected_host)
+        || context.selected_repository.account.login != attempt.selected_account
+        || !context
+            .selected_repository
+            .full_name()
+            .eq_ignore_ascii_case(&attempt.selected_repository)
+        || context.pull_request_number != attempt.pull_request_number
+    {
+        return Err(
+            "Current selected account, target repository, or pull request differs from the persisted attempt"
+                .into(),
+        );
+    }
+    validate_checkout(checkout, git)?;
+    let current_filesystem = PrPublishFilesystemIdentity {
+        checkout: checkout.association.checkout_identity,
+        git_dir: checkout.association.git_dir_identity,
+        common_git_dir: checkout.association.common_git_dir_identity,
+    };
+    if current_filesystem != attempt.filesystem {
+        return Err("Current checkout, Git directory, or common Git directory identity differs from the persisted attempt".into());
+    }
+    let attempted_oid = git
+        .resolve_commit_reference(&attempt.local_oid)
+        .map_err(|error| format!("Persisted attempted local OID is unavailable: {error}"))?;
+    if attempted_oid != attempt.local_oid {
+        return Err("Persisted attempted local OID no longer resolves exactly".into());
+    }
+
+    let fresh = context
+        .reader
+        .checkout_source(&context.selected_repository, context.pull_request_number)?;
+    validate_selected_identity(context, checkout, &fresh)?;
+    let source_repository = fresh.source_repository.as_ref().ok_or_else(|| {
+        "The persisted PR source repository is now deleted or unavailable".to_owned()
+    })?;
+    if !source_repository
+        .host
+        .eq_ignore_ascii_case(&attempt.source_host)
+        || !source_repository
+            .account
+            .host
+            .eq_ignore_ascii_case(&attempt.source_host)
+        || !source_repository
+            .full_name()
+            .eq_ignore_ascii_case(&attempt.source_repository)
+        || source_repository.account.login != attempt.selected_account
+    {
+        return Err("Current PR source repository differs from the persisted attempt".into());
+    }
+    if fresh.source_branch != attempt.remote_branch {
+        return Err("Current PR source branch differs from the persisted attempt".into());
+    }
+    if attempt.target_branch.is_empty() {
+        return Err(
+            "Legacy PR publication attempt lacks the frozen target branch and cannot be acknowledged"
+                .into(),
+        );
+    }
+    if fresh.target_branch != attempt.target_branch {
+        return Err("Current PR target branch differs from the persisted attempt".into());
+    }
+    let (owner, name) = attempt
+        .source_repository
+        .split_once('/')
+        .filter(|(owner, name)| !owner.is_empty() && !name.is_empty() && !name.contains('/'))
+        .ok_or_else(|| "Persisted PR source repository identity is invalid".to_owned())?;
+    let destination_repository = GitRepositoryIdentity {
+        host: attempt.source_host.clone(),
+        owner: owner.to_owned(),
+        name: name.to_owned(),
+    };
+    let expected_destination_label = format!(
+        "{}/{}/{}",
+        destination_repository.host, destination_repository.owner, destination_repository.name
+    );
+    if !attempt
+        .destination_repository
+        .eq_ignore_ascii_case(&expected_destination_label)
+    {
+        return Err(
+            "Persisted push destination repository differs from its PR source identity".into(),
+        );
+    }
+    let observed = git
+        .observe_frozen_push_destination_branch(
+            &attempt.destination_remote,
+            &destination_repository,
+            &attempt.destination_configuration_fingerprint,
+            &attempt.remote_branch,
+        )
+        .map_err(|error| format!("Exact frozen push destination is not validated: {error}"))?;
+    let Some(current_oid) = observed.oid else {
+        return Err(
+            "Exact frozen push destination branch is missing; the attempt outcome remains inconclusive"
+                .into(),
+        );
+    };
+    let outcome = if current_oid == attempt.local_oid {
+        PrPublishReconciliationOutcome::MatchesAttempted
+    } else if current_oid == attempt.expected_remote_oid {
+        PrPublishReconciliationOutcome::MatchesExpected
+    } else {
+        PrPublishReconciliationOutcome::Diverged(current_oid)
+    };
+    Ok(PrPublishReconciliation { outcome })
 }
 
 pub fn prepare(
@@ -405,6 +572,7 @@ fn prepare_with_source(
         pull_request_number: context.pull_request_number,
         source_host: source_repository.host.clone(),
         source_repository: source_repository.full_name(),
+        target_branch: source.target_branch.clone(),
         local_branch,
         local_oid,
         remote_branch: source.source_branch.clone(),
@@ -788,6 +956,197 @@ mod tests {
                 &["rev-parse", "refs/heads/feature/published"]
             ),
             published
+        );
+    }
+
+    #[test]
+    fn frozen_attempt_reconciliation_observes_exact_destination_without_repreparing() {
+        let (_checkout, source_bare, context, checkout, backend, _source, published) = fixture();
+        let prepared = prepare(&context, &checkout, &backend).expect("prepare");
+        let attempt = prepared.attempt(70);
+
+        let old = reconcile_attempt(&context, &checkout, &backend, &attempt)
+            .expect("observe exact old ref");
+        assert_eq!(old.outcome, PrPublishReconciliationOutcome::MatchesExpected);
+        assert!(
+            old.summary(&attempt)
+                .contains("outcome remains inconclusive")
+        );
+        assert_eq!(
+            git(
+                source_bare.path(),
+                &["rev-parse", "refs/heads/feature/published"]
+            ),
+            published,
+            "read-only equal-old reconciliation must not replay"
+        );
+
+        git(
+            backend.root(),
+            &[
+                "push",
+                "-q",
+                "fork-source",
+                &format!("{}:refs/heads/feature/published", attempt.local_oid),
+            ],
+        );
+        let moved_after_attempt = git(
+            backend.root(),
+            &[
+                "commit-tree",
+                "HEAD^{tree}",
+                "-p",
+                "HEAD",
+                "-m",
+                "later local",
+            ],
+        );
+        git(
+            backend.root(),
+            &[
+                "update-ref",
+                "refs/heads/cibergit/local-7",
+                &moved_after_attempt,
+                &attempt.local_oid,
+            ],
+        );
+        let applied = reconcile_attempt(&context, &checkout, &backend, &attempt)
+            .expect("observe exact attempted OID after local branch moved");
+        assert_eq!(
+            applied.outcome,
+            PrPublishReconciliationOutcome::MatchesAttempted
+        );
+        assert!(
+            applied
+                .summary(&attempt)
+                .contains("current-state evidence only")
+        );
+
+        git(
+            backend.root(),
+            &[
+                "push",
+                "-q",
+                "fork-source",
+                &format!("{moved_after_attempt}:refs/heads/feature/published"),
+            ],
+        );
+        let different = reconcile_attempt(&context, &checkout, &backend, &attempt)
+            .expect("observe different nonmissing OID");
+        assert_eq!(
+            different.outcome,
+            PrPublishReconciliationOutcome::Diverged(moved_after_attempt.clone())
+        );
+        assert!(
+            different
+                .summary(&attempt)
+                .contains("outcome remains inconclusive")
+        );
+        assert_eq!(
+            git(
+                source_bare.path(),
+                &["rev-parse", "refs/heads/feature/published"]
+            ),
+            moved_after_attempt,
+            "read-only different-OID reconciliation must not replay"
+        );
+
+        git(
+            source_bare.path(),
+            &["update-ref", "-d", "refs/heads/feature/published"],
+        );
+        let missing = reconcile_attempt(&context, &checkout, &backend, &attempt)
+            .expect_err("missing ref remains unresolved");
+        assert!(missing.contains("branch is missing"));
+        assert_ne!(attempt.local_oid, published);
+    }
+
+    #[test]
+    fn restarted_attempt_rejects_retargeted_source_branch_and_configuration() {
+        let (_checkout, _source_bare, context, checkout, backend, source, _published) = fixture();
+        let prepared = prepare(&context, &checkout, &backend).expect("prepare");
+        let attempt = prepared.attempt(71);
+        let encoded = serde_json::to_vec(&attempt).expect("serialize durable attempt");
+        let restarted: PrPublishAttempt =
+            serde_json::from_slice(&encoded).expect("read durable attempt after restart");
+
+        let mut retargeted = source.clone();
+        retargeted.target_branch = "release".into();
+        let retargeted_context = PrPublishContext::with_reader(
+            retargeted.base_repository.clone(),
+            7,
+            Arc::new(FixedReader(Ok(retargeted))),
+        );
+        assert!(
+            reconcile_attempt(&retargeted_context, &checkout, &backend, &restarted)
+                .unwrap_err()
+                .contains("target branch")
+        );
+
+        let mut changed_source = source.clone();
+        changed_source
+            .source_repository
+            .as_mut()
+            .expect("source")
+            .name = "replacement".into();
+        let changed_source_context = PrPublishContext::with_reader(
+            changed_source.base_repository.clone(),
+            7,
+            Arc::new(FixedReader(Ok(changed_source))),
+        );
+        assert!(
+            reconcile_attempt(&changed_source_context, &checkout, &backend, &restarted)
+                .unwrap_err()
+                .contains("source repository")
+        );
+
+        let mut changed_branch = source;
+        changed_branch.source_branch = "replacement/branch".into();
+        let changed_branch_context = PrPublishContext::with_reader(
+            changed_branch.base_repository.clone(),
+            7,
+            Arc::new(FixedReader(Ok(changed_branch))),
+        );
+        assert!(
+            reconcile_attempt(&changed_branch_context, &checkout, &backend, &restarted)
+                .unwrap_err()
+                .contains("source branch")
+        );
+
+        let replacement = TempDir::new().expect("replacement bare");
+        git(replacement.path(), &["init", "--bare", "-q"]);
+        git(
+            backend.root(),
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "fork-source",
+                replacement.path().to_str().expect("path"),
+            ],
+        );
+        assert!(
+            reconcile_attempt(&context, &checkout, &backend, &restarted)
+                .unwrap_err()
+                .contains("not validated")
+        );
+    }
+
+    #[test]
+    fn legacy_attempt_without_frozen_target_branch_remains_unresolved() {
+        let (_checkout, _source_bare, context, checkout, backend, _source, _published) = fixture();
+        let prepared = prepare(&context, &checkout, &backend).expect("prepare");
+        let mut value = serde_json::to_value(prepared.attempt(72)).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("attempt object")
+            .remove("target_branch");
+        let legacy: PrPublishAttempt = serde_json::from_value(value).expect("read legacy attempt");
+        assert!(legacy.target_branch.is_empty());
+        assert!(
+            reconcile_attempt(&context, &checkout, &backend, &legacy)
+                .unwrap_err()
+                .contains("Legacy PR publication attempt")
         );
     }
 }
