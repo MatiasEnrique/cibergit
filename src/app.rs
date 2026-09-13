@@ -15,6 +15,7 @@ mod file_tree;
 mod local_checkout;
 #[allow(dead_code)] // Public component surface also serves standalone native verification.
 mod local_workspace;
+mod notifications_view;
 mod pr_creation;
 mod pr_lifecycle;
 mod review_interactions;
@@ -140,6 +141,12 @@ impl Root {
 
     pub fn editor(window: &mut Window, cx: &mut Context<Self>, path: PathBuf) -> Self {
         Self::Editor(EditorWorkspace::new(window, cx, path))
+    }
+
+    pub(crate) fn system_notification_response(&mut self, tag: &str, cx: &mut Context<Self>) {
+        if let Self::Review(workspace) = self {
+            workspace.handle_system_notification_response(tag, cx);
+        }
     }
 
     /// Presentation-only integration point for the separately owned local
@@ -722,6 +729,7 @@ pub struct ReviewWorkspace {
     store: Option<Store>,
     interaction_root: PathBuf,
     stack_data_root: PathBuf,
+    notifications: notifications_view::NotificationController,
     workspace: WorkspaceState,
     persistence_error: Option<String>,
     accounts: Vec<cibergit::domain::Account>,
@@ -877,6 +885,7 @@ impl ReviewWorkspace {
                 .join("Library/Application Support/cibergit")
         });
         let interaction_root = data_root.join("review-interactions");
+        let notifications = notifications_view::NotificationController::new(data_root.clone());
         cx.bind_keys([
             KeyBinding::new("cmd-shift-e", local_checkout::EditLocally, None),
             KeyBinding::new("cmd-alt-shift-e", local_checkout::ReturnToReview, None),
@@ -971,6 +980,7 @@ impl ReviewWorkspace {
             store,
             interaction_root,
             stack_data_root: data_root,
+            notifications,
             workspace,
             persistence_error,
             accounts: Vec::new(),
@@ -1024,6 +1034,7 @@ impl ReviewWorkspace {
             if this.focused {
                 this.refresh_all(cx);
                 this.refresh_active(cx);
+                this.refresh_notifications(cx);
             }
             cx.notify();
         });
@@ -1156,6 +1167,7 @@ impl ReviewWorkspace {
             lifecycle_base_changes,
             discussion_changes,
         ]);
+        this.start_notifications(cx);
         this.discover_accounts(startup.account, cx);
         for index in 0..this.repositories.len() {
             this.refresh_repository(index, cx);
@@ -1328,6 +1340,13 @@ impl ReviewWorkspace {
                         for index in repositories {
                             this.refresh_repository_with_intent(index, false, cx);
                         }
+                        let notifications_due = this.repositories.iter().any(|runtime| {
+                            let key = notifications_view::schedule_key(&runtime.repository.account);
+                            poll_due(tick, this.schedule.delay(&key, false, this.focused))
+                        });
+                        if notifications_due {
+                            this.refresh_notifications(cx);
+                        }
                     })
                     .is_err()
                 {
@@ -1338,11 +1357,183 @@ impl ReviewWorkspace {
         .detach();
     }
 
+    fn start_notifications(&mut self, cx: &mut Context<Root>) {
+        let work = self.notifications.begin_bootstrap();
+        let task = cx.background_spawn(async move { work.run() });
+        cx.spawn(async move |root, cx| {
+            let completion = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                if this.notifications.complete_bootstrap(completion) {
+                    this.refresh_notifications(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_notifications(&mut self, cx: &mut Context<Root>) {
+        if !self.notifications.is_ready() {
+            return;
+        }
+        let repositories = self
+            .repositories
+            .iter()
+            .map(|runtime| runtime.repository.clone())
+            .collect::<Vec<_>>();
+        for work in self.notifications.begin_polls(&repositories) {
+            let task = cx.background_spawn(async move { work.run() });
+            cx.spawn(async move |root, cx| {
+                let completion = task.await;
+                let _ = root.update(cx, |root, cx| {
+                    let Root::Review(this) = root else { return };
+                    let schedule_key = completion.schedule_key();
+                    if completion.failed() {
+                        this.schedule.failed(&schedule_key);
+                    } else {
+                        this.schedule.succeeded(&schedule_key);
+                    }
+                    let admission = this.notifications.complete_poll(completion);
+                    if let Some(admission) = admission {
+                        let task = cx.background_spawn(async move { admission.run() });
+                        cx.spawn(async move |root, cx| {
+                            let completion = task.await;
+                            let _ = root.update(cx, |root, cx| {
+                                let Root::Review(this) = root else { return };
+                                if this.notifications.complete_admission(completion) {
+                                    #[cfg(feature = "ui-smoke")]
+                                    let requested = this
+                                        .notifications
+                                        .dispatch_to(&mut |_notification| {});
+                                    #[cfg(not(feature = "ui-smoke"))]
+                                    let requested = this.notifications.dispatch_to(
+                                        &mut |notification| {
+                                            cx.show_system_notification(notification)
+                                        },
+                                    );
+                                    if requested > 0 {
+                                        #[cfg(feature = "ui-smoke")]
+                                        let status = format!(
+                                            "Suppressed {requested} macOS alert request(s) in UI smoke; no platform call was made."
+                                        );
+                                        #[cfg(not(feature = "ui-smoke"))]
+                                        let status = format!(
+                                            "Requested {requested} eligible macOS alert(s) best effort; permission and delivery are not observable."
+                                        );
+                                        this.status = status;
+                                    }
+                                }
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn set_notification_consent(
+        &mut self,
+        account: &cibergit::domain::Account,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(work) = self.notifications.begin_toggle_consent(account) else {
+            return;
+        };
+        let task = cx.background_spawn(async move { work.run() });
+        cx.spawn(async move |root, cx| {
+            let completion = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                this.notifications.complete_consent(completion);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn mark_displayed_notifications(
+        &mut self,
+        account: &cibergit::domain::Account,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(work) = self.notifications.begin_mark_displayed(account) else {
+            self.status = "No rendered notification events are available to mark read.".into();
+            cx.notify();
+            return;
+        };
+        let task = cx.background_spawn(async move { work.run() });
+        cx.spawn(async move |root, cx| {
+            let completion = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                if this.notifications.complete_mark_displayed(completion) {
+                    this.status =
+                        "Only the exact displayed event IDs were marked read locally.".into();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_notification_target(
+        &mut self,
+        target: &cibergit::providers::notifications::NotificationPullRequest,
+        cx: &mut Context<Root>,
+    ) {
+        let repository = self.repositories.iter().position(|runtime| {
+            runtime.repository.host.eq_ignore_ascii_case(&target.host)
+                && runtime.repository.owner.eq_ignore_ascii_case(&target.owner)
+                && runtime
+                    .repository
+                    .name
+                    .eq_ignore_ascii_case(&target.repository)
+                && runtime
+                    .repository
+                    .account
+                    .login
+                    .eq_ignore_ascii_case(&target.account)
+        });
+        if let Some(repository) = repository {
+            self.open_pr(repository, target.pull_request, cx);
+        } else {
+            self.status = "Notification target is no longer an explicitly configured repository; nothing was opened.".into();
+            cx.notify();
+        }
+    }
+
+    fn handle_system_notification_response(&mut self, tag: &str, cx: &mut Context<Root>) {
+        let Some(route) = self.notifications.route_for_tag(tag) else {
+            self.status =
+                "Unknown or expired macOS notification response; nothing was opened.".into();
+            cx.notify();
+            return;
+        };
+        let target = cibergit::providers::notifications::NotificationPullRequest {
+            provider: "github".into(),
+            host: route.account.host,
+            account: route.account.login,
+            owner: route.owner,
+            repository: route.repository,
+            pull_request: route.pull_request,
+        };
+        self.open_notification_target(&target, cx);
+    }
+
     #[cfg(feature = "ui-smoke")]
     fn start_smoke(&mut self, window: &mut Window, cx: &mut Context<Root>) {
         let Some(output) = std::env::var_os("CIBERGIT_SMOKE_DIR").map(PathBuf::from) else {
             return;
         };
+        if std::env::var_os("CIBERGIT_SMOKE_NOTIFICATIONS").is_some() {
+            self.start_notifications_smoke(window, cx, output);
+            return;
+        }
         if std::env::var_os("CIBERGIT_SMOKE_LOCAL_CHECKOUT").is_some() {
             local_checkout::start_smoke(cx.weak_entity(), output, window, cx);
             return;
@@ -2352,6 +2543,80 @@ impl ReviewWorkspace {
                     }
                     cx.quit();
                 });
+            })
+            .detach();
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn start_notifications_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+        output: PathBuf,
+    ) {
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                let started = std::time::Instant::now();
+                loop {
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.notifications.is_ready())
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready || started.elapsed() > Duration::from_secs(15) {
+                        break;
+                    }
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                }
+                let fixture = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err("smoke left review workspace".to_owned());
+                            };
+                            let report = this.notifications.install_smoke_fixture()?;
+                            cx.notify();
+                            Ok(report)
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke entity unavailable: {error:#}")))
+                    })
+                    .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")));
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let appearance = std::env::var("CIBERGIT_SMOKE_APPEARANCE")
+                    .unwrap_or_else(|_| "system".into());
+                let _ = std::fs::create_dir_all(&output);
+                let capture_name = format!("native-notifications-{appearance}.png");
+                let captured = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| image.save(output.join(&capture_name)).map_err(Into::into))
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let report = format!(
+                    "Native unread notification UI smoke\nFixture: {}\nCapture: {}\nmacOS preference: default off\nTest sink calls: 0\nGPUI show_system_notification calls: 0 (hard-suppressed in ui-smoke)\nPermission prompt: not invoked\nRemote writes: 0\nForeground activation requested by background smoke: false\nPhysical OS delivery, permission state, input, AX and acrylic identity: not established by in-process capture.\n",
+                    fixture.as_deref().unwrap_or("failed"),
+                    if captured { capture_name.as_str() } else { "failed" },
+                );
+                let _ = std::fs::write(
+                    output.join(format!("native-notifications-{appearance}.txt")),
+                    report,
+                );
+                if fixture.is_err() || !captured {
+                    panic!("native notification UI smoke assertions failed: {fixture:?}");
+                }
+                let _ = window.update(|_, cx| cx.quit());
             })
             .detach();
     }
@@ -4104,6 +4369,7 @@ impl ReviewWorkspace {
                             this.repositories.len() - 1
                         };
                         this.refresh_repository(index, cx);
+                        this.refresh_notifications(cx);
                         if let Some(number) = this.startup_pr.take() {
                             this.open_pr(index, number, cx);
                         }
@@ -8561,6 +8827,9 @@ impl ReviewWorkspace {
             .when(self.view_editor.is_open(), |root| {
                 root.child(self.render_view_editor(colors, cx))
             })
+            .when(self.notifications.is_open(), |root| {
+                root.child(self.notifications.render(colors, cx))
+            })
             .when_some(self.creation_dialog.clone(), |root, dialog| {
                 root.child(dialog)
             })
@@ -8740,6 +9009,12 @@ impl ReviewWorkspace {
                                 && tab.pull_request.number == pull_request.number
                         });
                     let number = pull_request.number;
+                    let unread = self.notifications.unread_for(
+                        &self.repositories[repository_index].repository.account,
+                        &self.repositories[repository_index].repository.owner,
+                        &self.repositories[repository_index].repository.name,
+                        number,
+                    );
                     rows.push(
                         div()
                             .id(SharedString::from(format!(
@@ -8769,6 +9044,14 @@ impl ReviewWorkspace {
                                             .child(pull_request.title),
                                     ),
                             )
+                            .when(unread > 0, |row| {
+                                row.child(div().mt_1().text_xs().text_color(colors.accent).child(
+                                    format!(
+                                        "{unread} unread event{}",
+                                        if unread == 1 { "" } else { "s" }
+                                    ),
+                                ))
+                            })
                             .child(
                                 div()
                                     .mt_1()
@@ -8839,6 +9122,22 @@ impl ReviewWorkspace {
                                     .text_xs()
                                     .text_color(colors.faint)
                                     .child("NATIVE REVIEW"),
+                            )
+                            .child(
+                                div()
+                                    .id("open-notifications")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(colors.accent)
+                                    .child(format!("Alerts {}", self.notifications.unread_count()))
+                                    .on_click(cx.listener(|root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.notifications.toggle_open();
+                                            cx.notify();
+                                        }
+                                    })),
                             )
                             .child(
                                 div()

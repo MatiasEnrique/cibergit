@@ -169,6 +169,7 @@ fn main() {
     gpui_platform::application().run(move |cx| {
         gpui_base::init(cx);
         load_interface_fonts(cx);
+        cx.set_app_identity("dev.cibergit.cibergit", "cibergit");
         #[cfg(feature = "ui-smoke")]
         match std::env::var("CIBERGIT_SMOKE_APPEARANCE").as_deref() {
             Ok("dark") => cx.set_window_appearance(Some(gpui::WindowAppearance::Dark)),
@@ -241,6 +242,8 @@ fn main() {
             KeyBinding::new("end", DiffScrollEnd, Some("DiffPane")),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
+        let root_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let root_for_window = root_slot.clone();
         cx.open_window(
             WindowOptions {
                 focus: !background_smoke,
@@ -258,12 +261,28 @@ fn main() {
                 window_background: WindowBackgroundAppearance::Blurred,
                 ..Default::default()
             },
-            move |window, cx| match &startup.mode {
-                LaunchMode::Review => cx.new(|cx| app::Root::review(window, cx, startup.clone())),
-                LaunchMode::Edit(path) => cx.new(|cx| app::Root::editor(window, cx, path.clone())),
+            move |window, cx| {
+                let root = match &startup.mode {
+                    LaunchMode::Review => {
+                        cx.new(|cx| app::Root::review(window, cx, startup.clone()))
+                    }
+                    LaunchMode::Edit(path) => {
+                        cx.new(|cx| app::Root::editor(window, cx, path.clone()))
+                    }
+                };
+                *root_for_window.borrow_mut() = Some(root.downgrade());
+                root
             },
         )
         .expect("open native window");
+        cx.on_system_notification_response(move |response, cx| {
+            let Some(root) = root_slot.borrow().clone() else {
+                return;
+            };
+            let _ = root.update(cx, |root, cx| {
+                root.system_notification_response(&response.tag, cx)
+            });
+        });
         if !background_smoke {
             cx.activate(true);
         }
