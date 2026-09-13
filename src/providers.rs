@@ -885,7 +885,8 @@ else:
             account: account(login),
             runner: Runner {
                 gh: executable,
-                timeout: Duration::from_secs(5),
+                // Fixture process startup can contend with parallel native builds.
+                timeout: Duration::from_secs(30),
                 ..Runner::default()
             },
         };
