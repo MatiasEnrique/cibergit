@@ -4,13 +4,17 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+const WORKSPACE_SCHEMA_VERSION: u32 = 1;
+const WORKSPACE_FILE: &str = "workspace.json";
+const MAX_POLL_BACKOFF_SHIFT: u32 = 5;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Filter {
@@ -34,6 +38,9 @@ pub enum PersonalFilter {
     All,
     ReviewRequested,
     Own,
+    /// Author, requested reviewer, or assignee. Comment and submitted-review
+    /// participation is not represented on `PullRequest`, so this is not full
+    /// GitHub participating-search parity.
     Participating,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,9 +82,12 @@ impl Filter {
         };
         (state == "all" || pr.state.eq_ignore_ascii_case(state))
             && (search.is_empty()
-                || format!("{} #{} {}", pr.title, pr.number, pr.source_branch)
-                    .to_lowercase()
-                    .contains(&search))
+                || format!(
+                    "{} #{} {} {}",
+                    pr.title, pr.number, pr.source_branch, pr.target_branch
+                )
+                .to_lowercase()
+                .contains(&search))
             && equals(&pr.author, &self.author)
             && includes(&pr.reviewers, &self.reviewer)
             && includes(&pr.assignees, &self.assignee)
@@ -124,7 +134,7 @@ pub struct WorkspaceState {
 impl Default for WorkspaceState {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: WORKSPACE_SCHEMA_VERSION,
             repositories: vec![],
             views: vec![SavedView::default()],
             selected_view: 0,
@@ -172,18 +182,25 @@ impl Store {
         self.root.join(format!("{:x}.json", digest))
     }
     pub fn load_workspace(&self) -> Result<WorkspaceState> {
-        let path = self.root.join("workspace.json");
+        let path = self.root.join(WORKSPACE_FILE);
         if !path.exists() {
             return Ok(WorkspaceState::default());
         }
-        let workspace: WorkspaceState = read_json(&path)?;
-        if workspace.schema_version != 1 {
-            bail!("Workspace was saved by an unsupported application version");
-        }
-        Ok(workspace)
+        decode_workspace(&fs::read(&path).with_context(|| format!("Read {}", path.display()))?)
+            .with_context(|| format!("Load {}", path.display()))
     }
     pub fn save_workspace(&self, state: &WorkspaceState) -> Result<()> {
-        write_json(&self.root.join("workspace.json"), state)
+        if state.schema_version != WORKSPACE_SCHEMA_VERSION {
+            bail!("Workspace was saved by an unsupported application version");
+        }
+        let path = self.root.join(WORKSPACE_FILE);
+        if path.exists() {
+            let existing = fs::read(&path).with_context(|| format!("Read {}", path.display()))?;
+            if let Err(error) = decode_workspace(&existing) {
+                bail!("Refusing to overwrite unreadable or unsupported workspace data: {error:#}");
+            }
+        }
+        write_json(&path, state)
     }
     pub fn save_pull_requests(&self, repo: &Repository, prs: &[PullRequest]) -> Result<()> {
         write_json(&self.cache_path(repo, "prs"), &prs)
@@ -214,10 +231,14 @@ impl Store {
         number: u64,
         revision: &Revision,
     ) -> Result<Comparison> {
-        read_json(&self.cache_path(
+        let comparison: Comparison = read_json(&self.cache_path(
             repo,
             &format!("pr/{number}/{}/{}", revision.base_sha, revision.head_sha),
-        ))
+        ))?;
+        if comparison.revision != *revision {
+            bail!("Cached comparison revision does not match the requested base/head");
+        }
+        Ok(comparison)
     }
     /// Drafts are separate from disposable comparison caches and never auto-published.
     pub fn save_draft(&self, repo: &Repository, number: u64, key: &str, text: &str) -> Result<()> {
@@ -229,6 +250,17 @@ impl Store {
     pub fn load_draft(&self, repo: &Repository, number: u64, key: &str) -> Result<String> {
         read_json(&self.cache_path(repo, &format!("draft/{number}/{key}")))
     }
+}
+fn decode_workspace(bytes: &[u8]) -> Result<WorkspaceState> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let version = value
+        .get("schema_version")
+        .and_then(|v| v.as_u64())
+        .context("Workspace is missing schema_version")?;
+    if version != u64::from(WORKSPACE_SCHEMA_VERSION) {
+        bail!("Workspace was saved by an unsupported application version");
+    }
+    Ok(serde_json::from_value(value)?)
 }
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     Ok(serde_json::from_slice(
@@ -247,6 +279,13 @@ fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
         file.write_all(&serde_json::to_vec_pretty(value)?)?;
         file.sync_all()?;
         fs::rename(&temp, path)?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            let dir = fs::File::open(parent)?;
+            dir.sync_all()?;
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -275,19 +314,36 @@ pub fn group_path(
                     "Other branches".into()
                 }
             }
-            GroupBy::Stack => {
-                let parents: Vec<_> = prs
-                    .iter()
-                    .filter(|p| p.source_branch == pr.target_branch && p.number != pr.number)
-                    .collect();
-                match parents.as_slice() {
-                    [] => format!("{} (inferred root)", pr.source_branch),
-                    [parent] => format!("{} (inferred)", parent.source_branch),
-                    _ => "Ambiguous stack".into(),
-                }
-            }
+            GroupBy::Stack => inferred_stack_group(pr, prs),
         })
         .collect()
+}
+
+fn inferred_stack_group(pr: &PullRequest, prs: &[PullRequest]) -> String {
+    let mut current = pr;
+    let mut seen = BTreeSet::from([pr.number]);
+    loop {
+        if current.source_branch == current.target_branch {
+            return "Cyclic stack".into();
+        }
+        let parents: Vec<_> = prs
+            .iter()
+            .filter(|candidate| {
+                candidate.number != current.number
+                    && candidate.source_branch == current.target_branch
+            })
+            .collect();
+        match parents.as_slice() {
+            [] => return format!("{} (inferred)", current.source_branch),
+            [parent] => {
+                if !seen.insert(parent.number) {
+                    return "Cyclic stack".into();
+                }
+                current = parent;
+            }
+            _ => return "Ambiguous stack".into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -312,11 +368,17 @@ impl PollSchedule {
         } else {
             self.sidebar
         };
-        base * (1u32 << self.failures.get(key).copied().unwrap_or(0).min(5))
-            * if focused { 1 } else { 4 }
+        let shift = self
+            .failures
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+            .min(MAX_POLL_BACKOFF_SHIFT);
+        base * (1u32 << shift) * if focused { 1 } else { 4 }
     }
     pub fn failed(&mut self, key: &str) {
-        *self.failures.entry(key.into()).or_default() += 1;
+        let count = self.failures.entry(key.into()).or_default();
+        *count = count.saturating_add(1).min(MAX_POLL_BACKOFF_SHIFT);
     }
     pub fn succeeded(&mut self, key: &str) {
         self.failures.remove(key);
