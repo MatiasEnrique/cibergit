@@ -3,6 +3,7 @@ pub mod domain;
 pub mod local_git;
 pub mod participation;
 pub mod providers;
+pub mod rebase;
 pub mod review;
 pub mod workspace;
 pub mod worktrees;
