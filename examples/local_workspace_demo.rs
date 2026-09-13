@@ -347,6 +347,152 @@ fn start_smoke(
                         .is_ok()
                 })
                 .unwrap_or(false);
+            let invalid_prestart_refused = window
+                .update(|_, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace
+                                .request_action(
+                                    LocalAction::Commit {
+                                        message: "   ".into(),
+                                    },
+                                    cx,
+                                )
+                                .is_none()
+                                && workspace.in_flight_action_id().is_none()
+                                && workspace.status_message().contains("Git was not started")
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let _ = window.update(|_, cx| {
+                let _ = workspace.update(cx, |workspace, cx| workspace.refresh_all(cx));
+            });
+            let expected_guard = window
+                .background_executor()
+                .spawn({
+                    let checkout = checkout.clone();
+                    async move {
+                        LocalGit::open(checkout)
+                            .expect("open smoke checkout for guard")
+                            .snapshot()
+                            .expect("read smoke guard")
+                            .guard
+                    }
+                })
+                .await;
+            let guard_at = std::time::Instant::now();
+            loop {
+                window
+                    .background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let current = window
+                    .update(|_, cx| {
+                        workspace
+                            .read_with(cx, |workspace, _| {
+                                workspace
+                                    .local_snapshot()
+                                    .is_some_and(|snapshot| snapshot.guard == expected_guard)
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if current || guard_at.elapsed() > std::time::Duration::from_secs(20) {
+                    break;
+                }
+            }
+            let clean_refresh_confirmation_started = window
+                .update(|_, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.refresh_all(cx);
+                            let Some(request_id) = workspace.request_action(
+                                LocalAction::SwitchBranch {
+                                    branch: "feature/local-ui".into(),
+                                },
+                                cx,
+                            ) else {
+                                return false;
+                            };
+                            workspace.confirm_action(request_id, cx);
+                            workspace.in_flight_action_id() == Some(request_id)
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let clean_confirmation_at = std::time::Instant::now();
+            let clean_refresh_confirmation_finished = loop {
+                window
+                    .background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let finished = window
+                    .update(|_, cx| {
+                        workspace
+                            .read_with(cx, |workspace, _| {
+                                workspace.in_flight_action_id().is_none()
+                                    && workspace.status_message().contains("Completed")
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if finished
+                    || !clean_refresh_confirmation_started
+                    || clean_confirmation_at.elapsed() > std::time::Duration::from_secs(20)
+                {
+                    break finished;
+                }
+            };
+            let save_in_flight_confirmation_paused = window
+                .update(|window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            let Some(request_id) = workspace.request_action(
+                                LocalAction::SwitchBranch {
+                                    branch: "feature/local-ui".into(),
+                                },
+                                cx,
+                            ) else {
+                                return false;
+                            };
+                            let Some(editor) = workspace.active_editor() else {
+                                return false;
+                            };
+                            editor.update(cx, |editor, cx| {
+                                editor.insert("// save-in-flight guard\n", window, cx)
+                            });
+                            workspace.save_active(cx);
+                            workspace.confirm_action(request_id, cx);
+                            let paused = workspace.in_flight_action_id().is_none()
+                                && workspace
+                                    .status_message()
+                                    .contains("Confirmation paused");
+                            workspace.cancel_action(request_id, cx);
+                            paused && workspace.status_message().contains("cancelled")
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let save_guard_at = std::time::Instant::now();
+            loop {
+                window
+                    .background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let clean = window
+                    .update(|_, cx| {
+                        workspace
+                            .read_with(cx, |workspace, _| {
+                                workspace.active_document_status() == Some(DocumentStatus::Clean)
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if clean || save_guard_at.elapsed() > std::time::Duration::from_secs(20) {
+                    break;
+                }
+            }
             let checkout_action_edit_race_paused = window
                 .update(|window, cx| {
                     workspace
@@ -367,10 +513,13 @@ fn start_smoke(
                                 return false;
                             };
                             workspace.confirm_action(request_id, cx);
-                            workspace.in_flight_action_id().is_none()
+                            let paused_and_retained = workspace.in_flight_action_id().is_none()
                                 && workspace
                                     .status_message()
-                                    .contains("Confirmation paused")
+                                    .contains("Confirmation paused");
+                            workspace.cancel_action(request_id, cx);
+                            paused_and_retained
+                                && workspace.status_message().contains("cancelled")
                         })
                         .unwrap_or(false)
                 })
@@ -504,12 +653,16 @@ fn start_smoke(
                 }
             };
             let report = format!(
-                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nimmediate edit/persist versus checkout confirmation paused: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
+                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nclean checkout confirmation dispatched while no-op refresh pending: {}\nclean refresh-time confirmation completed authoritatively: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
                 if dark { "dark" } else { "light" },
                 opened,
                 edited,
                 readback.contains("highlighted local edit") && readback.contains("verified"),
                 highlighted_capture,
+                invalid_prestart_refused,
+                clean_refresh_confirmation_started,
+                clean_refresh_confirmation_finished,
+                save_in_flight_confirmation_paused,
                 checkout_action_edit_race_paused,
                 checkout_action_edit_race_paused && conflict_requested,
                 window

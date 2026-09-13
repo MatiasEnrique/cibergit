@@ -13,7 +13,8 @@ use cibergit::{
     domain::Repository,
     local_git::{
         DiffContent, DiffTarget, GitPath, HeadState, LocalGit, LocalGitError, LocalSnapshot,
-        MutationReceipt, OperationState, RemoteBranchObservation, SelectedDiff, SnapshotGuard,
+        MutationReceipt, OperationState, OutcomeCertainty, RemoteBranchObservation, SelectedDiff,
+        SnapshotGuard,
     },
     worktrees::{CheckoutView, FilesystemIdentity},
 };
@@ -30,12 +31,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    ffi::OsStr,
-    fs,
+    ffi::{CString, OsStr, OsString, c_char, c_int, c_void},
+    fs::{self, File},
     io::Write,
     ops::Range,
+    os::fd::{AsRawFd, FromRawFd},
     os::unix::{
-        ffi::OsStrExt,
+        ffi::{OsStrExt, OsStringExt},
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Component, Path, PathBuf},
@@ -51,6 +53,43 @@ const DEFAULT_FILE_LIMIT: usize = 20_000;
 const DEFAULT_DEPTH_LIMIT: usize = 64;
 const DEFAULT_PATH_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 const ACTION_JOURNAL: &str = "started-local-action.json";
+
+// Darwin values from <sys/fcntl.h> and <sys/file.h>. cibergit's native V1
+// target is macOS; these primitives fail closed instead of falling back to a
+// pathname traversal or a process-lifetime lock file.
+const O_RDONLY: c_int = 0;
+const O_RDWR: c_int = 2;
+const O_NONBLOCK: c_int = 0x0000_0004;
+const O_CREAT: c_int = 0x0000_0200;
+const O_RESOLVE_BENEATH: c_int = 0x0000_1000;
+const O_DIRECTORY: c_int = 0x0010_0000;
+const O_CLOEXEC: c_int = 0x0100_0000;
+const O_NOFOLLOW_ANY: c_int = 0x2000_0000;
+const LOCK_EX: c_int = 0x02;
+const LOCK_NB: c_int = 0x04;
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
+const DT_LNK: u8 = 10;
+
+#[repr(C)]
+struct DarwinDirent {
+    d_ino: u64,
+    d_seekoff: u64,
+    d_reclen: u16,
+    d_namlen: u16,
+    d_type: u8,
+    d_name: [c_char; 1024],
+}
+
+unsafe extern "C" {
+    fn openat(fd: c_int, path: *const c_char, oflag: c_int, ...) -> c_int;
+    fn flock(fd: c_int, operation: c_int) -> c_int;
+    fn dup(fd: c_int) -> c_int;
+    fn fdopendir(fd: c_int) -> *mut c_void;
+    fn readdir(directory: *mut c_void) -> *mut DarwinDirent;
+    fn closedir(directory: *mut c_void) -> c_int;
+    fn __error() -> *mut c_int;
+}
 
 actions!(
     local_workspace,
@@ -437,6 +476,7 @@ struct DocumentTab {
     view: DocumentView,
     generation: u64,
     persisted_generation: u64,
+    pending_checkout_operations: usize,
     message: String,
     pending_programmatic_reload: Option<PendingProgrammaticReload>,
     _subscription: Subscription,
@@ -760,6 +800,10 @@ impl LocalWorkspace {
             self.report_error("Local workspace is not ready".into(), cx);
             return None;
         };
+        if let Err(error) = validate_local_action_input(&action) {
+            self.report_error(format!("{error}; Git was not started"), cx);
+            return None;
+        }
         if self.in_flight_action.is_some() || self.reconciliation_clear_in_flight.is_some() {
             self.report_error(
                 "A local action or its durable reconciliation is still running".into(),
@@ -858,7 +902,6 @@ impl LocalWorkspace {
         if pending.action.changes_checkout()
             && let Some(reason) = self.checkout_action_blocker(cx)
         {
-            self.pending_action = None;
             self.report_error(format!("Confirmation paused: {reason}"), cx);
             return;
         }
@@ -898,14 +941,15 @@ impl LocalWorkspace {
             },
         };
         self.pending_action = None;
-        self.unresolved_started_action = Some(started.clone());
         self.in_flight_action = Some(request_id);
-        self.unresolved_refresh_required = true;
-        self.status = format!("Running {}…", started.summary);
+        self.unresolved_refresh_required = false;
+        self.status = format!("Checking and recording {}…", started.summary);
+        let retry = pending.clone();
         let action = pending.action;
         let guard = pending.guard;
+        let attempted = started.clone();
         let task = cx.background_spawn(async move {
-            run_local_action(&context, &journal_path, &started, action, &guard)
+            run_local_action(&context, &journal_path, &attempted, action, &guard)
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -915,27 +959,58 @@ impl LocalWorkspace {
                 }
                 this.in_flight_action = None;
                 match result {
-                Ok((receipt, snapshot)) => {
-                    this.git_generation = this.git_generation.wrapping_add(1);
-                    this.snapshot = Some(snapshot);
-                    this.unresolved_started_action = None;
-                    this.unresolved_refresh_required = false;
-                    this.status = format!("Completed {:?}; refreshed authoritative Git state", receipt.action);
-                    cx.emit(LocalWorkspaceEvent::LocalActionFinished {
-                        request_id,
-                        result: this.status.clone(),
-                    });
-                    cx.emit(LocalWorkspaceEvent::LocalSnapshotChanged);
-                    cx.notify();
-                }
-                Err(error) => {
-                    this.unresolved_refresh_required = true;
-                    this.status = format!(
-                        "Action may have started: {error}. Authoritative refresh and explicit reconciliation are required before retry."
-                    );
-                    cx.emit(LocalWorkspaceEvent::Error(this.status.clone()));
-                    this.refresh_git(cx);
-                }
+                    Ok((receipt, snapshot)) => {
+                        this.git_generation = this.git_generation.wrapping_add(1);
+                        this.snapshot = Some(snapshot);
+                        this.unresolved_started_action = None;
+                        this.unresolved_refresh_required = false;
+                        this.status = format!(
+                            "Completed {:?}; refreshed authoritative Git state",
+                            receipt.action
+                        );
+                        cx.emit(LocalWorkspaceEvent::LocalActionFinished {
+                            request_id,
+                            result: this.status.clone(),
+                        });
+                        cx.emit(LocalWorkspaceEvent::LocalSnapshotChanged);
+                        cx.notify();
+                    }
+                    Err(LocalActionRunError::NotDispatched {
+                        error,
+                        journal_preserved: false,
+                    }) => {
+                        this.unresolved_started_action = None;
+                        this.unresolved_refresh_required = false;
+                        if this.pending_action.is_none() {
+                            this.pending_action = Some(retry);
+                        }
+                        this.status = format!(
+                            "Git was not started: {error}. The same confirmation remains available to retry or cancel."
+                        );
+                        cx.emit(LocalWorkspaceEvent::Error(this.status.clone()));
+                        cx.notify();
+                    }
+                    Err(LocalActionRunError::NotDispatched {
+                        error,
+                        journal_preserved: true,
+                    }) => {
+                        this.unresolved_started_action = Some(started);
+                        this.unresolved_refresh_required = false;
+                        this.status = format!(
+                            "Git was not started, but its durable intent record was preserved: {error}. Reconcile that exact record before retrying."
+                        );
+                        cx.emit(LocalWorkspaceEvent::Error(this.status.clone()));
+                        cx.notify();
+                    }
+                    Err(LocalActionRunError::StartedOrUncertain(error)) => {
+                        this.unresolved_started_action = Some(started);
+                        this.unresolved_refresh_required = true;
+                        this.status = format!(
+                            "Action may have started: {error}. Authoritative refresh and explicit reconciliation are required before retry."
+                        );
+                        cx.emit(LocalWorkspaceEvent::Error(this.status.clone()));
+                        this.refresh_git(cx);
+                    }
                 }
             });
         })
@@ -1061,8 +1136,9 @@ impl LocalWorkspace {
             self.report_error(error, cx);
             return;
         }
+        tab.pending_checkout_operations = tab.pending_checkout_operations.saturating_add(1);
         tab.message = "Saving checked buffer…".into();
-        self.await_document_reply(path, receiver, cx);
+        self.await_document_reply(path, receiver, true, cx);
     }
 
     pub fn reload_active_from_disk(&mut self, cx: &mut Context<Self>) {
@@ -1080,7 +1156,8 @@ impl LocalWorkspace {
             .dispatch(DocumentCommand::Reload { generation, reply })
             .is_ok()
         {
-            self.await_document_reply(path, receiver, cx);
+            tab.pending_checkout_operations = tab.pending_checkout_operations.saturating_add(1);
+            self.await_document_reply(path, receiver, true, cx);
         }
     }
 
@@ -1109,7 +1186,8 @@ impl LocalWorkspace {
             })
             .is_ok()
         {
-            self.await_document_reply(path, receiver, cx);
+            tab.pending_checkout_operations = tab.pending_checkout_operations.saturating_add(1);
+            self.await_document_reply(path, receiver, true, cx);
         }
     }
 
@@ -1211,9 +1289,10 @@ impl LocalWorkspace {
                 })
                 .is_ok()
             {
+                tab.pending_checkout_operations = tab.pending_checkout_operations.saturating_add(1);
                 tab.message = "Persisting recovery…".into();
                 let path = path.clone();
-                this.await_document_reply(path, receiver, cx);
+                this.await_document_reply(path, receiver, true, cx);
             }
         });
         let worker = DocumentWorker::start(document);
@@ -1226,6 +1305,7 @@ impl LocalWorkspace {
                 view,
                 generation: 0,
                 persisted_generation: 0,
+                pending_checkout_operations: 0,
                 message: "Recovered/opened through DocumentStore".into(),
                 pending_programmatic_reload: None,
                 _subscription: subscription,
@@ -1249,7 +1329,7 @@ impl LocalWorkspace {
             .dispatch(DocumentCommand::Refresh { generation, reply })
             .is_ok()
         {
-            self.await_document_reply(path.to_owned(), receiver, cx);
+            self.await_document_reply(path.to_owned(), receiver, false, cx);
         }
     }
 
@@ -1257,6 +1337,7 @@ impl LocalWorkspace {
         &mut self,
         path: PathBuf,
         receiver: mpsc::Receiver<DocumentReply>,
+        blocks_checkout: bool,
         cx: &mut Context<Self>,
     ) {
         let task = cx.background_spawn(async move {
@@ -1267,7 +1348,13 @@ impl LocalWorkspace {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| match result {
-                Ok(reply) => this.apply_document_reply(&path, reply, cx),
+                Ok(reply) => {
+                    if blocks_checkout && let Some(tab) = this.documents.get_mut(&path) {
+                        tab.pending_checkout_operations =
+                            tab.pending_checkout_operations.saturating_sub(1);
+                    }
+                    this.apply_document_reply(&path, reply, cx);
+                }
                 Err(error) => this.report_error(error, cx),
             });
         })
@@ -1434,7 +1521,7 @@ impl LocalWorkspace {
         self.documents.values().find_map(|tab| {
             let editor_value = tab.editor.read(cx).value();
             let buffer_differs_from_accepted_base = editor_value.as_ref() != tab.view.base;
-            let operation_pending = tab.generation != tab.persisted_generation;
+            let operation_pending = tab.pending_checkout_operations != 0;
             let unresolved = tab.view.status != DocumentStatus::Clean
                 || tab.pending_programmatic_reload.is_some();
             (buffer_differs_from_accepted_base || operation_pending || unresolved).then(|| {
@@ -1643,10 +1730,33 @@ fn filesystem_identity(path: &Path) -> Result<FilesystemIdentity, String> {
 }
 
 fn enumerate_worktree(root: &Path, limits: BrowserLimits) -> Result<BrowserSnapshot, String> {
+    enumerate_worktree_with_hook(root, limits, |_| {})
+}
+
+fn enumerate_worktree_with_hook(
+    root: &Path,
+    limits: BrowserLimits,
+    mut before_descend: impl FnMut(&Path),
+) -> Result<BrowserSnapshot, String> {
     if limits.max_entries == 0 || limits.max_depth == 0 || limits.max_path_bytes == 0 {
         return Err("browser limits must be non-zero".into());
     }
     let root = fs::canonicalize(root).map_err(|error| format!("canonicalize worktree: {error}"))?;
+    let expected_root = filesystem_identity(&root)?;
+    let root_fd = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY)
+        .open(&root)
+        .map_err(|error| format!("open worktree root without following links: {error}"))?;
+    let opened_root = root_fd
+        .metadata()
+        .map_err(|error| format!("inspect opened worktree root: {error}"))?;
+    if !opened_root.is_dir()
+        || opened_root.dev() != expected_root.device
+        || opened_root.ino() != expected_root.inode
+    {
+        return Err("opened worktree root identity does not match the accepted path".into());
+    }
     let mut snapshot = BrowserSnapshot {
         entries: Vec::new(),
         truncated: false,
@@ -1659,40 +1769,70 @@ fn enumerate_worktree(root: &Path, limits: BrowserLimits) -> Result<BrowserSnaps
             truncate(&mut snapshot, "maximum directory depth reached");
             continue;
         }
-        let directory = root.join(&relative_dir);
-        let mut children = fs::read_dir(&directory)
-            .map_err(|error| format!("enumerate {}: {error}", directory.display()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("enumerate {}: {error}", directory.display()))?;
-        children.sort_by(|left, right| {
-            left.file_name()
-                .as_bytes()
-                .cmp(right.file_name().as_bytes())
-        });
-        for child in children {
-            let name = child.file_name();
-            if relative_dir.as_os_str().is_empty() && name.as_bytes() == b".git" {
+        let opened_directory;
+        let directory_fd = if relative_dir.as_os_str().is_empty() {
+            &root_fd
+        } else {
+            before_descend(&relative_dir);
+            let Ok(directory) = open_directory_at(&root_fd, relative_dir.as_os_str()) else {
                 continue;
+            };
+            opened_directory = directory;
+            &opened_directory
+        };
+        let mut bounded_children: Vec<(OsString, PathBuf, BrowserEntryKind)> = Vec::new();
+        let mut reached_bound = false;
+        read_directory_names(directory_fd, |name, entry_type| {
+            if name.as_bytes() == b".git" {
+                return true;
             }
             let relative = relative_dir.join(&name);
-            path_bytes = path_bytes.saturating_add(relative.as_os_str().as_bytes().len());
-            if snapshot.entries.len() >= limits.max_entries || path_bytes > limits.max_path_bytes {
-                truncate(&mut snapshot, "file or path-byte enumeration bound reached");
-                return Ok(snapshot);
+            let relative_bytes = relative.as_os_str().as_bytes().len();
+            if snapshot
+                .entries
+                .len()
+                .saturating_add(bounded_children.len())
+                >= limits.max_entries
+                || path_bytes.saturating_add(relative_bytes) > limits.max_path_bytes
+            {
+                reached_bound = true;
+                return false;
             }
-            let metadata = fs::symlink_metadata(child.path())
-                .map_err(|error| format!("inspect {}: {error}", relative.display()))?;
-            let kind = if metadata.file_type().is_symlink() {
+            path_bytes = path_bytes.saturating_add(relative_bytes);
+            let kind = if entry_type == DT_LNK {
                 BrowserEntryKind::Symlink
-            } else if metadata.is_dir() {
+            } else if entry_type == DT_DIR {
                 BrowserEntryKind::Directory
-            } else if metadata.is_file() && is_media_path(&relative) {
+            } else if entry_type == DT_REG && is_media_path(&relative) {
                 BrowserEntryKind::UnsupportedMedia
-            } else if metadata.is_file() {
+            } else if entry_type == DT_REG {
                 BrowserEntryKind::EditableCandidate
             } else {
                 BrowserEntryKind::Other
             };
+            bounded_children.push((name, relative, kind));
+            true
+        })
+        .map_err(|error| {
+            format!(
+                "enumerate descriptor for {}: {error}",
+                display_path(&relative_dir)
+            )
+        })?;
+        if reached_bound {
+            truncate(&mut snapshot, "file or path-byte enumeration bound reached");
+            snapshot.entries.extend(bounded_children.into_iter().map(
+                |(_, relative_path, kind)| BrowserEntry {
+                    display: display_path(&relative_path),
+                    relative_path,
+                    kind,
+                },
+            ));
+            sort_browser_entries(&mut snapshot.entries);
+            return Ok(snapshot);
+        }
+        bounded_children.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        for (_, relative, kind) in bounded_children {
             snapshot.entries.push(BrowserEntry {
                 display: display_path(&relative),
                 relative_path: relative.clone(),
@@ -1707,13 +1847,94 @@ fn enumerate_worktree(root: &Path, limits: BrowserLimits) -> Result<BrowserSnaps
             }
         }
     }
-    snapshot.entries.sort_by(|left, right| {
+    sort_browser_entries(&mut snapshot.entries);
+    Ok(snapshot)
+}
+
+struct DirectoryStream(*mut c_void);
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        unsafe {
+            closedir(self.0);
+        }
+    }
+}
+
+fn read_directory_names(
+    directory: &File,
+    mut visit: impl FnMut(OsString, u8) -> bool,
+) -> Result<(), String> {
+    let duplicate = unsafe { dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(format!(
+            "duplicate directory descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let stream = unsafe { fdopendir(duplicate) };
+    if stream.is_null() {
+        unsafe {
+            File::from_raw_fd(duplicate);
+        }
+        return Err(format!(
+            "open directory stream: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let stream = DirectoryStream(stream);
+    loop {
+        unsafe {
+            *__error() = 0;
+        }
+        let entry = unsafe { readdir(stream.0) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error().unwrap_or(0) == 0 {
+                return Ok(());
+            }
+            return Err(format!("read directory stream: {error}"));
+        }
+        let entry = unsafe { &*entry };
+        let name_len = usize::from(entry.d_namlen).min(entry.d_name.len());
+        let name =
+            unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr().cast::<u8>(), name_len) };
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if !visit(OsString::from_vec(name.to_vec()), entry.d_type) {
+            return Ok(());
+        }
+    }
+}
+
+fn open_directory_at(parent: &File, name: &OsStr) -> Result<File, String> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| "directory entry unexpectedly contains NUL".to_owned())?;
+    let fd = unsafe {
+        openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            O_RDONLY | O_NONBLOCK | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY | O_RESOLVE_BENEATH,
+        )
+    };
+    if fd < 0 {
+        Err(format!(
+            "open directory entry without following links: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn sort_browser_entries(entries: &mut [BrowserEntry]) {
+    entries.sort_by(|left, right| {
         left.relative_path
             .as_os_str()
             .as_bytes()
             .cmp(right.relative_path.as_os_str().as_bytes())
     });
-    Ok(snapshot)
 }
 
 fn truncate(snapshot: &mut BrowserSnapshot, reason: &str) {
@@ -1736,9 +1957,10 @@ fn validate_relative_path(path: &Path) -> Result<PathBuf, String> {
             | Component::Prefix(_) => return Err("path contains traversal or a root".into()),
         }
     }
-    if path.components().next().is_some_and(
-        |component| matches!(component, Component::Normal(name) if name.as_bytes() == b".git"),
-    ) {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::Normal(name) if name.as_bytes() == b".git"))
+    {
         return Err("Git internals are not part of the workspace browser".into());
     }
     Ok(path.to_owned())
@@ -1775,17 +1997,84 @@ fn display_path(path: &Path) -> String {
     path.as_os_str().to_string_lossy().into_owned()
 }
 
+fn validate_local_action_input(action: &LocalAction) -> Result<(), String> {
+    match action {
+        LocalAction::Commit { message } if message.trim().is_empty() => {
+            Err("Commit message must not be empty".into())
+        }
+        LocalAction::FastForwardPull { branch, .. }
+        | LocalAction::Push { branch, .. }
+        | LocalAction::ForcePushWithLease { branch, .. }
+        | LocalAction::CreateBranch { branch, .. }
+        | LocalAction::SwitchBranch { branch }
+            if branch.trim().is_empty() =>
+        {
+            Err("Branch name must not be empty".into())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LocalActionRunError {
+    NotDispatched {
+        error: String,
+        journal_preserved: bool,
+    },
+    StartedOrUncertain(String),
+}
+
+impl LocalActionRunError {
+    fn before_journal(error: impl Into<String>) -> Self {
+        Self::NotDispatched {
+            error: error.into(),
+            journal_preserved: false,
+        }
+    }
+
+    fn with_preserved_journal(error: impl Into<String>) -> Self {
+        Self::NotDispatched {
+            error: error.into(),
+            journal_preserved: true,
+        }
+    }
+}
+
 fn run_local_action(
     context: &LocalWorkspaceContext,
     journal_path: &Path,
     started: &StartedAction,
     action: LocalAction,
     guard: &SnapshotGuard,
-) -> Result<(MutationReceipt, LocalSnapshot), String> {
-    let git =
-        LocalGit::open(&context.checkout.association.path).map_err(|error| error.to_string())?;
-    validate_checkout(&context.checkout, &git)?;
-    write_started_action(journal_path, started)?;
+) -> Result<(MutationReceipt, LocalSnapshot), LocalActionRunError> {
+    run_local_action_with_journal(
+        context,
+        journal_path,
+        started,
+        action,
+        guard,
+        write_started_action,
+    )
+}
+
+fn run_local_action_with_journal(
+    context: &LocalWorkspaceContext,
+    journal_path: &Path,
+    started: &StartedAction,
+    action: LocalAction,
+    guard: &SnapshotGuard,
+    write_journal: impl FnOnce(&Path, &StartedAction) -> Result<(), JournalWriteError>,
+) -> Result<(MutationReceipt, LocalSnapshot), LocalActionRunError> {
+    validate_local_action_input(&action).map_err(LocalActionRunError::before_journal)?;
+    let git = LocalGit::open(&context.checkout.association.path)
+        .map_err(|error| LocalActionRunError::before_journal(error.to_string()))?;
+    validate_checkout(&context.checkout, &git).map_err(LocalActionRunError::before_journal)?;
+    write_journal(journal_path, started).map_err(|error| match error {
+        JournalWriteError::NotInstalled(error) => LocalActionRunError::before_journal(error),
+        JournalWriteError::InstalledOrUncertain(error) => {
+            LocalActionRunError::with_preserved_journal(error)
+        }
+    })?;
     let receipt = match action {
         LocalAction::Stage(paths) => git.stage(&paths, guard),
         LocalAction::Unstage(paths) => git.unstage(&paths, guard),
@@ -1804,45 +2093,99 @@ fn run_local_action(
             git.create_branch(&branch, start_oid.as_deref(), guard)
         }
         LocalAction::SwitchBranch { branch } => git.switch_branch(&branch, guard),
-    }
-    .map_err(|error| git_action_error(&error))?;
-    validate_checkout(&context.checkout, &git)?;
+    };
+    let receipt = match receipt {
+        Ok(receipt) => receipt,
+        Err(error) if local_git_error_is_certain(&error) => {
+            let message = format!("Git refused before mutation dispatch: {error}");
+            return match clear_started_action(journal_path, started) {
+                Ok(true) => Err(LocalActionRunError::before_journal(message)),
+                Ok(false) => Err(LocalActionRunError::before_journal(format!(
+                    "{message}; the exact journal record was not present, so no different record was erased"
+                ))),
+                Err(clear_error) => Err(LocalActionRunError::before_journal(format!(
+                    "{message}; the durable record could not be cleared safely and was preserved: {clear_error}"
+                ))),
+            };
+        }
+        Err(error) => {
+            return Err(LocalActionRunError::StartedOrUncertain(git_action_error(
+                &error,
+            )));
+        }
+    };
+    validate_checkout(&context.checkout, &git).map_err(LocalActionRunError::StartedOrUncertain)?;
     let snapshot = git.snapshot().map_err(|error| {
-        format!("post-start authoritative refresh failed: {error}; outcome is uncertain")
+        LocalActionRunError::StartedOrUncertain(format!(
+            "post-start authoritative refresh failed: {error}; outcome is uncertain"
+        ))
     })?;
-    if !clear_started_action(journal_path, started)? {
-        return Err("started-action record changed before completion; it was preserved".into());
+    let cleared = clear_started_action(journal_path, started)
+        .map_err(LocalActionRunError::StartedOrUncertain)?;
+    if !cleared {
+        return Err(LocalActionRunError::StartedOrUncertain(
+            "started-action record changed before completion; it was preserved".into(),
+        ));
     }
     Ok((receipt, snapshot))
+}
+
+fn local_git_error_is_certain(error: &LocalGitError) -> bool {
+    match error {
+        LocalGitError::MutationCommandFailed { certainty, .. }
+        | LocalGitError::MutationIo { certainty, .. }
+        | LocalGitError::TimedOut { certainty, .. }
+        | LocalGitError::OutputLimit { certainty, .. } => *certainty == OutcomeCertainty::Certain,
+        _ => true,
+    }
 }
 
 fn git_action_error(error: &LocalGitError) -> String {
     format!("Git reported {error}; the durable started-action record was retained")
 }
 
-fn write_started_action(path: &Path, started: &StartedAction) -> Result<(), String> {
+#[derive(Debug, PartialEq, Eq)]
+enum JournalWriteError {
+    NotInstalled(String),
+    InstalledOrUncertain(String),
+}
+
+fn write_started_action(path: &Path, started: &StartedAction) -> Result<(), JournalWriteError> {
+    write_started_action_with_hook(path, started, || Ok(()))
+}
+
+fn write_started_action_with_hook(
+    path: &Path,
+    started: &StartedAction,
+    after_install: impl FnOnce() -> Result<(), String>,
+) -> Result<(), JournalWriteError> {
+    let before_install = |error: String| JournalWriteError::NotInstalled(error);
+    let after_install_error = |error: String| JournalWriteError::InstalledOrUncertain(error);
     let parent = path
         .parent()
-        .ok_or_else(|| "action journal has no parent".to_owned())?;
-    prepare_private_directory(parent)?;
-    let _lock = ActionJournalLock::acquire(path)?;
+        .ok_or_else(|| before_install("action journal has no parent".to_owned()))?;
+    prepare_private_directory(parent).map_err(before_install)?;
+    let _lock = ActionJournalLock::acquire(path).map_err(before_install)?;
     match read_started_action(path) {
         Ok(Some(existing)) => {
-            return Err(format!(
+            return Err(JournalWriteError::NotInstalled(format!(
                 "an existing started action {} is still active; it was preserved",
                 existing.request_id
-            ));
+            )));
         }
         Ok(None) => {}
         Err(error) => {
-            return Err(format!(
+            return Err(JournalWriteError::NotInstalled(format!(
                 "existing action journal is unsafe, corrupt, or from a future schema; it was preserved: {error}"
-            ));
+            )));
         }
     }
-    let bytes = serde_json::to_vec_pretty(started).map_err(|error| error.to_string())?;
+    let bytes =
+        serde_json::to_vec_pretty(started).map_err(|error| before_install(error.to_string()))?;
     if bytes.len() > 64 * 1024 {
-        return Err("local action journal exceeds its 64 KiB bound".into());
+        return Err(before_install(
+            "local action journal exceeds its 64 KiB bound".into(),
+        ));
     }
     let temporary = parent.join(format!(".started-{}.tmp", started.request_id));
     let mut file = fs::OpenOptions::new()
@@ -1850,26 +2193,30 @@ fn write_started_action(path: &Path, started: &StartedAction) -> Result<(), Stri
         .create_new(true)
         .mode(0o600)
         .open(&temporary)
-        .map_err(|error| format!("create action journal: {error}"))?;
+        .map_err(|error| before_install(format!("create action journal: {error}")))?;
     let prepared = file
         .write_all(&bytes)
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("sync action journal: {error}"));
     if let Err(error) = prepared {
         let _ = fs::remove_file(&temporary);
-        return Err(error);
+        return Err(before_install(error));
     }
     // A hard link is an atomic create-without-overwrite in this same directory.
     // Even an uncooperative concurrent writer cannot be replaced silently.
     if let Err(error) = fs::hard_link(&temporary, path) {
         let _ = fs::remove_file(&temporary);
-        return Err(format!("install action journal without overwrite: {error}"));
+        return Err(before_install(format!(
+            "install action journal without overwrite: {error}"
+        )));
     }
-    fs::remove_file(&temporary)
-        .map_err(|error| format!("remove installed journal temporary: {error}"))?;
+    after_install().map_err(after_install_error)?;
+    fs::remove_file(&temporary).map_err(|error| {
+        after_install_error(format!("remove installed journal temporary: {error}"))
+    })?;
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("sync action journal directory: {error}"))
+        .map_err(|error| after_install_error(format!("sync action journal directory: {error}")))
 }
 
 fn read_started_action(path: &Path) -> Result<Option<StartedAction>, String> {
@@ -1933,7 +2280,7 @@ fn prepare_private_directory(path: &Path) -> Result<(), String> {
 }
 
 struct ActionJournalLock {
-    path: PathBuf,
+    _file: File,
 }
 
 impl ActionJournalLock {
@@ -1941,34 +2288,70 @@ impl ActionJournalLock {
         let parent = journal
             .parent()
             .ok_or_else(|| "action journal has no parent".to_owned())?;
-        let path = parent.join(".started-local-action.lock");
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|error| {
-                format!(
-                    "action journal is locked by another active or interrupted process; preserving state: {error}"
-                )
-            })?;
-        if let Err(error) = file
-            .write_all(format!("pid={}\n", std::process::id()).as_bytes())
-            .and_then(|()| file.sync_all())
+        let expected_parent = filesystem_identity(parent)?;
+        let canonical_parent = fs::canonicalize(parent)
+            .map_err(|error| format!("canonicalize action journal directory: {error}"))?;
+        let parent_fd = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECTORY | O_CLOEXEC)
+            .open(&canonical_parent)
+            .map_err(|error| format!("open action journal directory: {error}"))?;
+        let opened_parent = parent_fd
+            .metadata()
+            .map_err(|error| format!("inspect action journal directory descriptor: {error}"))?;
+        if !opened_parent.is_dir()
+            || opened_parent.dev() != expected_parent.device
+            || opened_parent.ino() != expected_parent.inode
         {
-            let _ = fs::remove_file(&path);
-            return Err(format!("sync action journal lock: {error}"));
+            return Err("action journal directory identity changed before lock acquisition".into());
         }
-        Ok(Self { path })
-    }
-}
-
-impl Drop for ActionJournalLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::File::open(parent).and_then(|directory| directory.sync_all());
+        let lock_name = CString::new(".started-local-action.lock").expect("static lock name");
+        let lock_fd = unsafe {
+            openat(
+                parent_fd.as_raw_fd(),
+                lock_name.as_ptr(),
+                O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW_ANY,
+                0o600,
+            )
+        };
+        if lock_fd < 0 {
+            return Err(format!(
+                "open private action journal lock without following links: {}",
+                std::io::Error::last_os_error()
+            ));
         }
+        let mut file = unsafe { File::from_raw_fd(lock_fd) };
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("inspect action journal lock descriptor: {error}"))?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err("action journal lock is not a single private regular file".into());
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("protect action journal lock: {error}"))?;
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+            return Err(format!(
+                "action journal is locked by another live process; preserving state: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let path = canonical_parent.join(".started-local-action.lock");
+        let path_metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect action journal lock path: {error}"))?;
+        if path_metadata.file_type().is_symlink()
+            || path_metadata.dev() != metadata.dev()
+            || path_metadata.ino() != metadata.ino()
+        {
+            return Err("action journal lock path changed while it was acquired".into());
+        }
+        file.set_len(0)
+            .and_then(|()| file.write_all(format!("pid={}\n", std::process::id()).as_bytes()))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("sync action journal lock owner: {error}"))?;
+        parent_fd
+            .sync_all()
+            .map_err(|error| format!("sync action journal lock directory: {error}"))?;
+        Ok(Self { _file: file })
     }
 }
 
@@ -3385,7 +3768,7 @@ fn local_change_rows(snapshot: &LocalSnapshot) -> Vec<(&'static str, GitPath, Di
 mod tests {
     use super::*;
     use cibergit::document::{ReconcileOutcome, TargetIssue};
-    use std::{os::unix::fs::symlink, process::Command};
+    use std::{os::unix::fs::symlink, process::Command, time::Instant};
     use tempfile::TempDir;
 
     fn git(root: &Path, args: &[&str]) {
@@ -3481,8 +3864,20 @@ mod tests {
         let root = temporary.path().join("checkout");
         let outside = temporary.path().join("outside");
         fs::create_dir_all(root.join(".git/objects")).expect("git internals");
+        fs::create_dir_all(root.join("nested/.git/objects")).expect("nested Git directory");
+        fs::create_dir_all(root.join("nested/.github/workflows")).expect("GitHub directory");
         fs::create_dir_all(&outside).expect("outside");
         fs::write(outside.join("secret.txt"), "outside").expect("outside file");
+        fs::write(root.join("nested/.git/config"), "metadata").expect("nested Git metadata");
+        fs::write(root.join("submodule"), "placeholder").expect("submodule parent");
+        fs::create_dir(root.join("submodule-dir")).expect("submodule directory");
+        fs::write(root.join("submodule-dir/.git"), "gitdir: elsewhere").expect("git file");
+        fs::write(root.join("nested/.gitignore"), "target\n").expect("gitignore");
+        fs::write(
+            root.join("nested/.github/workflows/check.yml"),
+            "name: check\n",
+        )
+        .expect("GitHub workflow");
         fs::write(root.join(OsStr::from_bytes(b"raw-\nname.txt")), b"raw").expect("raw file");
         fs::write(root.join("movie.mp4"), b"media").expect("media");
         symlink(&outside, root.join("escape")).expect("symlink");
@@ -3495,9 +3890,26 @@ mod tests {
         assert!(snapshot.entries.iter().any(|entry| {
             entry.relative_path == Path::new("escape") && entry.kind == BrowserEntryKind::Symlink
         }));
-        assert!(!snapshot.entries.iter().any(
-            |entry| entry.relative_path.starts_with(".git") || entry.display.contains("secret")
-        ));
+        assert!(!snapshot.entries.iter().any(|entry| {
+            entry
+                .relative_path
+                .components()
+                .any(|component| matches!(component, Component::Normal(name) if name == ".git"))
+                || entry.display.contains("secret")
+        }));
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.relative_path == Path::new("nested/.gitignore"))
+        );
+        assert!(snapshot.entries.iter().any(|entry| {
+            entry.relative_path == Path::new("nested/.github/workflows/check.yml")
+        }));
+        assert!(validate_relative_path(Path::new("nested/.git/config")).is_err());
+        assert!(validate_relative_path(Path::new("submodule-dir/.git")).is_err());
+        assert!(validate_relative_path(Path::new("nested/.gitignore")).is_ok());
+        assert!(validate_relative_path(Path::new("nested/.github/check.yml")).is_ok());
         assert_eq!(
             snapshot
                 .entries
@@ -3526,6 +3938,36 @@ mod tests {
         assert!(snapshot.truncated);
         assert_eq!(snapshot.entries.len(), 2);
         assert!(snapshot.truncation_reason.is_some());
+        assert!(snapshot.entries.windows(2).all(|entries| {
+            entries[0].relative_path.as_os_str().as_bytes()
+                <= entries[1].relative_path.as_os_str().as_bytes()
+        }));
+    }
+
+    #[test]
+    fn browser_does_not_follow_a_directory_replaced_before_descriptor_open() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let root = temporary.path().join("checkout");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(root.join("victim")).expect("victim directory");
+        fs::create_dir_all(&outside).expect("outside directory");
+        fs::write(root.join("victim/inside.txt"), "inside").expect("inside file");
+        fs::write(outside.join("secret.txt"), "secret").expect("outside secret");
+        let mut replaced = false;
+        let snapshot = enumerate_worktree_with_hook(&root, BrowserLimits::default(), |relative| {
+            if !replaced && relative == Path::new("victim") {
+                fs::rename(root.join("victim"), root.join("detached"))
+                    .expect("detach original directory");
+                symlink(&outside, root.join("victim")).expect("replacement symlink");
+                replaced = true;
+            }
+        })
+        .expect("descriptor enumeration");
+        assert!(replaced);
+        assert!(!snapshot.entries.iter().any(|entry| {
+            entry.relative_path == Path::new("victim/secret.txt")
+                || entry.display.contains("secret")
+        }));
     }
 
     #[test]
@@ -3668,7 +4110,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_guard_is_rejected_and_started_action_stays_journaled() {
+    fn stale_guard_is_a_certain_refusal_and_exact_journal_is_cleared() {
         let (_temporary, context) = checkout_fixture();
         let git = LocalGit::open(&context.checkout.association.path).expect("git");
         let stale = git.snapshot().expect("snapshot").guard;
@@ -3694,11 +4136,235 @@ mod tests {
             LocalAction::Stage(vec![GitPath::from_raw(b"same.txt".to_vec()).expect("path")]),
             &stale,
         );
-        assert!(result.is_err());
-        assert!(journal.exists(), "post-start error must retain uncertainty");
+        assert!(matches!(
+            result,
+            Err(LocalActionRunError::NotDispatched {
+                journal_preserved: false,
+                ..
+            })
+        ));
+        assert_eq!(read_started_action(&journal).expect("journal"), None);
+        let refreshed = git.snapshot().expect("refreshed snapshot");
+        assert!(
+            refreshed.staged.is_empty(),
+            "stale refusal dispatched no Git"
+        );
+    }
+
+    #[test]
+    fn certain_refusal_releases_attempt_without_erasing_changed_durable_record() {
+        let (_temporary, context) = checkout_fixture();
+        let git = LocalGit::open(&context.checkout.association.path).expect("git");
+        let stale = git.snapshot().expect("snapshot").guard;
+        fs::write(
+            context.checkout.association.path.join("same.txt"),
+            "changed outside",
+        )
+        .expect("external change");
+        let journal = context.data_root.join("changed-record.json");
+        let started = StartedAction {
+            schema_version: 1,
+            request_id: 10,
+            kind: "stage".into(),
+            summary: "Stage same.txt".into(),
+            checkout_identity: checkout_identity_label(&context.checkout),
+            displayed_head: "test".into(),
+            expected_remote_oid: None,
+        };
+        let different = StartedAction {
+            request_id: 99,
+            summary: "different durable record".into(),
+            ..started.clone()
+        };
+        let different_for_writer = different.clone();
+        let result = run_local_action_with_journal(
+            &context,
+            &journal,
+            &started,
+            LocalAction::Stage(vec![GitPath::from_raw(b"same.txt".to_vec()).expect("path")]),
+            &stale,
+            |path, attempted| {
+                write_started_action(path, attempted)?;
+                let bytes =
+                    serde_json::to_vec_pretty(&different_for_writer).expect("different JSON");
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(path)
+                    .expect("replace durable contents for race fixture");
+                file.write_all(&bytes).expect("different durable contents");
+                file.sync_all().expect("sync different durable contents");
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(LocalActionRunError::NotDispatched {
+                journal_preserved: false,
+                ..
+            })
+        ));
         assert_eq!(
-            read_started_action(&journal).expect("journal"),
-            Some(started)
+            read_started_action(&journal).expect("changed record remains"),
+            Some(different)
+        );
+        assert!(git.snapshot().expect("after refusal").staged.is_empty());
+    }
+
+    #[test]
+    fn prestart_validation_and_journal_failure_dispatch_zero_git_mutations() {
+        let (_temporary, context) = checkout_fixture();
+        fs::write(
+            context.checkout.association.path.join("same.txt"),
+            "eligible local change",
+        )
+        .expect("local change");
+        let git = LocalGit::open(&context.checkout.association.path).expect("git");
+        let guard = git.snapshot().expect("guard").guard;
+        let started = StartedAction {
+            schema_version: 1,
+            request_id: 21,
+            kind: "stage".into(),
+            summary: "Stage same.txt".into(),
+            checkout_identity: checkout_identity_label(&context.checkout),
+            displayed_head: "test".into(),
+            expected_remote_oid: None,
+        };
+        let blocked_parent = context.data_root.join("not-a-directory");
+        fs::write(&blocked_parent, "block journal directory").expect("blocking file");
+        let journal = blocked_parent.join("started.json");
+        let result = run_local_action(
+            &context,
+            &journal,
+            &started,
+            LocalAction::Stage(vec![GitPath::from_raw(b"same.txt".to_vec()).expect("path")]),
+            &guard,
+        );
+        assert!(matches!(
+            result,
+            Err(LocalActionRunError::NotDispatched {
+                journal_preserved: false,
+                ..
+            })
+        ));
+        assert!(
+            git.snapshot().expect("after refusal").staged.is_empty(),
+            "journal preflight failure must dispatch no mutation"
+        );
+
+        let mismatch_journal = context.data_root.join("mismatch/started.json");
+        let existing = StartedAction {
+            request_id: 90,
+            summary: "different durable attempt".into(),
+            ..started.clone()
+        };
+        write_started_action(&mismatch_journal, &existing).expect("existing durable attempt");
+        let mismatch = run_local_action(
+            &context,
+            &mismatch_journal,
+            &started,
+            LocalAction::Stage(vec![GitPath::from_raw(b"same.txt".to_vec()).expect("path")]),
+            &guard,
+        );
+        assert!(matches!(
+            mismatch,
+            Err(LocalActionRunError::NotDispatched {
+                journal_preserved: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            read_started_action(&mismatch_journal).expect("preserved mismatch"),
+            Some(existing)
+        );
+        assert!(git.snapshot().expect("after mismatch").staged.is_empty());
+
+        for action in [
+            LocalAction::Commit {
+                message: " \t".into(),
+            },
+            LocalAction::SwitchBranch { branch: "".into() },
+        ] {
+            let validation_journal = context
+                .data_root
+                .join(format!("validation-{}.json", action.journal_kind()));
+            let result = run_local_action(
+                &context,
+                &validation_journal,
+                &StartedAction {
+                    request_id: started.request_id + 1,
+                    kind: action.journal_kind().into(),
+                    summary: action.summary(),
+                    ..started.clone()
+                },
+                action,
+                &guard,
+            );
+            assert!(matches!(
+                result,
+                Err(LocalActionRunError::NotDispatched {
+                    journal_preserved: false,
+                    ..
+                })
+            ));
+            assert!(!validation_journal.exists());
+        }
+        assert!(git.snapshot().expect("after validation").staged.is_empty());
+    }
+
+    #[test]
+    fn failure_after_journal_install_is_conservative_and_restart_reconciles_exact_record() {
+        let (_temporary, context) = checkout_fixture();
+        fs::write(
+            context.checkout.association.path.join("same.txt"),
+            "eligible local change",
+        )
+        .expect("local change");
+        let git = LocalGit::open(&context.checkout.association.path).expect("git");
+        let guard = git.snapshot().expect("guard").guard;
+        let journal = context.data_root.join("post-install/started.json");
+        let started = StartedAction {
+            schema_version: 1,
+            request_id: 33,
+            kind: "stage".into(),
+            summary: "Stage same.txt".into(),
+            checkout_identity: checkout_identity_label(&context.checkout),
+            displayed_head: "test".into(),
+            expected_remote_oid: None,
+        };
+        let result = run_local_action_with_journal(
+            &context,
+            &journal,
+            &started,
+            LocalAction::Stage(vec![GitPath::from_raw(b"same.txt".to_vec()).expect("path")]),
+            &guard,
+            |path, started| {
+                write_started_action_with_hook(path, started, || {
+                    Err("injected failure after journal installation".into())
+                })
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(LocalActionRunError::NotDispatched {
+                journal_preserved: true,
+                ..
+            })
+        ));
+        assert!(
+            git.snapshot()
+                .expect("after injected failure")
+                .staged
+                .is_empty()
+        );
+        assert_eq!(
+            read_started_action(&journal).expect("restart journal read"),
+            Some(started.clone())
+        );
+        assert!(clear_started_action(&journal, &started).expect("exact restart acknowledgement"));
+        assert_eq!(
+            read_started_action(&journal).expect("cleared journal"),
+            None
         );
     }
 
@@ -3777,6 +4443,86 @@ mod tests {
         );
         assert!(clear_started_action(&path, &first).expect("exact clear"));
         assert_eq!(read_started_action(&path).expect("cleared"), None);
+    }
+
+    #[test]
+    fn descriptor_lock_refuses_live_contender_then_process_death_releases_acknowledgement() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let journal = temporary.path().join("actions/started.json");
+        let marker = temporary.path().join("helper-ready");
+        let started = StartedAction {
+            schema_version: 1,
+            request_id: 71,
+            kind: "stage".into(),
+            summary: "Stage same.txt".into(),
+            checkout_identity: "checkout".into(),
+            displayed_head: "head".into(),
+            expected_remote_oid: None,
+        };
+        write_started_action(&journal, &started).expect("durable journal before helper");
+        let mut helper = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("action_journal_lock_helper_process")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("CIBERGIT_TEST_LOCK_JOURNAL", &journal)
+            .env("CIBERGIT_TEST_LOCK_MARKER", &marker)
+            .spawn()
+            .expect("spawn lock helper");
+        let wait_started = Instant::now();
+        while !marker.exists() && wait_started.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(marker.exists(), "helper did not acquire descriptor lock");
+        let refusal_started = Instant::now();
+        let refusal = clear_started_action(&journal, &started);
+        assert!(refusal.is_err(), "live lock holder must refuse contender");
+        assert!(
+            refusal_started.elapsed() < Duration::from_secs(1),
+            "nonblocking lock refusal must be bounded"
+        );
+        helper.kill().expect("kill lock helper");
+        helper.wait().expect("reap lock helper");
+        assert!(
+            clear_started_action(&journal, &started).expect("acknowledge after helper death"),
+            "closing the killed helper descriptor must release the lock"
+        );
+        assert_eq!(
+            read_started_action(&journal).expect("cleared journal"),
+            None
+        );
+        let lock_path = journal
+            .parent()
+            .expect("journal parent")
+            .join(".started-local-action.lock");
+        assert!(
+            lock_path.exists(),
+            "one persistent lock namespace is retained"
+        );
+        assert_eq!(
+            fs::symlink_metadata(lock_path)
+                .expect("lock metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess helper; invoked by descriptor lock lifecycle test"]
+    fn action_journal_lock_helper_process() {
+        let Some(journal) = std::env::var_os("CIBERGIT_TEST_LOCK_JOURNAL").map(PathBuf::from)
+        else {
+            return;
+        };
+        let marker = std::env::var_os("CIBERGIT_TEST_LOCK_MARKER")
+            .map(PathBuf::from)
+            .expect("helper marker");
+        let _lock = ActionJournalLock::acquire(&journal).expect("helper descriptor lock");
+        fs::write(marker, "ready").expect("helper ready marker");
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
     }
 
     #[test]
