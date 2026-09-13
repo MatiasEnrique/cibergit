@@ -1,6 +1,6 @@
 # Building cibergit
 
-cibergit is a native, read-only pull-request review workspace for Apple Silicon Macs. The default launch opens repository setup; a reproducible direct launch can select a GitHub account, repository, and pull request from the command line.
+cibergit is a native pull-request review workspace for Apple Silicon Macs. Comparisons remain immutable until explicitly advanced; review and merge mutations are opt-in, confirmed where appropriate, and executed only through the selected account's provider session.
 
 ## Requirements
 
@@ -62,6 +62,26 @@ cargo run --locked -- --edit /absolute/path/to/file.rs
   stops; exceptionally long lines are split into bounded UTF-8-safe shaping chunks without
   removing source text.
 - Command-Shift-I toggles pull-request details.
+- Click a selectable diff line to open an inline composer; Shift-click another line on the same
+  side extends the exact range. Press `c` with the diff focused to choose the first selectable
+  line. Text changes are locally autosaved after a short debounce; Command-Return forces a local
+  restart/offline recovery save. Command-Shift-Return explicitly adds
+  the saved text to the selected account's pending review, and Command-Option-Return explicitly
+  posts it immediately. No comment action submits a review implicitly.
+- Activity keeps the selected user's pending review separate from historical review and issue
+  discussion. Linked pending comments can be reopened and edited; browser-created comments that
+  lack an exact local recovery link stay authoritative and are identified instead of guessed into
+  local state. Replies, resolve/unresolve, pending-summary updates, comment deletion and review
+  cancellation use their visible explicit controls. Partial provider reads are labelled.
+- Command-Shift-R opens native review submission confirmation. Choose Comment, Approve, or Request
+  changes and confirm the summary, pending count, account and exact reviewed head. If a newer head
+  exists, submission remains bound to the older displayed head and shows that warning.
+- Command-Shift-M performs a fresh merge preflight and then opens native confirmation with the
+  repository, pull request, account, reviewed/current heads, rule/check/review blockers, supported
+  merge methods and real auto-merge/queue choices. Confirmation dispatches one guarded request.
+  Enable/queue acknowledgement is displayed as enabled/queued, not merged. Branch deletion is
+  unavailable because the provider has no CAS-safe delete-ref operation; there is no working-looking
+  checkbox or automatic administrator bypass.
 - Drag the dividers beside the repository sidebar, changed-file tree, and details pane to resize
   them. Command-Shift-B and Command-Shift-F collapse/restore the sidebar and file tree. Control-
   Option-Left/Right adjusts the sidebar; add Shift for the file tree and Command for details.
@@ -77,15 +97,22 @@ cargo run --locked -- --edit /absolute/path/to/file.rs
 - Command-W closes the active review tab. Command-O opens repository setup.
 - File progress, per-file scroll, comparison mode, pinned revision, and tab state persist in the selected data directory.
 
-The M1 workspace performs GitHub and local repository reads only. Review/check state remains `UNKNOWN` when unavailable; it is never inferred from missing data. Drafting, publishing, and destructive local editing are outside this smoke path.
+The displayed `ReviewSession` remains authoritative for the immutable comparison and revision;
+independent metadata, comments, checks and pending-review polls never advance it. Review text is
+partitioned by account/repository/PR and saved in private, versioned atomic recovery files. A
+failed initial save sends zero provider writes. Started or uncertain review operations survive
+restart, freeze incompatible preparation, trigger reads only, and are never replayed blindly.
+Auxiliary and merge operations additionally write an exact caller-owned request/attempt journal
+before dispatch under a crash-released per-review lock. Corrupt/future recovery is preserved.
+Authentication, capability, mapping and persistence failures keep local text and are disclosed.
 
 ## Validation
 
 ```sh
 CARGO_TARGET_DIR=/tmp/cibergit-native-target cargo fmt --check
-CARGO_TARGET_DIR=/tmp/cibergit-native-target cargo check --locked --all-targets --features ui-smoke
-CARGO_TARGET_DIR=/tmp/cibergit-native-target cargo clippy --locked --all-targets --features ui-smoke -- -D warnings
-CARGO_TARGET_DIR=/tmp/cibergit-native-target cargo test --locked
+CARGO_TARGET_DIR=/tmp/cibergit-native-target cargo check --locked --all-targets --all-features
+CARGO_TARGET_DIR=/tmp/cibergit-native-target cargo clippy --locked --all-targets --all-features -- -D warnings
+CARGO_TARGET_DIR=/tmp/cibergit-native-target cargo test --locked --all-targets --all-features
 python3 scripts/dependency-notices.py
 ```
 
@@ -123,8 +150,11 @@ cargo run --locked --features ui-smoke -- \
 created without focus and the application does not request activation. Normal
 launches retain the standard foreground activation behavior.
 
-Each evidence directory receives `native-pr-review.png`, unified and split
-`native-long-line-end*.png` captures, `native-long-line-start-split.png`, `native-view-editor-filters.png`,
+Each evidence directory receives `native-pr-review.png`,
+`native-review-interactions-unified.png`, `native-review-interactions-split.png`,
+`native-submit-confirmation.png`, `native-merge-confirmation.png`,
+`native-merge-confirmation-controls.png`, `native-long-line-end*.png`
+captures, `native-long-line-start-split.png`, `native-view-editor-filters.png`,
 `native-view-editor-groups.png`, and `native-pr-smoke.txt`. The fresh Auto run also writes
 `native-pr-review-split.png` before applying an explicit override.
 The harness labels these as
@@ -144,7 +174,12 @@ evidence. The real `cli/cli#14130` Overview capture also exercises narrow select
 paragraph to a fragment flow whose wrapped origins can overlap at narrow widths. cibergit escapes
 inline-code delimiters into literal selectable backticks as a bounded fallback; exact visible text,
 links, fenced code blocks, and media-free rendering remain intact, while inline code does not receive
-special code styling.
+special code styling. The review-interaction captures use a real displayed patch and the actual
+line-selection/controller/render handlers to place two wrapped thread rows and a focused multiline
+composer between their exact source rows. They resize to the minimum-width scene, reach the shared
+horizontal end, and assert measured variable row heights and non-overlap in both unified and split
+modes. Their Markdown fixture verifies that media is removed from prose while fenced and indented
+code preserve literal backticks, HTML comments/tags, angle brackets and image-looking text.
 
 The first smoke run also saves a named view with an exact source-branch filter and global
 target → repository → source-prefix grouping. The restart run requires that exact view and the

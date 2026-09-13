@@ -13,6 +13,7 @@ use cibergit::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -38,7 +39,7 @@ pub struct ComposerState {
 
 #[derive(Clone, Debug)]
 pub enum ControllerLoad {
-    Ready(ReviewInteractionController),
+    Ready(Box<ReviewInteractionController>),
     RecoveryRequired(String),
 }
 
@@ -48,6 +49,7 @@ pub struct ReviewInteractionController {
     pub store: DraftStore,
     pub authority: ReviewStateAuthority,
     pub durable_composition: Option<ReviewComposition>,
+    undurable_drafts: HashSet<String>,
     pub composer: Option<ComposerState>,
     pub pending_review: Option<PendingReviewSnapshot>,
     pub pending_complete: bool,
@@ -98,16 +100,17 @@ impl ReviewInteractionController {
             }
         };
         let authority = ReviewStateAuthority::open(root.join("state-authority"), key)?;
-        Ok(ControllerLoad::Ready(Self {
+        Ok(ControllerLoad::Ready(Box::new(Self {
             composition,
             store,
             authority,
             durable_composition,
+            undurable_drafts: HashSet::new(),
             composer: None,
             pending_review: None,
             pending_complete: true,
             notice: None,
-        }))
+        })))
     }
 
     pub fn select_line(
@@ -130,8 +133,11 @@ impl ReviewInteractionController {
                 coordinate,
                 draft_id: Some(draft.id.clone()),
                 body: draft.body.clone(),
-                durable: true,
-                notice: None,
+                durable: !self.undurable_drafts.contains(&draft.id),
+                notice: self
+                    .undurable_drafts
+                    .contains(&draft.id)
+                    .then(|| "The latest text has not finished saving locally.".into()),
             },
             None => ComposerState {
                 coordinate,
@@ -158,12 +164,15 @@ impl ReviewInteractionController {
                     .into(),
             );
         }
+        let durable = !self.undurable_drafts.contains(&draft.id);
         let composer = ComposerState {
             coordinate: draft.coordinate.clone(),
             draft_id: Some(draft.id.clone()),
             body: draft.body.clone(),
-            durable: true,
-            notice: Some(if draft.remote.is_some() {
+            durable,
+            notice: Some(if !durable {
+                "The latest text has not finished saving locally.".into()
+            } else if draft.remote.is_some() {
                 "Editing the linked pending comment locally; Add to pending review is an explicit update."
                     .into()
             } else {
@@ -196,6 +205,9 @@ impl ReviewInteractionController {
                 .map_err(|error| error.to_string())?;
             composer.draft_id = Some(draft.id.clone());
         }
+        if let Some(draft_id) = &composer.draft_id {
+            self.undurable_drafts.insert(draft_id.clone());
+        }
         Ok(self.composition.clone())
     }
 
@@ -206,6 +218,10 @@ impl ReviewInteractionController {
         saved_body: &str,
         result: Result<(), String>,
     ) {
+        if result.is_ok() {
+            self.durable_composition = Some(saved.clone());
+            self.undurable_drafts.remove(draft_id);
+        }
         let Some(composer) = self.composer.as_mut() else {
             return;
         };
@@ -214,11 +230,11 @@ impl ReviewInteractionController {
         }
         match result {
             Ok(()) => {
-                self.durable_composition = Some(saved.clone());
                 composer.durable = true;
                 composer.notice = Some("Saved locally for restart and offline recovery.".into());
             }
             Err(error) => {
+                self.undurable_drafts.insert(draft_id.into());
                 composer.durable = false;
                 composer.notice = Some(format!(
                     "Local save failed; text remains only in this open window: {error}"
@@ -426,6 +442,7 @@ pub struct InlineThread {
 pub struct InlineAnchor {
     pub file_key: String,
     pub side: cibergit::participation::DiffSide,
+    pub start_line: u64,
     pub line: u64,
 }
 
@@ -468,9 +485,10 @@ fn place_thread(session: &ReviewSession, thread: &ReviewThread) -> Result<Inline
         _ => return Err("The provider did not return an OLD/NEW side.".into()),
     };
     let newest = thread.comments.last();
-    let (line, exact_commit) = if !thread.outdated {
+    let (line, start_line, exact_commit) = if !thread.outdated {
         (
             thread.line,
+            thread.start_line,
             newest.and_then(|comment| comment.commit_sha.as_deref()),
         )
     } else {
@@ -482,6 +500,7 @@ fn place_thread(session: &ReviewSession, thread: &ReviewThread) -> Result<Inline
         }
         (
             thread.original_line,
+            thread.original_start_line,
             newest.and_then(|comment| comment.original_commit_sha.as_deref()),
         )
     };
@@ -496,21 +515,44 @@ fn place_thread(session: &ReviewSession, thread: &ReviewThread) -> Result<Inline
         ));
     }
     let line = line.ok_or_else(|| "The provider did not return a usable line.".to_owned())?;
+    let start_line = start_line.unwrap_or(line);
+    let expected_side = match side {
+        cibergit::participation::DiffSide::Old => "LEFT",
+        cibergit::participation::DiffSide::New => "RIGHT",
+    };
+    if thread
+        .start_side
+        .as_deref()
+        .is_some_and(|candidate| candidate != expected_side)
+    {
+        return Err(
+            "The provider returned a cross-side range, which cannot be mapped safely.".into(),
+        );
+    }
     let key = file_key(file);
-    cibergit::participation::validate_coordinate(session, &key, LineSelection::single(side, line))
-        .map_err(|error| format!("The provider anchor is not selectable in this patch: {error}"))?;
+    cibergit::participation::validate_coordinate(
+        session,
+        &key,
+        LineSelection {
+            side,
+            start_line,
+            line,
+        },
+    )
+    .map_err(|error| format!("The provider anchor is not selectable in this patch: {error}"))?;
     Ok(InlineAnchor {
         file_key: key,
         side,
+        start_line,
         line,
     })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum JournalRequest {
-    Auxiliary(ReviewAuxiliaryRequest),
+    Auxiliary(Box<ReviewAuxiliaryRequest>),
     Merge {
-        preparation: MergePreparation,
+        preparation: Box<MergePreparation>,
         request: MergeExecutionRequest,
     },
 }
@@ -935,7 +977,7 @@ pub fn dispatch_auxiliary(
     request: &ReviewAuxiliaryRequest,
 ) -> ProviderMutationOutcome<ReviewAuxiliaryAcknowledgement> {
     journal.dispatch(
-        JournalRequest::Auxiliary(request.clone()),
+        JournalRequest::Auxiliary(Box::new(request.clone())),
         || provider.execute_review_auxiliary(repository, pull_request, request),
         |ack| {
             (
@@ -959,7 +1001,7 @@ pub fn dispatch_merge(
 ) -> ProviderMutationOutcome<MergeAcknowledgement> {
     journal.dispatch(
         JournalRequest::Merge {
-            preparation: preparation.clone(),
+            preparation: Box::new(preparation.clone()),
             request: request.clone(),
         },
         || provider.execute_merge(repository, preparation, request),
@@ -1093,6 +1135,7 @@ fn open_private_lock(path: &Path) -> Result<File, String> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open(path)
         .map_err(|error| format!("Cannot open private lock {}: {error}", path.display()))?;
@@ -1277,6 +1320,37 @@ mod tests {
     }
 
     #[test]
+    fn reselecting_an_unsaved_draft_never_claims_it_is_durable() {
+        let directory = tempdir().unwrap();
+        let session = session();
+        let mut controller =
+            match ReviewInteractionController::load(directory.path(), &repository(), 7, &session)
+                .unwrap()
+            {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+        let selection = LineSelection::single(DiffSide::New, 1);
+        controller.select_line(&session, selection).unwrap();
+        controller
+            .stage_composer_text("not on disk".into())
+            .unwrap();
+        controller.composer = None;
+        controller.select_line(&session, selection).unwrap();
+        assert!(!controller.composer.as_ref().unwrap().durable);
+        assert!(
+            controller
+                .prepare_pending(&session)
+                .unwrap_err()
+                .contains("Save")
+        );
+        assert!(matches!(
+            controller.store.load(&controller.composition.key).unwrap(),
+            LoadOutcome::Missing
+        ));
+    }
+
+    #[test]
     fn pending_immediate_and_submission_freeze_distinct_exact_payloads() {
         let directory = tempdir().unwrap();
         let session = session();
@@ -1388,7 +1462,7 @@ mod tests {
         };
         let calls = AtomicUsize::new(0);
         let outcome: ProviderMutationOutcome<()> = journal.dispatch(
-            JournalRequest::Auxiliary(auxiliary_request()),
+            JournalRequest::Auxiliary(Box::new(auxiliary_request())),
             || {
                 calls.fetch_add(1, Ordering::SeqCst);
                 ProviderMutationOutcome::Acknowledged(())
@@ -1409,7 +1483,7 @@ mod tests {
         let request = auxiliary_request();
         let calls = AtomicUsize::new(0);
         let outcome = journal.dispatch(
-            JournalRequest::Auxiliary(request.clone()),
+            JournalRequest::Auxiliary(Box::new(request.clone())),
             || {
                 calls.fetch_add(1, Ordering::SeqCst);
                 ProviderMutationOutcome::<()>::Uncertain {
@@ -1434,11 +1508,11 @@ mod tests {
         ));
         let second = AtomicUsize::new(0);
         let result = restored.dispatch(
-            JournalRequest::Auxiliary(ReviewAuxiliaryRequest {
+            JournalRequest::Auxiliary(Box::new(ReviewAuxiliaryRequest {
                 operation_id: "aux-2".into(),
                 attempt_id: "attempt-2".into(),
                 action: request.action,
-            }),
+            })),
             || {
                 second.fetch_add(1, Ordering::SeqCst);
                 ProviderMutationOutcome::Acknowledged(())
@@ -1461,7 +1535,7 @@ mod tests {
         let partition = path.parent().unwrap().to_owned();
         let displaced = partition.with_extension("displaced-for-test");
         let outcome = journal.dispatch(
-            JournalRequest::Auxiliary(request.clone()),
+            JournalRequest::Auxiliary(Box::new(request.clone())),
             || {
                 fs::rename(&partition, &displaced).unwrap();
                 fs::write(&partition, b"blocks journal partition").unwrap();
@@ -1496,7 +1570,7 @@ mod tests {
             workers.push(thread::spawn(move || {
                 barrier.wait();
                 journal.dispatch(
-                    JournalRequest::Auxiliary(request),
+                    JournalRequest::Auxiliary(Box::new(request)),
                     || {
                         calls.fetch_add(1, Ordering::SeqCst);
                         thread::sleep(Duration::from_millis(30));
@@ -1528,9 +1602,9 @@ mod tests {
         let journal = ActionJournal::open(directory.path(), review_key()).unwrap();
         let request = auxiliary_request();
         let _ = journal.dispatch(
-            JournalRequest::Auxiliary(request.clone()),
+            JournalRequest::Auxiliary(Box::new(request.clone())),
             || ProviderMutationOutcome::<()>::Uncertain {
-                context: JournalRequest::Auxiliary(request.clone()).mutation_context(),
+                context: JournalRequest::Auxiliary(Box::new(request.clone())).mutation_context(),
                 reason: "lost reply".into(),
             },
             |_| (true, true, "unused".into()),
@@ -1665,6 +1739,23 @@ mod tests {
             comments_complete: true,
         };
         assert_eq!(place_thread(&session, &current).unwrap().line, 1);
+        let range = ReviewThread {
+            line: Some(2),
+            start_line: Some(1),
+            start_side: Some("RIGHT".into()),
+            ..current.clone()
+        };
+        let range_anchor = place_thread(&session, &range).unwrap();
+        assert_eq!((range_anchor.start_line, range_anchor.line), (1, 2));
+        let cross_side = ReviewThread {
+            start_side: Some("LEFT".into()),
+            ..range
+        };
+        assert!(
+            place_thread(&session, &cross_side)
+                .unwrap_err()
+                .contains("cross-side")
+        );
         let old = ReviewThread {
             side: Some("LEFT".into()),
             outdated: true,

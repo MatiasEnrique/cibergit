@@ -31,7 +31,10 @@ use file_tree::{FileTree, TreeRowKind};
 use gpui::{prelude::*, *};
 use gpui_base::{
     Scrollbar, TextView, TextViewStyle,
-    input::{Editor, EditorState, Input, InputEditorStyle, InputState, Textarea, TextareaState},
+    input::{
+        Editor, EditorState, Input, InputEditorStyle, InputEvent, InputState, Textarea,
+        TextareaState,
+    },
 };
 use review_interactions::{
     ActionJournal, ComposerState, ControllerLoad, InlineThread, JournalRequest, JournalStatus,
@@ -71,6 +74,8 @@ const DIFF_CELL_WIDTH: f32 = 7.23;
 const DIFF_FIXED_COLUMNS: f32 = 122.;
 #[cfg(feature = "ui-smoke")]
 const SPLIT_GUTTER_WIDTH: f32 = 66.;
+#[cfg(feature = "ui-smoke")]
+const UNIFIED_GUTTER_WIDTH: f32 = 114.;
 const EXCEPTIONAL_LINE_CHUNK_BYTES: usize = 2_048;
 #[cfg(feature = "ui-smoke")]
 const SMOKE_LONG_LINE_TOKEN: &str = "CIBERGIT_LONG_LINE_END_7F3A";
@@ -575,7 +580,7 @@ enum NativeConfirmation {
         event: ReviewEvent,
     },
     Merge {
-        preparation: MergePreparation,
+        preparation: Box<MergePreparation>,
         method: MergeMethod,
         action: MergeConfirmationAction,
     },
@@ -610,7 +615,7 @@ enum DiffRow {
     Hunk(String),
     Unified(DiffLine),
     Split(AlignedRow),
-    Thread(InlineThread),
+    Thread(Box<InlineThread>),
     Composer {
         side: DiffSide,
         start_line: u64,
@@ -645,6 +650,7 @@ pub struct ReviewWorkspace {
     diff_focus: FocusHandle,
     panel_layout: PanelLayout,
     view_editor_scroll: ScrollHandle,
+    inspector_scroll: ScrollHandle,
     query: Entity<InputState>,
     composer_input: Entity<TextareaState>,
     review_summary_input: Entity<TextareaState>,
@@ -663,6 +669,7 @@ pub struct ReviewWorkspace {
     session_save_locks: HashMap<String, Arc<Mutex<()>>>,
     review_state_latest: HashMap<String, Arc<AtomicU64>>,
     review_state_locks: HashMap<String, Arc<Mutex<()>>>,
+    composer_edit_generation: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -873,6 +880,7 @@ impl ReviewWorkspace {
             diff_focus,
             panel_layout: PanelLayout::default(),
             view_editor_scroll: ScrollHandle::new(),
+            inspector_scroll: ScrollHandle::new(),
             query,
             composer_input,
             review_summary_input,
@@ -884,13 +892,14 @@ impl ReviewWorkspace {
             repository_input,
             pr_input,
             selected_account: 0,
-            status: "Read-only review workspace".into(),
+            status: "Native review workspace".into(),
             schedule: PollSchedule::default(),
             startup_pr: startup.pull_request,
             session_save_latest: HashMap::new(),
             session_save_locks: HashMap::new(),
             review_state_latest: HashMap::new(),
             review_state_locks: HashMap::new(),
+            composer_edit_generation: 0,
             _subscriptions: Vec::new(),
         };
         this.wide = this.available_diff_width(window) >= MIN_SPLIT_DIFF_WIDTH;
@@ -946,7 +955,40 @@ impl ReviewWorkspace {
                 cx.notify();
             }
         });
-        this._subscriptions.extend([activation, appearance, bounds]);
+        let composer_changes =
+            cx.subscribe(&this.composer_input, |root, _, event: &InputEvent, cx| {
+                let Root::Review(this) = root else { return };
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                this.composer_edit_generation += 1;
+                let generation = this.composer_edit_generation;
+                let executor = cx.background_executor().clone();
+                cx.spawn(async move |root, cx| {
+                    executor.timer(Duration::from_millis(450)).await;
+                    let _ = root.update(cx, |root, cx| {
+                        let Root::Review(this) = root else { return };
+                        if this.composer_edit_generation != generation {
+                            return;
+                        }
+                        let Some(index) = this.active_tab else { return };
+                        let body = this.composer_input.read(cx).value().to_string();
+                        let changed = matches!(
+                            &this.tabs[index].interactions,
+                            InteractionState::Ready(controller)
+                                if controller.composer.as_ref().is_some_and(|composer| {
+                                    composer.body != body || !composer.durable
+                                })
+                        );
+                        if changed && !this.tabs[index].write_in_flight {
+                            this.persist_composer(cx);
+                        }
+                    });
+                })
+                .detach();
+            });
+        this._subscriptions
+            .extend([activation, appearance, bounds, composer_changes]);
         this.discover_accounts(startup.account, cx);
         for index in 0..this.repositories.len() {
             this.refresh_repository(index, cx);
@@ -1090,6 +1132,10 @@ impl ReviewWorkspace {
                         break;
                     }
                 }
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
                 let _ = std::fs::create_dir_all(&output);
                 let split_review_captured = if expect_restore {
                     true
@@ -1269,6 +1315,263 @@ impl ReviewWorkspace {
                             .is_ok()
                     })
                     .unwrap_or(false);
+                let _ = window.update(|window, _| {
+                    window.resize(size(px(1040.), px(900.)));
+                });
+                let interaction_unified_installed = actions.is_ok()
+                    && window
+                        .update(|window, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                this.install_review_interaction_smoke(
+                                    DiffMode::Unified,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("smoke window unavailable".to_owned()))
+                        .is_ok();
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(400))
+                    .await;
+                if interaction_unified_installed {
+                    let _ = window.update(|_, cx| {
+                        let _ = weak.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                this.scroll_diff_horizontally(None, cx);
+                            }
+                        });
+                    });
+                }
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let interaction_unified_captured = interaction_unified_installed
+                    && window
+                        .update(|window, cx| {
+                            let verified = weak
+                                .read_with(cx, |root, _| {
+                                    let Root::Review(this) = root else {
+                                        return Err("smoke left review workspace".to_owned());
+                                    };
+                                    this.validate_review_interaction_smoke(DiffMode::Unified)
+                                })
+                                .unwrap_or_else(|error| {
+                                    Err(format!("smoke entity unavailable: {error:#}"))
+                                })
+                                .is_ok();
+                            verified
+                                && window
+                                    .render_to_image()
+                                    .and_then(|image| {
+                                        image
+                                            .save(output.join(
+                                                "native-review-interactions-unified.png",
+                                            ))
+                                            .map_err(Into::into)
+                                    })
+                                    .is_ok()
+                        })
+                        .unwrap_or(false);
+                let interaction_split_installed = actions.is_ok()
+                    && window
+                        .update(|window, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                this.install_review_interaction_smoke(
+                                    DiffMode::SideBySide,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("smoke window unavailable".to_owned()))
+                        .is_ok();
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(400))
+                    .await;
+                if interaction_split_installed {
+                    let _ = window.update(|_, cx| {
+                        let _ = weak.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                this.scroll_diff_horizontally(None, cx);
+                            }
+                        });
+                    });
+                }
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let interaction_split_captured = interaction_split_installed
+                    && window
+                        .update(|window, cx| {
+                            let verified = weak
+                                .read_with(cx, |root, _| {
+                                    let Root::Review(this) = root else {
+                                        return Err("smoke left review workspace".to_owned());
+                                    };
+                                    this.validate_review_interaction_smoke(DiffMode::SideBySide)
+                                })
+                                .unwrap_or_else(|error| {
+                                    Err(format!("smoke entity unavailable: {error:#}"))
+                                })
+                                .is_ok();
+                            verified
+                                && window
+                                    .render_to_image()
+                                    .and_then(|image| {
+                                        image
+                                            .save(output.join(
+                                                "native-review-interactions-split.png",
+                                            ))
+                                            .map_err(Into::into)
+                                    })
+                                    .is_ok()
+                        })
+                        .unwrap_or(false);
+                let submission_confirmation_installed = actions.is_ok()
+                    && window
+                        .update(|window, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                this.install_submission_confirmation_smoke(window, cx)
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("smoke window unavailable".to_owned()))
+                        .is_ok();
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let submission_confirmation_captured = submission_confirmation_installed
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join("native-submit-confirmation.png"))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let stale_merge_refused = actions.is_ok()
+                    && window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else { return false };
+                                if let Some(index) = this.active_tab {
+                                    this.tabs[index].confirmation = None;
+                                    if let Some(newer) = this.tabs[index]
+                                        .session
+                                        .as_ref()
+                                        .and_then(ReviewSession::available_revision)
+                                    {
+                                        this.tabs[index].pull_request.head_sha =
+                                            newer.head_sha.clone();
+                                    }
+                                }
+                                this.prepare_merge_confirmation(cx);
+                                this.status.contains("Merge is unavailable")
+                                    && this.status.contains("current remote head")
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                let merge_confirmation_installed = stale_merge_refused
+                    && window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                this.install_merge_confirmation_smoke(cx)
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("smoke window unavailable".to_owned()))
+                        .is_ok();
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let merge_confirmation_captured = merge_confirmation_installed
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join("native-merge-confirmation.png"))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.inspector_scroll.scroll_to_bottom();
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let merge_confirmation_controls_captured = merge_confirmation_installed
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(
+                                            output.join(
+                                                "native-merge-confirmation-controls.png",
+                                            ),
+                                        )
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let _ = window.update(|window, _| {
+                    window.resize(size(px(1440.), px(900.)));
+                });
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.panel_layout.details_width = DEFAULT_DETAILS_WIDTH;
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                            cx.notify();
+                        }
+                    });
+                });
                 let long_line_installed = actions.is_ok()
                     && window
                         .update(|_, cx| {
@@ -1504,6 +1807,36 @@ impl ReviewWorkspace {
                                 "Persistence: selected/viewed state read back after queued two-tab saves\n",
                             );
                             actions.report.push_str(&format!(
+                                "Variable-height inline review scene (unified, narrow resize, horizontal end): {}\nVariable-height inline review scene (split, narrow resize, horizontal end): {}\nSubmission confirmation with pending count and older-head warning: {}\nStale merge refusal through native handler: {}\nMerge rule/capability/queue confirmation matrix: {}\nComposer: focused multiline exact-revision fixture\nInline Markdown fixture: wrapped prose plus literal fenced code; media excluded only from prose\n",
+                                if interaction_unified_captured {
+                                    "passed"
+                                } else {
+                                    "failed"
+                                },
+                                if interaction_split_captured {
+                                    "passed"
+                                } else {
+                                    "failed"
+                                },
+                                if submission_confirmation_captured {
+                                    "passed"
+                                } else {
+                                    "failed"
+                                },
+                                if stale_merge_refused {
+                                    "passed"
+                                } else {
+                                    "failed"
+                                },
+                                if merge_confirmation_captured
+                                    && merge_confirmation_controls_captured
+                                {
+                                    "passed"
+                                } else {
+                                    "failed"
+                                },
+                            ));
+                            actions.report.push_str(&format!(
                                 "Long-line source end: {SMOKE_LONG_LINE_TOKEN}\nUnified horizontal maximum offset: {}px\nUnified far-end native render state: {}\nSplit start sentinels: OLD={SMOKE_OLD_LINE_START}, NEW={SMOKE_NEW_LINE_START}\nSplit start native render state: {}\nSplit end sentinels: OLD={SMOKE_OLD_LINE_END}, NEW={SMOKE_NEW_LINE_END}\nSplit horizontal maximum offset: {}px\nSplit far-end native render state: {}\n",
                                 long_line_maximum.as_ref().copied().unwrap_or_default(),
                                 if long_line_verified { "passed" } else { "failed" },
@@ -1529,6 +1862,12 @@ impl ReviewWorkspace {
                     let passed = validation.is_ok()
                         && split_review_captured
                         && review_captured
+                        && interaction_unified_captured
+                        && interaction_split_captured
+                        && submission_confirmation_captured
+                        && stale_merge_refused
+                        && merge_confirmation_captured
+                        && merge_confirmation_controls_captured
                         && long_line_captured
                         && split_long_line_start_captured
                         && split_long_line_captured
@@ -1538,7 +1877,7 @@ impl ReviewWorkspace {
                         .map(|actions| actions.report)
                         .unwrap_or_else(|error| format!("Smoke failed: {error}\n"));
                     let report = format!(
-                        "{details}Programmatic native actions: {}\nInitial split review scene capture: {}\nReview scene capture: {}\nUnified long-line end scene capture: {}\nSplit long-line start scene capture: {}\nSplit long-line end scene capture: {}\nFilter editor scene capture: {}\nGrouping editor scene capture: {}\nNative backdrop blending and physical input: not established by in-process capture\nRemote writes: none\n",
+                        "{details}Programmatic native actions: {}\nInitial split review scene capture: {}\nReview scene capture: {}\nInline review unified capture: {}\nInline review split capture: {}\nSubmission confirmation capture: {}\nMerge confirmation capture: {}\nMerge confirmation controls capture: {}\nUnified long-line end scene capture: {}\nSplit long-line start scene capture: {}\nSplit long-line end scene capture: {}\nFilter editor scene capture: {}\nGrouping editor scene capture: {}\nNative backdrop blending and physical input: not established by in-process capture\nRemote writes: none\n",
                         if passed { "passed" } else { "failed" },
                         if expect_restore {
                             "covered by fresh light run"
@@ -1549,6 +1888,31 @@ impl ReviewWorkspace {
                         },
                         if review_captured {
                             "native-pr-review.png"
+                        } else {
+                            "failed"
+                        },
+                        if interaction_unified_captured {
+                            "native-review-interactions-unified.png"
+                        } else {
+                            "failed"
+                        },
+                        if interaction_split_captured {
+                            "native-review-interactions-split.png"
+                        } else {
+                            "failed"
+                        },
+                        if submission_confirmation_captured {
+                            "native-submit-confirmation.png"
+                        } else {
+                            "failed"
+                        },
+                        if merge_confirmation_captured {
+                            "native-merge-confirmation.png"
+                        } else {
+                            "failed"
+                        },
+                        if merge_confirmation_controls_captured {
+                            "native-merge-confirmation-controls.png"
                         } else {
                             "failed"
                         },
@@ -1712,7 +2076,7 @@ impl ReviewWorkspace {
                 "Actual prose omits ![remote media](https://example.invalid/image.png) and escapes <unsafe tags>, while the code fixture below remains literal.\n\n```rust\nlet literal = `tick`; <!-- keep --> <tag> ![inside](asset.png)\n```",
             ],
         );
-        let second_selection = selections.get(2).copied().unwrap_or(selections[1]);
+        let second_selection = selections[0];
         let second = make_thread(
             "cibergit-smoke-thread-b",
             second_selection,
@@ -1746,10 +2110,7 @@ impl ReviewWorkspace {
         };
         controller.select_line(&session, selection)?;
         let body = "Focused multiline composer bound to this exact reviewed revision.\nSecond line remains visible between actual diff rows after resize.";
-        if let Some(composer) = &mut controller.composer {
-            composer.body = body.into();
-            composer.durable = false;
-        }
+        controller.stage_composer_text(body.into())?;
         self.composer_input.update(cx, |input, cx| {
             input.set_value(body, window, cx);
             input.focus(window, cx);
@@ -1873,6 +2234,106 @@ impl ReviewWorkspace {
                 "interaction scene is not at meaningful horizontal end (offset={offset}, maximum={maximum})"
             ));
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn install_submission_confirmation_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) -> Result<(), String> {
+        let index = self
+            .active_tab
+            .ok_or_else(|| "submission smoke has no active tab".to_owned())?;
+        let session = self.tabs[index]
+            .session
+            .as_mut()
+            .ok_or_else(|| "submission smoke has no immutable session".to_owned())?;
+        let mut newer = session.revision().clone();
+        newer.head_sha = format!("{}-newer-smoke", newer.head_sha);
+        session.observe_revision(newer);
+        self.review_summary_input.update(cx, |input, cx| {
+            input.set_value(
+                "Summary shown in the native confirmation; no review is submitted by smoke.",
+                window,
+                cx,
+            );
+        });
+        self.open_submit_confirmation(cx);
+        let Some(NativeConfirmation::Submit { .. }) = self.tabs[index].confirmation else {
+            return Err("submission handler did not open native confirmation".into());
+        };
+        if self.tabs[index]
+            .session
+            .as_ref()
+            .and_then(ReviewSession::available_revision)
+            .is_none()
+        {
+            return Err("older-head submission warning fixture was not retained".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn install_merge_confirmation_smoke(&mut self, cx: &mut Context<Root>) -> Result<(), String> {
+        let index = self
+            .active_tab
+            .ok_or_else(|| "merge confirmation smoke has no active tab".to_owned())?;
+        let tab = &mut self.tabs[index];
+        let reviewed_head = tab
+            .session
+            .as_ref()
+            .map(|session| session.revision().head_sha.clone())
+            .ok_or_else(|| "merge confirmation smoke has no immutable session".to_owned())?;
+        let coordinates = cibergit::domain::ProviderCoordinates {
+            provider: "github".into(),
+            host: tab.repository.host.clone(),
+            owner: tab.repository.owner.clone(),
+            repository: tab.repository.name.clone(),
+            pull_request: tab.pull_request.number,
+            remote_id: "cibergit-smoke-pr-node".into(),
+        };
+        let preparation = MergePreparation {
+            pull_request: coordinates,
+            pull_request_node_id: "cibergit-smoke-pr-node".into(),
+            reviewed_head_sha: reviewed_head.clone(),
+            current_head_sha: reviewed_head,
+            head_ref_name: "review-interactions-smoke".into(),
+            head_ref_node_id: Some("cibergit-smoke-head-ref".into()),
+            head_repository: tab.repository.full_name(),
+            state: "OPEN".into(),
+            draft: false,
+            mergeable: "MERGEABLE".into(),
+            merge_state_status: "BLOCKED".into(),
+            review_status: "CHANGES_REQUESTED".into(),
+            check_status: "PENDING".into(),
+            repository_permission: Some("WRITE".into()),
+            allowed_methods: vec![MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase],
+            blockers: vec![
+                "Required review is pending".into(),
+                "Required check has not completed".into(),
+            ],
+            auto_merge_allowed: true,
+            auto_merge_enabled: false,
+            can_enable_auto_merge: true,
+            can_disable_auto_merge: false,
+            merge_queue_required: true,
+            in_merge_queue: false,
+            viewer_can_merge_as_admin: true,
+            viewer_can_delete_head_ref: true,
+            preferred_headlines: vec![(MergeMethod::Squash, "Native smoke headline".into())],
+            preferred_bodies: vec![(MergeMethod::Squash, "Native smoke body".into())],
+        };
+        tab.confirmation = Some(NativeConfirmation::Merge {
+            preparation: Box::new(preparation),
+            method: MergeMethod::Squash,
+            action: MergeConfirmationAction::Enqueue,
+        });
+        self.panel_layout.details_width = MAX_PANEL_WIDTH;
+        self.inspector_open = true;
+        self.status = "Deterministic merge confirmation fixture; zero provider writes.".into();
+        cx.notify();
         Ok(())
     }
 
@@ -2939,7 +3400,7 @@ impl ReviewWorkspace {
                         }
                         controller
                             .install_pending_snapshot(this.tabs[index].pending_snapshot.clone());
-                        InteractionState::Ready(Box::new(controller))
+                        InteractionState::Ready(controller)
                     }
                     Ok(ControllerLoad::RecoveryRequired(reason)) | Err(reason) => {
                         InteractionState::RecoveryRequired(reason)
@@ -3173,6 +3634,34 @@ impl ReviewWorkspace {
         .detach();
     }
 
+    fn close_inline_composer(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status = "Wait for the started review action before closing this composer.".into();
+            return;
+        }
+        let body = self.composer_input.read(cx).value().to_string();
+        let needs_save = match &self.tabs[index].interactions {
+            InteractionState::Ready(controller) => controller
+                .composer
+                .as_ref()
+                .is_some_and(|composer| !composer.durable || composer.body != body),
+            InteractionState::Loading | InteractionState::RecoveryRequired(_) => false,
+        };
+        if needs_save {
+            self.persist_composer(cx);
+            self.status =
+                "Saving local recovery before close; close again after it is durable.".into();
+            return;
+        }
+        if let InteractionState::Ready(controller) = &mut self.tabs[index].interactions {
+            controller.composer = None;
+        }
+        self.rebuild_diff(index, self.wide);
+        self.status = "Inline composer closed; saved text remains available.".into();
+        cx.notify();
+    }
+
     fn start_comment_write(&mut self, immediate: bool, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         if self.tabs[index].write_in_flight {
@@ -3276,15 +3765,14 @@ impl ReviewWorkspace {
                 if let InteractionState::Ready(controller) = &mut this.tabs[index].interactions {
                     controller.composition = composition;
                     controller.durable_composition = durable;
-                    if let Some(composer) = &mut controller.composer {
-                        if let Some(draft) = composer
+                    if let Some(composer) = &mut controller.composer
+                        && let Some(draft) = composer
                             .draft_id
                             .as_deref()
                             .and_then(|id| controller.composition.drafts.iter().find(|d| d.id == id))
-                        {
-                            composer.body = draft.body.clone();
-                            composer.durable = true;
-                        }
+                    {
+                        composer.body = draft.body.clone();
+                        composer.durable = true;
                     }
                 }
                 if this.active_tab == Some(index) {
@@ -3397,7 +3885,7 @@ impl ReviewWorkspace {
                             MergeConfirmationAction::Merge
                         };
                         this.tabs[index].confirmation = Some(NativeConfirmation::Merge {
-                            preparation,
+                            preparation: Box::new(preparation),
                             method,
                             action,
                         });
@@ -4081,7 +4569,6 @@ impl ReviewWorkspace {
                                         Ok(true) => {
                                             if let InteractionState::Ready(controller) =
                                                 &mut this.tabs[index].interactions
-                                                && controller.composition == snapshot
                                             {
                                                 controller.durable_composition =
                                                     Some(snapshot.clone());
@@ -5011,7 +5498,12 @@ impl ReviewWorkspace {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().text_xs().text_color(colors.faint).child("READ ONLY"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors.faint)
+                                    .child("NATIVE REVIEW"),
+                            )
                             .child(
                                 div()
                                     .id("collapse-sidebar")
@@ -6572,6 +7064,7 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) -> impl IntoElement {
         let tab = &self.tabs[index];
+        let confirmation_open = tab.confirmation.is_some();
         let current = tab.inspector_section;
         let section = |name: &'static str, value: InspectorSection| {
             side_control(name, current == value, colors)
@@ -6881,26 +7374,47 @@ impl ReviewWorkspace {
                 }
                 if let Some(details) = &tab.details {
                     for (position, comment) in details.issue_comments.iter().take(20).enumerate() {
-                        activity.push(activity_item(
-                            format!("issue-comment-{position}"),
-                            comment.author.as_deref().unwrap_or("Unknown author"),
-                            &comment.body,
-                            &comment.created_at,
-                            colors,
-                        ));
+                        activity.push(
+                            activity_item(
+                                format!("issue-comment-{position}"),
+                                comment.author.as_deref().unwrap_or("Unknown author"),
+                                &comment.body,
+                                &comment.created_at,
+                                colors,
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(colors.faint)
+                                    .child(format!("Remote ID {}", comment.coordinates.remote_id)),
+                            ),
+                        );
                     }
                     for (position, review) in details.reviews.iter().take(20).enumerate() {
-                        activity.push(activity_item(
-                            format!("review-{position}"),
-                            review.author.as_deref().unwrap_or("Unknown reviewer"),
-                            if review.body.is_empty() {
-                                &review.state
-                            } else {
-                                &review.body
-                            },
-                            review.submitted_at.as_deref().unwrap_or("Pending"),
-                            colors,
-                        ));
+                        activity.push(
+                            activity_item(
+                                format!("review-{position}"),
+                                review.author.as_deref().unwrap_or("Unknown reviewer"),
+                                if review.body.is_empty() {
+                                    &review.state
+                                } else {
+                                    &review.body
+                                },
+                                review.submitted_at.as_deref().unwrap_or("Pending"),
+                                colors,
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(colors.faint)
+                                    .child(format!(
+                                        "{} · Remote ID {}",
+                                        review.state, review.coordinates.remote_id
+                                    )),
+                            ),
+                        );
                     }
                     let placed = tab
                         .session
@@ -6919,12 +7433,22 @@ impl ReviewWorkspace {
                                 )
                             },
                             |anchor| {
-                                format!(
-                                    "{} · {} {}",
-                                    thread.thread.path,
-                                    anchor.side.provider_name(),
-                                    anchor.line
-                                )
+                                if anchor.start_line == anchor.line {
+                                    format!(
+                                        "{} · {} {}",
+                                        thread.thread.path,
+                                        anchor.side.provider_name(),
+                                        anchor.line
+                                    )
+                                } else {
+                                    format!(
+                                        "{} · {} {}–{}",
+                                        thread.thread.path,
+                                        anchor.side.provider_name(),
+                                        anchor.start_line,
+                                        anchor.line
+                                    )
+                                }
                             },
                         );
                         activity.push(
@@ -6940,6 +7464,32 @@ impl ReviewWorkspace {
                                     },
                                     location
                                 ))
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(colors.faint)
+                                        .child(format!(
+                                            "Current {:?} {:?}–{:?} · original {:?}–{:?} · commit {:?} · original commit {:?}",
+                                            thread.thread.side,
+                                            thread.thread.start_line,
+                                            thread.thread.line,
+                                            thread.thread.original_start_line,
+                                            thread.thread.original_line,
+                                            thread
+                                                .thread
+                                                .comments
+                                                .last()
+                                                .and_then(|comment| comment.commit_sha.as_deref()),
+                                            thread
+                                                .thread
+                                                .comments
+                                                .last()
+                                                .and_then(|comment| {
+                                                    comment.original_commit_sha.as_deref()
+                                                }),
+                                        )),
+                                )
                                 .when_some(thread.thread.comments.last(), |item, comment| {
                                     item.child(
                                         div().mt_1().child(
@@ -7047,7 +7597,8 @@ impl ReviewWorkspace {
                         self.render_confirmation(index, colors, cx),
                         |panel, confirmation| panel.child(confirmation),
                     )
-                    .child(content),
+                    .when(!confirmation_open, |panel| panel.child(content))
+                    .track_scroll(&self.inspector_scroll),
             )
     }
 
@@ -7135,6 +7686,7 @@ impl ReviewWorkspace {
                             div()
                                 .mt_3()
                                 .flex()
+                                .flex_wrap()
                                 .gap_1()
                                 .child(event_button("Comment", ReviewEvent::Comment))
                                 .child(event_button("Approve", ReviewEvent::Approve))
@@ -7233,11 +7785,23 @@ impl ReviewWorkspace {
                                     tab.repository.account.login
                                 )),
                         )
-                        .child(detail("Current head", &preparation.current_head_sha, colors))
-                        .child(detail("Mergeable", &preparation.mergeable, colors))
-                        .child(detail("Rules", &preparation.merge_state_status, colors))
-                        .child(detail("Checks", &preparation.check_status, colors))
-                        .child(detail("Reviews", &preparation.review_status, colors))
+                        .child(compact_detail(
+                            "Current head",
+                            &preparation.current_head_sha,
+                            colors,
+                        ))
+                        .child(compact_detail("Mergeable", &preparation.mergeable, colors))
+                        .child(compact_detail(
+                            "Rules",
+                            &preparation.merge_state_status,
+                            colors,
+                        ))
+                        .child(compact_detail("Checks", &preparation.check_status, colors))
+                        .child(compact_detail(
+                            "Reviews",
+                            &preparation.review_status,
+                            colors,
+                        ))
                         .when(!preparation.blockers.is_empty(), |card| {
                             card.child(
                                 div()
@@ -7251,7 +7815,7 @@ impl ReviewWorkspace {
                             )
                         })
                         .child(
-                            div().mt_2().flex().gap_1().children(
+                            div().mt_2().flex().flex_wrap().gap_1().children(
                                 preparation
                                     .allowed_methods
                                     .iter()
@@ -7371,6 +7935,7 @@ impl ReviewWorkspace {
         div()
             .mt_3()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_3()
             .child(confirm)
@@ -7843,6 +8408,17 @@ fn detail(label: &str, value: impl Into<String>, colors: Palette) -> Div {
         .child(div().mt_1().child(value.into()))
 }
 
+fn compact_detail(label: &str, value: impl Into<String>, colors: Palette) -> Div {
+    div()
+        .mt_1()
+        .flex()
+        .flex_wrap()
+        .gap_1()
+        .text_xs()
+        .child(div().text_color(colors.muted).child(format!("{label}:")))
+        .child(value.into())
+}
+
 fn markdown_detail(id: String, label: &str, body: &str, colors: Palette) -> Div {
     div()
         .mb_4()
@@ -8096,7 +8672,7 @@ fn attach_inline_rows(
                     && diff_row_has_line(&row, anchor.side, anchor.line)
             })
         }) {
-            attached.push(DiffRow::Thread(thread.clone()));
+            attached.push(DiffRow::Thread(Box::new(thread.clone())));
         }
         if let Some(composer) = composer
             && composer.coordinate.file_key == selected_file_key
@@ -8206,7 +8782,7 @@ fn effective_diff_viewport_width(rows: &[DiffRow], horizontal: &ScrollHandle) ->
     if rows.iter().any(|row| matches!(row, DiffRow::Split(_))) {
         2. * (source_viewport + SPLIT_GUTTER_WIDTH)
     } else {
-        source_viewport
+        source_viewport + UNIFIED_GUTTER_WIDTH
     }
 }
 
@@ -8302,6 +8878,7 @@ fn render_diff_row(row: &DiffRow, colors: Palette) -> AnyElement {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Keeps per-frame borrowed render state out of an allocated context.
 fn render_interactive_diff_row(
     row: &DiffRow,
     colors: Palette,
@@ -8455,6 +9032,21 @@ fn render_inline_thread(
     let reply_entity = root.clone();
     let reply_coordinate = thread.thread.coordinates.clone();
     let replying = reply_target == Some(&thread.thread.coordinates);
+    let anchor_label = thread.anchor.as_ref().map_or_else(
+        || "unplaced".to_owned(),
+        |anchor| {
+            if anchor.start_line == anchor.line {
+                format!("{} {}", anchor.side.provider_name(), anchor.line)
+            } else {
+                format!(
+                    "{} {}–{}",
+                    anchor.side.provider_name(),
+                    anchor.start_line,
+                    anchor.line
+                )
+            }
+        },
+    );
     let mut card = div()
         .w_full()
         .min_h(px(72.))
@@ -8473,7 +9065,7 @@ fn render_inline_thread(
                 .items_center()
                 .justify_between()
                 .text_xs()
-                .child(format!("Review thread · {state}"))
+                .child(format!("Review thread · {state} · {anchor_label}"))
                 .child(
                     div()
                         .flex()
@@ -8666,6 +9258,7 @@ fn render_inline_composer(
     let immediate_root = root.clone();
     let cancel_root = root.clone();
     div()
+        .key_context("ReviewComposer")
         .w_full()
         .min_h(px(172.))
         .px_4()
@@ -8737,17 +9330,8 @@ fn render_inline_composer(
                 .child(div().flex_1())
                 .child(action_link("Close", colors).on_click(move |_, _, cx| {
                     cancel_root.update(cx, |root, cx| {
-                        if let Root::Review(this) = root
-                            && let Some(index) = this.active_tab
-                            && !this.tabs[index].write_in_flight
-                        {
-                            if let InteractionState::Ready(controller) =
-                                &mut this.tabs[index].interactions
-                            {
-                                controller.composer = None;
-                            }
-                            this.rebuild_diff(index, this.wide);
-                            cx.notify();
+                        if let Root::Review(this) = root {
+                            this.close_inline_composer(cx);
                         }
                     });
                 })),
