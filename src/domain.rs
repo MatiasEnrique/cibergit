@@ -50,6 +50,16 @@ pub struct PullRequest {
     pub reviewers: Vec<String>,
     pub assignees: Vec<String>,
     pub labels: Vec<String>,
+    /// User identities known to have participated in this PR. This includes the
+    /// author, requested user reviewers, assignees, issue commenters, and
+    /// authors of submitted reviews. Teams are not user identities.
+    #[serde(default)]
+    pub participants: Vec<String>,
+    /// False means `participants` is a safe partial set, never a complete claim.
+    #[serde(default)]
+    pub participants_complete: bool,
+    #[serde(default)]
+    pub participants_notice: Option<String>,
     pub draft: bool,
     /// OPEN, CLOSED, MERGED.
     pub state: String,
@@ -66,6 +76,137 @@ impl PullRequest {
             head_sha: self.head_sha.clone(),
         }
     }
+}
+
+/// Stable coordinates for a provider-owned collaboration object.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCoordinates {
+    pub provider: String,
+    pub host: String,
+    pub owner: String,
+    pub repository: String,
+    pub pull_request: u64,
+    pub remote_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueComment {
+    pub coordinates: ProviderCoordinates,
+    pub author: Option<String>,
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestReview {
+    pub coordinates: ProviderCoordinates,
+    pub author: Option<String>,
+    pub body: String,
+    /// APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, or PENDING.
+    pub state: String,
+    pub submitted_at: Option<String>,
+    /// May be unavailable after history is removed or becomes inaccessible.
+    pub commit_sha: Option<String>,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewComment {
+    pub coordinates: ProviderCoordinates,
+    pub author: Option<String>,
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub url: String,
+    pub path: String,
+    pub line: Option<u64>,
+    pub original_line: Option<u64>,
+    pub start_line: Option<u64>,
+    pub original_start_line: Option<u64>,
+    pub side: Option<String>,
+    pub diff_hunk: String,
+    /// Both values are optional because GitHub can retain activity after the
+    /// referenced commits are no longer accessible to the selected account.
+    pub commit_sha: Option<String>,
+    pub original_commit_sha: Option<String>,
+    pub outdated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewThread {
+    pub coordinates: ProviderCoordinates,
+    pub path: String,
+    pub line: Option<u64>,
+    pub original_line: Option<u64>,
+    pub start_line: Option<u64>,
+    pub original_start_line: Option<u64>,
+    pub side: Option<String>,
+    pub start_side: Option<String>,
+    pub resolved: bool,
+    pub outdated: bool,
+    pub comments: Vec<ReviewComment>,
+    /// False when GitHub reported more nested comments than this bounded read.
+    pub comments_complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CheckKind {
+    CheckRun,
+    CommitStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCheck {
+    pub coordinates: ProviderCoordinates,
+    pub kind: CheckKind,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub description: Option<String>,
+    pub details_url: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub required: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeEligibility {
+    /// OPEN, CLOSED, or MERGED.
+    pub state: String,
+    pub draft: bool,
+    pub mergeable: String,
+    pub merge_state_status: String,
+    pub review_status: String,
+    pub check_status: String,
+    pub maintainer_can_modify: bool,
+    pub can_rebase: bool,
+    pub can_update_branch: bool,
+    pub auto_merge_enabled: bool,
+    pub in_merge_queue: bool,
+}
+
+/// Mutable collaboration data for Overview, Activity, and Checks. It contains
+/// no displayed comparison revision and must never replace a pinned diff.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestDetails {
+    pub number: u64,
+    pub body: String,
+    pub requested_reviewers: Vec<String>,
+    pub labels: Vec<String>,
+    pub assignees: Vec<String>,
+    pub merge_eligibility: MergeEligibility,
+    pub issue_comments: Vec<IssueComment>,
+    pub reviews: Vec<PullRequestReview>,
+    pub review_threads: Vec<ReviewThread>,
+    pub checks: Vec<PullRequestCheck>,
+    /// False when any activity connection was partial or hit an explicit cap.
+    pub activity_complete: bool,
+    /// False when the status/check context connection was partial or capped.
+    pub checks_complete: bool,
+    pub notice: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -3,9 +3,18 @@
 //! Credentials live only in a private child environment; no global login is changed.
 //! Comparisons use GitHub's three-dot (merge-base to head) PR semantics. REST caps
 //! compare files at 300 and current PR files at 3,000; see `comparison` for limits.
-use crate::domain::{Account, ChangedFile, Comparison, PullRequest, Repository, Revision};
+//! Sidebar metadata uses one GraphQL batch per REST page (up to 100 PRs), never one
+//! request per PR. Participant sources are bounded to 100 entries each and expose
+//! incompleteness. Details paginates four top-level connections 50 at a time for at most
+//! 20 pages; nested review-thread comments are bounded to 100 with explicit flags.
+use crate::domain::{
+    Account, ChangedFile, CheckKind, Comparison, IssueComment, MergeEligibility,
+    ProviderCoordinates, PullRequest, PullRequestCheck, PullRequestDetails, PullRequestReview,
+    Repository, ReviewComment, ReviewThread, Revision,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
+use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
@@ -21,6 +30,8 @@ const API_VERSION: &str = "X-GitHub-Api-Version: 2026-03-10";
 const PAGE_SIZE: usize = 100;
 const MAX_PR_PAGES: usize = 100;
 const MAX_FILE_PAGES: usize = 30;
+const PARTICIPANT_LIMIT: usize = 100;
+const MAX_DETAILS_PAGES: usize = 20;
 const MAX_OPERATION_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -118,13 +129,17 @@ impl GithubProvider {
                 "repos/{}/pulls?state={api_state}&sort=created&direction=asc&per_page={PAGE_SIZE}&page={page}", repo.full_name()))?;
             ensure!(pulls.len() <= PAGE_SIZE, "Invalid PR pagination response");
             let last = pulls.len() < PAGE_SIZE;
+            let mut batch = Vec::with_capacity(pulls.len());
             for pull in pulls {
                 pull.validate(repo, None)?;
                 ensure!(
                     seen.insert(pull.number),
                     "PR list changed during pagination; refresh to retry"
                 );
-                let pull = pull.into_domain();
+                batch.push(pull.into_domain());
+            }
+            session.hydrate_metadata(repo, &mut batch)?;
+            for pull in batch {
                 if state != "merged" || pull.state == "MERGED" {
                     result.push(pull);
                 }
@@ -138,7 +153,22 @@ impl GithubProvider {
 
     pub fn pull_request(&self, repo: &Repository, number: u64) -> Result<PullRequest> {
         self.validate_repo(repo)?;
-        Ok(Session::new(self).pull(repo, number)?.into_domain())
+        let mut session = Session::new(self);
+        let mut pulls = vec![session.pull(repo, number)?.into_domain()];
+        session.hydrate_metadata(repo, &mut pulls)?;
+        Ok(pulls.pop().expect("one PR"))
+    }
+
+    /// Fetch current, read-only collaboration data for Overview, Activity, and
+    /// Checks. This snapshot intentionally carries no comparison revision and
+    /// must not advance or replace the caller's displayed diff.
+    pub fn details(&self, repo: &Repository, number: u64) -> Result<PullRequestDetails> {
+        self.validate_repo(repo)?;
+        ensure!(
+            number > 0 && number <= i32::MAX as u64,
+            "PR number is outside GitHub GraphQL limits"
+        );
+        Session::new(self).details(repo, number)
     }
 
     /// Fetch a pinned PR comparison. A moving live PR is never substituted for the
@@ -211,11 +241,16 @@ impl GithubProvider {
                         .get(f.filename.as_str())
                         .is_some_and(|live| f.same_change(live))
                 }) && (files.len() == 300 || files.len() == current_files.len());
-                if agrees {
+                if agrees && current_files.len() as u64 <= expected {
                     files = current_files;
                     if files.len() as u64 != expected {
                         notices.push(format!("Incomplete file list: GitHub returned {} of {expected} files (PR files API limit: 3,000).", files.len()));
                     }
+                } else if current_files.len() as u64 > expected {
+                    notices.push(format!(
+                        "PR file list is inconsistent with GitHub metadata: the API returned {} files but reported {expected}; only immutable comparison files are shown.",
+                        current_files.len()
+                    ));
                 } else {
                     notices.push("PR file list disagrees with the immutable comparison; only immutable files are shown.".into());
                 }
@@ -403,6 +438,161 @@ impl<'a> Session<'a> {
         );
         decode(&bytes)
     }
+
+    fn graphql<T: serde::de::DeserializeOwned>(
+        &mut self,
+        query: &str,
+        variables: Value,
+    ) -> Result<GraphqlResult<T>> {
+        ensure!(
+            self.started.elapsed() < Duration::from_secs(180),
+            "GitHub operation time limit reached"
+        );
+        ensure!(
+            query.trim_start().starts_with("query ") && !query.contains("mutation"),
+            "Only read-only GitHub GraphQL queries are allowed"
+        );
+        let mut token_command = self.provider.runner.gh_command();
+        token_command.args([
+            "auth",
+            "token",
+            "--hostname",
+            &self.provider.account.host,
+            "--user",
+            &self.provider.account.login,
+        ]);
+        let token = self
+            .provider
+            .runner
+            .run(token_command, "resolve selected GitHub credential")?;
+        let token = std::str::from_utf8(&token)
+            .map_err(|_| anyhow::anyhow!("Invalid credential encoding"))?
+            .trim();
+        ensure!(
+            !token.is_empty() && token.len() <= 4096 && !token.chars().any(char::is_whitespace),
+            "Missing or invalid selected GitHub credential"
+        );
+        let input = serde_json::to_vec(&json!({"query": query, "variables": variables}))
+            .context("Cannot encode GitHub GraphQL read")?;
+        ensure!(
+            input.len() <= 1024 * 1024,
+            "GitHub GraphQL input limit reached"
+        );
+        let mut command = self.provider.runner.gh_command();
+        command.env("GH_TOKEN", token).args([
+            "api",
+            "--hostname",
+            HOST,
+            "--method",
+            "POST",
+            "--header",
+            "Accept: application/vnd.github+json",
+            "--header",
+            API_VERSION,
+            "graphql",
+            "--input",
+            "-",
+        ]);
+        let bytes = self
+            .provider
+            .runner
+            .run_with_input(command, "GitHub GraphQL read", &input)?;
+        self.bytes += bytes.len();
+        ensure!(
+            self.bytes <= MAX_OPERATION_BYTES,
+            "GitHub operation output limit reached"
+        );
+        let envelope: GraphqlEnvelope<T> = decode(&bytes)?;
+        let data = envelope
+            .data
+            .context("GitHub GraphQL read returned no usable data")?;
+        Ok(GraphqlResult {
+            data,
+            partial: !envelope.errors.is_empty(),
+        })
+    }
+
+    fn hydrate_metadata(&mut self, repo: &Repository, pulls: &mut [PullRequest]) -> Result<()> {
+        if pulls.is_empty() {
+            return Ok(());
+        }
+        ensure!(
+            pulls.len() <= PAGE_SIZE,
+            "GitHub metadata batch is too large"
+        );
+        ensure!(
+            pulls
+                .iter()
+                .all(|pull| pull.number > 0 && pull.number <= i32::MAX as u64),
+            "PR number is outside GitHub GraphQL limits"
+        );
+        let (query, variables) = bulk_metadata_query(repo, pulls);
+        let response: GraphqlResult<BulkMetadataData> = self.graphql(&query, variables)?;
+        let repository = response
+            .data
+            .repository
+            .context("GitHub metadata repository is unavailable")?;
+        ensure!(
+            repository
+                .name_with_owner
+                .eq_ignore_ascii_case(&repo.full_name()),
+            "GitHub metadata repository mismatch"
+        );
+        for (index, pull) in pulls.iter_mut().enumerate() {
+            let alias = format!("pr{index}");
+            let metadata = repository
+                .pulls
+                .get(&alias)
+                .and_then(Option::as_ref)
+                .context("PR changed or became inaccessible during metadata refresh")?;
+            metadata.apply(repo, pull, response.partial)?;
+        }
+        Ok(())
+    }
+
+    fn details(&mut self, repo: &Repository, number: u64) -> Result<PullRequestDetails> {
+        let mut cursors = DetailsCursors::initial();
+        let mut builder = DetailsBuilder::default();
+        for page in 0..MAX_DETAILS_PAGES {
+            let response: GraphqlResult<DetailsData> =
+                self.graphql(DETAILS_QUERY, details_variables(repo, number, &cursors))?;
+            let repository = response
+                .data
+                .repository
+                .context("GitHub details repository is unavailable")?;
+            ensure!(
+                repository
+                    .name_with_owner
+                    .eq_ignore_ascii_case(&repo.full_name()),
+                "GitHub details repository mismatch"
+            );
+            let pull = repository
+                .pull_request
+                .context("PR details are unavailable or inaccessible")?;
+            pull.validate(repo, number)?;
+            let next = builder.absorb(repo, pull, response.partial, page == 0)?;
+            if next.done() {
+                return builder.finish(number);
+            }
+            cursors = next;
+        }
+        if cursors.comments.include || cursors.reviews.include || cursors.threads.include {
+            builder.notices.push(format!(
+                "Activity pagination stopped at the explicit {}-page limit.",
+                MAX_DETAILS_PAGES
+            ));
+            builder.activity_complete = false;
+        }
+        if cursors.checks.include {
+            builder.notices.push(format!(
+                "Check pagination stopped at the explicit {}-page limit.",
+                MAX_DETAILS_PAGES
+            ));
+            builder.checks_complete = false;
+        }
+        builder.finish(number)
+    }
+
     fn pull(&mut self, repo: &Repository, number: u64) -> Result<ApiPullRequest> {
         ensure!(number > 0, "PR number must be positive");
         let pull: ApiPullRequest =
@@ -473,13 +663,40 @@ impl Runner {
         command
     }
     fn run(&self, mut command: Command, action: &'static str) -> Result<Vec<u8>> {
+        self.run_inner(&mut command, action, None)
+    }
+    fn run_with_input(
+        &self,
+        mut command: Command,
+        action: &'static str,
+        input: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.run_inner(&mut command, action, Some(input))
+    }
+    fn run_inner(
+        &self,
+        command: &mut Command,
+        action: &'static str,
+        input: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
         command
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().map_err(|_| {
             anyhow::anyhow!("Cannot start subprocess to {action}; check installed gh/Git")
         })?;
+        if let Some(input) = input {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            stdin
+                .write_all(input)
+                .map_err(|_| anyhow::anyhow!("Cannot send bounded input to {action}"))?;
+        }
         let (tx, rx) = mpsc::channel();
         let limit = self.output_limit;
         let stdout = child.stdout.take().expect("piped stdout");
@@ -538,6 +755,926 @@ impl Runner {
             let _ = child.wait();
         }
         result
+    }
+}
+
+struct GraphqlResult<T> {
+    data: T,
+    partial: bool,
+}
+
+#[derive(Deserialize)]
+struct GraphqlEnvelope<T> {
+    data: Option<T>,
+    #[serde(default)]
+    errors: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlConnection<T> {
+    nodes: Vec<Option<T>>,
+    page_info: PageInfo,
+}
+
+#[derive(Deserialize)]
+struct GraphqlActor {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct BulkReview {
+    author: Option<GraphqlActor>,
+    state: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkReviewRequest {
+    requested_reviewer: Option<BulkRequestedReviewer>,
+}
+
+#[derive(Deserialize)]
+struct BulkRequestedReviewer {
+    login: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BulkRollup {
+    state: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkPullMetadata {
+    number: u64,
+    url: String,
+    review_decision: Option<String>,
+    status_check_rollup: Option<BulkRollup>,
+    comments: Option<GraphqlConnection<GraphqlActorNode>>,
+    reviews: Option<GraphqlConnection<BulkReview>>,
+    review_requests: Option<GraphqlConnection<BulkReviewRequest>>,
+    assignees: Option<GraphqlConnection<GraphqlActor>>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlActorNode {
+    author: Option<GraphqlActor>,
+}
+
+impl BulkPullMetadata {
+    fn apply(&self, repo: &Repository, pull: &mut PullRequest, partial: bool) -> Result<()> {
+        ensure!(
+            self.number == pull.number
+                && self.url
+                    == format!(
+                        "https://{}/{}/pull/{}",
+                        repo.host,
+                        repo.full_name(),
+                        pull.number
+                    ),
+            "GitHub metadata PR identity mismatch"
+        );
+        pull.review_status = map_review_status(self.review_decision.as_deref(), partial).into();
+        pull.check_status = map_check_status(
+            self.status_check_rollup
+                .as_ref()
+                .map(|rollup| rollup.state.as_str()),
+            partial,
+        )
+        .into();
+
+        let mut participants = Vec::new();
+        add_identity(&mut participants, &pull.author);
+        for reviewer in &pull.reviewers {
+            if !reviewer.starts_with("team:") {
+                add_identity(&mut participants, reviewer);
+            }
+        }
+        for assignee in &pull.assignees {
+            add_identity(&mut participants, assignee);
+        }
+
+        let mut complete = !partial;
+        match &self.comments {
+            Some(connection) => {
+                complete &= connection_complete(connection);
+                for node in connection.nodes.iter().flatten() {
+                    if let Some(author) = &node.author {
+                        add_identity(&mut participants, &author.login);
+                    }
+                }
+            }
+            None => complete = false,
+        }
+        match &self.reviews {
+            Some(connection) => {
+                complete &= connection_complete(connection);
+                for review in connection.nodes.iter().flatten() {
+                    if review.state != "PENDING"
+                        && let Some(author) = &review.author
+                    {
+                        add_identity(&mut participants, &author.login);
+                    }
+                }
+            }
+            None => complete = false,
+        }
+        match &self.review_requests {
+            Some(connection) => {
+                complete &= connection_complete(connection);
+                for request in connection.nodes.iter().flatten() {
+                    if let Some(login) = request
+                        .requested_reviewer
+                        .as_ref()
+                        .and_then(|reviewer| reviewer.login.as_deref())
+                    {
+                        add_identity(&mut participants, login);
+                    }
+                }
+            }
+            None => complete = false,
+        }
+        match &self.assignees {
+            Some(connection) => {
+                complete &= connection_complete(connection);
+                for assignee in connection.nodes.iter().flatten() {
+                    add_identity(&mut participants, &assignee.login);
+                }
+            }
+            None => complete = false,
+        }
+        participants.sort_by_key(|login| login.to_ascii_lowercase());
+        pull.participants = participants;
+        pull.participants_complete = complete;
+        pull.participants_notice = (!complete).then(|| {
+            format!(
+                "Participant identities are partial; comments, submitted reviews, requested reviewers, and assignees are each limited to {PARTICIPANT_LIMIT} per PR, and partial API fields are not treated as complete."
+            )
+        });
+        Ok(())
+    }
+}
+
+fn connection_complete<T>(connection: &GraphqlConnection<T>) -> bool {
+    !connection.page_info.has_next_page && connection.nodes.iter().all(Option::is_some)
+}
+
+fn add_identity(identities: &mut Vec<String>, login: &str) {
+    if !login.is_empty()
+        && !identities
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(login))
+    {
+        identities.push(login.to_owned());
+    }
+}
+
+fn map_review_status(decision: Option<&str>, partial: bool) -> &'static str {
+    match decision {
+        Some("APPROVED") => "Approved",
+        Some("CHANGES_REQUESTED") => "ChangesRequested",
+        Some("REVIEW_REQUIRED") => "ReviewRequired",
+        Some(_) => "UNKNOWN",
+        None if partial => "UNKNOWN",
+        None => "None",
+    }
+}
+
+fn map_check_status(state: Option<&str>, partial: bool) -> &'static str {
+    match state {
+        Some("SUCCESS") => "Passing",
+        Some("PENDING" | "EXPECTED") => "Pending",
+        Some("ERROR" | "FAILURE") => "Failing",
+        Some(_) => "UNKNOWN",
+        None if partial => "UNKNOWN",
+        None => "None",
+    }
+}
+
+fn bulk_metadata_query(repo: &Repository, pulls: &[PullRequest]) -> (String, Value) {
+    let mut definitions = vec!["$owner: String!".to_owned(), "$name: String!".to_owned()];
+    let mut selections = Vec::with_capacity(pulls.len());
+    let mut variables = Map::new();
+    variables.insert("owner".into(), Value::String(repo.owner.clone()));
+    variables.insert("name".into(), Value::String(repo.name.clone()));
+    for (index, pull) in pulls.iter().enumerate() {
+        definitions.push(format!("$n{index}: Int!"));
+        variables.insert(format!("n{index}"), Value::from(pull.number));
+        selections.push(format!(
+            "pr{index}: pullRequest(number: $n{index}) {{\n\
+                number url reviewDecision statusCheckRollup {{ state }}\n\
+                comments(first: {PARTICIPANT_LIMIT}) {{ nodes {{ author {{ login }} }} pageInfo {{ hasNextPage endCursor }} }}\n\
+                reviews(first: {PARTICIPANT_LIMIT}, states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]) {{ nodes {{ author {{ login }} state }} pageInfo {{ hasNextPage endCursor }} }}\n\
+                reviewRequests(first: {PARTICIPANT_LIMIT}) {{ nodes {{ requestedReviewer {{ ... on User {{ login }} }} }} pageInfo {{ hasNextPage endCursor }} }}\n\
+                assignees(first: {PARTICIPANT_LIMIT}) {{ nodes {{ login }} pageInfo {{ hasNextPage endCursor }} }}\n\
+            }}"
+        ));
+    }
+    let query = format!(
+        "query PullRequestMetadata({}) {{ repository(owner: $owner, name: $name) {{ nameWithOwner {} }} }}",
+        definitions.join(", "),
+        selections.join("\n")
+    );
+    (query, Value::Object(variables))
+}
+
+#[derive(Deserialize)]
+struct BulkMetadataData {
+    repository: Option<BulkMetadataRepository>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkMetadataRepository {
+    name_with_owner: String,
+    #[serde(flatten)]
+    pulls: HashMap<String, Option<BulkPullMetadata>>,
+}
+
+const DETAILS_QUERY: &str = r#"query PullRequestDetails(
+    $owner: String!, $name: String!, $number: Int!,
+    $commentsCursor: String, $reviewsCursor: String, $threadsCursor: String,
+    $checksCursor: String, $includeComments: Boolean!, $includeReviews: Boolean!,
+    $includeThreads: Boolean!, $includeChecks: Boolean!
+) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequest(number: $number) {
+      number url body state isDraft maintainerCanModify canBeRebased
+      viewerCanUpdateBranch mergeable mergeStateStatus reviewDecision
+      autoMergeRequest { enabledAt }
+      isInMergeQueue
+      reviewRequests(first: 100) {
+        nodes { requestedReviewer { ... on User { login } ... on Team { slug } } }
+        pageInfo { hasNextPage endCursor }
+      }
+      assignees(first: 100) { nodes { login } pageInfo { hasNextPage endCursor } }
+      labels(first: 100) { nodes { name } pageInfo { hasNextPage endCursor } }
+      comments(first: 50, after: $commentsCursor) @include(if: $includeComments) {
+        nodes { id author { login } body createdAt updatedAt url }
+        pageInfo { hasNextPage endCursor }
+      }
+      reviews(first: 50, after: $reviewsCursor) @include(if: $includeReviews) {
+        nodes { id author { login } body state submittedAt commit { oid } url }
+        pageInfo { hasNextPage endCursor }
+      }
+      reviewThreads(first: 50, after: $threadsCursor) @include(if: $includeThreads) {
+        nodes {
+          id path line originalLine startLine originalStartLine diffSide startDiffSide
+          isResolved isOutdated
+          comments(first: 100) {
+            nodes {
+              id author { login } body createdAt updatedAt url path line originalLine
+              startLine originalStartLine diffHunk outdated commit { oid } originalCommit { oid }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+      statusCheckRollup {
+        state
+        contexts(first: 50, after: $checksCursor) @include(if: $includeChecks) {
+          nodes {
+            __typename
+            ... on CheckRun {
+              id name status conclusion detailsUrl startedAt completedAt
+              isRequired(pullRequestNumber: $number)
+            }
+            ... on StatusContext {
+              id context state description targetUrl createdAt updatedAt
+              isRequired(pullRequestNumber: $number)
+            }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    }
+  }
+}"#;
+
+#[derive(Clone, Default)]
+struct ConnectionCursor {
+    after: Option<String>,
+    include: bool,
+}
+
+#[derive(Clone, Default)]
+struct DetailsCursors {
+    comments: ConnectionCursor,
+    reviews: ConnectionCursor,
+    threads: ConnectionCursor,
+    checks: ConnectionCursor,
+}
+
+impl DetailsCursors {
+    fn initial() -> Self {
+        Self {
+            comments: ConnectionCursor {
+                include: true,
+                ..Default::default()
+            },
+            reviews: ConnectionCursor {
+                include: true,
+                ..Default::default()
+            },
+            threads: ConnectionCursor {
+                include: true,
+                ..Default::default()
+            },
+            checks: ConnectionCursor {
+                include: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn done(&self) -> bool {
+        !self.comments.include
+            && !self.reviews.include
+            && !self.threads.include
+            && !self.checks.include
+    }
+}
+
+fn details_variables(repo: &Repository, number: u64, cursors: &DetailsCursors) -> Value {
+    json!({
+        "owner": repo.owner,
+        "name": repo.name,
+        "number": number,
+        "commentsCursor": cursors.comments.after,
+        "reviewsCursor": cursors.reviews.after,
+        "threadsCursor": cursors.threads.after,
+        "checksCursor": cursors.checks.after,
+        "includeComments": cursors.comments.include,
+        "includeReviews": cursors.reviews.include,
+        "includeThreads": cursors.threads.include,
+        "includeChecks": cursors.checks.include,
+    })
+}
+
+#[derive(Deserialize)]
+struct DetailsData {
+    repository: Option<DetailsRepository>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsRepository {
+    name_with_owner: String,
+    pull_request: Option<DetailsPull>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsPull {
+    number: u64,
+    url: String,
+    body: String,
+    state: String,
+    is_draft: bool,
+    maintainer_can_modify: bool,
+    can_be_rebased: bool,
+    viewer_can_update_branch: bool,
+    mergeable: String,
+    merge_state_status: String,
+    review_decision: Option<String>,
+    auto_merge_request: Option<Value>,
+    is_in_merge_queue: bool,
+    review_requests: GraphqlConnection<DetailsReviewRequest>,
+    assignees: GraphqlConnection<GraphqlActor>,
+    labels: GraphqlConnection<DetailsLabel>,
+    comments: Option<GraphqlConnection<DetailsIssueComment>>,
+    reviews: Option<GraphqlConnection<DetailsReview>>,
+    review_threads: Option<GraphqlConnection<DetailsThread>>,
+    status_check_rollup: Option<DetailsRollup>,
+}
+
+impl DetailsPull {
+    fn validate(&self, repo: &Repository, number: u64) -> Result<()> {
+        ensure!(
+            self.number == number
+                && self.url == format!("https://{}/{}/pull/{number}", repo.host, repo.full_name()),
+            "GitHub details PR identity mismatch"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsReviewRequest {
+    requested_reviewer: Option<DetailsRequestedReviewer>,
+}
+
+#[derive(Deserialize)]
+struct DetailsRequestedReviewer {
+    login: Option<String>,
+    slug: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DetailsLabel {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsIssueComment {
+    id: String,
+    author: Option<GraphqlActor>,
+    body: String,
+    created_at: String,
+    updated_at: String,
+    url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsReview {
+    id: String,
+    author: Option<GraphqlActor>,
+    body: String,
+    state: String,
+    submitted_at: Option<String>,
+    commit: Option<GraphqlOid>,
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct GraphqlOid {
+    oid: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsThread {
+    id: String,
+    path: String,
+    line: Option<u64>,
+    original_line: Option<u64>,
+    start_line: Option<u64>,
+    original_start_line: Option<u64>,
+    diff_side: Option<String>,
+    start_diff_side: Option<String>,
+    is_resolved: bool,
+    is_outdated: bool,
+    comments: GraphqlConnection<DetailsReviewComment>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsReviewComment {
+    id: String,
+    author: Option<GraphqlActor>,
+    body: String,
+    created_at: String,
+    updated_at: String,
+    url: String,
+    path: String,
+    line: Option<u64>,
+    original_line: Option<u64>,
+    start_line: Option<u64>,
+    original_start_line: Option<u64>,
+    diff_hunk: String,
+    outdated: bool,
+    commit: Option<GraphqlOid>,
+    original_commit: Option<GraphqlOid>,
+}
+
+#[derive(Deserialize)]
+struct DetailsRollup {
+    state: String,
+    contexts: Option<GraphqlConnection<DetailsCheckNode>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum DetailsCheckNode {
+    CheckRun {
+        id: String,
+        name: String,
+        status: String,
+        conclusion: Option<String>,
+        #[serde(rename = "detailsUrl")]
+        details_url: Option<String>,
+        #[serde(rename = "startedAt")]
+        started_at: Option<String>,
+        #[serde(rename = "completedAt")]
+        completed_at: Option<String>,
+        #[serde(rename = "isRequired")]
+        required: bool,
+    },
+    StatusContext {
+        id: String,
+        context: String,
+        state: String,
+        description: Option<String>,
+        #[serde(rename = "targetUrl")]
+        target_url: Option<String>,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+        #[serde(rename = "updatedAt")]
+        updated_at: String,
+        #[serde(rename = "isRequired")]
+        required: bool,
+    },
+}
+
+struct DetailsOverview {
+    body: String,
+    requested_reviewers: Vec<String>,
+    labels: Vec<String>,
+    assignees: Vec<String>,
+    merge_eligibility: MergeEligibility,
+}
+
+struct DetailsBuilder {
+    overview: Option<DetailsOverview>,
+    issue_comments: Vec<IssueComment>,
+    reviews: Vec<PullRequestReview>,
+    review_threads: Vec<ReviewThread>,
+    checks: Vec<PullRequestCheck>,
+    activity_ids: HashSet<String>,
+    thread_ids: HashSet<String>,
+    check_ids: HashSet<String>,
+    activity_complete: bool,
+    checks_complete: bool,
+    notices: Vec<String>,
+}
+
+impl Default for DetailsBuilder {
+    fn default() -> Self {
+        Self {
+            overview: None,
+            issue_comments: Vec::new(),
+            reviews: Vec::new(),
+            review_threads: Vec::new(),
+            checks: Vec::new(),
+            activity_ids: HashSet::new(),
+            thread_ids: HashSet::new(),
+            check_ids: HashSet::new(),
+            activity_complete: true,
+            checks_complete: true,
+            notices: Vec::new(),
+        }
+    }
+}
+
+impl DetailsBuilder {
+    fn absorb(
+        &mut self,
+        repo: &Repository,
+        pull: DetailsPull,
+        partial: bool,
+        first: bool,
+    ) -> Result<DetailsCursors> {
+        let number = pull.number;
+        if partial {
+            self.activity_complete = false;
+            self.checks_complete = false;
+            self.notice("GitHub returned partial collaboration data; unavailable fields were not treated as complete.");
+        }
+        if first {
+            let requested_reviewers = pull
+                .review_requests
+                .nodes
+                .iter()
+                .flatten()
+                .filter_map(|request| request.requested_reviewer.as_ref())
+                .filter_map(|reviewer| {
+                    reviewer
+                        .login
+                        .clone()
+                        .or_else(|| reviewer.slug.as_ref().map(|slug| format!("team:{slug}")))
+                })
+                .collect();
+            let labels = pull
+                .labels
+                .nodes
+                .iter()
+                .flatten()
+                .map(|label| label.name.clone())
+                .collect();
+            let assignees = pull
+                .assignees
+                .nodes
+                .iter()
+                .flatten()
+                .map(|actor| actor.login.clone())
+                .collect();
+            for (label, connection_complete) in [
+                (
+                    "requested reviewers",
+                    connection_complete(&pull.review_requests),
+                ),
+                ("labels", connection_complete(&pull.labels)),
+                ("assignees", connection_complete(&pull.assignees)),
+            ] {
+                if !connection_complete {
+                    self.activity_complete = false;
+                    self.notice(&format!(
+                        "PR {label} are partial at the explicit 100-item overview limit."
+                    ));
+                }
+            }
+            self.overview = Some(DetailsOverview {
+                body: pull.body.clone(),
+                requested_reviewers,
+                labels,
+                assignees,
+                merge_eligibility: MergeEligibility {
+                    state: pull.state.clone(),
+                    draft: pull.is_draft,
+                    mergeable: pull.mergeable.clone(),
+                    merge_state_status: pull.merge_state_status.clone(),
+                    review_status: map_review_status(pull.review_decision.as_deref(), partial)
+                        .into(),
+                    check_status: map_check_status(
+                        pull.status_check_rollup
+                            .as_ref()
+                            .map(|rollup| rollup.state.as_str()),
+                        partial,
+                    )
+                    .into(),
+                    maintainer_can_modify: pull.maintainer_can_modify,
+                    can_rebase: pull.can_be_rebased,
+                    can_update_branch: pull.viewer_can_update_branch,
+                    auto_merge_enabled: pull.auto_merge_request.is_some(),
+                    in_merge_queue: pull.is_in_merge_queue,
+                },
+            });
+        }
+
+        let mut next = DetailsCursors::default();
+        if let Some(connection) = pull.comments {
+            next.comments = next_cursor(&connection.page_info)?;
+            if connection.nodes.iter().any(Option::is_none) {
+                self.activity_complete = false;
+                self.notice("Issue comments contained unavailable entries; the activity snapshot is partial.");
+            }
+            for comment in connection.nodes.into_iter().flatten() {
+                ensure!(
+                    self.activity_ids.insert(comment.id.clone()),
+                    "PR activity changed during pagination; refresh to retry"
+                );
+                self.issue_comments.push(comment.into_domain(repo, number));
+            }
+        }
+        if let Some(connection) = pull.reviews {
+            next.reviews = next_cursor(&connection.page_info)?;
+            if connection.nodes.iter().any(Option::is_none) {
+                self.activity_complete = false;
+                self.notice(
+                    "Reviews contained unavailable entries; the activity snapshot is partial.",
+                );
+            }
+            for review in connection.nodes.into_iter().flatten() {
+                ensure!(
+                    self.activity_ids.insert(review.id.clone()),
+                    "PR activity changed during pagination; refresh to retry"
+                );
+                self.reviews.push(review.into_domain(repo, number));
+            }
+        }
+        if let Some(connection) = pull.review_threads {
+            next.threads = next_cursor(&connection.page_info)?;
+            if connection.nodes.iter().any(Option::is_none) {
+                self.activity_complete = false;
+                self.notice("Review threads contained unavailable entries; the activity snapshot is partial.");
+            }
+            for thread in connection.nodes.into_iter().flatten() {
+                ensure!(
+                    self.thread_ids.insert(thread.id.clone()),
+                    "PR review threads changed during pagination; refresh to retry"
+                );
+                let comments_complete = connection_complete(&thread.comments);
+                if thread.comments.page_info.has_next_page {
+                    self.activity_complete = false;
+                    self.notice(&format!(
+                        "Review thread comments are partial at the explicit {PARTICIPANT_LIMIT}-comment per-thread limit."
+                    ));
+                }
+                if thread.comments.nodes.iter().any(Option::is_none) {
+                    self.activity_complete = false;
+                    self.notice("Review thread comments contained unavailable entries; the activity snapshot is partial.");
+                }
+                self.review_threads
+                    .push(thread.into_domain(repo, number, comments_complete));
+            }
+        }
+        if let Some(rollup) = pull.status_check_rollup
+            && let Some(connection) = rollup.contexts
+        {
+            next.checks = next_cursor(&connection.page_info)?;
+            if connection.nodes.iter().any(Option::is_none) {
+                self.checks_complete = false;
+                self.notice(
+                    "Checks contained unavailable entries; the checks snapshot is partial.",
+                );
+            }
+            for check in connection.nodes.into_iter().flatten() {
+                let id = check.id();
+                ensure!(
+                    self.check_ids.insert(id.to_owned()),
+                    "PR checks changed during pagination; refresh to retry"
+                );
+                self.checks.push(check.into_domain(repo, number));
+            }
+        }
+        Ok(next)
+    }
+
+    fn notice(&mut self, notice: &str) {
+        if !self.notices.iter().any(|known| known == notice) {
+            self.notices.push(notice.to_owned());
+        }
+    }
+
+    fn finish(self, number: u64) -> Result<PullRequestDetails> {
+        let overview = self
+            .overview
+            .context("GitHub PR overview was unavailable")?;
+        Ok(PullRequestDetails {
+            number,
+            body: overview.body,
+            requested_reviewers: overview.requested_reviewers,
+            labels: overview.labels,
+            assignees: overview.assignees,
+            merge_eligibility: overview.merge_eligibility,
+            issue_comments: self.issue_comments,
+            reviews: self.reviews,
+            review_threads: self.review_threads,
+            checks: self.checks,
+            activity_complete: self.activity_complete,
+            checks_complete: self.checks_complete,
+            notice: (!self.notices.is_empty()).then(|| self.notices.join(" ")),
+        })
+    }
+}
+
+fn next_cursor(page: &PageInfo) -> Result<ConnectionCursor> {
+    if !page.has_next_page {
+        return Ok(ConnectionCursor::default());
+    }
+    let after = page
+        .end_cursor
+        .clone()
+        .filter(|cursor| !cursor.is_empty())
+        .context("GitHub pagination omitted its continuation cursor")?;
+    Ok(ConnectionCursor {
+        after: Some(after),
+        include: true,
+    })
+}
+
+fn coordinates(repo: &Repository, pull_request: u64, remote_id: String) -> ProviderCoordinates {
+    ProviderCoordinates {
+        provider: "github".into(),
+        host: repo.host.clone(),
+        owner: repo.owner.clone(),
+        repository: repo.name.clone(),
+        pull_request,
+        remote_id,
+    }
+}
+
+impl DetailsIssueComment {
+    fn into_domain(self, repo: &Repository, number: u64) -> IssueComment {
+        IssueComment {
+            coordinates: coordinates(repo, number, self.id),
+            author: self.author.map(|author| author.login),
+            body: self.body,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            url: self.url,
+        }
+    }
+}
+
+impl DetailsReview {
+    fn into_domain(self, repo: &Repository, number: u64) -> PullRequestReview {
+        PullRequestReview {
+            coordinates: coordinates(repo, number, self.id),
+            author: self.author.map(|author| author.login),
+            body: self.body,
+            state: self.state,
+            submitted_at: self.submitted_at,
+            commit_sha: self.commit.map(|commit| commit.oid),
+            url: self.url,
+        }
+    }
+}
+
+impl DetailsThread {
+    fn into_domain(self, repo: &Repository, number: u64, comments_complete: bool) -> ReviewThread {
+        let side = self.diff_side.clone();
+        ReviewThread {
+            coordinates: coordinates(repo, number, self.id),
+            path: self.path,
+            line: self.line,
+            original_line: self.original_line,
+            start_line: self.start_line,
+            original_start_line: self.original_start_line,
+            side: self.diff_side,
+            start_side: self.start_diff_side,
+            resolved: self.is_resolved,
+            outdated: self.is_outdated,
+            comments: self
+                .comments
+                .nodes
+                .into_iter()
+                .flatten()
+                .map(|comment| comment.into_domain(repo, number, side.clone()))
+                .collect(),
+            comments_complete,
+        }
+    }
+}
+
+impl DetailsReviewComment {
+    fn into_domain(self, repo: &Repository, number: u64, side: Option<String>) -> ReviewComment {
+        ReviewComment {
+            coordinates: coordinates(repo, number, self.id),
+            author: self.author.map(|author| author.login),
+            body: self.body,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            url: self.url,
+            path: self.path,
+            line: self.line,
+            original_line: self.original_line,
+            start_line: self.start_line,
+            original_start_line: self.original_start_line,
+            side,
+            diff_hunk: self.diff_hunk,
+            commit_sha: self.commit.map(|commit| commit.oid),
+            original_commit_sha: self.original_commit.map(|commit| commit.oid),
+            outdated: self.outdated,
+        }
+    }
+}
+
+impl DetailsCheckNode {
+    fn id(&self) -> &str {
+        match self {
+            Self::CheckRun { id, .. } | Self::StatusContext { id, .. } => id,
+        }
+    }
+
+    fn into_domain(self, repo: &Repository, number: u64) -> PullRequestCheck {
+        match self {
+            Self::CheckRun {
+                id,
+                name,
+                status,
+                conclusion,
+                details_url,
+                started_at,
+                completed_at,
+                required,
+            } => PullRequestCheck {
+                coordinates: coordinates(repo, number, id),
+                kind: CheckKind::CheckRun,
+                name,
+                status,
+                conclusion,
+                description: None,
+                details_url,
+                started_at,
+                completed_at,
+                required: Some(required),
+            },
+            Self::StatusContext {
+                id,
+                context,
+                state,
+                description,
+                target_url,
+                created_at,
+                updated_at,
+                required,
+            } => PullRequestCheck {
+                coordinates: coordinates(repo, number, id),
+                kind: CheckKind::CommitStatus,
+                name: context,
+                status: state,
+                conclusion: None,
+                description,
+                details_url: target_url,
+                started_at: Some(created_at),
+                completed_at: Some(updated_at),
+                required: Some(required),
+            },
+        }
     }
 }
 
@@ -648,6 +1785,9 @@ impl ApiPullRequest {
                 .collect(),
             assignees: self.assignees.into_iter().map(|u| u.login).collect(),
             labels: self.labels.into_iter().map(|l| l.name).collect(),
+            participants: Vec::new(),
+            participants_complete: false,
+            participants_notice: Some("Participant metadata has not been hydrated.".into()),
             draft: self.draft,
             state: if self.merged_at.is_some() {
                 "MERGED"
@@ -657,7 +1797,7 @@ impl ApiPullRequest {
                 "CLOSED"
             }
             .into(),
-            // These require separate review/check reads, delivered in M2.
+            // These are replaced by the account-isolated GraphQL metadata read.
             review_status: "UNKNOWN".into(),
             check_status: "UNKNOWN".into(),
             base_sha: self.base.sha,
@@ -834,6 +1974,32 @@ mod tests {
     fn step(path: &str, response: Value) -> Value {
         json!({"endpoint": path, "response": response})
     }
+    fn graphql_step(response: Value, numbers: &[u64]) -> Value {
+        json!({"graphql": true, "response": response, "numbers": numbers})
+    }
+    fn details_step(response: Value, variables: Value) -> Value {
+        json!({"graphql": true, "response": response, "variables": variables})
+    }
+    fn metadata(numbers: &[u64]) -> Value {
+        let mut pulls = Map::new();
+        pulls.insert("nameWithOwner".into(), json!("owner/repo"));
+        for (index, number) in numbers.iter().enumerate() {
+            pulls.insert(
+                format!("pr{index}"),
+                json!({
+                    "number": number,
+                    "url": format!("https://github.com/owner/repo/pull/{number}"),
+                    "reviewDecision": "APPROVED",
+                    "statusCheckRollup": {"state": "SUCCESS"},
+                    "comments": {"nodes": [{"author": {"login": "commenter"}}], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+                    "reviews": {"nodes": [{"author": {"login": "review-author"}, "state": "APPROVED"}], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+                    "reviewRequests": {"nodes": [{"requestedReviewer": {"login": "reviewer"}}], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+                    "assignees": {"nodes": [{"login": "assignee"}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+                }),
+            );
+        }
+        json!({"data": {"repository": Value::Object(pulls)}})
+    }
 
     // A real child executable verifies argument arrays and its private environment.
     // Logs contain only a numeric call count; fixture credential bytes never log.
@@ -869,7 +2035,17 @@ if args[:2] == ['auth', 'status']:
     assert 'GH_TOKEN' not in os.environ
 else:
     assert os.environ.get('GH_TOKEN') == credential, 'wrong identity'
-    assert args == ['api', '--hostname', 'github.com', '--method', 'GET', '--header', 'Accept: application/vnd.github+json', '--header', 'X-GitHub-Api-Version: 2026-03-10', step['endpoint']], 'unexpected request'
+    if step.get('graphql'):
+        assert args == ['api', '--hostname', 'github.com', '--method', 'POST', '--header', 'Accept: application/vnd.github+json', '--header', 'X-GitHub-Api-Version: 2026-03-10', 'graphql', '--input', '-'], 'unexpected GraphQL request'
+        payload = json.load(sys.stdin)
+        assert payload['query'].lstrip().startswith('query '), 'not a query'
+        assert 'mutation' not in payload['query'], 'mutation attempted'
+        actual = [payload['variables']['n' + str(i)] for i in range(len(step.get('numbers', [])))]
+        assert actual == step.get('numbers', []), 'wrong PR batch'
+        for key, value in step.get('variables', {}).items():
+            assert payload['variables'].get(key) == value, 'wrong GraphQL variable ' + key
+    else:
+        assert args == ['api', '--hostname', 'github.com', '--method', 'GET', '--header', 'Accept: application/vnd.github+json', '--header', 'X-GitHub-Api-Version: 2026-03-10', step['endpoint']], 'unexpected request'
 counter.write_text(str(index + 1))
 if step.get('fail'):
     print(credential, file=sys.stderr)
@@ -956,7 +2132,10 @@ else:
 
     #[test]
     fn credentials_are_child_only_and_account_specific() {
-        let steps = vec![step("repos/owner/repo/pulls/1", pull(1, 1))];
+        let steps = vec![
+            step("repos/owner/repo/pulls/1", pull(1, 1)),
+            graphql_step(metadata(&[1]), &[1]),
+        ];
         let (alice_dir, alice) = fixture("alice", steps.clone());
         let (bob_dir, bob) = fixture("bob", steps);
         let command = alice.runner.gh_command();
@@ -985,10 +2164,10 @@ else:
             scope.spawn(|| alice.pull_request(&repo("alice"), 1).unwrap());
             scope.spawn(|| bob.pull_request(&repo("bob"), 1).unwrap());
         });
-        exhausted(&alice_dir, 1);
-        exhausted(&bob_dir, 1);
+        exhausted(&alice_dir, 2);
+        exhausted(&bob_dir, 2);
         for dir in [&alice_dir, &bob_dir] {
-            assert_eq!(fs::read_to_string(dir.path().join("tokens")).unwrap(), "1");
+            assert_eq!(fs::read_to_string(dir.path().join("tokens")).unwrap(), "2");
         }
     }
 
@@ -1027,10 +2206,15 @@ else:
                     "repos/owner/repo/pulls?state=all&sort=created&direction=asc&per_page=100&page=1",
                     json!(first),
                 ),
+                graphql_step(
+                    metadata(&(1..=100).collect::<Vec<_>>()),
+                    &(1..=100).collect::<Vec<_>>(),
+                ),
                 step(
                     "repos/owner/repo/pulls?state=all&sort=created&direction=asc&per_page=100&page=2",
                     json!([merged]),
                 ),
+                graphql_step(metadata(&[101]), &[101]),
             ],
         );
         let pulls = provider.list_pull_requests(&repo("alice"), "ALL").unwrap();
@@ -1039,8 +2223,83 @@ else:
         assert_eq!(pulls[0].body, "");
         assert_eq!(pulls[0].source_branch, "feature");
         assert_eq!(pulls[0].reviewers, ["reviewer", "team:maintainers"]);
-        assert_eq!(pulls[0].check_status, "UNKNOWN");
+        assert_eq!(pulls[0].review_status, "Approved");
+        assert_eq!(pulls[0].check_status, "Passing");
+        assert_eq!(
+            pulls[0].participants,
+            [
+                "assignee",
+                "author",
+                "commenter",
+                "review-author",
+                "reviewer"
+            ]
+        );
+        assert!(pulls[0].participants_complete);
+        exhausted(&dir, 4);
+    }
+
+    #[test]
+    fn nullable_and_partial_metadata_never_claims_false_status_or_completeness() {
+        let partial = json!({
+            "data": {"repository": {
+                "nameWithOwner": "owner/repo",
+                "pr0": {
+                    "number": 1,
+                    "url": "https://github.com/owner/repo/pull/1",
+                    "reviewDecision": null,
+                    "statusCheckRollup": null,
+                    "comments": {"nodes": [{"author": {"login": "COMMENTER"}}], "pageInfo": {"hasNextPage": true, "endCursor": "more"}},
+                    "reviews": {"nodes": [{"author": {"login": "pending-user"}, "state": "PENDING"}, null], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+                    "reviewRequests": {"nodes": [{"requestedReviewer": {"login": "reviewer"}}], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+                    "assignees": {"nodes": [{"login": "assignee"}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+                }
+            }},
+            "errors": [{"message": "withheld fixture detail"}]
+        });
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                step("repos/owner/repo/pulls/1", pull(1, 1)),
+                graphql_step(partial, &[1]),
+            ],
+        );
+        let hydrated = provider.pull_request(&repo("alice"), 1).unwrap();
+        assert_eq!(hydrated.review_status, "UNKNOWN");
+        assert_eq!(hydrated.check_status, "UNKNOWN");
+        assert!(!hydrated.participants_complete);
+        assert!(hydrated.participants.contains(&"COMMENTER".into()));
+        assert!(!hydrated.participants.contains(&"pending-user".into()));
+        assert!(
+            hydrated
+                .participants_notice
+                .unwrap()
+                .contains("limited to 100")
+        );
         exhausted(&dir, 2);
+
+        let no_rules = json!({"data": {"repository": {
+            "nameWithOwner": "owner/repo",
+            "pr0": {
+                "number": 1, "url": "https://github.com/owner/repo/pull/1",
+                "reviewDecision": null, "statusCheckRollup": null,
+                "comments": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+                "reviews": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+                "reviewRequests": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+                "assignees": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+            }
+        }}});
+        let (_dir, provider) = fixture(
+            "alice",
+            vec![
+                step("repos/owner/repo/pulls/1", pull(1, 1)),
+                graphql_step(no_rules, &[1]),
+            ],
+        );
+        let hydrated = provider.pull_request(&repo("alice"), 1).unwrap();
+        assert_eq!(hydrated.review_status, "None");
+        assert_eq!(hydrated.check_status, "None");
+        assert!(hydrated.participants_complete);
     }
 
     #[test]
@@ -1062,6 +2321,10 @@ else:
                         "repos/owner/repo/pulls?state=open&sort=created&direction=asc&per_page=100&page=1",
                         json!(first),
                     ),
+                    graphql_step(
+                        metadata(&(1..=100).collect::<Vec<_>>()),
+                        &(1..=100).collect::<Vec<_>>(),
+                    ),
                     second,
                 ],
             );
@@ -1071,6 +2334,117 @@ else:
                 .to_string();
             assert!(!err.contains("fixture-private"));
         }
+    }
+
+    #[test]
+    fn details_pages_activity_and_checks_and_marks_partial_history() {
+        let overview = json!({
+            "number": 1,
+            "url": "https://github.com/owner/repo/pull/1",
+            "body": "Overview body",
+            "state": "OPEN",
+            "isDraft": false,
+            "maintainerCanModify": true,
+            "canBeRebased": true,
+            "viewerCanUpdateBranch": false,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "reviewDecision": "APPROVED",
+            "autoMergeRequest": null,
+            "isInMergeQueue": false,
+            "reviewRequests": {"nodes": [{"requestedReviewer": {"login": "reviewer"}}, {"requestedReviewer": {"slug": "maintainers"}}], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+            "assignees": {"nodes": [{"login": "assignee"}], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+            "labels": {"nodes": [{"name": "bug"}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+        });
+        let mut first = overview.clone();
+        first["comments"] = json!({
+            "nodes": [{"id": "IC1", "author": {"login": "one"}, "body": "first", "createdAt": "2026-09-12T10:00:00Z", "updatedAt": "2026-09-12T10:00:00Z", "url": "https://github.com/owner/repo/pull/1#issuecomment-1"}],
+            "pageInfo": {"hasNextPage": true, "endCursor": "comments-1"}
+        });
+        first["reviews"] = json!({
+            "nodes": [{"id": "R1", "author": {"login": "reviewer"}, "body": "approved", "state": "APPROVED", "submittedAt": "2026-09-12T11:00:00Z", "commit": null, "url": "https://github.com/owner/repo/pull/1#pullrequestreview-1"}],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        });
+        first["reviewThreads"] = json!({
+            "nodes": [{
+                "id": "T1", "path": "src/lib.rs", "line": 8, "originalLine": 7,
+                "startLine": null, "originalStartLine": null, "diffSide": "RIGHT", "startDiffSide": null,
+                "isResolved": true, "isOutdated": true,
+                "comments": {"nodes": [{
+                    "id": "RC1", "author": {"login": "reviewer"}, "body": "old line",
+                    "createdAt": "2026-09-12T11:00:00Z", "updatedAt": "2026-09-12T11:01:00Z",
+                    "url": "https://github.com/owner/repo/pull/1#discussion_r1", "path": "src/lib.rs",
+                    "line": null, "originalLine": 7, "startLine": null, "originalStartLine": null,
+                    "diffHunk": "@@ -7 +8 @@", "outdated": true, "commit": null, "originalCommit": null
+                }], "pageInfo": {"hasNextPage": true, "endCursor": "nested-more"}}
+            }],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        });
+        first["statusCheckRollup"] = json!({
+            "state": "SUCCESS",
+            "contexts": {"nodes": [{
+                "__typename": "CheckRun", "id": "CR1", "name": "build", "status": "COMPLETED",
+                "conclusion": "SUCCESS", "detailsUrl": "https://example.test/build", "startedAt": "2026-09-12T09:00:00Z",
+                "completedAt": "2026-09-12T09:01:00Z", "isRequired": true
+            }], "pageInfo": {"hasNextPage": true, "endCursor": "checks-1"}}
+        });
+
+        let mut second = overview;
+        second["comments"] = json!({
+            "nodes": [{"id": "IC2", "author": null, "body": "second", "createdAt": "2026-09-12T12:00:00Z", "updatedAt": "2026-09-12T12:00:00Z", "url": "https://github.com/owner/repo/pull/1#issuecomment-2"}],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        });
+        second["statusCheckRollup"] = json!({
+            "state": "SUCCESS",
+            "contexts": {"nodes": [{
+                "__typename": "StatusContext", "id": "SC1", "context": "deploy", "state": "SUCCESS",
+                "description": "ready", "targetUrl": null, "createdAt": "2026-09-12T09:00:00Z",
+                "updatedAt": "2026-09-12T09:02:00Z", "isRequired": false
+            }], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+        });
+
+        let first_response = json!({
+            "data": {"repository": {"nameWithOwner": "owner/repo", "pullRequest": first}},
+            "errors": [{"message": "one field was inaccessible"}]
+        });
+        let second_response =
+            json!({"data": {"repository": {"nameWithOwner": "owner/repo", "pullRequest": second}}});
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                details_step(
+                    first_response,
+                    json!({"number": 1, "commentsCursor": null, "checksCursor": null, "includeReviews": true, "includeThreads": true}),
+                ),
+                details_step(
+                    second_response,
+                    json!({"number": 1, "commentsCursor": "comments-1", "checksCursor": "checks-1", "includeReviews": false, "includeThreads": false}),
+                ),
+            ],
+        );
+        let details = provider.details(&repo("alice"), 1).unwrap();
+        assert_eq!(details.body, "Overview body");
+        assert_eq!(
+            details.requested_reviewers,
+            ["reviewer", "team:maintainers"]
+        );
+        assert_eq!(details.issue_comments.len(), 2);
+        assert_eq!(details.reviews.len(), 1);
+        assert_eq!(details.reviews[0].commit_sha, None);
+        assert_eq!(details.review_threads.len(), 1);
+        assert!(details.review_threads[0].resolved);
+        assert!(details.review_threads[0].outdated);
+        assert!(!details.review_threads[0].comments_complete);
+        assert_eq!(details.review_threads[0].comments[0].commit_sha, None);
+        assert_eq!(details.checks.len(), 2);
+        assert_eq!(details.checks[0].coordinates.pull_request, 1);
+        assert_eq!(details.merge_eligibility.check_status, "Passing");
+        assert!(!details.activity_complete);
+        assert!(!details.checks_complete);
+        let notice = details.notice.unwrap();
+        assert!(notice.contains("partial collaboration data"));
+        assert!(notice.contains("100-comment per-thread limit"));
+        exhausted(&dir, 2);
     }
 
     #[test]
@@ -1120,6 +2494,43 @@ else:
         assert!(!result.complete);
         assert!(result.notice.unwrap().contains("PR changed"));
         exhausted(&dir, 4);
+    }
+
+    #[test]
+    fn mutable_file_over_return_never_replaces_immutable_comparison() {
+        let immutable: Vec<_> = (0..300).map(file).collect();
+        let mutable: Vec<_> = (0..301).map(file).collect();
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                step("repos/owner/repo/pulls/1", pull(1, 300)),
+                step(&compare_path(), compare(immutable)),
+                step(
+                    "repos/owner/repo/pulls/1/files?per_page=100&page=1",
+                    json!(&mutable[..100]),
+                ),
+                step(
+                    "repos/owner/repo/pulls/1/files?per_page=100&page=2",
+                    json!(&mutable[100..200]),
+                ),
+                step(
+                    "repos/owner/repo/pulls/1/files?per_page=100&page=3",
+                    json!(&mutable[200..300]),
+                ),
+                step(
+                    "repos/owner/repo/pulls/1/files?per_page=100&page=4",
+                    json!(&mutable[300..]),
+                ),
+                step("repos/owner/repo/pulls/1", pull(1, 300)),
+            ],
+        );
+        let result = provider.comparison(&repo("alice"), 1, &revision()).unwrap();
+        assert_eq!(result.files.len(), 300);
+        assert!(!result.complete);
+        let notice = result.notice.unwrap();
+        assert!(notice.contains("returned 301 files but reported 300"));
+        assert!(!notice.contains("301 of 300"));
+        exhausted(&dir, 7);
     }
 
     #[test]
@@ -1436,5 +2847,25 @@ else:
                 comparison.notice
             );
         }
+    }
+
+    /// Explicit opt-in schema check, public data only.
+    #[test]
+    #[ignore = "uses existing gh auth and public cli/cli API reads"]
+    fn live_public_pull_request_details() {
+        let account = GithubProvider::accounts().unwrap().remove(0);
+        let provider = GithubProvider::new(account);
+        let repo = provider.repository("cli/cli").unwrap();
+        let pull = provider.pull_request(&repo, 14398).unwrap();
+        assert_eq!(pull.number, 14398);
+        assert_ne!(pull.review_status, "UNKNOWN");
+        let details = provider.details(&repo, 14398).unwrap();
+        assert_eq!(details.number, 14398);
+        assert!(
+            details
+                .issue_comments
+                .iter()
+                .all(|comment| comment.coordinates.pull_request == 14398)
+        );
     }
 }
