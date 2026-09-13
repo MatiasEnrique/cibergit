@@ -5803,10 +5803,11 @@ impl ReviewWorkspace {
                             weak.update(cx, |root, cx| {
                                 let Root::Review(this) = root else { return false };
                                 let maximum = this.inspector_scroll.max_offset().y;
+                                let continuation_offset = maximum.min(px(420.));
                                 this.inspector_scroll
-                                    .set_offset(point(px(0.), -maximum));
+                                    .set_offset(point(px(0.), -continuation_offset));
                                 cx.notify();
-                                maximum > px(0.)
+                                continuation_offset > px(0.)
                             })
                             .unwrap_or(false)
                         })
