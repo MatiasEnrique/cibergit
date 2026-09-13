@@ -6,5 +6,6 @@ pub mod participation;
 pub mod providers;
 pub mod rebase;
 pub mod review;
+pub mod stacks;
 pub mod workspace;
 pub mod worktrees;
