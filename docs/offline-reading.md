@@ -7,6 +7,37 @@ the provider's original completeness state and notice. If the inspector displays
 20 reviews, 30 mapped threads, or 40 checks from a larger cached payload, it discloses that display
 limit. Top-level issue comments keep their existing paging.
 
+## Saved workspace restart
+
+An ordinary launch restores saved review tabs without `--repo`, `--account`, or `--pr`. The loader
+keeps tab order and the active tab, resolves each tab against the exact saved repository and account,
+and restores its validated comparison context. A closed pull request does not need to appear in the
+cached open-pull-request list. Each new tab record therefore includes the last provider-observed
+`PullRequest` value for presentation. That value may report a newer head than the pinned canonical
+revision. The loader compares the saved canonical revision with the persisted review context and
+does not advance it to the metadata head.
+
+The presentation value does not populate fresh details, lifecycle state, pending-review linkage,
+permissions, or write controls. Those states still require their normal fresh provider reads and
+generation checks. Failed account discovery or provider reads do not prevent the saved session,
+local drafts, and disposable collaboration cache from rendering.
+
+Workspace schema v1 remains readable. A legacy tab without presentation metadata can use a pull
+request from the exact-account sidebar cache. If that cache does not contain the pull request, the
+app keeps the tab record and shows a notice. Opening the same repository, account, and pull request
+successfully later records actual metadata and repairs the entry. The loader never invents a title,
+revision, object ID, or capability.
+
+Each tab's encoded presentation metadata is limited to 256 KiB, and `workspace.json` is limited to
+4 MiB. The workspace reader stops after 4 MiB before parsing. Oversized, corrupt, future-version,
+wrong-account, and mismatched-session data is refused and left in place. Workspace saves merge live
+tabs into their prior slots, so an unavailable entry is not dropped when another tab changes.
+Closing that exact tab removes its slot. Manual open, activation, or close actions also invalidate a
+delayed startup batch, so a late callback cannot restore tabs over newer user navigation. An
+explicit CLI destination may keep other saved tabs, but it wins the active selection after it
+resolves. If the saved active tab is unavailable, the first restored tab becomes active while the
+unavailable record remains saved.
+
 This snapshot is disposable presentation data. It is separate from the workspace Store,
 DraftStore, and ActionJournal. In particular, it does not:
 
@@ -70,3 +101,16 @@ special entries have unprovable occupancy and therefore make the write fail clos
 invalid CAS control in a non-empty cache also fails closed rather than resetting reservations. Any
 cache failure leaves admitted fresh collaboration data and local draft persistence usable and is
 reported honestly in the inspector.
+
+## Native validation scope
+
+The mixed-freshness offline collaboration smoke disables the details transport but still admits a
+fresh lifecycle read. It checks that fresh lifecycle identity cannot make cached comments editable.
+It is not a full provider-refusal test.
+
+The ordinary-startup refusal smoke starts with only `--data-dir` and places a process-local `gh`
+shim first on `PATH`. The shim logs and refuses every attempted `gh` command, including account
+discovery, sidebar, metadata, details, and lifecycle reads. The smoke requires the saved tab, pinned
+session, local draft, and cached collaboration view to render while fresh details, lifecycle, and
+pending-review authority remain absent. This establishes independence from successful `gh` reads.
+It does not claim a machine-wide network disconnect.

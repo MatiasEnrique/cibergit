@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -18,6 +18,8 @@ use std::{
 
 const WORKSPACE_SCHEMA_VERSION: u32 = 1;
 const WORKSPACE_FILE: &str = "workspace.json";
+const MAX_WORKSPACE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TAB_PRESENTATION_BYTES: usize = 256 * 1024;
 const MAX_POLL_BACKOFF_SHIFT: u32 = 5;
 const MAX_REVIEW_CONTEXT_BYTES: usize = 32 * 1024 * 1024;
 
@@ -123,9 +125,34 @@ pub struct TabState {
     pub repository_key: String,
     pub number: u64,
     pub revision: Revision,
+    /// Last observed provider metadata for presenting this exact saved tab.
+    /// This is not lifecycle, details, pending-review, or write authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequest>,
     pub selected_file: Option<String>,
     pub scroll_offset: f32,
     pub diff_mode: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RestoredWorkspaceTab {
+    pub saved_index: usize,
+    pub repository: Repository,
+    pub pull_request: PullRequest,
+    pub context: PersistedComparisonContext,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceRestoreNotice {
+    pub saved_index: Option<usize>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkspaceRestorePlan {
+    pub tabs: Vec<RestoredWorkspaceTab>,
+    pub active_tab: Option<usize>,
+    pub notices: Vec<WorkspaceRestoreNotice>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceState {
@@ -163,6 +190,42 @@ impl WorkspaceState {
             .get(self.selected_view)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Merge live tabs into their retained saved slots. Unavailable startup
+    /// entries remain durable until that exact identity is opened or closed.
+    pub fn merge_tabs(
+        &mut self,
+        live_tabs: Vec<TabState>,
+        closed_tabs: &BTreeSet<(String, u64)>,
+        active_identity: Option<(String, u64)>,
+    ) {
+        let retained_active = self
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| (tab.repository_key.clone(), tab.number));
+        let mut live_tabs = live_tabs.into_iter().map(Some).collect::<Vec<_>>();
+        let mut merged = Vec::with_capacity(self.tabs.len() + live_tabs.len());
+        for saved in std::mem::take(&mut self.tabs) {
+            let identity = (saved.repository_key.clone(), saved.number);
+            if closed_tabs.contains(&identity) {
+                continue;
+            }
+            let live = live_tabs.iter_mut().find(|candidate| {
+                candidate.as_ref().is_some_and(|candidate| {
+                    candidate.repository_key == identity.0 && candidate.number == identity.1
+                })
+            });
+            merged.push(live.and_then(Option::take).unwrap_or(saved));
+        }
+        merged.extend(live_tabs.into_iter().flatten());
+        let selected = active_identity.or(retained_active);
+        self.active_tab = selected.and_then(|(repository_key, number)| {
+            merged
+                .iter()
+                .position(|tab| tab.repository_key == repository_key && tab.number == number)
+        });
+        self.tabs = merged;
     }
 }
 
@@ -324,30 +387,154 @@ impl Store {
     }
     pub fn load_workspace(&self) -> Result<WorkspaceState> {
         let path = self.root.join(WORKSPACE_FILE);
-        if !path.exists() {
-            return Ok(WorkspaceState::default());
-        }
-        decode_workspace(&fs::read(&path).with_context(|| format!("Read {}", path.display()))?)
-            .with_context(|| format!("Load {}", path.display()))
+        let bytes = match read_workspace_bounded(&path) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(WorkspaceState::default());
+            }
+            Err(error) => return Err(error).with_context(|| format!("Read {}", path.display())),
+        };
+        decode_workspace(&bytes).with_context(|| format!("Load {}", path.display()))
     }
     pub fn save_workspace(&self, state: &WorkspaceState) -> Result<()> {
         if state.schema_version != WORKSPACE_SCHEMA_VERSION {
             bail!("Workspace was saved by an unsupported application version");
         }
+        validate_workspace(state)?;
+        let encoded = serde_json::to_vec_pretty(state)?;
+        if encoded.len() > MAX_WORKSPACE_BYTES {
+            bail!("Serialized workspace exceeds the {MAX_WORKSPACE_BYTES}-byte persistence limit");
+        }
         let path = self.root.join(WORKSPACE_FILE);
         if path.exists() {
-            let existing = fs::read(&path).with_context(|| format!("Read {}", path.display()))?;
+            let existing = read_workspace_bounded(&path)
+                .with_context(|| format!("Read {}", path.display()))?;
             if let Err(error) = decode_workspace(&existing) {
                 bail!("Refusing to overwrite unreadable or unsupported workspace data: {error:#}");
             }
         }
-        write_json(&path, state)
+        write_bytes(&path, &encoded)
     }
     pub fn save_pull_requests(&self, repo: &Repository, prs: &[PullRequest]) -> Result<()> {
         write_json(&self.cache_path(repo, "prs"), &prs)
     }
     pub fn load_pull_requests(&self, repo: &Repository) -> Result<Vec<PullRequest>> {
         read_json(&self.cache_path(repo, "prs"))
+    }
+    /// Load every saved tab needed for ordinary startup without consulting a
+    /// provider. Call this on a background executor.
+    pub fn load_workspace_restore(&self, workspace: &WorkspaceState) -> WorkspaceRestorePlan {
+        let mut plan = WorkspaceRestorePlan::default();
+        let mut seen = BTreeSet::new();
+        if workspace
+            .active_tab
+            .is_some_and(|index| index >= workspace.tabs.len())
+        {
+            plan.notices.push(WorkspaceRestoreNotice {
+                saved_index: None,
+                message: "Saved active tab is outside the saved tab list".into(),
+            });
+        }
+        for (saved_index, saved) in workspace.tabs.iter().enumerate() {
+            let identity = (saved.repository_key.clone(), saved.number);
+            if !seen.insert(identity.clone()) {
+                plan.notices.push(WorkspaceRestoreNotice {
+                    saved_index: Some(saved_index),
+                    message: format!(
+                        "Saved tab #{} duplicates an earlier repository/account/PR identity",
+                        saved.number
+                    ),
+                });
+                continue;
+            }
+            let Some(repository) = workspace
+                .repositories
+                .iter()
+                .find(|repository| repository.cache_key() == saved.repository_key)
+                .cloned()
+            else {
+                plan.notices.push(WorkspaceRestoreNotice {
+                    saved_index: Some(saved_index),
+                    message: format!(
+                        "Saved tab #{} no longer matches an exact configured repository/account",
+                        saved.number
+                    ),
+                });
+                continue;
+            };
+            let pull_request = match &saved.pull_request {
+                Some(pull_request) if pull_request.number == saved.number => pull_request.clone(),
+                Some(_) => {
+                    plan.notices.push(WorkspaceRestoreNotice {
+                        saved_index: Some(saved_index),
+                        message: format!(
+                            "Saved tab #{} has mismatched pull-request presentation metadata",
+                            saved.number
+                        ),
+                    });
+                    continue;
+                }
+                None => match self.load_pull_requests(&repository).ok().and_then(|pulls| {
+                    pulls
+                        .into_iter()
+                        .find(|pull_request| pull_request.number == saved.number)
+                }) {
+                    Some(pull_request) => pull_request,
+                    None => {
+                        plan.notices.push(WorkspaceRestoreNotice {
+                            saved_index: Some(saved_index),
+                            message: format!(
+                                "Saved tab #{} has no stored presentation metadata; open it explicitly once while reachable to repair this legacy entry",
+                                saved.number
+                            ),
+                        });
+                        continue;
+                    }
+                },
+            };
+            let context = match self.load_review_context(&repository, saved.number) {
+                Ok(context) if context.canonical_full_revision == saved.revision => context,
+                Ok(_) => {
+                    plan.notices.push(WorkspaceRestoreNotice {
+                        saved_index: Some(saved_index),
+                        message: format!(
+                            "Saved tab #{} does not match its pinned canonical review session",
+                            saved.number
+                        ),
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    plan.notices.push(WorkspaceRestoreNotice {
+                        saved_index: Some(saved_index),
+                        message: format!(
+                            "Saved tab #{} review session was refused and preserved: {error:#}",
+                            saved.number
+                        ),
+                    });
+                    continue;
+                }
+            };
+            plan.tabs.push(RestoredWorkspaceTab {
+                saved_index,
+                repository,
+                pull_request,
+                context,
+            });
+        }
+        plan.active_tab = workspace.active_tab.and_then(|saved_index| {
+            plan.tabs
+                .iter()
+                .position(|tab| tab.saved_index == saved_index)
+        });
+        if plan.active_tab.is_none() && !plan.tabs.is_empty() {
+            plan.active_tab = Some(0);
+        }
+        plan
     }
     pub fn save_comparison(
         &self,
@@ -494,6 +681,9 @@ impl Store {
     }
 }
 fn decode_workspace(bytes: &[u8]) -> Result<WorkspaceState> {
+    if bytes.len() > MAX_WORKSPACE_BYTES {
+        bail!("Workspace exceeds the {MAX_WORKSPACE_BYTES}-byte persistence limit");
+    }
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     let version = value
         .get("schema_version")
@@ -502,7 +692,36 @@ fn decode_workspace(bytes: &[u8]) -> Result<WorkspaceState> {
     if version != u64::from(WORKSPACE_SCHEMA_VERSION) {
         bail!("Workspace was saved by an unsupported application version");
     }
-    Ok(serde_json::from_value(value)?)
+    let workspace: WorkspaceState = serde_json::from_value(value)?;
+    validate_workspace(&workspace)?;
+    Ok(workspace)
+}
+
+fn read_workspace_bounded(path: &Path) -> Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take((MAX_WORKSPACE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_WORKSPACE_BYTES {
+        bail!("Workspace exceeds the {MAX_WORKSPACE_BYTES}-byte persistence limit");
+    }
+    Ok(bytes)
+}
+
+fn validate_workspace(workspace: &WorkspaceState) -> Result<()> {
+    for tab in &workspace.tabs {
+        if let Some(pull_request) = &tab.pull_request {
+            let size = serde_json::to_vec(pull_request)?.len();
+            if size > MAX_TAB_PRESENTATION_BYTES {
+                bail!(
+                    "Saved tab #{} presentation metadata exceeds the {}-byte persistence limit",
+                    tab.number,
+                    MAX_TAB_PRESENTATION_BYTES
+                );
+            }
+        }
+    }
+    Ok(())
 }
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     Ok(serde_json::from_slice(

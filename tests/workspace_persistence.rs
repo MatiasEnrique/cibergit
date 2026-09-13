@@ -405,6 +405,13 @@ fn workspace_round_trip_keeps_saved_views_and_tabs() {
             base_sha: "a".into(),
             head_sha: "b".into(),
         },
+        pull_request: Some(PullRequest {
+            number: 12,
+            title: "Persisted metadata".into(),
+            base_sha: "a".into(),
+            head_sha: "newer-observed-head".into(),
+            ..Default::default()
+        }),
         selected_file: Some("src/lib.rs".into()),
         scroll_offset: 24.0,
         diff_mode: "unified".into(),
@@ -415,6 +422,283 @@ fn workspace_round_trip_keeps_saved_views_and_tabs() {
     assert_eq!(loaded.views[0].name, "Needs review");
     assert_eq!(loaded.tabs[0].selected_file.as_deref(), Some("src/lib.rs"));
     assert_eq!(loaded.active_tab, Some(0));
+}
+
+#[test]
+fn ordinary_startup_restore_wires_saved_order_active_pin_and_closed_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let repository = repo("one");
+    let mut workspace = WorkspaceState::default();
+    workspace.add_repository(repository.clone());
+
+    for (number, marker) in [(41, "first"), (17, "second")] {
+        let revision = Revision {
+            base_sha: format!("{marker}-base"),
+            head_sha: format!("{marker}-pinned"),
+        };
+        let mut snapshot = comparison(&revision.base_sha, &revision.head_sha);
+        snapshot.files.push(cibergit::domain::ChangedFile {
+            path: format!("{marker}.rs"),
+            previous_path: None,
+            raw_path: None,
+            raw_previous_path: None,
+            status: "modified".into(),
+            additions: 1,
+            deletions: 0,
+            patch: Some("@@ -0,0 +1 @@\n+saved\n".into()),
+            patch_complete: true,
+        });
+        let mut session = ReviewSession::new(snapshot);
+        session.set_scroll_position(number as f32);
+        store
+            .save_review_context(
+                &repository,
+                number,
+                &PersistedComparisonContext::full(session),
+            )
+            .unwrap();
+        workspace.tabs.push(cibergit::workspace::TabState {
+            repository_key: repository.cache_key(),
+            number,
+            revision: revision.clone(),
+            pull_request: Some(PullRequest {
+                number,
+                title: format!("Closed {marker}"),
+                state: "CLOSED".into(),
+                base_sha: revision.base_sha.clone(),
+                // A newer observed metadata head is not the restored pin.
+                head_sha: format!("{marker}-newer-observed"),
+                ..Default::default()
+            }),
+            selected_file: None,
+            scroll_offset: number as f32,
+            diff_mode: "auto".into(),
+        });
+    }
+    workspace.active_tab = Some(0);
+    store.save_workspace(&workspace).unwrap();
+    // An empty cached open list proves closed tabs do not depend on sidebar membership.
+    store.save_pull_requests(&repository, &[]).unwrap();
+
+    let reopened = store.load_workspace().unwrap();
+    let plan = store.load_workspace_restore(&reopened);
+    assert!(plan.notices.is_empty(), "{:?}", plan.notices);
+    assert_eq!(
+        plan.tabs
+            .iter()
+            .map(|tab| tab.pull_request.number)
+            .collect::<Vec<_>>(),
+        vec![41, 17]
+    );
+    assert_eq!(plan.active_tab, Some(0));
+    assert_eq!(
+        plan.tabs[0].context.canonical_full_revision.head_sha,
+        "first-pinned"
+    );
+    assert_eq!(plan.tabs[0].pull_request.head_sha, "first-newer-observed");
+    assert_eq!(
+        plan.tabs[1].context.selected_session.scroll_position(),
+        17.0
+    );
+}
+
+#[test]
+fn legacy_restore_uses_only_exact_account_cached_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let exact = repo("one");
+    let other_account = repo("two");
+    let revision = Revision {
+        base_sha: "legacy-base".into(),
+        head_sha: "legacy-head".into(),
+    };
+    store
+        .save_review_context(
+            &exact,
+            9,
+            &PersistedComparisonContext::full(ReviewSession::new(comparison(
+                &revision.base_sha,
+                &revision.head_sha,
+            ))),
+        )
+        .unwrap();
+    store
+        .save_pull_requests(
+            &exact,
+            &[PullRequest {
+                number: 9,
+                title: "Exact account cache".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    let legacy = cibergit::workspace::TabState {
+        repository_key: exact.cache_key(),
+        number: 9,
+        revision,
+        pull_request: None,
+        selected_file: None,
+        scroll_offset: 0.0,
+        diff_mode: "auto".into(),
+    };
+    let mut exact_workspace = WorkspaceState::default();
+    exact_workspace.add_repository(exact.clone());
+    exact_workspace.tabs.push(legacy.clone());
+    assert_eq!(
+        store.load_workspace_restore(&exact_workspace).tabs[0]
+            .pull_request
+            .title,
+        "Exact account cache"
+    );
+
+    let mut mismatched = WorkspaceState::default();
+    mismatched.add_repository(other_account);
+    mismatched.tabs.push(legacy);
+    let refused = store.load_workspace_restore(&mismatched);
+    assert!(refused.tabs.is_empty());
+    assert!(refused.notices[0].message.contains("repository/account"));
+}
+
+#[test]
+fn unavailable_legacy_tab_is_retained_while_other_tabs_save_and_can_repair() {
+    use std::collections::BTreeSet;
+
+    let repository = repo("one");
+    let unavailable = cibergit::workspace::TabState {
+        repository_key: repository.cache_key(),
+        number: 88,
+        revision: Revision {
+            base_sha: "old-base".into(),
+            head_sha: "old-head".into(),
+        },
+        pull_request: None,
+        selected_file: None,
+        scroll_offset: 0.0,
+        diff_mode: "auto".into(),
+    };
+    let mut workspace = WorkspaceState::default();
+    workspace.add_repository(repository.clone());
+    workspace.tabs.push(unavailable.clone());
+    workspace.active_tab = Some(0);
+
+    let live = cibergit::workspace::TabState {
+        repository_key: repository.cache_key(),
+        number: 99,
+        revision: Revision {
+            base_sha: "new-base".into(),
+            head_sha: "new-head".into(),
+        },
+        pull_request: Some(PullRequest {
+            number: 99,
+            title: "New live tab".into(),
+            ..Default::default()
+        }),
+        selected_file: None,
+        scroll_offset: 0.0,
+        diff_mode: "auto".into(),
+    };
+    workspace.merge_tabs(
+        vec![live.clone()],
+        &BTreeSet::new(),
+        Some((live.repository_key.clone(), live.number)),
+    );
+    assert_eq!(
+        workspace
+            .tabs
+            .iter()
+            .map(|tab| tab.number)
+            .collect::<Vec<_>>(),
+        vec![88, 99]
+    );
+    assert_eq!(workspace.active_tab, Some(1));
+    assert!(workspace.tabs[0].pull_request.is_none());
+
+    let repaired = cibergit::workspace::TabState {
+        pull_request: Some(PullRequest {
+            number: 88,
+            title: "Actual closed PR metadata".into(),
+            ..Default::default()
+        }),
+        ..unavailable
+    };
+    workspace.merge_tabs(
+        vec![repaired, live],
+        &BTreeSet::new(),
+        Some((repository.cache_key(), 88)),
+    );
+    assert_eq!(workspace.tabs[0].pull_request.as_ref().unwrap().number, 88);
+    assert_eq!(workspace.active_tab, Some(0));
+
+    let mut closed = BTreeSet::new();
+    closed.insert((repository.cache_key(), 88));
+    workspace.merge_tabs(Vec::new(), &closed, None);
+    assert_eq!(
+        workspace
+            .tabs
+            .iter()
+            .map(|tab| tab.number)
+            .collect::<Vec<_>>(),
+        vec![99],
+        "only an explicit close removes the retained unavailable slot"
+    );
+}
+
+#[test]
+fn restore_refuses_mismatched_metadata_and_session_without_dropping_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let repository = repo("one");
+    let session_revision = Revision {
+        base_sha: "session-base".into(),
+        head_sha: "session-head".into(),
+    };
+    store
+        .save_review_context(
+            &repository,
+            5,
+            &PersistedComparisonContext::full(ReviewSession::new(comparison(
+                &session_revision.base_sha,
+                &session_revision.head_sha,
+            ))),
+        )
+        .unwrap();
+    let mut workspace = WorkspaceState::default();
+    workspace.add_repository(repository.clone());
+    workspace.tabs.push(cibergit::workspace::TabState {
+        repository_key: repository.cache_key(),
+        number: 5,
+        revision: Revision {
+            base_sha: "different".into(),
+            head_sha: "pin".into(),
+        },
+        pull_request: Some(PullRequest {
+            number: 5,
+            ..Default::default()
+        }),
+        selected_file: None,
+        scroll_offset: 0.0,
+        diff_mode: "auto".into(),
+    });
+    workspace.tabs.push(cibergit::workspace::TabState {
+        repository_key: repository.cache_key(),
+        number: 6,
+        revision: session_revision,
+        pull_request: Some(PullRequest {
+            number: 600,
+            ..Default::default()
+        }),
+        selected_file: None,
+        scroll_offset: 0.0,
+        diff_mode: "auto".into(),
+    });
+    let before = serde_json::to_vec(&workspace.tabs).unwrap();
+    let plan = store.load_workspace_restore(&workspace);
+    assert!(plan.tabs.is_empty());
+    assert_eq!(plan.notices.len(), 2);
+    assert!(plan.notices[0].message.contains("pinned canonical"));
+    assert!(plan.notices[1].message.contains("mismatched"));
+    assert_eq!(serde_json::to_vec(&workspace.tabs).unwrap(), before);
 }
 
 #[test]
@@ -469,4 +753,51 @@ fn store_refuses_to_write_an_unsupported_in_memory_schema() {
     };
     assert!(store.save_workspace(&state).is_err());
     assert!(!dir.path().join("workspace.json").exists());
+}
+
+#[test]
+fn oversized_tab_presentation_is_refused_without_replacing_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let mut workspace = WorkspaceState::default();
+    workspace.add_repository(repo("one"));
+    store.save_workspace(&workspace).unwrap();
+    let path = dir.path().join("workspace.json");
+    let original = fs::read(&path).unwrap();
+
+    workspace.tabs.push(cibergit::workspace::TabState {
+        repository_key: repo("one").cache_key(),
+        number: 73,
+        revision: Revision {
+            base_sha: "base".into(),
+            head_sha: "head".into(),
+        },
+        pull_request: Some(PullRequest {
+            number: 73,
+            body: "x".repeat(300 * 1024),
+            ..Default::default()
+        }),
+        selected_file: None,
+        scroll_offset: 0.0,
+        diff_mode: "auto".into(),
+    });
+    let error = store.save_workspace(&workspace).unwrap_err().to_string();
+    assert!(error.contains("presentation metadata exceeds"), "{error}");
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn workspace_reader_refuses_input_beyond_its_preparse_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workspace.json");
+    fs::write(&path, vec![b' '; 4 * 1024 * 1024 + 1]).unwrap();
+    let error = format!(
+        "{:#}",
+        Store::open(dir.path())
+            .unwrap()
+            .load_workspace()
+            .unwrap_err()
+    );
+    assert!(error.contains("persistence limit"), "{error}");
+    assert_eq!(fs::metadata(path).unwrap().len(), 4 * 1024 * 1024 + 1);
 }

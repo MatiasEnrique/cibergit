@@ -45,7 +45,7 @@ use cibergit::{
     },
     workspace::{
         Filter, GroupBy, PersistedComparisonContext, PersistedComparisonSession, PersonalFilter,
-        PollSchedule, Store, TabState, WorkspaceState,
+        PollSchedule, Store, TabState, WorkspaceRestorePlan, WorkspaceState,
     },
 };
 use collaboration_cache::{CachedObservation, CollaborationCache, PreparedWrite, now_unix_ms};
@@ -72,7 +72,7 @@ use stack_view::{
 use std::fs;
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     ops::Range,
     path::PathBuf,
     rc::Rc,
@@ -612,6 +612,100 @@ struct TabReadEpoch {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StartupRestoreToken {
+    workspace_instance: u64,
+    generation: u64,
+}
+
+impl StartupRestoreToken {
+    fn matches(self, workspace_instance: u64, generation: u64, pending: bool) -> bool {
+        pending && self.workspace_instance == workspace_instance && self.generation == generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenPrIntent {
+    User,
+    ExplicitStartup,
+}
+
+type TabIdentity = (String, u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpenPrToken {
+    workspace_instance: u64,
+    user_intent_generation: u64,
+    identity: TabIdentity,
+    intent: OpenPrIntent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenPrCompletion {
+    Install,
+    Existing(usize),
+    Refused,
+}
+
+fn admit_open_pr_completion(
+    token: &OpenPrToken,
+    workspace_instance: u64,
+    user_intent_generation: u64,
+    current: &[TabIdentity],
+) -> OpenPrCompletion {
+    if token.workspace_instance != workspace_instance
+        || token.user_intent_generation != user_intent_generation
+    {
+        return OpenPrCompletion::Refused;
+    }
+    current
+        .iter()
+        .position(|identity| identity == &token.identity)
+        .map(OpenPrCompletion::Existing)
+        .unwrap_or(OpenPrCompletion::Install)
+}
+
+fn saved_repository_is_current(repositories: &[Repository], restored: &Repository) -> bool {
+    repositories
+        .iter()
+        .any(|repository| repository.cache_key() == restored.cache_key() && repository == restored)
+}
+
+fn startup_tab_order(current: &[TabIdentity], saved: &[TabIdentity]) -> Vec<usize> {
+    let mut order = Vec::with_capacity(current.len());
+    for identity in saved {
+        if let Some(index) = current
+            .iter()
+            .enumerate()
+            .find(|(index, candidate)| !order.contains(index) && *candidate == identity)
+            .map(|(index, _)| index)
+        {
+            order.push(index);
+        }
+    }
+    for index in 0..current.len() {
+        if !order.contains(&index) {
+            order.push(index);
+        }
+    }
+    order
+}
+
+fn startup_active_identity(
+    available: &BTreeSet<TabIdentity>,
+    explicit: Option<TabIdentity>,
+    saved: Option<TabIdentity>,
+    prior: Option<TabIdentity>,
+    admitted: &[TabIdentity],
+) -> Option<TabIdentity> {
+    explicit
+        .filter(|identity| available.contains(identity))
+        .or_else(|| saved.filter(|identity| available.contains(identity)))
+        .or_else(|| prior.filter(|identity| available.contains(identity)))
+        .or_else(|| admitted.first().cloned())
+        .or_else(|| available.first().cloned())
+}
+
 impl TabReadEpoch {
     fn matches(self, instance: u64, generation: u64) -> bool {
         self.instance == instance && self.generation == generation
@@ -832,6 +926,13 @@ pub struct ReviewWorkspace {
     status: String,
     schedule: PollSchedule,
     startup_pr: Option<u64>,
+    startup_restore_generation: u64,
+    startup_restore_pending: bool,
+    startup_restore_notice: Option<String>,
+    explicit_startup_selection: Option<(String, u64)>,
+    closed_workspace_tabs: BTreeSet<(String, u64)>,
+    user_intent_generation: u64,
+    explicit_startup_generation: Option<u64>,
     session_save_latest: HashMap<String, Arc<AtomicU64>>,
     session_save_locks: HashMap<String, Arc<Mutex<()>>>,
     review_state_latest: HashMap<String, Arc<AtomicU64>>,
@@ -990,6 +1091,8 @@ impl ReviewWorkspace {
                 Some(format!("Cannot open workspace data: {error:#}")),
             ),
         };
+        let startup_restore_pending = store.is_some() && !workspace.tabs.is_empty();
+        let explicit_startup_generation = startup.pull_request.map(|_| 0);
         let query = new_input(
             workspace.view().filter.search,
             "Search pull requests",
@@ -1061,7 +1164,7 @@ impl ReviewWorkspace {
             repositories,
             tabs: Vec::new(),
             active_tab: None,
-            setup_open: startup.repository.is_none(),
+            setup_open: startup.repository.is_none() && !startup_restore_pending,
             command_palette: false,
             creation_dialog: None,
             creation_subscription: None,
@@ -1092,6 +1195,13 @@ impl ReviewWorkspace {
             status: "Native review workspace".into(),
             schedule: PollSchedule::default(),
             startup_pr: startup.pull_request,
+            startup_restore_generation: u64::from(startup_restore_pending),
+            startup_restore_pending,
+            startup_restore_notice: None,
+            explicit_startup_selection: None,
+            closed_workspace_tabs: BTreeSet::new(),
+            user_intent_generation: 0,
+            explicit_startup_generation,
             session_save_latest: HashMap::new(),
             session_save_locks: HashMap::new(),
             review_state_latest: HashMap::new(),
@@ -1248,6 +1358,7 @@ impl ReviewWorkspace {
             lifecycle_base_changes,
             discussion_changes,
         ]);
+        this.start_workspace_restore(cx);
         this.start_notifications(cx);
         this.discover_accounts(startup.account, cx);
         for index in 0..this.repositories.len() {
@@ -1329,6 +1440,148 @@ impl ReviewWorkspace {
         self.creation_dialog = Some(dialog);
         self.command_palette = false;
         cx.notify();
+    }
+
+    fn start_workspace_restore(&mut self, cx: &mut Context<Root>) {
+        if !self.startup_restore_pending {
+            return;
+        }
+        let Some(store) = self.store.clone() else {
+            self.startup_restore_pending = false;
+            return;
+        };
+        let workspace = self.workspace.clone();
+        let token = StartupRestoreToken {
+            workspace_instance: self.workspace_instance,
+            generation: self.startup_restore_generation,
+        };
+        let task = cx.background_spawn(async move { store.load_workspace_restore(&workspace) });
+        cx.spawn(async move |root, cx| {
+            let plan = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                if !token.matches(
+                    this.workspace_instance,
+                    this.startup_restore_generation,
+                    this.startup_restore_pending,
+                ) {
+                    return;
+                }
+                this.startup_restore_pending = false;
+                this.apply_workspace_restore(plan, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn cancel_startup_restore(&mut self) {
+        if self.startup_restore_pending {
+            self.startup_restore_pending = false;
+            self.startup_restore_generation = self.startup_restore_generation.saturating_add(1);
+        }
+    }
+
+    fn record_user_navigation(&mut self) {
+        self.user_intent_generation = self.user_intent_generation.saturating_add(1);
+        self.explicit_startup_selection = None;
+        self.cancel_startup_restore();
+    }
+
+    fn apply_workspace_restore(&mut self, plan: WorkspaceRestorePlan, cx: &mut Context<Root>) {
+        let prior_active = self.active_tab.and_then(|index| {
+            self.tabs
+                .get(index)
+                .map(|tab| (tab.repository.cache_key(), tab.pull_request.number))
+        });
+        let saved_active = plan.active_tab.and_then(|index| {
+            plan.tabs
+                .get(index)
+                .map(|tab| (tab.repository.cache_key(), tab.pull_request.number))
+        });
+        let mut notices = plan.notices;
+        let mut admitted_order = Vec::new();
+        for restored in plan.tabs {
+            let identity = (
+                restored.repository.cache_key(),
+                restored.pull_request.number,
+            );
+            if !saved_repository_is_current(&self.workspace.repositories, &restored.repository) {
+                notices.push(cibergit::workspace::WorkspaceRestoreNotice {
+                    saved_index: Some(restored.saved_index),
+                    message: format!(
+                        "Saved tab #{} was not restored because its exact repository/account was removed while startup data loaded",
+                        restored.pull_request.number
+                    ),
+                });
+                continue;
+            }
+            admitted_order.push(identity.clone());
+            if self.tabs.iter().any(|tab| {
+                tab.repository.cache_key() == identity.0 && tab.pull_request.number == identity.1
+            }) {
+                continue;
+            }
+            self.install_tab_with_restore(
+                restored.repository,
+                restored.pull_request,
+                Some(Ok(restored.context)),
+                false,
+                cx,
+            );
+        }
+        self.reorder_tabs_for_startup(&admitted_order);
+        let available = self
+            .tabs
+            .iter()
+            .map(|tab| (tab.repository.cache_key(), tab.pull_request.number))
+            .collect::<BTreeSet<_>>();
+        let desired = startup_active_identity(
+            &available,
+            self.explicit_startup_selection.clone(),
+            saved_active,
+            prior_active,
+            &admitted_order,
+        );
+        self.active_tab = desired.and_then(|(repository_key, number)| {
+            self.tabs.iter().position(|tab| {
+                tab.repository.cache_key() == repository_key && tab.pull_request.number == number
+            })
+        });
+        self.setup_open = self.tabs.is_empty() && self.startup_pr.is_none();
+        self.startup_restore_notice = if notices.is_empty() {
+            None
+        } else {
+            let first = &notices[0].message;
+            Some(if notices.len() == 1 {
+                first.clone()
+            } else {
+                format!(
+                    "{first} (and {} more saved-tab notice{})",
+                    notices.len() - 1,
+                    if notices.len() == 2 { "" } else { "s" }
+                )
+            })
+        };
+        self.save_workspace();
+        cx.notify();
+    }
+
+    fn reorder_tabs_for_startup(&mut self, saved_order: &[(String, u64)]) {
+        let current = self
+            .tabs
+            .iter()
+            .map(|tab| (tab.repository.cache_key(), tab.pull_request.number))
+            .collect::<Vec<_>>();
+        let order = startup_tab_order(&current, saved_order);
+        let mut tabs = std::mem::take(&mut self.tabs)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let mut ordered = Vec::with_capacity(tabs.len());
+        for index in order {
+            ordered.extend(tabs[index].take());
+        }
+        self.tabs = ordered;
     }
 
     fn discover_accounts(&mut self, requested: Option<String>, cx: &mut Context<Root>) {
@@ -2682,19 +2935,36 @@ impl ReviewWorkspace {
                                 let Root::Review(this) = root else { return false };
                                 let Some(index) = this.active_tab else { return false };
                                 let tab = &this.tabs[index];
-                                if phase == "populate" {
-                                    tab.session.is_some()
-                                        && tab.details.is_some()
-                                        && matches!(tab.interactions, InteractionState::Ready(_))
-                                        && !tab.details_refresh.active
-                                } else {
-                                    tab.session.is_some()
-                                        && tab.details.is_none()
-                                        && tab.cached_collaboration.is_some()
-                                        && tab.lifecycle.snapshot.is_some()
-                                        && matches!(tab.interactions, InteractionState::Ready(_))
-                                        && !tab.details_refresh.active
-                                        && matches!(tab.details_state, LoadState::Cached(_))
+                                match phase.as_str() {
+                                    "populate" => {
+                                        tab.session.is_some()
+                                            && tab.details.is_some()
+                                            && matches!(tab.interactions, InteractionState::Ready(_))
+                                            && !tab.details_refresh.active
+                                    }
+                                    "offline" => {
+                                        tab.session.is_some()
+                                            && tab.details.is_none()
+                                            && tab.cached_collaboration.is_some()
+                                            && tab.lifecycle.snapshot.is_some()
+                                            && matches!(tab.interactions, InteractionState::Ready(_))
+                                            && !tab.details_refresh.active
+                                            && matches!(tab.details_state, LoadState::Cached(_))
+                                    }
+                                    "refused" => {
+                                        tab.session.is_some()
+                                            && tab.details.is_none()
+                                            && tab.cached_collaboration.is_some()
+                                            && tab.lifecycle.snapshot.is_none()
+                                            && tab.pending_snapshot.is_none()
+                                            && matches!(tab.interactions, InteractionState::Ready(_))
+                                            && !tab.details_refresh.active
+                                            && !tab.lifecycle_refresh.active
+                                            && !tab.metadata_refresh.active
+                                            && this.repositories.iter().all(|repository| !repository.refresh.active)
+                                            && matches!(tab.details_state, LoadState::Cached(_))
+                                    }
+                                    _ => false,
                                 }
                             })
                             .unwrap_or(false)
@@ -2878,7 +3148,10 @@ impl ReviewWorkspace {
                     return;
                 }
 
-                assert_eq!(phase, "offline", "unknown offline collaboration smoke phase");
+                assert!(
+                    phase == "offline" || phase == "refused",
+                    "unknown offline collaboration smoke phase"
+                );
                 let baseline_task = window.background_executor().spawn({
                     let path = output.join("offline-collaboration-baseline.json");
                     async move { fs::read(path) }
@@ -2889,6 +3162,122 @@ impl ReviewWorkspace {
                         .expect("read offline collaboration baseline"),
                 )
                 .expect("parse offline collaboration baseline");
+                if phase == "refused" {
+                    let state = window
+                        .update(|window, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                let index = this
+                                    .active_tab
+                                    .ok_or_else(|| "smoke has no active tab".to_owned())?;
+                                let tab = &this.tabs[index];
+                                let cached = tab.cached_collaboration.as_ref().ok_or_else(|| {
+                                    "refused-provider restart did not install cached presentation"
+                                        .to_owned()
+                                })?;
+                                if tab.details.is_some()
+                                    || tab.lifecycle.snapshot.is_some()
+                                    || tab.pending_snapshot.is_some()
+                                {
+                                    return Err(
+                                        "saved presentation created fresh details, lifecycle, or pending authority"
+                                            .into(),
+                                    );
+                                }
+                                if tab.canonical_full_revision != baseline {
+                                    return Err(
+                                        "refused-provider restart changed the pinned comparison"
+                                            .into(),
+                                    );
+                                }
+                                if tab.session.as_ref().map(ReviewSession::revision)
+                                    != Some(&baseline)
+                                {
+                                    return Err(
+                                        "refused-provider restart did not render the persisted session"
+                                            .into(),
+                                    );
+                                }
+                                let draft_saved = matches!(&tab.interactions, InteractionState::Ready(controller)
+                                    if controller.composition.drafts.iter().any(|draft| draft.body == SMOKE_OFFLINE_DRAFT));
+                                if !draft_saved {
+                                    return Err("local draft did not survive refused-provider restart".into());
+                                }
+                                if cached.details.body.is_empty()
+                                    || cached.details.issue_comments.is_empty()
+                                    || cached.details.reviews.is_empty()
+                                    || cached.details.checks.is_empty()
+                                {
+                                    return Err(
+                                        "cached Overview/Activity/Checks evidence is empty".into(),
+                                    );
+                                }
+                                let state = (
+                                    tab.pull_request.number,
+                                    tab.pull_request.title.clone(),
+                                    cached.observed_at_unix_ms,
+                                    cached.details.issue_comments.len(),
+                                    cached.details.reviews.len(),
+                                    cached.details.checks.len(),
+                                );
+                                this.inspector_open = true;
+                                this.tabs[index].inspector_section = InspectorSection::Overview;
+                                this.refresh_auto_layout(window);
+                                cx.notify();
+                                Ok(state)
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")))
+                        .unwrap_or_else(|error| {
+                            panic!("refused-provider validation failed: {error}")
+                        });
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
+                    let capture_name = format!("native-refused-provider-overview-{appearance}.png");
+                    let capture = window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image.save(output.join(&capture_name)).map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                    let report = format!(
+                        "Ordinary saved-workspace restart with all gh commands refused ({appearance})\nExplicit repository/account/PR CLI arguments: absent\nRestored saved tab: #{} {:?}\nPinned comparison unchanged: true ({}..{})\nPersisted session rendered: true\nCached collaboration rendered: true (observed_at={}, issue comments={}, reviews={}, checks={})\nLocal DraftStore draft survived restart: true\nFresh details installed: false\nFresh lifecycle installed: false\nPending-review authority installed: false\nSaved presentation granted write authority: false\nProvider command refusal/count is established by the process-local PATH shim harness, not by this in-process scene.\nCapture: {}\nRemote mutation dispatches from smoke path: 0\nOS notifications: not invoked\nFocus requested by smoke: false\nPhysical disconnect, input, AX, and acrylic identity: not established.\n",
+                        state.0,
+                        state.1,
+                        baseline.base_sha,
+                        baseline.head_sha,
+                        state.2,
+                        state.3,
+                        state.4,
+                        state.5,
+                        if capture { &capture_name } else { "failed" },
+                    );
+                    let report_name = format!("offline-collaboration-refused-{appearance}.txt");
+                    let write = window.background_executor().spawn({
+                        let output = output.clone();
+                        async move {
+                            fs::create_dir_all(&output)?;
+                            fs::write(output.join(report_name), report)
+                        }
+                    });
+                    write.await.expect("write refused-provider restart evidence");
+                    if !capture {
+                        panic!("refused-provider restart capture failed");
+                    }
+                    let _ = window.update(|_, cx| cx.quit());
+                    return;
+                }
                 let state = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
@@ -4961,7 +5350,12 @@ impl ReviewWorkspace {
                         this.refresh_repository(index, cx);
                         this.refresh_notifications(cx);
                         if let Some(number) = this.startup_pr.take() {
-                            this.open_pr(index, number, cx);
+                            this.open_pr_with_intent(
+                                index,
+                                number,
+                                OpenPrIntent::ExplicitStartup,
+                                cx,
+                            );
                         }
                         this.status = format!(
                             "Added {} for {}",
@@ -5447,7 +5841,7 @@ impl ReviewWorkspace {
     }
 
     fn save_workspace(&mut self) {
-        if self.persistence_error.is_some() {
+        if self.persistence_error.is_some() || self.startup_restore_pending {
             return;
         }
         let active_identity = self.active_tab.and_then(|index| {
@@ -5468,6 +5862,7 @@ impl ReviewWorkspace {
                     repository_key: tab.repository.cache_key(),
                     number: tab.pull_request.number,
                     revision: tab.canonical_full_revision.clone(),
+                    pull_request: Some(tab.pull_request.clone()),
                     selected_file: session.selected_file().map(file_key),
                     scroll_offset: session.scroll_position(),
                     diff_mode: match session.diff_mode() {
@@ -5479,8 +5874,12 @@ impl ReviewWorkspace {
                 });
             }
         }
-        self.workspace.tabs = tabs;
-        self.workspace.active_tab = active_tab;
+        let active_identity = active_tab.and_then(|index| {
+            tabs.get(index)
+                .map(|tab| (tab.repository_key.clone(), tab.number))
+        });
+        self.workspace
+            .merge_tabs(tabs, &self.closed_workspace_tabs, active_identity);
         if let Some(store) = &self.store
             && let Err(error) = store.save_workspace(&self.workspace)
         {
@@ -6181,6 +6580,16 @@ impl ReviewWorkspace {
     }
 
     fn open_pr(&mut self, repo_index: usize, number: u64, cx: &mut Context<Root>) {
+        self.open_pr_with_intent(repo_index, number, OpenPrIntent::User, cx);
+    }
+
+    fn open_pr_with_intent(
+        &mut self,
+        repo_index: usize,
+        number: u64,
+        intent: OpenPrIntent,
+        cx: &mut Context<Root>,
+    ) {
         let Some(repository) = self
             .repositories
             .get(repo_index)
@@ -6188,9 +6597,28 @@ impl ReviewWorkspace {
         else {
             return;
         };
+        let user_intent_generation = match intent {
+            OpenPrIntent::User => {
+                self.record_user_navigation();
+                self.user_intent_generation
+            }
+            OpenPrIntent::ExplicitStartup => {
+                let Some(generation) = self.explicit_startup_generation else {
+                    return;
+                };
+                if generation != self.user_intent_generation {
+                    return;
+                }
+                generation
+            }
+        };
+        let identity = (repository.cache_key(), number);
+        self.closed_workspace_tabs.remove(&identity);
+        if intent == OpenPrIntent::ExplicitStartup {
+            self.explicit_startup_selection = Some(identity.clone());
+        }
         if let Some(index) = self.tabs.iter().position(|tab| {
-            tab.repository.cache_key() == repository.cache_key()
-                && tab.pull_request.number == number
+            tab.repository.cache_key() == identity.0 && tab.pull_request.number == identity.1
         }) {
             self.active_tab = Some(index);
             self.setup_open = false;
@@ -6208,7 +6636,14 @@ impl ReviewWorkspace {
         }
         self.status = format!("Loading #{} from {}…", number, repository.full_name());
         let key = repository.cache_key();
+        let expected_repository = repository.clone();
         let request_repo = repository.clone();
+        let token = OpenPrToken {
+            workspace_instance: self.workspace_instance,
+            user_intent_generation,
+            identity: identity.clone(),
+            intent,
+        };
         let task = cx.background_spawn(async move {
             GithubProvider::new(request_repo.account.clone()).pull_request(&request_repo, number)
         });
@@ -6216,23 +6651,55 @@ impl ReviewWorkspace {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
+                let current = this
+                    .tabs
+                    .iter()
+                    .map(|tab| (tab.repository.cache_key(), tab.pull_request.number))
+                    .collect::<Vec<_>>();
+                let completion = admit_open_pr_completion(
+                    &token,
+                    this.workspace_instance,
+                    this.user_intent_generation,
+                    &current,
+                );
+                if completion == OpenPrCompletion::Refused {
+                    return;
+                }
                 match result {
                     Ok(pull_request) => {
-                        if let Some(runtime) = this
-                            .repositories
-                            .iter_mut()
-                            .find(|runtime| runtime.repository.cache_key() == key)
-                            && !runtime
-                                .pull_requests
-                                .iter()
-                                .any(|listed| listed.number == pull_request.number)
+                        match completion {
+                            OpenPrCompletion::Refused => unreachable!("checked above"),
+                            OpenPrCompletion::Existing(index) => {
+                                // Provider metadata can be newer than the pinned session. It is
+                                // presentation only and must not replace restored review state.
+                                this.tabs[index].pull_request = pull_request;
+                                if token.intent == OpenPrIntent::ExplicitStartup {
+                                    this.active_tab = Some(index);
+                                    this.setup_open = false;
+                                }
+                                this.save_workspace();
+                                cx.notify();
+                                return;
+                            }
+                            OpenPrCompletion::Install => {}
+                        }
+                        if let Some(runtime) = this.repositories.iter_mut().find(|runtime| {
+                            runtime.repository.cache_key() == key
+                                && runtime.repository == expected_repository
+                        }) && !runtime
+                            .pull_requests
+                            .iter()
+                            .any(|listed| listed.number == pull_request.number)
                         {
                             runtime.pull_requests.push(pull_request.clone());
                         }
                         let Some(repository) = this
                             .repositories
                             .iter()
-                            .find(|runtime| runtime.repository.cache_key() == key)
+                            .find(|runtime| {
+                                runtime.repository.cache_key() == key
+                                    && runtime.repository == expected_repository
+                            })
                             .map(|runtime| runtime.repository.clone())
                         else {
                             return;
@@ -6251,6 +6718,7 @@ impl ReviewWorkspace {
 
     fn activate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Root>) {
         if index < self.tabs.len() {
+            self.record_user_navigation();
             self.stage_active_metadata_inputs(cx);
             if let Some(previous) = self.active_tab {
                 let body = self.discussion_input.read(cx).value().to_string();
@@ -6326,11 +6794,22 @@ impl ReviewWorkspace {
         pull_request: PullRequest,
         cx: &mut Context<Root>,
     ) {
-        let revision = pull_request.revision();
         let restored = self
             .store
             .as_ref()
             .map(|store| store.load_review_context(&repository, pull_request.number));
+        self.install_tab_with_restore(repository, pull_request, restored, true, cx);
+    }
+
+    fn install_tab_with_restore(
+        &mut self,
+        repository: Repository,
+        pull_request: PullRequest,
+        restored: Option<anyhow::Result<PersistedComparisonContext>>,
+        activate: bool,
+        cx: &mut Context<Root>,
+    ) {
+        let revision = pull_request.revision();
         let (
             session,
             canonical_session,
@@ -6472,7 +6951,9 @@ impl ReviewWorkspace {
             local_visible: false,
         });
         let index = self.tabs.len() - 1;
-        self.active_tab = Some(index);
+        if activate {
+            self.active_tab = Some(index);
+        }
         self.setup_open = false;
         self.load_cached_collaboration(index, cx);
         #[cfg(feature = "ui-smoke")]
@@ -6485,7 +6966,8 @@ impl ReviewWorkspace {
             if self.tabs[index].local_inventory {
                 self.load_selected_local_file(index, cx);
             }
-            self.refresh_active(cx);
+            self.refresh_metadata(index, true, cx);
+            self.refresh_details_with_intent(index, true, cx);
             self.load_commit_inventory(index, cx);
         } else {
             self.load_comparison(index, revision, false, cx);
@@ -7002,7 +7484,7 @@ impl ReviewWorkspace {
             || tab.pull_request.head_sha != tab.canonical_full_revision.head_sha
         {
             self.status = format!(
-                "Merge is unavailable: advance the displayed review from {} to the current remote head {}.",
+                "Merge is unavailable: advance the displayed review from {} to the last observed provider head {} before fresh merge preflight.",
                 short_sha(tab.canonical_full_revision.head_sha.as_str()),
                 short_sha(tab.pull_request.head_sha.as_str())
             );
@@ -9027,6 +9509,11 @@ impl ReviewWorkspace {
                 cx.notify();
                 return;
             }
+            self.record_user_navigation();
+            self.closed_workspace_tabs.insert((
+                self.tabs[index].repository.cache_key(),
+                self.tabs[index].pull_request.number,
+            ));
             let current = self.composer_input.read(cx).value().to_string();
             if matches!(&self.tabs[index].interactions, InteractionState::Ready(controller) if controller.composer.as_ref().is_some_and(|composer| composer.body != current))
             {
@@ -14429,6 +14916,10 @@ impl ReviewWorkspace {
             })
             .child("·")
             .child(self.status.clone())
+            .when_some(self.startup_restore_notice.clone(), |bar, notice| {
+                bar.child("·")
+                    .child(div().text_color(colors.amber).child(notice))
+            })
             .when_some(self.persistence_error.clone(), |bar, error| {
                 bar.child("·")
                     .child(div().text_color(colors.red).child(error))
@@ -16423,6 +16914,111 @@ mod layout_tests {
         assert!(collaboration_completion_matches(10, 10, 20, 20));
         assert!(!collaboration_completion_matches(10, 11, 20, 20));
         assert!(!collaboration_completion_matches(10, 10, 20, 21));
+    }
+
+    #[test]
+    fn delayed_startup_restore_is_fenced_by_workspace_lifetime_navigation_and_close() {
+        let token = super::StartupRestoreToken {
+            workspace_instance: 10,
+            generation: 4,
+        };
+        assert!(token.matches(10, 4, true));
+        assert!(
+            !token.matches(11, 4, true),
+            "a replaced root rejects the batch"
+        );
+        assert!(
+            !token.matches(10, 5, true),
+            "navigation invalidates its generation"
+        );
+        assert!(
+            !token.matches(10, 4, false),
+            "close/cancel clears pending admission"
+        );
+    }
+
+    #[test]
+    fn startup_restore_reorders_saved_tabs_and_explicit_destination_wins_active() {
+        use std::collections::BTreeSet;
+
+        let id = |number: u64| ("exact-account/repository".to_owned(), number);
+        let current = vec![id(2), id(1), id(3), id(99)];
+        let saved = vec![id(1), id(2), id(3)];
+        assert_eq!(super::startup_tab_order(&current, &saved), vec![1, 0, 2, 3]);
+        let available = current.iter().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(
+            super::startup_active_identity(
+                &available,
+                Some(id(99)),
+                Some(id(1)),
+                Some(id(2)),
+                &saved,
+            ),
+            Some(id(99))
+        );
+        assert_eq!(
+            super::startup_active_identity(&available, None, None, None, &saved),
+            Some(id(1)),
+            "first admitted tab is the visible fallback when saved active is unavailable"
+        );
+    }
+
+    #[test]
+    fn delayed_restore_revalidates_exact_repository_account_before_install() {
+        use cibergit::domain::{Account, Repository};
+
+        let repository = |login: &str| Repository {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "app".into(),
+            account: Account {
+                host: "github.com".into(),
+                login: login.into(),
+            },
+            local_path: None,
+        };
+        let saved = repository("one");
+        assert!(super::saved_repository_is_current(
+            std::slice::from_ref(&saved),
+            &saved
+        ));
+        assert!(!super::saved_repository_is_current(
+            &[repository("two")],
+            &saved
+        ));
+        assert!(!super::saved_repository_is_current(&[], &saved));
+    }
+
+    #[test]
+    fn explicit_lookup_and_disk_restore_converge_without_duplicate_or_late_reopen() {
+        let identity = ("exact-account/repository".to_owned(), 42);
+        let token = super::OpenPrToken {
+            workspace_instance: 7,
+            user_intent_generation: 3,
+            identity: identity.clone(),
+            intent: super::OpenPrIntent::ExplicitStartup,
+        };
+
+        assert_eq!(
+            super::admit_open_pr_completion(&token, 7, 3, std::slice::from_ref(&identity)),
+            super::OpenPrCompletion::Existing(0),
+            "disk-first completion selects and refreshes the restored tab"
+        );
+        assert_eq!(
+            super::admit_open_pr_completion(&token, 7, 3, &[]),
+            super::OpenPrCompletion::Install,
+            "network-first completion installs once before disk restore sees the identity"
+        );
+        assert_eq!(
+            super::admit_open_pr_completion(&token, 7, 4, &[]),
+            super::OpenPrCompletion::Refused,
+            "newer navigation or close prevents a delayed explicit reopen"
+        );
+        assert_eq!(
+            super::admit_open_pr_completion(&token, 8, 3, &[]),
+            super::OpenPrCompletion::Refused,
+            "a replaced workspace rejects the old lookup"
+        );
     }
 
     #[test]
