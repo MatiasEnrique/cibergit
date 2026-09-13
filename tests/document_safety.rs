@@ -3,16 +3,123 @@ use cibergit::document::{
     ReconcileOutcome, RecoveryScope, RecoveryStatus, RefreshOutcome, SaveOutcome, TargetIssue,
 };
 use std::{
-    ffi::OsString,
-    fs::{self, OpenOptions},
+    ffi::{CString, OsString, c_void},
+    fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::{
-        ffi::{OsStrExt, OsStringExt},
-        fs::PermissionsExt,
+    os::{
+        fd::AsRawFd,
+        macos::fs::MetadataExt as MacMetadataExt,
+        raw::{c_char, c_int, c_uint},
+        unix::{
+            ffi::{OsStrExt, OsStringExt},
+            fs::{MetadataExt, PermissionsExt},
+        },
     },
     path::{Path, PathBuf},
+    process::Command,
 };
 use tempfile::TempDir;
+
+unsafe extern "C" {
+    fn fsetxattr(
+        fd: c_int,
+        name: *const c_char,
+        value: *const c_void,
+        size: usize,
+        position: c_uint,
+        options: c_int,
+    ) -> c_int;
+    fn fgetxattr(
+        fd: c_int,
+        name: *const c_char,
+        value: *mut c_void,
+        size: usize,
+        position: c_uint,
+        options: c_int,
+    ) -> isize;
+}
+
+fn set_xattr(path: &Path, name: &str, value: &[u8]) {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let name = CString::new(name).unwrap();
+    let result = unsafe {
+        fsetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "fsetxattr failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+fn get_xattr(path: &Path, name: &str) -> Vec<u8> {
+    let file = File::open(path).unwrap();
+    let name = CString::new(name).unwrap();
+    let size = unsafe {
+        fgetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+        )
+    };
+    assert!(
+        size >= 0,
+        "fgetxattr size failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut value = vec![0_u8; size as usize];
+    if value.is_empty() {
+        return value;
+    }
+    let read = unsafe {
+        fgetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    assert!(
+        read >= 0,
+        "fgetxattr failed: {}",
+        std::io::Error::last_os_error()
+    );
+    value.truncate(read as usize);
+    value
+}
+
+fn acl_entries(path: &Path) -> Vec<String> {
+    let output = Command::new("ls").arg("-le").arg(path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "ls -le failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .map(str::to_owned)
+        .collect()
+}
 
 struct Fixture {
     _temp: TempDir,
@@ -164,6 +271,58 @@ fn stale_reconciliation_preserves_merge_draft_and_requires_new_comparison() {
 }
 
 #[test]
+fn undo_to_old_base_keeps_conflict_recoverable_until_explicit_resolution() {
+    let fixture = Fixture::new();
+    fixture.write("undo-reconcile.txt", "A\n");
+    let recovery_path = {
+        let mut document = fixture.store().open("undo-reconcile.txt").unwrap();
+        document.set_buffer("B\n").unwrap();
+        fixture.write("undo-reconcile.txt", "C\n");
+        assert_eq!(document.refresh().unwrap(), RefreshOutcome::Conflict);
+
+        document.set_buffer("A\n").unwrap();
+        assert!(document.is_dirty());
+        assert_eq!(document.status(), DocumentStatus::Conflict);
+        assert_eq!(document.refresh().unwrap(), RefreshOutcome::Conflict);
+        assert!(matches!(
+            document.save().unwrap(),
+            SaveOutcome::Blocked {
+                status: DocumentStatus::Conflict
+            }
+        ));
+        document.recovery_path().to_owned()
+    };
+    assert!(recovery_path.exists());
+
+    let mut restarted = fixture.store().open("undo-reconcile.txt").unwrap();
+    assert_eq!(restarted.buffer(), "A\n");
+    assert_eq!(restarted.base().text, "A\n");
+    assert!(restarted.is_dirty());
+    assert_eq!(restarted.status(), DocumentStatus::Conflict);
+    let compared_c = match restarted.disk() {
+        DiskState::Present(snapshot) => snapshot.version.clone(),
+        other => panic!("expected C on disk, got {other:?}"),
+    };
+    assert_eq!(
+        restarted.reconcile(&compared_c, "A\n").unwrap(),
+        ReconcileOutcome::Applied
+    );
+    assert!(restarted.conflict().is_none());
+    assert!(restarted.is_dirty());
+
+    fixture.write("undo-reload.txt", "A\n");
+    let mut reload = fixture.store().open("undo-reload.txt").unwrap();
+    reload.set_buffer("B\n").unwrap();
+    fixture.write("undo-reload.txt", "C\n");
+    assert_eq!(reload.refresh().unwrap(), RefreshOutcome::Conflict);
+    reload.set_buffer("A\n").unwrap();
+    reload.reload_from_disk().unwrap();
+    assert_eq!(reload.buffer(), "C\n");
+    assert_eq!(reload.status(), DocumentStatus::Clean);
+    assert!(!reload.is_dirty());
+}
+
+#[test]
 fn delayed_external_edit_at_atomic_save_boundary_is_retained_and_reported() {
     let fixture = Fixture::new();
     fixture.write("race.txt", "base\n");
@@ -203,6 +362,179 @@ fn delayed_external_edit_at_atomic_save_boundary_is_retained_and_reported() {
         retained_external.display(),
         fixture.recovery.display()
     );
+}
+
+#[test]
+fn save_preserves_xattrs_resource_fork_permissions_flags_and_ownership() {
+    let fixture = Fixture::new();
+    fixture.write("metadata.txt", "base\n");
+    let path = fixture.worktree.join("metadata.txt");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o754)).unwrap();
+    set_xattr(&path, "com.cibergit.fixture", b"benign attribute");
+    set_xattr(&path, "com.apple.ResourceFork", b"small resource fork");
+    let status = Command::new("chflags")
+        .arg("hidden")
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let before = fs::metadata(&path).unwrap();
+
+    let mut document = fixture.store().open("metadata.txt").unwrap();
+    document.set_buffer("saved\n").unwrap();
+    assert!(matches!(
+        document.save().unwrap(),
+        SaveOutcome::Saved { .. }
+    ));
+
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "saved\n");
+    assert_eq!(
+        get_xattr(&path, "com.cibergit.fixture"),
+        b"benign attribute"
+    );
+    assert_eq!(
+        get_xattr(&path, "com.apple.ResourceFork"),
+        b"small resource fork"
+    );
+    assert_eq!(after.mode() & 0o7777, before.mode() & 0o7777);
+    assert_eq!(after.uid(), before.uid());
+    assert_eq!(after.gid(), before.gid());
+    assert_eq!(after.st_flags(), before.st_flags());
+}
+
+#[test]
+fn save_preserves_extended_acl_entries() {
+    let fixture = Fixture::new();
+    fixture.write("acl.txt", "base\n");
+    let path = fixture.worktree.join("acl.txt");
+    let output = Command::new("chmod")
+        .args(["+a", "everyone allow read"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "chmod +a failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let before = acl_entries(&path);
+    assert!(!before.is_empty());
+
+    let mut document = fixture.store().open("acl.txt").unwrap();
+    document.set_buffer("saved\n").unwrap();
+    assert!(matches!(
+        document.save().unwrap(),
+        SaveOutcome::Saved { .. }
+    ));
+
+    assert_eq!(acl_entries(&path), before);
+}
+
+#[test]
+fn metadata_only_external_change_after_baseline_is_authoritative() {
+    let fixture = Fixture::new();
+    fixture.write("metadata-refresh.txt", "same text\n");
+    let path = fixture.worktree.join("metadata-refresh.txt");
+    let mut document = fixture.store().open("metadata-refresh.txt").unwrap();
+    let before = document.base().version.metadata_sha256.clone();
+
+    set_xattr(&path, "com.cibergit.fixture", b"external metadata");
+
+    assert_eq!(document.refresh().unwrap(), RefreshOutcome::Reloaded);
+    assert_eq!(document.buffer(), "same text\n");
+    assert_ne!(document.base().version.metadata_sha256, before);
+    assert_eq!(document.status(), DocumentStatus::Clean);
+}
+
+#[test]
+fn dirty_save_blocks_on_metadata_only_external_change() {
+    let fixture = Fixture::new();
+    fixture.write("metadata-dirty.txt", "base\n");
+    let path = fixture.worktree.join("metadata-dirty.txt");
+    let mut document = fixture.store().open("metadata-dirty.txt").unwrap();
+    document.set_buffer("editor\n").unwrap();
+
+    set_xattr(&path, "com.cibergit.fixture", b"external metadata");
+
+    assert!(matches!(
+        document.save().unwrap(),
+        SaveOutcome::Blocked {
+            status: DocumentStatus::Conflict
+        }
+    ));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "base\n");
+    assert_eq!(
+        get_xattr(&path, "com.cibergit.fixture"),
+        b"external metadata"
+    );
+    assert_eq!(document.buffer(), "editor\n");
+}
+
+#[test]
+fn reconcile_rejects_metadata_only_advance_after_displayed_version() {
+    let fixture = Fixture::new();
+    fixture.write("metadata-reconcile.txt", "base\n");
+    let path = fixture.worktree.join("metadata-reconcile.txt");
+    let mut document = fixture.store().open("metadata-reconcile.txt").unwrap();
+    document.set_buffer("editor\n").unwrap();
+    set_xattr(&path, "com.cibergit.fixture", b"displayed metadata");
+    assert_eq!(document.refresh().unwrap(), RefreshOutcome::Conflict);
+    let displayed = match document.disk() {
+        DiskState::Present(snapshot) => snapshot.version.clone(),
+        other => panic!("expected displayed metadata version, got {other:?}"),
+    };
+
+    set_xattr(&path, "com.cibergit.fixture", b"newer metadata");
+
+    assert_eq!(
+        document.reconcile(&displayed, "merge draft\n").unwrap(),
+        ReconcileOutcome::Stale
+    );
+    assert_eq!(document.buffer(), "merge draft\n");
+    assert_eq!(get_xattr(&path, "com.cibergit.fixture"), b"newer metadata");
+    assert!(matches!(
+        document.save().unwrap(),
+        SaveOutcome::Blocked {
+            status: DocumentStatus::Conflict
+        }
+    ));
+}
+
+#[test]
+fn metadata_only_change_at_exchange_boundary_is_retained_as_a_save_race() {
+    let fixture = Fixture::new();
+    fixture.write("metadata-race.txt", "base\n");
+    let path = fixture.worktree.join("metadata-race.txt");
+    set_xattr(&path, "com.cibergit.fixture", b"baseline metadata");
+    let mut document = fixture.store().open("metadata-race.txt").unwrap();
+    document.set_buffer("editor\n").unwrap();
+
+    let outcome = document
+        .save_with_hook(|path| {
+            set_xattr(path, "com.cibergit.fixture", b"boundary metadata");
+            Ok(())
+        })
+        .unwrap();
+
+    let SaveOutcome::ConflictRetained {
+        retained_external,
+        target_contains_buffer,
+    } = outcome
+    else {
+        panic!("expected retained metadata race, got {outcome:?}");
+    };
+    assert!(target_contains_buffer);
+    assert_eq!(
+        get_xattr(&retained_external, "com.cibergit.fixture"),
+        b"boundary metadata"
+    );
+    assert_eq!(
+        get_xattr(&path, "com.cibergit.fixture"),
+        b"baseline metadata"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), "editor\n");
+    assert_eq!(document.conflict().unwrap().kind, ConflictKind::SaveRace);
 }
 
 #[test]

@@ -13,12 +13,13 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    ffi::CString,
+    ffi::{CString, c_void},
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
+        macos::fs::MetadataExt as MacMetadataExt,
         raw::{c_char, c_int, c_uint},
         unix::{
             ffi::OsStrExt,
@@ -38,12 +39,14 @@ const MAX_CONFIGURED_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
 const PRIVATE_DIR_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
+const MAX_METADATA_BYTES: usize = MAX_CONFIGURED_BYTES;
 
 // Darwin values from <sys/fcntl.h> and <sys/stdio.h>. cibergit V1 targets
 // macOS on Apple Silicon only; refusing an unavailable primitive is safer than
 // silently falling back to a replacing rename.
 const O_RDONLY: c_int = 0;
 const O_WRONLY: c_int = 1;
+const O_RDWR: c_int = 2;
 const O_NONBLOCK: c_int = 0x0000_0004;
 const O_CREAT: c_int = 0x0000_0200;
 const O_EXCL: c_int = 0x0000_0800;
@@ -56,6 +59,10 @@ const RENAME_SWAP: c_uint = 0x0000_0002;
 const RENAME_EXCL: c_uint = 0x0000_0004;
 const RENAME_NOFOLLOW_ANY: c_uint = 0x0000_0010;
 const RENAME_RESOLVE_BENEATH: c_uint = 0x0000_0020;
+const COPYFILE_METADATA: c_uint = (1 << 0) | (1 << 1) | (1 << 2);
+const COPYFILE_STATE_PRESERVE_SUID: c_uint = 16;
+const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+const XATTR_SHOWCOMPRESSION: c_int = 0x0020;
 
 unsafe extern "C" {
     fn openat(fd: c_int, path: *const c_char, oflag: c_int, ...) -> c_int;
@@ -67,6 +74,22 @@ unsafe extern "C" {
         flags: c_uint,
     ) -> c_int;
     fn renamex_np(from: *const c_char, to: *const c_char, flags: c_uint) -> c_int;
+    fn fcopyfile(from_fd: c_int, to_fd: c_int, state: *mut c_void, flags: c_uint) -> c_int;
+    fn copyfile_state_alloc() -> *mut c_void;
+    fn copyfile_state_free(state: *mut c_void) -> c_int;
+    fn copyfile_state_set(state: *mut c_void, flag: c_uint, source: *const c_void) -> c_int;
+    fn flistxattr(fd: c_int, names: *mut c_char, size: usize, options: c_int) -> isize;
+    fn fgetxattr(
+        fd: c_int,
+        name: *const c_char,
+        value: *mut c_void,
+        size: usize,
+        position: c_uint,
+        options: c_int,
+    ) -> isize;
+    fn acl_get_fd_np(fd: c_int, acl_type: c_int) -> *mut c_void;
+    fn acl_to_text(acl: *mut c_void, len: *mut isize) -> *mut c_char;
+    fn acl_free(object: *mut c_void) -> c_int;
 }
 
 static UNIQUE_NAME: AtomicU64 = AtomicU64::new(1);
@@ -113,6 +136,17 @@ pub struct DiskVersion {
     pub modified_seconds: i64,
     pub modified_nanoseconds: i64,
     pub mode: u32,
+    /// Digest of metadata that must survive an atomic replacement: ownership,
+    /// mode, flags, modification time, ACL, and all extended attributes.
+    #[serde(default)]
+    pub metadata_sha256: String,
+    /// Status-change time is used only to reject a race before exchange. It is
+    /// deliberately excluded from [`DiskVersion::is_same_generation`]
+    /// because Darwin rename/exchange updates it on an otherwise same inode.
+    #[serde(default)]
+    pub changed_seconds: i64,
+    #[serde(default)]
+    pub changed_nanoseconds: i64,
 }
 
 impl DiskVersion {
@@ -122,6 +156,13 @@ impl DiskVersion {
             && self.device == other.device
             && self.inode == other.inode
             && self.mode == other.mode
+            && self.metadata_sha256 == other.metadata_sha256
+    }
+
+    fn is_same_observation(&self, other: &Self) -> bool {
+        self.is_same_generation(other)
+            && self.changed_seconds == other.changed_seconds
+            && self.changed_nanoseconds == other.changed_nanoseconds
     }
 }
 
@@ -139,6 +180,7 @@ pub enum TargetIssue {
     InvalidUtf8,
     TooLarge { bytes: u64, limit: usize },
     PermissionDenied,
+    UnsupportedMetadata { reason: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -457,7 +499,7 @@ impl Document {
         &self.recovery
     }
     pub fn is_dirty(&self) -> bool {
-        self.buffer != self.base.text
+        self.buffer != self.base.text || self.conflict.is_some()
     }
 
     pub fn status(&self) -> DocumentStatus {
@@ -492,7 +534,7 @@ impl Document {
                 limit: self.store.limits.max_buffer_bytes,
             });
         }
-        if text == self.base.text {
+        if text == self.base.text && self.conflict.is_none() {
             self.store.recovery.clear(&self.relative_path)?;
             self.recovery = RecoveryStatus::None;
         } else {
@@ -515,10 +557,18 @@ impl Document {
     pub fn refresh(&mut self) -> Result<RefreshOutcome, DocumentError> {
         let disk = self.store.read_disk(&self.relative_path)?;
         let was_same = disk_matches_base(&disk, &self.base);
+        let had_conflict = self.conflict.is_some();
         self.disk = disk.clone();
 
         if self.is_dirty() {
             if was_same {
+                if had_conflict {
+                    if let Some(conflict) = &mut self.conflict {
+                        conflict.buffer = self.buffer.clone();
+                        conflict.current = disk;
+                    }
+                    return Ok(RefreshOutcome::Conflict);
+                }
                 self.conflict = None;
                 return Ok(RefreshOutcome::Unchanged);
             }
@@ -641,20 +691,37 @@ impl Document {
     {
         self.require_writable_recovery()?;
         let _ = self.refresh()?;
-        if !self.is_dirty() {
-            return Ok(SaveOutcome::Unchanged);
-        }
         if self.conflict.is_some() {
             return Ok(SaveOutcome::Blocked {
                 status: self.status(),
             });
         }
+        if !self.is_dirty() {
+            return Ok(SaveOutcome::Unchanged);
+        }
         self.store.validate_writable(&self.relative_path)?;
 
         let expected = self.base.clone();
-        let (temp_relative, mut temp_file) = self
-            .store
-            .create_save_temp(&self.relative_path, expected.version.mode)?;
+        let mut source_file = self.store.open_document(&self.relative_path)?;
+        let source_before = self.store.inspect_open_file(&mut source_file)?;
+        let RawDiskState::Present {
+            version: source_before_version,
+            ..
+        } = &source_before
+        else {
+            let _ = self.refresh();
+            return Ok(SaveOutcome::Blocked {
+                status: self.status(),
+            });
+        };
+        if !expected.version.is_same_observation(source_before_version) {
+            let _ = self.refresh();
+            return Ok(SaveOutcome::Blocked {
+                status: self.status(),
+            });
+        }
+
+        let (temp_relative, mut temp_file) = self.store.create_save_temp(&self.relative_path)?;
         if let Err(error) = temp_file
             .write_all(self.buffer.as_bytes())
             .and_then(|_| temp_file.sync_all())
@@ -665,7 +732,83 @@ impl Document {
                 source: error,
             });
         }
+        if let Err(error) = copy_complete_metadata(&source_file, &temp_file) {
+            self.store.remove_temp(&temp_relative);
+            return Err(error);
+        }
+        if let Err(source) = temp_file.sync_all() {
+            self.store.remove_temp(&temp_relative);
+            return Err(DocumentError::Io {
+                action: "sync metadata-preserving save candidate",
+                source,
+            });
+        }
+
+        let source_after = match self.store.inspect_open_file(&mut source_file) {
+            Ok(source_after) => source_after,
+            Err(error) => {
+                drop(temp_file);
+                self.store.remove_temp(&temp_relative);
+                return Err(error);
+            }
+        };
+        let RawDiskState::Present {
+            version: source_after_version,
+            ..
+        } = &source_after
+        else {
+            drop(temp_file);
+            self.store.remove_temp(&temp_relative);
+            drop(source_file);
+            let _ = self.refresh();
+            return Ok(SaveOutcome::Blocked {
+                status: self.status(),
+            });
+        };
+        let candidate = match self.store.inspect_open_file(&mut temp_file) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                drop(temp_file);
+                self.store.remove_temp(&temp_relative);
+                return Err(error);
+            }
+        };
+        let RawDiskState::Present {
+            bytes: candidate_bytes,
+            version: candidate_version,
+        } = &candidate
+        else {
+            drop(temp_file);
+            self.store.remove_temp(&temp_relative);
+            return Err(unsupported_metadata(
+                "metadata copy made the save candidate unsafe",
+            ));
+        };
+        if !source_before_version.is_same_observation(source_after_version)
+            || !expected.version.is_same_observation(source_after_version)
+        {
+            self.store.remove_temp(&temp_relative);
+            drop(temp_file);
+            drop(source_file);
+            let _ = self.refresh();
+            return Ok(SaveOutcome::Blocked {
+                status: self.status(),
+            });
+        }
+        if candidate_bytes != self.buffer.as_bytes()
+            || candidate_version.metadata_sha256 != source_after_version.metadata_sha256
+        {
+            self.store.remove_temp(&temp_relative);
+            return Err(DocumentError::UnsafeTarget(
+                TargetIssue::UnsupportedMetadata {
+                    reason:
+                        "Darwin metadata copy could not be verified exactly on the save candidate"
+                            .into(),
+                },
+            ));
+        }
         drop(temp_file);
+        drop(source_file);
 
         if let Err(error) = hook(&self.absolute_path()) {
             self.store.remove_temp(&temp_relative);
@@ -767,7 +910,9 @@ impl Document {
             });
         };
 
-        if saved.text != self.buffer {
+        if saved.text != self.buffer
+            || saved.version.metadata_sha256 != expected.version.metadata_sha256
+        {
             let retained = self
                 .store
                 .recovery
@@ -777,7 +922,7 @@ impl Document {
             self.conflict = conflict_for(&self.base, &self.buffer, &current, None, None);
             return Ok(SaveOutcome::CommittedButUncertain {
                 retained_path: Some(retained),
-                reason: "the path changed again after the atomic exchange; the editor buffer remains in recovery".into(),
+                reason: "the saved content or preserved metadata changed again after the atomic exchange; the editor buffer remains in recovery".into(),
             });
         }
 
@@ -839,6 +984,19 @@ impl StoreInner {
         }
     }
 
+    fn open_document(&self, relative: &Path) -> Result<File, DocumentError> {
+        let flags =
+            O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW_ANY | O_RESOLVE_BENEATH | O_UNIQUE;
+        match self.open_relative(relative, flags, None) {
+            Ok(file) => Ok(file),
+            Err(source) => match classify_open_error(source)? {
+                RawDiskState::Missing => Err(DocumentError::MissingTarget),
+                RawDiskState::Unsafe(issue) => Err(DocumentError::UnsafeTarget(issue)),
+                RawDiskState::Present { .. } => unreachable!(),
+            },
+        }
+    }
+
     fn read_raw(&self, relative: &Path) -> Result<RawDiskState, DocumentError> {
         let flags =
             O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW_ANY | O_RESOLVE_BENEATH | O_UNIQUE;
@@ -846,6 +1004,10 @@ impl StoreInner {
             Ok(file) => file,
             Err(error) => return classify_open_error(error),
         };
+        self.inspect_open_file(&mut file)
+    }
+
+    fn inspect_open_file(&self, file: &mut File) -> Result<RawDiskState, DocumentError> {
         let before = file.metadata().map_err(|source| DocumentError::Io {
             action: "inspect document",
             source,
@@ -863,7 +1025,11 @@ impl StoreInner {
             }));
         }
         let mut bytes = Vec::with_capacity(before.len() as usize);
-        Read::by_ref(&mut file)
+        file.rewind().map_err(|source| DocumentError::Io {
+            action: "rewind document for verification",
+            source,
+        })?;
+        Read::by_ref(file)
             .take(self.limits.max_file_bytes as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|source| DocumentError::Io {
@@ -876,6 +1042,13 @@ impl StoreInner {
                 limit: self.limits.max_file_bytes,
             }));
         }
+        let metadata_sha256 = match metadata_sha256(file, &before) {
+            Ok(digest) => digest,
+            Err(DocumentError::UnsafeTarget(issue)) => {
+                return Ok(RawDiskState::Unsafe(issue));
+            }
+            Err(error) => return Err(error),
+        };
         let after = file.metadata().map_err(|source| DocumentError::Io {
             action: "reinspect document",
             source,
@@ -884,7 +1057,7 @@ impl StoreInner {
             return Err(DocumentError::UnstableRead);
         }
         Ok(RawDiskState::Present {
-            version: disk_version(&after, &bytes),
+            version: disk_version(&after, &bytes, metadata_sha256),
             bytes,
         })
     }
@@ -919,11 +1092,7 @@ impl StoreInner {
         }
     }
 
-    fn create_save_temp(
-        &self,
-        relative: &Path,
-        mode: u32,
-    ) -> Result<(PathBuf, File), DocumentError> {
+    fn create_save_temp(&self, relative: &Path) -> Result<(PathBuf, File), DocumentError> {
         let parent = relative.parent().unwrap_or_else(|| Path::new(""));
         for _ in 0..32 {
             let leaf = format!(
@@ -936,17 +1105,9 @@ impl StoreInner {
             } else {
                 parent.join(leaf)
             };
-            let flags =
-                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW_ANY | O_RESOLVE_BENEATH;
+            let flags = O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW_ANY | O_RESOLVE_BENEATH;
             match self.open_relative(&candidate, flags, Some(PRIVATE_FILE_MODE)) {
-                Ok(file) => {
-                    file.set_permissions(fs::Permissions::from_mode(mode & 0o7777))
-                        .map_err(|source| DocumentError::Io {
-                            action: "copy document permissions",
-                            source,
-                        })?;
-                    return Ok((candidate, file));
-                }
+                Ok(file) => return Ok((candidate, file)),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(source) => {
                     return Err(DocumentError::Io {
@@ -1282,7 +1443,222 @@ fn raw_to_disk(bytes: Vec<u8>, version: DiskVersion, limit: usize) -> DiskState 
     }
 }
 
-fn disk_version(metadata: &fs::Metadata, bytes: &[u8]) -> DiskVersion {
+fn copy_complete_metadata(source: &File, destination: &File) -> Result<(), DocumentError> {
+    let state = unsafe { copyfile_state_alloc() };
+    if state.is_null() {
+        return Err(unsupported_metadata(
+            "Darwin copyfile state allocation failed",
+        ));
+    }
+    let preserve_suid: c_uint = 1;
+    let configured = unsafe {
+        copyfile_state_set(
+            state,
+            COPYFILE_STATE_PRESERVE_SUID,
+            (&preserve_suid as *const c_uint).cast(),
+        )
+    };
+    if configured != 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            copyfile_state_free(state);
+        }
+        return Err(unsupported_metadata(format!(
+            "Darwin cannot configure complete mode preservation: {error}"
+        )));
+    }
+    let copied = unsafe {
+        fcopyfile(
+            source.as_raw_fd(),
+            destination.as_raw_fd(),
+            state,
+            COPYFILE_METADATA,
+        )
+    };
+    let copy_error = (copied != 0).then(io::Error::last_os_error);
+    let freed = unsafe { copyfile_state_free(state) };
+    if let Some(error) = copy_error {
+        return Err(unsupported_metadata(format!(
+            "Darwin could not copy file ownership, mode, flags, ACL, and extended attributes: {error}"
+        )));
+    }
+    if freed != 0 {
+        return Err(unsupported_metadata(format!(
+            "Darwin could not release metadata-copy state: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+fn metadata_sha256(file: &File, metadata: &fs::Metadata) -> Result<String, DocumentError> {
+    let mut hash = Sha256::new();
+    hash.update(b"cibergit-darwin-file-metadata-v1");
+    hash_framed(&mut hash, &metadata.mode().to_be_bytes());
+    hash_framed(&mut hash, &metadata.uid().to_be_bytes());
+    hash_framed(&mut hash, &metadata.gid().to_be_bytes());
+    hash_framed(&mut hash, &metadata.mtime().to_be_bytes());
+    hash_framed(&mut hash, &metadata.mtime_nsec().to_be_bytes());
+    hash_framed(&mut hash, &metadata.st_flags().to_be_bytes());
+
+    let mut names = list_extended_attributes(file)?;
+    names.sort_unstable();
+    let mut total_bytes = names.iter().map(Vec::len).sum::<usize>();
+    hash_framed(&mut hash, &(names.len() as u64).to_be_bytes());
+    for name in names {
+        let value = read_extended_attribute(file, &name)?;
+        total_bytes = total_bytes.checked_add(value.len()).ok_or_else(|| {
+            unsupported_metadata("extended-attribute sizes overflowed verification bounds")
+        })?;
+        if total_bytes > MAX_METADATA_BYTES {
+            return Err(unsupported_metadata(format!(
+                "extended attributes exceed the {} MiB verification limit",
+                MAX_METADATA_BYTES / (1024 * 1024)
+            )));
+        }
+        hash_framed(&mut hash, &name);
+        hash_framed(&mut hash, &value);
+    }
+    hash_framed(&mut hash, &read_acl_text(file)?);
+    Ok(hex_bytes(&hash.finalize()))
+}
+
+fn list_extended_attributes(file: &File) -> Result<Vec<Vec<u8>>, DocumentError> {
+    let size = unsafe {
+        flistxattr(
+            file.as_raw_fd(),
+            std::ptr::null_mut(),
+            0,
+            XATTR_SHOWCOMPRESSION,
+        )
+    };
+    if size < 0 {
+        return Err(metadata_syscall_error("list extended attributes"));
+    }
+    let size = size as usize;
+    if size > MAX_METADATA_BYTES {
+        return Err(unsupported_metadata(format!(
+            "extended-attribute names exceed the {} MiB verification limit",
+            MAX_METADATA_BYTES / (1024 * 1024)
+        )));
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut names = vec![0_u8; size];
+    let read = unsafe {
+        flistxattr(
+            file.as_raw_fd(),
+            names.as_mut_ptr().cast(),
+            names.len(),
+            XATTR_SHOWCOMPRESSION,
+        )
+    };
+    if read < 0 {
+        return Err(metadata_syscall_error("read extended-attribute names"));
+    }
+    names.truncate(read as usize);
+    if names.last() != Some(&0) {
+        return Err(unsupported_metadata(
+            "Darwin returned a malformed extended-attribute name list",
+        ));
+    }
+    names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| Ok(name.to_vec()))
+        .collect()
+}
+
+fn read_extended_attribute(file: &File, name: &[u8]) -> Result<Vec<u8>, DocumentError> {
+    let name = CString::new(name).map_err(|_| {
+        unsupported_metadata("Darwin returned an extended-attribute name containing NUL")
+    })?;
+    let size = unsafe {
+        fgetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            XATTR_SHOWCOMPRESSION,
+        )
+    };
+    if size < 0 {
+        return Err(metadata_syscall_error("size extended attribute"));
+    }
+    let size = size as usize;
+    if size > MAX_METADATA_BYTES {
+        return Err(unsupported_metadata(format!(
+            "one extended attribute exceeds the {} MiB verification limit",
+            MAX_METADATA_BYTES / (1024 * 1024)
+        )));
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut value = vec![0_u8; size];
+    let read = unsafe {
+        fgetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            XATTR_SHOWCOMPRESSION,
+        )
+    };
+    if read < 0 {
+        return Err(metadata_syscall_error("read extended attribute"));
+    }
+    value.truncate(read as usize);
+    Ok(value)
+}
+
+fn read_acl_text(file: &File) -> Result<Vec<u8>, DocumentError> {
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        // Darwin reports ENOENT when a supported file has no extended ACL.
+        if io::Error::last_os_error().raw_os_error() == Some(2) {
+            return Ok(Vec::new());
+        }
+        return Err(metadata_syscall_error("read access control list"));
+    }
+    let mut len = 0_isize;
+    let text = unsafe { acl_to_text(acl, &mut len) };
+    if text.is_null() || len < 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            acl_free(acl);
+        }
+        return Err(unsupported_metadata(format!(
+            "serialize access control list: {error}"
+        )));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(text.cast::<u8>(), len as usize) }.to_vec();
+    unsafe {
+        acl_free(text.cast());
+        acl_free(acl);
+    }
+    Ok(bytes)
+}
+
+fn unsupported_metadata(reason: impl Into<String>) -> DocumentError {
+    DocumentError::UnsafeTarget(TargetIssue::UnsupportedMetadata {
+        reason: reason.into(),
+    })
+}
+
+fn metadata_syscall_error(action: &str) -> DocumentError {
+    unsupported_metadata(format!("cannot {action}: {}", io::Error::last_os_error()))
+}
+
+fn hash_framed(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+}
+
+fn disk_version(metadata: &fs::Metadata, bytes: &[u8], metadata_sha256: String) -> DiskVersion {
     DiskVersion {
         sha256: hex_digest(bytes),
         len: bytes.len() as u64,
@@ -1291,6 +1667,9 @@ fn disk_version(metadata: &fs::Metadata, bytes: &[u8]) -> DiskVersion {
         modified_seconds: metadata.mtime(),
         modified_nanoseconds: metadata.mtime_nsec(),
         mode: metadata.mode(),
+        metadata_sha256,
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
     }
 }
 
@@ -1301,6 +1680,11 @@ fn metadata_changed_during_read(before: &fs::Metadata, after: &fs::Metadata) -> 
         || before.mtime() != after.mtime()
         || before.mtime_nsec() != after.mtime_nsec()
         || before.mode() != after.mode()
+        || before.uid() != after.uid()
+        || before.gid() != after.gid()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+        || before.st_flags() != after.st_flags()
 }
 
 fn disk_matches_base(disk: &DiskState, base: &DiskSnapshot) -> bool {
