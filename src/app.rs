@@ -757,6 +757,32 @@ fn collaboration_completion_matches(
     expected_workspace == current_workspace && expected_tab == current_tab
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActionJournalCompletionToken {
+    workspace_instance: u64,
+    tab_instance: u64,
+    repository_key: String,
+    pull_request: u64,
+}
+
+impl ActionJournalCompletionToken {
+    fn matches_values(
+        &self,
+        workspace_instance: u64,
+        tab_instance: u64,
+        repository_key: &str,
+        pull_request: u64,
+    ) -> bool {
+        collaboration_completion_matches(
+            self.workspace_instance,
+            workspace_instance,
+            self.tab_instance,
+            tab_instance,
+        ) && self.repository_key == repository_key
+            && self.pull_request == pull_request
+    }
+}
+
 fn issue_comment_is_editable(tab: &ReviewTab, comment: &cibergit::domain::IssueComment) -> bool {
     tab.details.is_some() && tab.lifecycle.current_user_comment(comment)
 }
@@ -5583,7 +5609,7 @@ impl ReviewWorkspace {
                             this.begin_submitted_summary_edit(review, window, cx);
                             let per_review_draft_routing =
                                 repeated_a_retained && a_after_b_retained && b_after_a_retained;
-                            let mut multi_tab_routing = second_pr.is_none();
+                            let mut cross_tab_routing = second_pr.is_none();
                             if let Some(second) = second_pr
                                 && let Some(second_index) = this
                                     .tabs
@@ -5602,9 +5628,8 @@ impl ReviewWorkspace {
                                     .read(cx)
                                     .value()
                                     .contains("zero update mutation transport");
-                                multi_tab_routing = secondary_empty && primary_restored;
+                                cross_tab_routing = secondary_empty && primary_restored;
                             }
-                            multi_tab_routing &= per_review_draft_routing;
                             this.prepare_submitted_summary_confirmation(cx);
                             let Some(NativeConfirmation::UpdateSubmittedSummary {
                                 generation,
@@ -5644,11 +5669,11 @@ impl ReviewWorkspace {
                                         )
                                     });
                                 this.activate_tab(index, window, cx);
-                                multi_tab_routing &=
+                                cross_tab_routing &=
                                     stale_cancel_rejected && primary_confirmation_retained;
                             }
                             this.inspector_scroll.set_offset(point(px(0.), px(0.)));
-                            Ok((token, multi_tab_routing))
+                            Ok((token, per_review_draft_routing, cross_tab_routing))
                         })
                         .unwrap_or_else(|error| Err(format!("smoke entity unavailable: {error:#}")))
                     })
@@ -5670,7 +5695,7 @@ impl ReviewWorkspace {
                                 .is_ok()
                         })
                         .unwrap_or(false);
-                let submitted_cancelled = if let Ok((token, _)) = &submitted_scene {
+                let submitted_cancelled = if let Ok((token, _, _)) = &submitted_scene {
                     window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
@@ -5684,7 +5709,7 @@ impl ReviewWorkspace {
                     false
                 };
                 let confirmation_aba_guard = if submitted_cancelled
-                    && let Ok((old_token, _)) = &submitted_scene
+                    && let Ok((old_token, _, _)) = &submitted_scene
                 {
                     window
                         .update(|_, cx| {
@@ -5736,9 +5761,12 @@ impl ReviewWorkspace {
                 } else {
                     false
                 };
+                let per_review_draft_routing = submitted_scene
+                    .as_ref()
+                    .is_ok_and(|(_, routed, _)| *routed);
                 let multi_tab_routing = submitted_scene
                     .as_ref()
-                    .is_ok_and(|(_, routed)| *routed);
+                    .is_ok_and(|(_, _, routed)| *routed);
                 let submitted_draft_retained = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
@@ -5817,6 +5845,38 @@ impl ReviewWorkspace {
                         .unwrap_or(false)
                     })
                     .unwrap_or(false);
+                let late_journal_callback_fenced = window
+                    .update(|_, cx| {
+                        weak.read_with(cx, |root, _| {
+                            let Root::Review(this) = root else { return false };
+                            let Some(index) = this.active_tab else { return false };
+                            let tab = &this.tabs[index];
+                            let token = ActionJournalCompletionToken {
+                                workspace_instance: this.workspace_instance,
+                                tab_instance: tab.instance_generation,
+                                repository_key: tab.repository.cache_key(),
+                                pull_request: tab.pull_request.number,
+                            };
+                            token.matches_values(
+                                this.workspace_instance,
+                                tab.instance_generation,
+                                &tab.repository.cache_key(),
+                                tab.pull_request.number,
+                            ) && !token.matches_values(
+                                this.workspace_instance.wrapping_add(1),
+                                tab.instance_generation,
+                                &tab.repository.cache_key(),
+                                tab.pull_request.number,
+                            ) && !token.matches_values(
+                                this.workspace_instance,
+                                tab.instance_generation.wrapping_add(1),
+                                &tab.repository.cache_key(),
+                                tab.pull_request.number,
+                            )
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
                 let (real_title, viewer, values_complete, capabilities_complete) = before
                     .as_ref()
                     .map(|(_, _, title, viewer, values, capabilities)| {
@@ -5831,10 +5891,12 @@ impl ReviewWorkspace {
                     && confirmation_aba_guard
                     && submitted_draft_retained
                     && changed_source_draft_retained
+                    && per_review_draft_routing
                     && multi_tab_routing
+                    && late_journal_callback_fenced
                     && unchanged;
                 let report = format!(
-                    "Native PR lifecycle and submitted-summary smoke: {}\nReal read-only provider preparation: cli/cli snapshot title {:?}, selected account {}, values_complete={}, capabilities_complete={}\nSynthetic metadata confirmation capture: {}\nSynthetic exact-ID discussion confirmation capture: {}\nClearly labelled synthetic owned-review summary confirmation capture: {}\nSubmitted-summary cancellation through exact native handler: {}\nCancelled/reprepared identical confirmation rejects the stale native handler token: {}\nPer-review A→B→A, repeated-edit, and cross-tab typed drafts retained: {}\nChanged-source rejection plus explicit refresh retained typed draft: {}\nCanonical and selected comparison identities unchanged: {}\nMutation transport: not invoked; ZERO updatePullRequestReview and zero live metadata/comment/review/merge writes\nWindow focus requested: false when CIBERGIT_SMOKE_BACKGROUND=1\nPhysical input is not implied by an in-process scene render.\n",
+                    "Native PR lifecycle and submitted-summary smoke: {}\nReal read-only provider preparation: cli/cli snapshot title {:?}, selected account {}, values_complete={}, capabilities_complete={}\nSynthetic metadata confirmation capture: {}\nSynthetic exact-ID discussion confirmation capture: {}\nClearly labelled synthetic owned-review summary confirmation capture: {}\nSubmitted-summary cancellation through exact native handler: {}\nCancelled/reprepared identical confirmation rejects the stale native handler token: {}\nPer-review A→B→A and repeated-edit typed drafts retained: {}\nCross-tab editor restore and stale handler routing rejected: {}\nChanged-source rejection plus explicit refresh retained typed draft: {}\nLate journal reconciliation completion fenced by workspace and tab lifetime: {}\nCanonical and selected comparison identities unchanged: {}\nMutation transport: not invoked; ZERO updatePullRequestReview and zero live metadata/comment/review/merge writes\nWindow focus requested: false when CIBERGIT_SMOKE_BACKGROUND=1\nPhysical input is not implied by an in-process scene render.\n",
                     if passed { "passed" } else { "failed" },
                     real_title,
                     viewer,
@@ -5845,8 +5907,10 @@ impl ReviewWorkspace {
                     submitted_captured,
                     submitted_cancelled,
                     confirmation_aba_guard,
-                    submitted_draft_retained && multi_tab_routing,
+                    submitted_draft_retained && per_review_draft_routing,
+                    multi_tab_routing,
                     changed_source_draft_retained,
+                    late_journal_callback_fenced,
                     unchanged,
                 );
                 let _ = std::fs::write(output.join("native-lifecycle-smoke.txt"), report);
@@ -8662,7 +8726,12 @@ impl ReviewWorkspace {
         }
         let repository = self.tabs[index].repository.clone();
         let number = self.tabs[index].pull_request.number;
-        let identity = repository.cache_key();
+        let completion = ActionJournalCompletionToken {
+            workspace_instance: self.workspace_instance,
+            tab_instance: self.tabs[index].instance_generation,
+            repository_key: repository.cache_key(),
+            pull_request: number,
+        };
         let key = match ReviewKey::for_repository("github", &repository, number) {
             Ok(key) => key,
             Err(error) => {
@@ -8767,7 +8836,12 @@ impl ReviewWorkspace {
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
                 let Some(index) = this.tabs.iter().position(|tab| {
-                    tab.repository.cache_key() == identity && tab.pull_request.number == number
+                    completion.matches_values(
+                        this.workspace_instance,
+                        tab.instance_generation,
+                        &tab.repository.cache_key(),
+                        tab.pull_request.number,
+                    )
                 }) else {
                     return;
                 };
@@ -17973,10 +18047,11 @@ impl EditorWorkspace {
 #[cfg(test)]
 mod layout_tests {
     use super::{
-        COLLAPSED_PANEL_WIDTH, CollaborationReadToken, DEFAULT_SIDEBAR_WIDTH, DiffLine,
-        DiffLineKind, DiffMode, DiffRow, EXCEPTIONAL_LINE_CHUNK_BYTES, JournalOperation,
-        JournalRequest, JournalStatus, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
-        MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
+        ActionJournalCompletionToken, COLLAPSED_PANEL_WIDTH, CollaborationReadToken,
+        DEFAULT_SIDEBAR_WIDTH, DiffLine, DiffLineKind, DiffMode, DiffRow,
+        EXCEPTIONAL_LINE_CHUNK_BYTES, JournalOperation, JournalRequest, JournalStatus,
+        MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH, MIN_SIDEBAR_WIDTH,
+        MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
         SubmittedConfirmationToken, SubmittedSummaryEditor, available_diff_width_for, bounded_page,
         collaboration_completion_matches, diff_content_width, display_columns,
         journal_operation_description, journal_operation_summary, line_text_chunks,
@@ -18348,6 +18423,21 @@ mod layout_tests {
             super::OpenPrCompletion::Refused,
             "a replaced workspace rejects the old lookup"
         );
+    }
+
+    #[test]
+    fn action_journal_reconciliation_completion_rejects_reopened_target_lifetimes() {
+        let token = ActionJournalCompletionToken {
+            workspace_instance: 10,
+            tab_instance: 20,
+            repository_key: "selected-account/repository".into(),
+            pull_request: 7,
+        };
+        assert!(token.matches_values(10, 20, "selected-account/repository", 7));
+        assert!(!token.matches_values(11, 20, "selected-account/repository", 7));
+        assert!(!token.matches_values(10, 21, "selected-account/repository", 7));
+        assert!(!token.matches_values(10, 20, "other-account/repository", 7));
+        assert!(!token.matches_values(10, 20, "selected-account/repository", 8));
     }
 
     #[test]
