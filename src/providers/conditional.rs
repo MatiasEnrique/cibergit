@@ -310,7 +310,15 @@ fn collect_header_fields(header: &[u8]) -> Result<CollectedHeaderFields, RestRea
 
 fn rejected_header_poll(prefix: &[u8]) -> RestPollDirective {
     let Some(last_newline) = prefix.iter().rposition(|byte| *byte == b'\n') else {
-        return RestPollDirective::default();
+        let status = std::str::from_utf8(prefix)
+            .ok()
+            .and_then(|line| parse_status(line).ok());
+        return RestPollDirective {
+            x_poll_interval: None,
+            rate_limit: status
+                .filter(|status| matches!(status, 403 | 429))
+                .map(|_| BoundedDelay::Suspend),
+        };
     };
     let complete = &prefix[..last_newline];
     let partial = &prefix[last_newline + 1..];
@@ -764,6 +772,12 @@ mod tests {
 
     #[test]
     fn post_status_structural_errors_keep_safe_independent_floors() {
+        for status in ["403 Forbidden", "429 Too Many Requests"] {
+            let response = format!("HTTP/2 {status}");
+            let error = parse_included_response(response.as_bytes(), false).unwrap_err();
+            assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Suspend));
+        }
+
         let error = parse_included_response(
             b"HTTP/2 429 Too Many Requests\r\nRetry-After: 90\r\n continuation\r\n\r\nprivate",
             false,
