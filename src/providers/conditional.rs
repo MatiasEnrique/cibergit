@@ -309,10 +309,36 @@ fn collect_header_fields(header: &[u8]) -> Result<CollectedHeaderFields, RestRea
 }
 
 fn rejected_header_poll(prefix: &[u8]) -> RestPollDirective {
-    let Ok(collected) = collect_header_fields(prefix) else {
+    let Some(last_newline) = prefix.iter().rposition(|byte| *byte == b'\n') else {
         return RestPollDirective::default();
     };
-    parse_poll_directive(collected.status, &collected.fields, true).0
+    let complete = &prefix[..last_newline];
+    let partial = &prefix[last_newline + 1..];
+    let Ok(collected) = collect_header_fields(complete) else {
+        return RestPollDirective::default();
+    };
+    let mut poll = parse_poll_directive(collected.status, &collected.fields, true).0;
+    let partial_name = partial
+        .iter()
+        .position(|byte| *byte == b':')
+        .map(|colon| &partial[..colon]);
+    if partial_name.is_some_and(|name| name.eq_ignore_ascii_case(b"x-poll-interval")) {
+        poll.x_poll_interval = Some(BoundedDelay::Suspend);
+    }
+    let partial_retry = partial_name.is_some_and(|name| name.eq_ignore_ascii_case(b"retry-after"));
+    let partial_rate = partial_retry
+        || partial_name.is_some_and(|name| {
+            name.eq_ignore_ascii_case(b"x-ratelimit-remaining")
+                || name.eq_ignore_ascii_case(b"x-ratelimit-reset")
+        });
+    let complete_retry = capture_decimal(&collected.fields, "retry-after").0;
+    if matches!(collected.status, 403 | 429)
+        && partial_rate
+        && (partial_retry || bounded_delay(&complete_retry).is_none())
+    {
+        poll.rate_limit = Some(BoundedDelay::Suspend);
+    }
+    poll
 }
 
 fn parse_poll_directive(
@@ -769,5 +795,51 @@ mod tests {
         );
         let error = parse_included_response(oversized.as_bytes(), false).unwrap_err();
         assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Seconds(90)));
+
+        for (status, prior, name, expected_poll, expected_rate) in [
+            (
+                "429 Too Many Requests",
+                "",
+                "Retry-After",
+                None,
+                Some(BoundedDelay::Suspend),
+            ),
+            (
+                "200 OK",
+                "",
+                "X-Poll-Interval",
+                Some(BoundedDelay::Suspend),
+                None,
+            ),
+            (
+                "429 Too Many Requests",
+                "Retry-After: 90\r\n",
+                "Retry-After",
+                None,
+                Some(BoundedDelay::Suspend),
+            ),
+            (
+                "200 OK",
+                "X-Poll-Interval: 90\r\n",
+                "X-Poll-Interval",
+                Some(BoundedDelay::Suspend),
+                None,
+            ),
+        ] {
+            let mut response = format!("HTTP/2 {status}\r\n{prior}").into_bytes();
+            let partial = format!("{name}: 90");
+            let fill = MAX_HEADER_BYTES
+                .checked_sub(response.len() + "X-Fill: \r\n".len() + partial.len())
+                .unwrap();
+            response.extend_from_slice(b"X-Fill: ");
+            response.extend(std::iter::repeat_n(b'x', fill));
+            response.extend_from_slice(b"\r\n");
+            response.extend_from_slice(partial.as_bytes());
+            assert_eq!(response.len(), MAX_HEADER_BYTES);
+            response.extend_from_slice(b"000000000000000000\r\n\r\nprivate");
+            let error = parse_included_response(&response, false).unwrap_err();
+            assert_eq!(error.poll().x_poll_interval, expected_poll);
+            assert_eq!(error.poll().rate_limit, expected_rate);
+        }
     }
 }
