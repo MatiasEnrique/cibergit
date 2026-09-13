@@ -43,8 +43,8 @@ Unreadable, foreign, or future-version workspace/session data is reported and pr
 ## Local editing from a pull request
 
 Choose **Edit locally** (Command-Shift-E) in a PR tab. Create a dedicated checkout
-at the displayed review commit, or verify and attach an existing checkout. The
-selected file opens in the focused editor. The published comparison keeps its
+at the pinned canonical published head, never at a narrower selected commit, or verify and attach
+an existing checkout. The selected file opens in the focused editor. The published comparison keeps its
 commit and selection while you work locally. Return with **Published review**
 (Command-Option-Shift-E); Command-Shift-R remains review submission.
 
@@ -69,6 +69,18 @@ files; it opens a compatibility screen directing you to the PR workspace.
   follows the complete comparison order even when a destination directory is collapsed; its
   ancestors are expanded and the selected row is revealed.
 - Command-Shift-D cycles Auto, Unified, and Side-by-side diff modes. Auto responds to window width; explicit modes do not.
+- The compact Compare bar above the diff switches among Full PR, one commit, a contiguous
+  first-parent range, and Since review. Commit and range open the complete immutable commit list;
+  each row shows the short and full OID plus its headline. Root commits, merge commits, reversed or
+  non-contiguous ranges, and incomplete/capped inventories stay disabled with the exact reason.
+  Command-Option-K opens the list, Command-Option-1 returns to Full PR, Command-Option-4 selects
+  Since review, and Command-Option-[ / Command-Option-] step between individual commits. The same
+  operations are available from the command palette.
+- The Compare bar always shows the actual selected base/head beside the separately pinned canonical
+  full-PR base/head. Since review identifies the selected account's submitted-review baseline or
+  explains its full-PR fallback. A selected pair ending before the canonical head is read-only for
+  review composition and merge; drafts remain preserved and the UI directs the reviewer back to
+  Full PR or a range ending at the current head.
 - Diff lines scroll horizontally with the trackpad/native scrollbar. After clicking the diff,
   Left/Right scroll by one keyboard step and Home/End reach its horizontal edges. Line numbers
   and change markers remain aligned in unified and side-by-side modes. Tabs use stable four-column
@@ -132,7 +144,13 @@ files; it opens a compatibility screen directing you to the PR workspace.
   applying a changed name renames the selected view, and **Delete view** always leaves a valid
   default or another saved view selected.
 - Command-W closes the active review tab. Command-O opens repository setup.
-- File progress, per-file scroll, comparison mode, pinned revision, and tab state persist in the selected data directory.
+- Canonical full progress, selected-pair progress, raw-safe selected file, per-file scroll, exact
+  comparison request, diff mode, lazy-load plan, pinned canonical revision, and tab state persist in
+  one versioned atomic per-PR record in the selected data directory. Legacy full-only sessions migrate
+  without treating an unproven selected pair as the canonical PR. Up to eight losslessly keyed narrow
+  requests retain independent viewed/navigation progress, so returning to a commit or range does not
+  inherit another range's scroll or promote its viewed marks. Advancing the canonical revision clears
+  that cache deliberately.
 
 The displayed `ReviewSession` remains authoritative for the immutable comparison and revision;
 independent metadata, comments, checks and pending-review polls never advance it. Review text is
@@ -224,6 +242,46 @@ The first smoke run also saves a named view with an exact source-branch filter a
 target → repository → source-prefix grouping. The restart run requires that exact view and the
 review session to restore, then reads the persisted view back before reporting success. Use the
 same isolated data directory for the two runs and remove it before starting a new smoke pair.
+
+### Comparison-selector smoke
+
+The focused selector harness uses the real `cli/cli#14130` pinned snapshot and a second PR without
+publishing, commenting, reviewing, or merging. It invokes the native controller handlers for the
+full list, individual commit, contiguous range, explicit no-baseline Since-review fallback, return
+to Full PR, and a simulated newer-canonical observation. The latter proves that changing the
+displayed direct pair is not treated as polling or manual advance. The first run ends on the range;
+the dark restart must restore both canonical and selected identities from the one per-PR record.
+
+```sh
+test ! -e /tmp/cibergit-comparison-smoke-store
+mkdir -p /absolute/path/to/evidence/comparisons-light
+CIBERGIT_DATA_DIR=/tmp/cibergit-comparison-smoke-store \
+CIBERGIT_SMOKE_DIR=/absolute/path/to/evidence/comparisons-light \
+CIBERGIT_SMOKE_BACKGROUND=1 \
+CIBERGIT_SMOKE_COMPARISONS=1 \
+CIBERGIT_SMOKE_APPEARANCE=light \
+CIBERGIT_SMOKE_SECOND_PR=14259 \
+CARGO_TARGET_DIR=/tmp/cibergit-native-target \
+cargo run --locked --features ui-smoke -- \
+  --repo cli/cli --account YOUR_GH_LOGIN --pr 14130
+
+mkdir -p /absolute/path/to/evidence/comparisons-dark
+CIBERGIT_DATA_DIR=/tmp/cibergit-comparison-smoke-store \
+CIBERGIT_SMOKE_DIR=/absolute/path/to/evidence/comparisons-dark \
+CIBERGIT_SMOKE_BACKGROUND=1 \
+CIBERGIT_SMOKE_COMPARISONS=1 \
+CIBERGIT_SMOKE_EXPECT_RESTORE=1 \
+CIBERGIT_SMOKE_APPEARANCE=dark \
+CARGO_TARGET_DIR=/tmp/cibergit-native-target \
+cargo run --locked --features ui-smoke -- \
+  --repo cli/cli --account YOUR_GH_LOGIN --pr 14130
+```
+
+The focused harness writes `native-comparison-full-list.png`, commit/range/Since-fallback/return-full
+captures, `native-comparison-newer-head.png`, `native-comparison-two-tabs.png`, and a text report in
+the light directory; the restart directory receives `native-comparison-restart.png` and its report.
+These are in-process application-owned scene captures, not claims of physical input, Accessibility,
+or the exact macOS acrylic material behind the window.
 
 ## Native dependency notes
 

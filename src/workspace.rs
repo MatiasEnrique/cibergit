@@ -1,6 +1,9 @@
 //! Personal workspace state and account-partitioned offline data.
-use crate::domain::{Comparison, PullRequest, Repository, Revision};
-use crate::review::ReviewSession;
+use crate::{
+    comparisons::{ComparisonRequest, LocalFileLoadPlan},
+    domain::{Comparison, PullRequest, Repository, Revision},
+    review::{ComparisonMode, ReviewSession},
+};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -16,6 +19,7 @@ use std::{
 const WORKSPACE_SCHEMA_VERSION: u32 = 1;
 const WORKSPACE_FILE: &str = "workspace.json";
 const MAX_POLL_BACKOFF_SHIFT: u32 = 5;
+const MAX_REVIEW_CONTEXT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Filter {
@@ -167,12 +171,141 @@ impl WorkspaceState {
 pub struct Store {
     root: PathBuf,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PersistedComparisonContext {
+    /// The immutable published PR snapshot. This is never inferred from the
+    /// narrower pair in `selected_session`.
+    pub canonical_full_revision: Revision,
+    /// Full-PR progress and the actual canonical patch used for comment mapping.
+    pub canonical_session: ReviewSession,
+    /// Lossless request identity, including unavailable since-review requests.
+    pub selected_request: ComparisonRequest,
+    /// The currently displayed pair and its independent navigation/progress.
+    pub selected_session: ReviewSession,
+    /// Exact lazy-load semantics for the selected local pair.
+    pub local_file_load: Option<LocalFileLoadPlan>,
+    /// Bounded, losslessly keyed progress for comparisons inspected during this
+    /// pinned canonical review. Full-PR progress remains in `canonical_session`.
+    #[serde(default)]
+    pub request_sessions: Vec<PersistedComparisonSession>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PersistedComparisonSession {
+    pub request: ComparisonRequest,
+    pub session: ReviewSession,
+    pub local_file_load: Option<LocalFileLoadPlan>,
+}
+
+pub const MAX_PERSISTED_COMPARISON_SESSIONS: usize = 8;
+
+impl PersistedComparisonContext {
+    pub fn full(session: ReviewSession) -> Self {
+        Self {
+            canonical_full_revision: session.revision().clone(),
+            canonical_session: session.clone(),
+            selected_request: ComparisonRequest::FullPullRequest,
+            selected_session: session,
+            local_file_load: None,
+            request_sessions: Vec::new(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.canonical_session.revision() != &self.canonical_full_revision
+            || self.canonical_session.metadata().mode != ComparisonMode::FullPullRequest
+        {
+            bail!("Stored canonical review session is not the pinned full pull request");
+        }
+        if matches!(self.selected_request, ComparisonRequest::FullPullRequest)
+            && (self.selected_session.revision() != &self.canonical_full_revision
+                || self.selected_session.metadata().mode != ComparisonMode::FullPullRequest)
+        {
+            bail!("Stored full selection does not match the canonical pull request");
+        }
+        match (
+            &self.selected_request,
+            &self.selected_session.metadata().mode,
+        ) {
+            (ComparisonRequest::FullPullRequest, ComparisonMode::FullPullRequest)
+            | (ComparisonRequest::CommitRange { .. }, ComparisonMode::CommitRange)
+            | (
+                ComparisonRequest::SinceLastReview { .. },
+                ComparisonMode::SinceLastReview { .. } | ComparisonMode::FullPullRequest,
+            ) => {}
+            (ComparisonRequest::Commit { sha }, ComparisonMode::Commit { sha: selected_sha })
+                if sha == selected_sha && self.selected_session.revision().head_sha == *sha => {}
+            _ => bail!("Stored selected request and comparison mode do not agree"),
+        }
+        if let ComparisonRequest::CommitRange { last_sha, .. } = &self.selected_request
+            && self.selected_session.revision().head_sha != *last_sha
+        {
+            bail!("Stored range head does not match its selected endpoint");
+        }
+        if matches!(
+            self.selected_request,
+            ComparisonRequest::SinceLastReview { .. }
+        ) && self.selected_session.revision().head_sha != self.canonical_full_revision.head_sha
+        {
+            bail!("Stored since-review selection does not end at the canonical head");
+        }
+        if let Some(plan) = &self.local_file_load
+            && plan.revision != *self.selected_session.revision()
+        {
+            bail!("Stored local file-load plan does not match the selected comparison");
+        }
+        if self.request_sessions.len() > MAX_PERSISTED_COMPARISON_SESSIONS {
+            bail!("Stored comparison progress exceeds the bounded request limit");
+        }
+        for saved in &self.request_sessions {
+            if matches!(saved.request, ComparisonRequest::FullPullRequest) {
+                bail!("Stored comparison progress duplicates canonical full progress");
+            }
+            validate_selected_session(
+                &self.canonical_full_revision,
+                &saved.request,
+                &saved.session,
+                saved.local_file_load.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_selected_session(
+    canonical: &Revision,
+    request: &ComparisonRequest,
+    session: &ReviewSession,
+    local_file_load: Option<&LocalFileLoadPlan>,
+) -> Result<()> {
+    match (request, &session.metadata().mode) {
+        (ComparisonRequest::CommitRange { last_sha, .. }, ComparisonMode::CommitRange)
+            if session.revision().head_sha == *last_sha => {}
+        (ComparisonRequest::Commit { sha }, ComparisonMode::Commit { sha: selected_sha })
+            if sha == selected_sha && session.revision().head_sha == *sha => {}
+        (
+            ComparisonRequest::SinceLastReview { .. },
+            ComparisonMode::SinceLastReview { .. } | ComparisonMode::FullPullRequest,
+        ) if session.revision().head_sha == canonical.head_sha => {}
+        _ => bail!("Stored saved request and comparison mode do not agree"),
+    }
+    if let Some(plan) = local_file_load
+        && plan.revision != *session.revision()
+    {
+        bail!("Stored saved request file-load plan does not match its comparison");
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredReviewSession {
     schema_version: u32,
     repository_key: String,
     number: u64,
-    session: ReviewSession,
+    #[serde(default)]
+    session: Option<ReviewSession>,
+    #[serde(default)]
+    context: Option<PersistedComparisonContext>,
 }
 impl Store {
     pub fn open_default() -> Result<Self> {
@@ -271,26 +404,93 @@ impl Store {
             self.load_review_session(repo, number)
                 .context("Refusing to overwrite unreadable or unsupported review progress")?;
         }
-        write_json(
+        write_json_bounded(
             &path,
             &StoredReviewSession {
                 schema_version: 1,
                 repository_key: repo.cache_key(),
                 number,
-                session: session.clone(),
+                session: Some(session.clone()),
+                context: None,
             },
+            MAX_REVIEW_CONTEXT_BYTES,
         )
     }
     pub fn load_review_session(&self, repo: &Repository, number: u64) -> Result<ReviewSession> {
         let stored: StoredReviewSession =
             read_json(&self.cache_path(repo, &format!("review-session/{number}")))?;
-        if stored.schema_version != 1 {
-            bail!("Review progress was saved by an unsupported application version");
-        }
         if stored.repository_key != repo.cache_key() || stored.number != number {
             bail!("Stored review progress does not match the requested repository, account and PR");
         }
-        Ok(stored.session)
+        match stored.schema_version {
+            1 => stored
+                .session
+                .context("Legacy review progress is missing its session"),
+            2 => {
+                let context = stored
+                    .context
+                    .context("Review progress is missing its comparison context")?;
+                context.validate()?;
+                Ok(context.selected_session)
+            }
+            _ => bail!("Review progress was saved by an unsupported application version"),
+        }
+    }
+    /// Atomically persist canonical and selected identities/progress in one
+    /// bounded record. Callers serialize writes for the repository/account/PR key.
+    pub fn save_review_context(
+        &self,
+        repo: &Repository,
+        number: u64,
+        context: &PersistedComparisonContext,
+    ) -> Result<()> {
+        context.validate()?;
+        let path = self.cache_path(repo, &format!("review-session/{number}"));
+        if path.try_exists()? {
+            self.load_review_context(repo, number)
+                .context("Refusing to overwrite unreadable or unsupported review progress")?;
+        }
+        write_json_bounded(
+            &path,
+            &StoredReviewSession {
+                schema_version: 2,
+                repository_key: repo.cache_key(),
+                number,
+                session: None,
+                context: Some(context.clone()),
+            },
+            MAX_REVIEW_CONTEXT_BYTES,
+        )
+    }
+    pub fn load_review_context(
+        &self,
+        repo: &Repository,
+        number: u64,
+    ) -> Result<PersistedComparisonContext> {
+        let stored: StoredReviewSession =
+            read_json(&self.cache_path(repo, &format!("review-session/{number}")))?;
+        if stored.repository_key != repo.cache_key() || stored.number != number {
+            bail!("Stored review progress does not match the requested repository, account and PR");
+        }
+        let context = match stored.schema_version {
+            1 => {
+                let session = stored
+                    .session
+                    .context("Legacy review progress is missing its session")?;
+                if session.metadata().mode != ComparisonMode::FullPullRequest {
+                    bail!(
+                        "Legacy selected comparison cannot be proven to be the canonical full pull request"
+                    );
+                }
+                PersistedComparisonContext::full(session)
+            }
+            2 => stored
+                .context
+                .context("Review progress is missing its comparison context")?,
+            _ => bail!("Review progress was saved by an unsupported application version"),
+        };
+        context.validate()?;
+        Ok(context)
     }
 }
 fn decode_workspace(bytes: &[u8]) -> Result<WorkspaceState> {
@@ -310,6 +510,16 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     )?)
 }
 fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
+    write_bytes(path, &serde_json::to_vec_pretty(value)?)
+}
+fn write_json_bounded<T: Serialize + ?Sized>(path: &Path, value: &T, maximum: usize) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    if bytes.len() > maximum {
+        bail!("Serialized review context exceeds the {maximum}-byte persistence limit");
+    }
+    write_bytes(path, &bytes)
+}
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), stamp));
     let result = (|| -> Result<()> {
@@ -318,7 +528,7 @@ fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
             .create_new(true)
             .mode(0o600)
             .open(&temp)?;
-        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temp, path)?;
         if let Some(parent) = path

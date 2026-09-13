@@ -39,6 +39,11 @@ actions!(
         PostImmediateComment,
         SubmitReview,
         MergePullRequest,
+        ToggleComparisonPicker,
+        SelectFullComparison,
+        SelectSinceLastReview,
+        SelectPreviousComparisonCommit,
+        SelectNextComparisonCommit,
     ]
 );
 actions!(
@@ -170,6 +175,11 @@ fn main() {
             ),
             KeyBinding::new("cmd-shift-r", SubmitReview, None),
             KeyBinding::new("cmd-shift-m", MergePullRequest, None),
+            KeyBinding::new("cmd-alt-k", ToggleComparisonPicker, None),
+            KeyBinding::new("cmd-alt-1", SelectFullComparison, None),
+            KeyBinding::new("cmd-alt-4", SelectSinceLastReview, None),
+            KeyBinding::new("cmd-alt-[", SelectPreviousComparisonCommit, None),
+            KeyBinding::new("cmd-alt-]", SelectNextComparisonCommit, None),
             KeyBinding::new("up", FileTreeUp, Some("FileTree")),
             KeyBinding::new("down", FileTreeDown, Some("FileTree")),
             KeyBinding::new("left", FileTreeLeft, Some("FileTree")),

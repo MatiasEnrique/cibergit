@@ -1,6 +1,9 @@
 use cibergit::domain::{Account, Comparison, PullRequest, Repository, Revision};
 use cibergit::review::{ComparisonMetadata, ComparisonMode, DiffMode, ReviewSession};
-use cibergit::workspace::{Store, WorkspaceState};
+use cibergit::{
+    comparisons::{ComparisonRequest, LocalFileLoadPlan},
+    workspace::{PersistedComparisonContext, PersistedComparisonSession, Store, WorkspaceState},
+};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 fn repo(login: &str) -> Repository {
@@ -93,6 +96,145 @@ fn review_progress_restores_pinned_code_and_independent_file_positions() {
     assert_eq!(restored.metadata().mode, ComparisonMode::CommitRange);
     assert!(reopened.load_review_session(&repo("two"), 9).is_err());
     assert!(reopened.load_review_session(&one, 10).is_err());
+}
+
+#[test]
+fn comparison_context_restores_canonical_and_selected_identities_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let repository = repo("one");
+    let canonical_revision = Revision {
+        base_sha: "a".repeat(40),
+        head_sha: "c".repeat(40),
+    };
+    let mut full = comparison(&canonical_revision.base_sha, &canonical_revision.head_sha);
+    full.files.push(cibergit::domain::ChangedFile {
+        path: "full.rs".into(),
+        previous_path: None,
+        raw_path: None,
+        raw_previous_path: None,
+        status: "modified".into(),
+        additions: 1,
+        deletions: 1,
+        patch_complete: true,
+        patch: Some("@@ -1 +1 @@\n-old\n+full\n".into()),
+    });
+    let mut canonical_session = ReviewSession::new(full);
+    canonical_session.mark_viewed("full.rs", true);
+    canonical_session.set_diff_mode(DiffMode::SideBySide);
+
+    let selected_revision = Revision {
+        base_sha: "a".repeat(40),
+        head_sha: "b".repeat(40),
+    };
+    let mut selected = comparison(&selected_revision.base_sha, &selected_revision.head_sha);
+    selected.files.push(cibergit::domain::ChangedFile {
+        path: "narrow.rs".into(),
+        previous_path: None,
+        raw_path: None,
+        raw_previous_path: None,
+        status: "modified".into(),
+        additions: 1,
+        deletions: 1,
+        patch_complete: false,
+        patch: None,
+    });
+    let mut selected_session = ReviewSession::new(selected.clone());
+    selected_session.select_comparison(
+        selected,
+        ComparisonMetadata {
+            mode: ComparisonMode::Commit {
+                sha: selected_revision.head_sha.clone(),
+            },
+            requested_mode: None,
+            notice: None,
+        },
+    );
+    selected_session.mark_viewed("narrow.rs", true);
+    selected_session.set_scroll_position(88.0);
+    selected_session.set_diff_mode(DiffMode::Unified);
+
+    let context = PersistedComparisonContext {
+        canonical_full_revision: canonical_revision.clone(),
+        canonical_session,
+        selected_request: ComparisonRequest::Commit {
+            sha: selected_revision.head_sha.clone(),
+        },
+        selected_session: selected_session.clone(),
+        local_file_load: Some(LocalFileLoadPlan {
+            revision: selected_revision.clone(),
+            full_pr: false,
+        }),
+        request_sessions: vec![PersistedComparisonSession {
+            request: ComparisonRequest::Commit {
+                sha: selected_revision.head_sha.clone(),
+            },
+            session: selected_session,
+            local_file_load: Some(LocalFileLoadPlan {
+                revision: selected_revision.clone(),
+                full_pr: false,
+            }),
+        }],
+    };
+    let store = Store::open(dir.path()).unwrap();
+    store
+        .save_review_context(&repository, 19, &context)
+        .unwrap();
+    assert_eq!(json_files(dir.path()).len(), 1);
+
+    let restored = store.load_review_context(&repository, 19).unwrap();
+    assert_eq!(restored.canonical_full_revision, canonical_revision);
+    assert_eq!(
+        restored.canonical_session.revision().head_sha,
+        "c".repeat(40)
+    );
+    assert_eq!(restored.selected_session.revision(), &selected_revision);
+    assert!(matches!(
+        restored.selected_request,
+        ComparisonRequest::Commit { .. }
+    ));
+    assert!(restored.canonical_session.is_viewed("full.rs"));
+    assert!(!restored.canonical_session.is_viewed("narrow.rs"));
+    assert!(restored.selected_session.is_viewed("narrow.rs"));
+    assert_eq!(restored.selected_session.scroll_position(), 88.0);
+    assert_eq!(restored.selected_session.diff_mode(), DiffMode::Unified);
+    assert_eq!(restored.request_sessions.len(), 1);
+    assert!(restored.request_sessions[0].session.is_viewed("narrow.rs"));
+    assert_eq!(restored.request_sessions[0].session.scroll_position(), 88.0);
+    assert_eq!(
+        restored.local_file_load.unwrap().revision,
+        selected_revision
+    );
+}
+
+#[test]
+fn legacy_full_only_session_migrates_without_reinterpreting_a_selected_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let repository = repo("one");
+    let store = Store::open(dir.path()).unwrap();
+    let full = ReviewSession::new(comparison(&"a".repeat(40), &"b".repeat(40)));
+    store.save_review_session(&repository, 3, &full).unwrap();
+    let restored = store.load_review_context(&repository, 3).unwrap();
+    assert_eq!(restored.canonical_full_revision, *full.revision());
+    assert!(matches!(
+        restored.selected_request,
+        ComparisonRequest::FullPullRequest
+    ));
+
+    let mut selected = full;
+    selected.select_comparison(
+        comparison(&"a".repeat(40), &"b".repeat(40)),
+        ComparisonMetadata {
+            mode: ComparisonMode::CommitRange,
+            requested_mode: None,
+            notice: None,
+        },
+    );
+    let other = tempfile::tempdir().unwrap();
+    let other_store = Store::open(other.path()).unwrap();
+    other_store
+        .save_review_session(&repository, 4, &selected)
+        .unwrap();
+    assert!(other_store.load_review_context(&repository, 4).is_err());
 }
 
 #[test]

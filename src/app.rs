@@ -3,9 +3,12 @@ use crate::{
     DetailsWider, DiffScrollEnd, DiffScrollHome, DiffScrollLeft, DiffScrollRight, FileTreeActivate,
     FileTreeDown, FileTreeLeft, FileTreeNarrower, FileTreeRight, FileTreeUp, FileTreeWider,
     MergePullRequest, NextFile, OpenRepositorySetup, PostImmediateComment, PreviousFile, Refresh,
-    ResetLayout, Save, SaveReviewDraft, SidebarNarrower, SidebarWider, SubmitReview,
-    ToggleFileTree, ToggleInspector, TogglePalette, ToggleSidebar,
+    ResetLayout, Save, SaveReviewDraft, SelectFullComparison, SelectNextComparisonCommit,
+    SelectPreviousComparisonCommit, SelectSinceLastReview, SidebarNarrower, SidebarWider,
+    SubmitReview, ToggleComparisonPicker, ToggleFileTree, ToggleInspector, TogglePalette,
+    ToggleSidebar,
 };
+mod comparison_picker;
 mod file_tree;
 mod local_checkout;
 #[allow(dead_code)] // Public component surface also serves standalone native verification.
@@ -16,6 +19,11 @@ mod view_editor;
 #[cfg(feature = "ui-smoke")]
 use cibergit::participation::ReviewOperationPayload;
 use cibergit::{
+    comparisons::{
+        BaselineResolution, CommitInventory, ComparisonRequest, InventoryAvailability,
+        LocalFileLoadPlan, local_commit_inventory, resolve_review_baseline,
+        select_github_comparison, select_local_comparison,
+    },
     domain::{
         MergeAction, MergeExecutionRequest, MergeMethod, MergePreparation, PendingReviewSnapshot,
         ProviderMutationOutcome, PullRequest, PullRequestDetails, Repository,
@@ -27,7 +35,13 @@ use cibergit::{
         AlignedRow, DiffLine, DiffLineKind, DiffMode, ParsedDiff, PatchStatus, ReviewSession,
         file_key, load_local_file, local_pr_inventory, parse_file,
     },
-    workspace::{Filter, GroupBy, PersonalFilter, PollSchedule, Store, TabState, WorkspaceState},
+    workspace::{
+        Filter, GroupBy, PersistedComparisonContext, PersistedComparisonSession, PersonalFilter,
+        PollSchedule, Store, TabState, WorkspaceState,
+    },
+};
+use comparison_picker::{
+    ComparisonPicker, PickerMode, RequestToken, remember_request_progress, saved_request_progress,
 };
 use file_tree::{FileTree, TreeRowKind};
 use gpui::{prelude::*, *};
@@ -39,7 +53,7 @@ use review_interactions::{
     ActionJournal, ComposerState, ControllerLoad, InlineThread, JournalOperation, JournalRequest,
     JournalStatus, ReviewInteractionController, ReviewReconciliationItem,
     ReviewReconciliationOutcome, dispatch_auxiliary, dispatch_merge, load_merge_preference,
-    next_attempt_id, place_threads, save_merge_preference,
+    next_attempt_id, place_threads_with_canonical, save_merge_preference,
 };
 use std::{
     cell::Cell,
@@ -540,8 +554,14 @@ struct ReviewTab {
     repository: Repository,
     pull_request: PullRequest,
     session: Option<ReviewSession>,
+    canonical_session: Option<ReviewSession>,
+    canonical_full_revision: Revision,
+    comparison_picker: ComparisonPicker,
+    selected_local_file_load: Option<LocalFileLoadPlan>,
+    request_sessions: Vec<PersistedComparisonSession>,
     state: LoadState,
-    generation: u64,
+    request_generation: u64,
+    inventory_generation: u64,
     metadata_generation: u64,
     diff_rows: Vec<DiffRow>,
     diff_scroll: ListState,
@@ -623,6 +643,7 @@ enum DiffRow {
         side: DiffSide,
         start_line: u64,
         line: u64,
+        canonical_reanchored: bool,
     },
 }
 
@@ -673,10 +694,16 @@ pub struct ReviewWorkspace {
     review_state_latest: HashMap<String, Arc<AtomicU64>>,
     review_state_locks: HashMap<String, Arc<Mutex<()>>>,
     composer_edit_generation: u64,
+    next_request_generation: u64,
     _subscriptions: Vec<Subscription>,
 }
 
 impl ReviewWorkspace {
+    fn issue_request_generation(&mut self) -> u64 {
+        self.next_request_generation = self.next_request_generation.saturating_add(1);
+        self.next_request_generation
+    }
+
     fn edit_locally(&mut self, window: &mut Window, cx: &mut Context<Root>) {
         use std::os::unix::ffi::OsStringExt;
         let Some(index) = self.active_tab else { return };
@@ -698,7 +725,7 @@ impl ReviewWorkspace {
         } else {
             let repository = tab.repository.clone();
             let pull = tab.pull_request.clone();
-            let revision = session.revision().clone();
+            let revision = tab.canonical_full_revision.clone();
             let root = self
                 .interaction_root
                 .parent()
@@ -903,6 +930,7 @@ impl ReviewWorkspace {
             review_state_latest: HashMap::new(),
             review_state_locks: HashMap::new(),
             composer_edit_generation: 0,
+            next_request_generation: 0,
             _subscriptions: Vec::new(),
         };
         this.wide = this.available_diff_width(window) >= MIN_SPLIT_DIFF_WIDTH;
@@ -1114,6 +1142,10 @@ impl ReviewWorkspace {
             .ok()
             .and_then(|value| value.parse::<u64>().ok());
         let expect_restore = std::env::var_os("CIBERGIT_SMOKE_EXPECT_RESTORE").is_some();
+        if std::env::var_os("CIBERGIT_SMOKE_COMPARISONS").is_some() {
+            self.start_comparison_smoke(window, cx, output, second_pr, expect_restore);
+            return;
+        }
         let weak = cx.weak_entity();
         window
             .spawn(cx, async move |window| {
@@ -3311,6 +3343,472 @@ impl ReviewWorkspace {
         .detach();
     }
 
+    #[cfg(feature = "ui-smoke")]
+    fn start_comparison_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+        output: PathBuf,
+        second_pr: Option<u64>,
+        expect_restore: bool,
+    ) {
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                let started = std::time::Instant::now();
+                loop {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.smoke_ready() && this.active_tab.is_some_and(|index| {
+                                    !this.tabs[index].comparison_picker.inventory_loading
+                                        && this.tabs[index].comparison_picker.inventory_ready()
+                                }))
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready || started.elapsed() > Duration::from_secs(90) {
+                        break;
+                    }
+                }
+                let _ = std::fs::create_dir_all(&output);
+                if expect_restore {
+                    let restored = window
+                        .update(|window, cx| {
+                            let valid = weak
+                                .read_with(cx, |root, _| {
+                                    matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                        matches!(this.tabs[index].comparison_picker.request, ComparisonRequest::CommitRange { .. })
+                                            && this.tabs[index].session.as_ref().is_some_and(|session| session.revision() != &this.tabs[index].canonical_full_revision)
+                                    }))
+                                })
+                                .unwrap_or(false);
+                            valid
+                                && window
+                                    .render_to_image()
+                                    .and_then(|image| {
+                                        image
+                                            .save(output.join("native-comparison-restart.png"))
+                                            .map_err(Into::into)
+                                    })
+                                    .is_ok()
+                        })
+                        .unwrap_or(false);
+                    let report = format!(
+                        "Dark restart restored canonical full identity plus lossless CommitRange request and distinct selected pair: {}\nPhysical input / AX / acrylic material identity: not established by in-process capture\nRemote writes: none\n",
+                        if restored { "passed" } else { "failed" }
+                    );
+                    let _ = std::fs::write(output.join("native-comparison-smoke.txt"), report);
+                    if !restored {
+                        panic!("comparison restart smoke failed");
+                    }
+                    let _ = window.update(|_, cx| cx.quit());
+                    return;
+                }
+
+                let full_installed = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return false };
+                            let Some(index) = this.active_tab else { return false };
+                            this.tabs[index].comparison_picker.expanded = true;
+                            this.tabs[index].comparison_picker.editing_mode = PickerMode::Commit;
+                            cx.notify();
+                            true
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let full_ready = full_installed
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join("native-comparison-full-list.png"))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let commit_started = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return false };
+                            let Some(index) = this.active_tab else { return false };
+                            this.select_picker_commit(index, 0, cx);
+                            true
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                for _ in 0..160 {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(125))
+                        .await;
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                    matches!(this.tabs[index].comparison_picker.request, ComparisonRequest::Commit { .. })
+                                        && !matches!(this.tabs[index].state, LoadState::Loading(_))
+                                }))
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready {
+                        break;
+                    }
+                }
+                let commit_captured = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join("native-comparison-commit.png"))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let range_started = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return false };
+                            let Some(index) = this.active_tab else { return false };
+                            let count = this.tabs[index].comparison_picker.commits().len();
+                            if count < 2
+                                || this.tabs[index]
+                                    .comparison_picker
+                                    .begin_endpoint_selection(PickerMode::Range)
+                                    .is_err()
+                            {
+                                return false;
+                            }
+                            this.select_picker_range_endpoint(index, 0, cx);
+                            this.select_picker_range_endpoint(index, count - 1, cx);
+                            true
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                for _ in 0..160 {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(125))
+                        .await;
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                    matches!(this.tabs[index].comparison_picker.request, ComparisonRequest::CommitRange { .. })
+                                        && !matches!(this.tabs[index].state, LoadState::Loading(_))
+                                }))
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready {
+                        break;
+                    }
+                }
+                let range_captured = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join("native-comparison-range.png"))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let since_started = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return false };
+                            let Some(index) = this.active_tab else { return false };
+                            this.select_comparison_request(
+                                index,
+                                ComparisonRequest::SinceLastReview {
+                                    baseline: BaselineResolution::Unavailable(
+                                        cibergit::comparisons::BaselineUnavailableReason::NoSubmittedReview,
+                                    ),
+                                },
+                                cx,
+                            );
+                            true
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                for _ in 0..160 {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(125))
+                        .await;
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                    matches!(this.tabs[index].comparison_picker.request, ComparisonRequest::SinceLastReview { .. })
+                                        && !matches!(this.tabs[index].state, LoadState::Loading(_))
+                                }))
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready {
+                        break;
+                    }
+                }
+                let since_captured = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join("native-comparison-since-fallback.png"))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let full_returned = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return false };
+                            let Some(index) = this.active_tab else { return false };
+                            this.restore_full_comparison(index, cx);
+                            true
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let full_return_captured = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join("native-comparison-return-full.png"))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let poll_indicator_installed = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return false };
+                            let Some(index) = this.active_tab else { return false };
+                            let mut newer = this.tabs[index].canonical_full_revision.clone();
+                            newer.head_sha = "f".repeat(40);
+                            if let Some(session) = &mut this.tabs[index].canonical_session {
+                                session.observe_revision(newer.clone());
+                            }
+                            if let Some(session) = &mut this.tabs[index].session {
+                                session.observe_revision(newer);
+                            }
+                            cx.notify();
+                            true
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let poll_indicator_captured = poll_indicator_installed
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join("native-comparison-newer-head.png"))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let tabs_captured = if let Some(second) = second_pr {
+                    let _ = window.update(|_, cx| {
+                        let _ = weak.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                this.open_pr(0, second, cx);
+                            }
+                        });
+                    });
+                    for _ in 0..240 {
+                        window
+                            .background_executor()
+                            .timer(Duration::from_millis(125))
+                            .await;
+                        let ready = window
+                            .update(|_, cx| {
+                                weak.read_with(cx, |root, _| {
+                                    matches!(root, Root::Review(this) if this.tabs.len() >= 2 && this.smoke_ready())
+                                })
+                                .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if ready {
+                            break;
+                        }
+                    }
+                    window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join("native-comparison-two-tabs.png"))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
+                let final_started = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return None };
+                            let primary = this
+                                .tabs
+                                .iter()
+                                .position(|tab| tab.pull_request.number == 14130)?;
+                            this.active_tab = Some(primary);
+                            let canonical = this.tabs[primary].canonical_full_revision.clone();
+                            if let Some(session) = &mut this.tabs[primary].canonical_session {
+                                session.observe_revision(canonical.clone());
+                            }
+                            if let Some(session) = &mut this.tabs[primary].session {
+                                session.observe_revision(canonical);
+                            }
+                            let count = this.tabs[primary].comparison_picker.commits().len();
+                            this.tabs[primary]
+                                .comparison_picker
+                                .begin_endpoint_selection(PickerMode::Range)
+                                .ok()?;
+                            this.select_picker_range_endpoint(primary, 0, cx);
+                            this.select_picker_range_endpoint(primary, count.checked_sub(1)?, cx);
+                            Some(())
+                        })
+                        .ok()
+                        .flatten()
+                    })
+                    .ok()
+                    .flatten()
+                    .is_some();
+                for _ in 0..160 {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(125))
+                        .await;
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.tabs.iter().any(|tab| {
+                                    tab.pull_request.number == 14130
+                                        && matches!(tab.comparison_picker.request, ComparisonRequest::CommitRange { .. })
+                                        && !matches!(tab.state, LoadState::Loading(_))
+                                }))
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready {
+                        break;
+                    }
+                }
+                let final_state = window
+                    .update(|_, cx| {
+                        weak.read_with(cx, |root, _| {
+                            let Root::Review(this) = root else { return None };
+                            let tab = this
+                                .tabs
+                                .iter()
+                                .find(|tab| tab.pull_request.number == 14130)?;
+                            Some((
+                                tab.canonical_full_revision.clone(),
+                                tab.session
+                                    .as_ref()
+                                    .map(|session| session.revision().clone()),
+                            ))
+                        })
+                        .ok()
+                        .flatten()
+                    })
+                    .ok()
+                    .flatten();
+                window
+                    .background_executor()
+                    .timer(Duration::from_secs(1))
+                    .await;
+                let passed = full_ready
+                    && commit_started
+                    && commit_captured
+                    && range_started
+                    && range_captured
+                    && since_started
+                    && since_captured
+                    && full_returned
+                    && full_return_captured
+                    && poll_indicator_captured
+                    && tabs_captured
+                    && final_started
+                    && final_state.is_some();
+                let report = final_state.map_or_else(
+                    || "Final persisted range state unavailable".into(),
+                    |(canonical, selected)| {
+                        format!(
+                            "Canonical full: {} -> {}\nSelected before restart: {}\n",
+                            canonical.base_sha,
+                            canonical.head_sha,
+                            selected
+                                .map(|revision| format!("{} -> {}", revision.base_sha, revision.head_sha))
+                                .unwrap_or_else(|| "unavailable".into())
+                        )
+                    },
+                );
+                let report = format!(
+                    "{report}Full list: {full_ready}\nCommit: {}\nRange: {}\nSince no-baseline fallback: {}\nReturn full: {}\nNewer canonical indicator without selected-pair advance: {poll_indicator_captured}\nTwo PR tabs: {tabs_captured}\nActual native controller handlers: used\nPhysical input / AX / acrylic material identity: not established by in-process capture\nRemote writes: none\n",
+                    commit_started && commit_captured,
+                    range_started && range_captured,
+                    since_started && since_captured,
+                    full_returned && full_return_captured,
+                );
+                let _ = std::fs::write(output.join("native-comparison-smoke.txt"), report);
+                if !passed {
+                    panic!("native comparison smoke assertions failed");
+                }
+                let _ = window.update(|_, cx| cx.quit());
+            })
+            .detach();
+    }
+
     fn save_workspace(&mut self) {
         if self.persistence_error.is_some() {
             return;
@@ -3332,7 +3830,7 @@ impl ReviewWorkspace {
                 tabs.push(TabState {
                     repository_key: tab.repository.cache_key(),
                     number: tab.pull_request.number,
-                    revision: session.revision().clone(),
+                    revision: tab.canonical_full_revision.clone(),
                     selected_file: session.selected_file().map(file_key),
                     scroll_offset: session.scroll_position(),
                     diff_mode: match session.diff_mode() {
@@ -3353,7 +3851,28 @@ impl ReviewWorkspace {
         }
     }
 
+    fn save_current_request_progress(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let Some(session) = tab.session.clone() else {
+            return;
+        };
+        let request = tab.comparison_picker.request.clone();
+        if matches!(request, ComparisonRequest::FullPullRequest) {
+            tab.canonical_session = Some(session);
+            return;
+        }
+        remember_request_progress(
+            &mut tab.request_sessions,
+            request,
+            session,
+            tab.selected_local_file_load.clone(),
+        );
+    }
+
     fn persist_session(&mut self, index: usize, cx: &mut Context<Root>) {
+        self.save_current_request_progress(index);
         let Some(store) = self.store.clone() else {
             return;
         };
@@ -3363,8 +3882,26 @@ impl ReviewWorkspace {
         if tab.session_persistence_error.is_some() {
             return;
         }
-        let Some(session) = tab.session.clone() else {
+        let Some(selected_session) = tab.session.clone() else {
             return;
+        };
+        let Some(canonical_session) = (if matches!(
+            tab.comparison_picker.request,
+            ComparisonRequest::FullPullRequest
+        ) {
+            Some(selected_session.clone())
+        } else {
+            tab.canonical_session.clone()
+        }) else {
+            return;
+        };
+        let context = PersistedComparisonContext {
+            canonical_full_revision: tab.canonical_full_revision.clone(),
+            canonical_session,
+            selected_request: tab.comparison_picker.request.clone(),
+            selected_session,
+            local_file_load: tab.selected_local_file_load.clone(),
+            request_sessions: tab.request_sessions.clone(),
         };
         let repository = tab.repository.clone();
         let number = tab.pull_request.number;
@@ -3388,7 +3925,7 @@ impl ReviewWorkspace {
             if latest.load(Ordering::Acquire) != sequence {
                 return Ok(());
             }
-            store.save_review_session(&repository, number, &session)
+            store.save_review_context(&repository, number, &context)
         });
         cx.spawn(async move |root, cx| {
             let result = task.await;
@@ -3429,10 +3966,367 @@ impl ReviewWorkspace {
         (latest, lock, sequence)
     }
 
+    fn load_commit_inventory(&mut self, index: usize, cx: &mut Context<Root>) {
+        let generation = self.issue_request_generation();
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        tab.inventory_generation = generation;
+        let repository = tab.repository.clone();
+        let repository_key = repository.cache_key();
+        let number = tab.pull_request.number;
+        let canonical = tab.canonical_full_revision.clone();
+        let token = RequestToken {
+            repository_key: repository_key.clone(),
+            pull_request: number,
+            canonical_full_revision: canonical.clone(),
+            generation,
+        };
+        tab.comparison_picker.inventory_loading = true;
+        let task = cx.background_spawn(async move {
+            if let Some(path) = repository.local_path.as_deref()
+                && let Ok(inventory) = local_commit_inventory(path, &canonical)
+            {
+                return inventory;
+            }
+            match GithubProvider::new(repository.account.clone()).commit_inventory(
+                &repository,
+                number,
+                &canonical,
+            ) {
+                Ok(inventory) => inventory,
+                Err(error) => CommitInventory {
+                    full_revision: canonical,
+                    commits: Vec::new(),
+                    availability: InventoryAvailability::Unavailable,
+                    notice: Some(format!("Commit inventory unavailable: {error:#}")),
+                },
+            }
+        });
+        cx.spawn(async move |root, cx| {
+            let inventory = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(tab) = this.tabs.iter_mut().find(|tab| {
+                    token.matches(
+                        &tab.repository.cache_key(),
+                        tab.pull_request.number,
+                        &tab.canonical_full_revision,
+                        tab.inventory_generation,
+                    ) && tab.canonical_full_revision == inventory.full_revision
+                }) else {
+                    return;
+                };
+                tab.comparison_picker
+                    .install_inventory(&tab.canonical_full_revision, inventory);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn restore_full_comparison(&mut self, index: usize, cx: &mut Context<Root>) {
+        self.capture_scroll(index);
+        self.save_current_request_progress(index);
+        let generation = self.issue_request_generation();
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        if matches!(
+            tab.comparison_picker.request,
+            ComparisonRequest::FullPullRequest
+        ) && let Some(session) = tab.session.clone()
+        {
+            tab.canonical_session = Some(session);
+        }
+        let Some(canonical) = tab.canonical_session.clone() else {
+            tab.state = LoadState::Error("The pinned full pull request is unavailable.".into());
+            return;
+        };
+        tab.request_generation = generation;
+        tab.session = Some(canonical);
+        tab.comparison_picker
+            .select_request(ComparisonRequest::FullPullRequest);
+        tab.comparison_picker.expanded = false;
+        tab.selected_local_file_load =
+            tab.repository
+                .local_path
+                .as_ref()
+                .map(|_| LocalFileLoadPlan {
+                    revision: tab.canonical_full_revision.clone(),
+                    full_pr: true,
+                });
+        if let Some(session) = &tab.session {
+            tab.file_tree.sync(&session.comparison().files);
+        }
+        tab.state = LoadState::Ready;
+        self.rebuild_diff(index, self.wide);
+        self.persist_session(index, cx);
+        if self.tabs[index]
+            .session
+            .as_ref()
+            .and_then(ReviewSession::selected_file)
+            .is_some_and(|file| file.patch.is_none())
+        {
+            self.load_selected_local_file(index, cx);
+        }
+        cx.notify();
+    }
+
+    fn select_comparison_request(
+        &mut self,
+        index: usize,
+        request: ComparisonRequest,
+        cx: &mut Context<Root>,
+    ) {
+        if matches!(request, ComparisonRequest::FullPullRequest) {
+            self.restore_full_comparison(index, cx);
+            return;
+        }
+        self.capture_scroll(index);
+        self.save_current_request_progress(index);
+        let generation = self.issue_request_generation();
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let Some(previous) = tab.session.clone() else {
+            return;
+        };
+        if matches!(
+            tab.comparison_picker.request,
+            ComparisonRequest::FullPullRequest
+        ) {
+            tab.canonical_session = Some(previous.clone());
+        }
+        let previous_key = previous.selected_file().map(file_key);
+        let previous_scroll = previous.scroll_position();
+        let previous_mode = previous.diff_mode();
+        if let Some(saved) = saved_request_progress(&tab.request_sessions, &request) {
+            let mut session = saved.session;
+            session.set_diff_mode(previous_mode);
+            tab.request_generation = generation;
+            tab.session = Some(session);
+            tab.selected_local_file_load = saved.local_file_load;
+            tab.comparison_picker.select_request(request);
+            tab.comparison_picker.expanded = false;
+            tab.state = LoadState::Ready;
+            if let Some(session) = &tab.session {
+                tab.file_tree.sync(&session.comparison().files);
+            }
+            self.rebuild_diff(index, self.wide);
+            self.persist_session(index, cx);
+            if self.tabs[index]
+                .session
+                .as_ref()
+                .and_then(ReviewSession::selected_file)
+                .is_some_and(|file| file.patch.is_none())
+            {
+                self.load_selected_local_file(index, cx);
+            }
+            cx.notify();
+            return;
+        }
+        let repository = tab.repository.clone();
+        let repository_key = repository.cache_key();
+        let number = tab.pull_request.number;
+        let canonical = tab.canonical_full_revision.clone();
+        let token = RequestToken {
+            repository_key: repository_key.clone(),
+            pull_request: number,
+            canonical_full_revision: canonical.clone(),
+            generation,
+        };
+        let inventory =
+            tab.comparison_picker
+                .inventory
+                .clone()
+                .unwrap_or_else(|| CommitInventory {
+                    full_revision: canonical.clone(),
+                    commits: Vec::new(),
+                    availability: InventoryAvailability::Unavailable,
+                    notice: Some("The commit inventory has not been established.".into()),
+                });
+        tab.request_generation = generation;
+        tab.comparison_picker.expanded = false;
+        tab.state = LoadState::Loading("Loading selected immutable comparison…".into());
+        let task_canonical = canonical.clone();
+        let task = cx.background_spawn(async move {
+            if let Some(path) = repository.local_path.as_deref()
+                && let Ok(selection) = select_local_comparison(
+                    path,
+                    &task_canonical,
+                    &inventory,
+                    request.clone(),
+                    true,
+                )
+            {
+                return Ok(selection);
+            }
+            select_github_comparison(
+                &GithubProvider::new(repository.account.clone()),
+                &repository,
+                number,
+                &task_canonical,
+                &inventory,
+                request,
+            )
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(tab_index) = this.tabs.iter().position(|tab| {
+                    token.matches(
+                        &tab.repository.cache_key(),
+                        tab.pull_request.number,
+                        &tab.canonical_full_revision,
+                        tab.request_generation,
+                    )
+                }) else {
+                    return;
+                };
+                match result {
+                    Ok(selection) if selection.full_revision == canonical => {
+                        let comparison = selection.comparison;
+                        let mut selected = ReviewSession::new(comparison.clone());
+                        selected.select_comparison(comparison, selection.metadata);
+                        selected.set_diff_mode(previous_mode);
+                        if let Some(key) = previous_key.as_deref()
+                            && selected.select_file(key)
+                        {
+                            selected.set_scroll_position(previous_scroll);
+                        }
+                        let tab = &mut this.tabs[tab_index];
+                        tab.session = Some(selected);
+                        tab.selected_local_file_load = selection.local_file_load;
+                        tab.comparison_picker.select_request(selection.request);
+                        tab.state = LoadState::Ready;
+                        if let Some(session) = &tab.session {
+                            tab.file_tree.sync(&session.comparison().files);
+                        }
+                        this.rebuild_diff(tab_index, this.wide);
+                        this.persist_session(tab_index, cx);
+                        if this.tabs[tab_index]
+                            .session
+                            .as_ref()
+                            .and_then(ReviewSession::selected_file)
+                            .is_some_and(|file| file.patch.is_none())
+                        {
+                            this.load_selected_local_file(tab_index, cx);
+                        }
+                    }
+                    Ok(_) => {
+                        this.tabs[tab_index].state = LoadState::Error(
+                            "Comparison service returned another canonical snapshot.".into(),
+                        );
+                    }
+                    Err(error) => {
+                        this.tabs[tab_index].state =
+                            LoadState::Error(format!("Comparison unavailable: {error:#}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn select_since_last_review(&mut self, index: usize, cx: &mut Context<Root>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let baseline = tab.details.as_ref().map_or_else(
+            || {
+                BaselineResolution::Unavailable(
+                    cibergit::comparisons::BaselineUnavailableReason::ReviewActivityIncomplete,
+                )
+            },
+            |details| {
+                resolve_review_baseline(
+                    &tab.repository,
+                    tab.pull_request.number,
+                    &details.reviews,
+                    details.activity_complete,
+                    None,
+                )
+            },
+        );
+        self.select_comparison_request(index, ComparisonRequest::SinceLastReview { baseline }, cx);
+    }
+
+    fn select_picker_commit(&mut self, index: usize, commit: usize, cx: &mut Context<Root>) {
+        let request = self.tabs.get_mut(index).and_then(|tab| {
+            match tab.comparison_picker.choose_commit(commit) {
+                Ok(request) => Some(request),
+                Err(error) => {
+                    self.status = error;
+                    None
+                }
+            }
+        });
+        if let Some(request) = request {
+            self.select_comparison_request(index, request, cx);
+        }
+    }
+
+    fn select_picker_range_endpoint(
+        &mut self,
+        index: usize,
+        commit: usize,
+        cx: &mut Context<Root>,
+    ) {
+        let result = self
+            .tabs
+            .get_mut(index)
+            .map(|tab| tab.comparison_picker.choose_range_endpoint(commit));
+        match result {
+            Some(Ok(Some(request))) => self.select_comparison_request(index, request, cx),
+            Some(Ok(None)) => cx.notify(),
+            Some(Err(error)) => {
+                self.status = error;
+                cx.notify();
+            }
+            None => {}
+        }
+    }
+
+    fn step_comparison_commit(&mut self, delta: isize, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if !tab.comparison_picker.inventory_ready() {
+            self.status = tab.comparison_picker.inventory_reason();
+            cx.notify();
+            return;
+        }
+        let commits = tab.comparison_picker.commits();
+        if commits.is_empty() {
+            self.status = "This pull request has no selectable commits.".into();
+            cx.notify();
+            return;
+        }
+        let current = match &tab.comparison_picker.request {
+            ComparisonRequest::Commit { sha } => {
+                commits.iter().position(|commit| commit.sha == *sha)
+            }
+            ComparisonRequest::CommitRange { last_sha, .. } => {
+                commits.iter().position(|commit| commit.sha == *last_sha)
+            }
+            _ => None,
+        }
+        .unwrap_or(commits.len() - 1);
+        let target = current
+            .saturating_add_signed(delta)
+            .min(commits.len().saturating_sub(1));
+        self.select_picker_commit(index, target, cx);
+    }
+
     fn load_selected_local_file(&mut self, index: usize, cx: &mut Context<Root>) {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
+        let generation = tab.request_generation;
         let Some(path) = tab.repository.local_path.clone() else {
             return;
         };
@@ -3442,44 +4336,116 @@ impl ReviewWorkspace {
         let Some(file) = session.selected_file() else {
             return;
         };
-        if file.patch.is_some() {
+        let selected_needs_load = file.patch.is_none();
+        let Some(plan) = tab.selected_local_file_load.clone() else {
+            tab.state = LoadState::Error(
+                "The selected local comparison has no exact lazy-load plan.".into(),
+            );
+            return;
+        };
+        let repository_key = tab.repository.cache_key();
+        let number = tab.pull_request.number;
+        let canonical_revision = tab.canonical_full_revision.clone();
+        let token = RequestToken {
+            repository_key: repository_key.clone(),
+            pull_request: number,
+            canonical_full_revision: canonical_revision.clone(),
+            generation,
+        };
+        let selected_key = file_key(file);
+        let hydrate_canonical = tab
+            .canonical_session
+            .as_ref()
+            .and_then(|canonical| {
+                canonical
+                    .comparison()
+                    .files
+                    .iter()
+                    .find(|file| file_key(file) == selected_key)
+            })
+            .is_some_and(|file| file.patch.is_none());
+        if !selected_needs_load && !hydrate_canonical {
             self.persist_session(index, cx);
             return;
         }
-        tab.generation += 1;
-        let generation = tab.generation;
-        let repository_key = tab.repository.cache_key();
-        let number = tab.pull_request.number;
-        let revision = session.revision().clone();
-        let selected_key = file_key(file);
         tab.state = LoadState::Loading("Loading selected local file…".into());
-        let request_revision = revision.clone();
         let request_key = selected_key.clone();
+        let task_canonical_revision = canonical_revision.clone();
         let task = cx.background_spawn(async move {
-            load_local_file(&path, &request_revision, &request_key, true)
+            let selected = if selected_needs_load {
+                Some(load_local_file(
+                    &path,
+                    &plan.revision,
+                    &request_key,
+                    plan.full_pr,
+                )?)
+            } else {
+                None
+            };
+            let canonical = if hydrate_canonical {
+                if plan.full_pr && plan.revision == task_canonical_revision {
+                    match selected.clone() {
+                        Some(file) => Some(file),
+                        None => Some(load_local_file(
+                            &path,
+                            &task_canonical_revision,
+                            &request_key,
+                            true,
+                        )?),
+                    }
+                } else {
+                    Some(load_local_file(
+                        &path,
+                        &task_canonical_revision,
+                        &request_key,
+                        true,
+                    )?)
+                }
+            } else {
+                None
+            };
+            Ok::<_, anyhow::Error>((selected, canonical, plan))
         });
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
                 let Some(tab_index) = this.tabs.iter().position(|tab| {
-                    tab.repository.cache_key() == repository_key
-                        && tab.pull_request.number == number
-                        && tab.generation == generation
-                        && tab.local_inventory
+                    token.matches(
+                        &tab.repository.cache_key(),
+                        tab.pull_request.number,
+                        &tab.canonical_full_revision,
+                        tab.request_generation,
+                    ) && tab.local_inventory
+                        && tab
+                            .session
+                            .as_ref()
+                            .and_then(ReviewSession::selected_file)
+                            .is_some_and(|file| file_key(file) == selected_key)
                 }) else {
                     return;
                 };
                 match result {
-                    Ok(file) => {
-                        let installed =
+                    Ok((file, canonical_file, plan)) => {
+                        let installed = file.is_none_or(|file| {
                             this.tabs[tab_index]
                                 .session
                                 .as_mut()
                                 .is_some_and(|session| {
-                                    session.install_file_patch(&revision, file).is_ok()
-                                });
-                        if installed {
+                                    session.install_file_patch(&plan.revision, file).is_ok()
+                                })
+                        });
+                        let canonical_installed = canonical_file.is_none_or(|file| {
+                            this.tabs[tab_index]
+                                .canonical_session
+                                .as_mut()
+                                .is_some_and(|session| {
+                                    session
+                                        .install_file_patch(&canonical_revision, file)
+                                        .is_ok()
+                                })
+                        });
+                        if installed && canonical_installed {
                             this.tabs[tab_index].state = LoadState::Ready;
                             this.rebuild_diff(tab_index, this.wide);
                             this.persist_session(tab_index, cx);
@@ -3685,10 +4651,24 @@ impl ReviewWorkspace {
         let restored = self
             .store
             .as_ref()
-            .map(|store| store.load_review_session(&repository, pull_request.number));
-        let (session, state, session_persistence_error) = match restored {
-            Some(Ok(session)) => (
-                Some(session),
+            .map(|store| store.load_review_context(&repository, pull_request.number));
+        let (
+            session,
+            canonical_session,
+            canonical_full_revision,
+            selected_request,
+            selected_local_file_load,
+            request_sessions,
+            state,
+            session_persistence_error,
+        ) = match restored {
+            Some(Ok(context)) => (
+                Some(context.selected_session),
+                Some(context.canonical_session),
+                context.canonical_full_revision,
+                context.selected_request,
+                context.local_file_load,
+                context.request_sessions,
                 LoadState::Cached("Restored pinned review session · refreshing metadata".into()),
                 None,
             ),
@@ -3699,12 +4679,22 @@ impl ReviewWorkspace {
             {
                 (
                     None,
+                    None,
+                    revision.clone(),
+                    ComparisonRequest::FullPullRequest,
+                    None,
+                    Vec::new(),
                     LoadState::Loading("Loading immutable comparison…".into()),
                     None,
                 )
             }
             Some(Err(error)) => (
                 None,
+                None,
+                revision.clone(),
+                ComparisonRequest::FullPullRequest,
+                None,
+                Vec::new(),
                 LoadState::Loading("Loading immutable comparison…".into()),
                 Some(format!(
                     "Saved review session is unreadable and will not be overwritten: {error:#}"
@@ -3712,28 +4702,48 @@ impl ReviewWorkspace {
             ),
             None => (
                 None,
+                None,
+                revision.clone(),
+                ComparisonRequest::FullPullRequest,
+                None,
+                Vec::new(),
                 LoadState::Loading("Loading immutable comparison…".into()),
                 None,
             ),
         };
         let local_inventory = repository.local_path.is_some()
-            && session.as_ref().is_some_and(|session| {
-                session
-                    .comparison()
-                    .files
-                    .iter()
-                    .any(|file| file.patch.is_none())
-            });
+            && (selected_local_file_load.is_some()
+                || session.as_ref().is_some_and(|session| {
+                    session
+                        .comparison()
+                        .files
+                        .iter()
+                        .any(|file| file.patch.is_none())
+                })
+                || canonical_session.as_ref().is_some_and(|session| {
+                    session
+                        .comparison()
+                        .files
+                        .iter()
+                        .any(|file| file.patch.is_none())
+                }));
         let file_tree = session
             .as_ref()
             .map(|session| FileTree::new(&session.comparison().files))
             .unwrap_or_default();
+        let request_generation = self.issue_request_generation();
         self.tabs.push(ReviewTab {
             repository,
             pull_request,
             session,
+            canonical_session,
+            canonical_full_revision,
+            comparison_picker: ComparisonPicker::new(selected_request),
+            selected_local_file_load,
+            request_sessions,
             state,
-            generation: 0,
+            request_generation,
+            inventory_generation: request_generation,
             metadata_generation: 0,
             diff_rows: Vec::new(),
             diff_scroll: ListState::new(0, ListAlignment::Top, px(480.)),
@@ -3767,16 +4777,11 @@ impl ReviewWorkspace {
         if self.tabs[index].session.is_some() {
             self.rebuild_diff(index, self.wide);
             self.load_interactions(index, cx);
-            if self.tabs[index].local_inventory
-                && self.tabs[index]
-                    .session
-                    .as_ref()
-                    .and_then(|session| session.selected_file())
-                    .is_some_and(|file| file.patch.is_none())
-            {
+            if self.tabs[index].local_inventory {
                 self.load_selected_local_file(index, cx);
             }
             self.refresh_active(cx);
+            self.load_commit_inventory(index, cx);
         } else {
             self.load_comparison(index, revision, false, cx);
             self.refresh_details(index, cx);
@@ -3787,7 +4792,7 @@ impl ReviewWorkspace {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
-        let Some(session) = tab.session.clone() else {
+        let Some(session) = tab.canonical_session.clone() else {
             return;
         };
         if !matches!(tab.interactions, InteractionState::Loading) {
@@ -3855,6 +4860,10 @@ impl ReviewWorkspace {
             self.status = "The immutable comparison is still loading.".into();
             return;
         };
+        let Some(canonical) = self.tabs[index].canonical_session.clone() else {
+            self.status = "The canonical full pull request is still loading.".into();
+            return;
+        };
         let selection = match &self.tabs[index].interactions {
             InteractionState::Ready(controller) if extend => controller
                 .composer
@@ -3869,7 +4878,9 @@ impl ReviewWorkspace {
             _ => LineSelection::single(side, line),
         };
         let result = match &mut self.tabs[index].interactions {
-            InteractionState::Ready(controller) => controller.select_line(&session, selection),
+            InteractionState::Ready(controller) => {
+                controller.select_line_with_canonical(&session, &canonical, selection)
+            }
             InteractionState::Loading => Err("Review recovery is still loading.".into()),
             InteractionState::RecoveryRequired(reason) => Err(reason.clone()),
         };
@@ -3943,6 +4954,13 @@ impl ReviewWorkspace {
             self.status = "Wait for the started review action before editing this comment.".into();
             return;
         }
+        let routed_to_full = !matches!(
+            self.tabs[index].comparison_picker.request,
+            ComparisonRequest::FullPullRequest
+        );
+        if routed_to_full {
+            self.restore_full_comparison(index, cx);
+        }
         let result = match &mut self.tabs[index].interactions {
             InteractionState::Ready(controller) => controller.reopen_draft(draft_id),
             InteractionState::Loading => Err("Review recovery is still loading.".into()),
@@ -3967,9 +4985,14 @@ impl ReviewWorkspace {
                     input.focus(window, cx);
                 });
                 self.rebuild_diff(index, self.wide);
-                self.status = composer
-                    .notice
-                    .unwrap_or_else(|| "Pending comment opened.".into());
+                self.status = if routed_to_full {
+                    "Pending comment reopened in Full PR because its persisted canonical coordinate does not claim the earlier narrow source view."
+                        .into()
+                } else {
+                    composer
+                        .notice
+                        .unwrap_or_else(|| "Pending comment opened.".into())
+                };
             }
             Err(error) => self.status = error,
         }
@@ -4109,16 +5132,18 @@ impl ReviewWorkspace {
         }
         let (repository, number, mut composition, store, authority, expected, operation_id) = {
             let tab = &mut self.tabs[index];
-            let Some(session) = tab.session.as_ref() else {
+            let (Some(session), Some(canonical)) =
+                (tab.session.as_ref(), tab.canonical_session.as_ref())
+            else {
                 return;
             };
             let InteractionState::Ready(controller) = &mut tab.interactions else {
                 return;
             };
             let operation_id = if immediate {
-                controller.prepare_immediate(session)
+                controller.prepare_immediate_with_canonical(session, canonical)
             } else {
-                controller.prepare_pending(session)
+                controller.prepare_pending_with_canonical(session, canonical)
             };
             let operation_id = match operation_id {
                 Ok(operation_id) => operation_id,
@@ -4243,15 +5268,23 @@ impl ReviewWorkspace {
     fn prepare_merge_confirmation(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         let tab = &mut self.tabs[index];
-        let Some(session) = tab.session.as_ref() else {
+        let Some(session) = tab.canonical_session.as_ref() else {
             return;
         };
+        if tab.session.as_ref().is_none_or(|displayed| {
+            displayed.revision().head_sha != tab.canonical_full_revision.head_sha
+        }) {
+            self.status =
+                "Merge is unavailable from an older selected pair. Return to Full PR or choose a range ending at the canonical head."
+                    .into();
+            return;
+        }
         if session.requires_advance_before_merge()
-            || tab.pull_request.head_sha != session.revision().head_sha
+            || tab.pull_request.head_sha != tab.canonical_full_revision.head_sha
         {
             self.status = format!(
                 "Merge is unavailable: advance the displayed review from {} to the current remote head {}.",
-                short_sha(session.revision().head_sha.as_str()),
+                short_sha(tab.canonical_full_revision.head_sha.as_str()),
                 short_sha(tab.pull_request.head_sha.as_str())
             );
             return;
@@ -4263,7 +5296,7 @@ impl ReviewWorkspace {
         tab.write_in_flight = true;
         let repository = tab.repository.clone();
         let number = tab.pull_request.number;
-        let reviewed_head = session.revision().head_sha.clone();
+        let reviewed_head = tab.canonical_full_revision.head_sha.clone();
         let identity = repository.cache_key();
         let preference_root = self.interaction_root.clone();
         let provider = GithubProvider::new(repository.account.clone());
@@ -4340,11 +5373,21 @@ impl ReviewWorkspace {
         let (repository, number, mut composition, store, authority, expected, operation_id) = {
             let tab = &mut self.tabs[index];
             let current_head = tab.pull_request.head_sha.as_str();
+            let (Some(displayed), Some(canonical)) =
+                (tab.session.as_ref(), tab.canonical_session.as_ref())
+            else {
+                return;
+            };
             let InteractionState::Ready(controller) = &mut tab.interactions else {
                 return;
             };
-            let operation_id = match controller.prepare_submission(event, body, Some(current_head))
-            {
+            let operation_id = match controller.prepare_submission_with_displayed(
+                displayed,
+                canonical,
+                event,
+                body,
+                Some(current_head),
+            ) {
                 Ok(operation_id) => operation_id,
                 Err(error) => {
                     self.status = format!("Review is not ready to submit: {error}");
@@ -4885,14 +5928,15 @@ impl ReviewWorkspace {
         advancing: bool,
         cx: &mut Context<Root>,
     ) {
+        let generation = self.issue_request_generation();
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
-        tab.generation += 1;
-        let generation = tab.generation;
+        tab.request_generation = generation;
         let repository = tab.repository.clone();
         let number = tab.pull_request.number;
         let key = repository.cache_key();
+        let prior_canonical = tab.canonical_full_revision.clone();
         tab.state = LoadState::Loading(
             if advancing {
                 "Loading newer revision…"
@@ -4907,15 +5951,19 @@ impl ReviewWorkspace {
             if let Some(path) = repository.local_path.as_deref()
                 && let Ok(comparison) = local_pr_inventory(path, &revision)
             {
-                return Ok((comparison, false, true));
+                let plan = LocalFileLoadPlan {
+                    revision: comparison.revision.clone(),
+                    full_pr: true,
+                };
+                return Ok((comparison, false, true, Some(plan)));
             }
             match provider.comparison(&repository, number, &revision) {
-                Ok(comparison) => Ok((comparison, false, false)),
+                Ok(comparison) => Ok((comparison, false, false, None)),
                 Err(error) => match store
                     .as_ref()
                     .and_then(|store| store.load_comparison(&repository, number, &revision).ok())
                 {
-                    Some(cached) => Ok((cached, true, false)),
+                    Some(cached) => Ok((cached, true, false, None)),
                     None => Err(error),
                 },
             }
@@ -4927,12 +5975,13 @@ impl ReviewWorkspace {
                 let Some(tab_index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == key
                         && tab.pull_request.number == number
-                        && tab.generation == generation
+                        && tab.request_generation == generation
+                        && (!advancing || tab.canonical_full_revision == prior_canonical)
                 }) else {
                     return;
                 };
                 match result {
-                    Ok((comparison, cached, local_inventory)) => {
+                    Ok((comparison, cached, local_inventory, load_plan)) => {
                         if !cached && let Some(store) = &this.store {
                             let _ = store.save_comparison(
                                 &this.tabs[tab_index].repository,
@@ -4941,7 +5990,8 @@ impl ReviewWorkspace {
                             );
                         }
                         if advancing {
-                            if let Some(session) = &mut this.tabs[tab_index].session
+                            if let Some(session) =
+                                &mut this.tabs[tab_index].canonical_session
                                 && let Err(error) = session.advance(comparison)
                             {
                                 this.tabs[tab_index].state =
@@ -4949,8 +5999,33 @@ impl ReviewWorkspace {
                                 cx.notify();
                                 return;
                             }
+                            let canonical = this.tabs[tab_index]
+                                .canonical_session
+                                .clone()
+                                .expect("advanced canonical session");
+                            this.tabs[tab_index].canonical_full_revision =
+                                canonical.revision().clone();
+                            this.tabs[tab_index].request_sessions.clear();
+                            this.tabs[tab_index].session = Some(canonical);
+                            this.tabs[tab_index]
+                                .comparison_picker
+                                .select_request(ComparisonRequest::FullPullRequest);
+                            this.tabs[tab_index].comparison_picker.inventory = None;
+                            this.tabs[tab_index].comparison_picker.notice = Some(
+                                "Advanced to the observed published snapshot; selection reset to Full pull request."
+                                    .into(),
+                            );
+                            this.tabs[tab_index].selected_local_file_load = load_plan;
                         } else {
-                            this.tabs[tab_index].session = Some(ReviewSession::new(comparison));
+                            let session = ReviewSession::new(comparison);
+                            this.tabs[tab_index].canonical_full_revision =
+                                session.revision().clone();
+                            this.tabs[tab_index].canonical_session = Some(session.clone());
+                            this.tabs[tab_index].session = Some(session);
+                            this.tabs[tab_index]
+                                .comparison_picker
+                                .select_request(ComparisonRequest::FullPullRequest);
+                            this.tabs[tab_index].selected_local_file_load = load_plan;
                         }
                         if let Some((files, selected)) =
                             this.tabs[tab_index].session.as_ref().map(|session| {
@@ -4980,6 +6055,8 @@ impl ReviewWorkspace {
                         this.load_interactions(tab_index, cx);
                         this.schedule.succeeded(&format!("pr:{key}:{number}"));
                         this.save_workspace();
+                        this.persist_session(tab_index, cx);
+                        this.load_commit_inventory(tab_index, cx);
                         if local_inventory {
                             this.load_selected_local_file(tab_index, cx);
                         } else {
@@ -5024,7 +6101,14 @@ impl ReviewWorkspace {
                 };
                 match result {
                     Ok(pull_request) => {
-                        if let Some(session) = &mut tab.session {
+                        if let Some(session) = &mut tab.canonical_session {
+                            session.observe_revision(pull_request.revision());
+                        }
+                        if matches!(
+                            tab.comparison_picker.request,
+                            ComparisonRequest::FullPullRequest
+                        ) && let Some(session) = &mut tab.session
+                        {
                             session.observe_revision(pull_request.revision());
                         }
                         tab.pull_request = pull_request;
@@ -5209,7 +6293,11 @@ impl ReviewWorkspace {
         let threads = tab
             .details
             .as_ref()
-            .map(|details| place_threads(session, details))
+            .and_then(|details| {
+                tab.canonical_session
+                    .as_ref()
+                    .map(|canonical| place_threads_with_canonical(session, canonical, details))
+            })
             .unwrap_or_default();
         let composer = match &tab.interactions {
             InteractionState::Ready(controller) => controller.composer.as_ref(),
@@ -5266,13 +6354,7 @@ impl ReviewWorkspace {
             }
             self.rebuild_diff(index, wide);
             self.save_workspace();
-            if self.tabs[index].local_inventory
-                && self.tabs[index]
-                    .session
-                    .as_ref()
-                    .and_then(|session| session.selected_file())
-                    .is_some_and(|file| file.patch.is_none())
-            {
+            if self.tabs[index].local_inventory {
                 self.load_selected_local_file(index, cx);
                 return;
             }
@@ -5310,13 +6392,7 @@ impl ReviewWorkspace {
             }
             self.rebuild_diff(index, self.wide);
             self.save_workspace();
-            if self.tabs[index].local_inventory
-                && self.tabs[index]
-                    .session
-                    .as_ref()
-                    .and_then(|session| session.selected_file())
-                    .is_some_and(|file| file.patch.is_none())
-            {
+            if self.tabs[index].local_inventory {
                 self.load_selected_local_file(index, cx);
             } else {
                 self.persist_session(index, cx);
@@ -5571,7 +6647,7 @@ impl ReviewWorkspace {
     fn advance_revision(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         let revision = self.tabs[index]
-            .session
+            .canonical_session
             .as_ref()
             .and_then(|session| session.available_revision().cloned());
         if let Some(revision) = revision {
@@ -5632,6 +6708,41 @@ impl ReviewWorkspace {
                 if let Root::Review(this) = root {
                     this.command_palette = !this.command_palette;
                     cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|root, _: &ToggleComparisonPicker, _, cx| {
+                if let Root::Review(this) = root
+                    && let Some(index) = this.active_tab
+                {
+                    this.tabs[index].comparison_picker.expanded =
+                        !this.tabs[index].comparison_picker.expanded;
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|root, _: &SelectFullComparison, _, cx| {
+                if let Root::Review(this) = root
+                    && let Some(index) = this.active_tab
+                {
+                    this.restore_full_comparison(index, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &SelectSinceLastReview, _, cx| {
+                if let Root::Review(this) = root
+                    && let Some(index) = this.active_tab
+                {
+                    this.select_since_last_review(index, cx);
+                }
+            }))
+            .on_action(
+                cx.listener(|root, _: &SelectPreviousComparisonCommit, _, cx| {
+                    if let Root::Review(this) = root {
+                        this.step_comparison_commit(-1, cx);
+                    }
+                }),
+            )
+            .on_action(cx.listener(|root, _: &SelectNextComparisonCommit, _, cx| {
+                if let Root::Review(this) = root {
+                    this.step_comparison_commit(1, cx);
                 }
             }))
             .on_action(cx.listener(|root, _: &ToggleInspector, window, cx| {
@@ -6905,7 +8016,9 @@ impl ReviewWorkspace {
             .map(|session| session.revision().head_sha.as_str())
             .map(|sha| &sha[..sha.len().min(8)])
             .unwrap_or("loading");
-        let newer = session
+        let newer = tab
+            .canonical_session
+            .as_ref()
             .and_then(|session| session.available_revision())
             .is_some();
         div()
@@ -6998,7 +8111,10 @@ impl ReviewWorkspace {
                                 tab.pull_request.source_branch, tab.pull_request.target_branch
                             ))
                             .child("·")
-                            .child(format!("Full pull request · {revision}"))
+                            .child(format!(
+                                "{} · {revision}",
+                                tab.comparison_picker.request_label()
+                            ))
                             .when(newer, |row| {
                                 row.child(
                                     div()
@@ -7071,6 +8187,7 @@ impl ReviewWorkspace {
                             ),
                     ),
             )
+            .child(self.render_comparison_picker(index, colors, cx))
             .when_some(tab.state.notice(), |view, notice| {
                 view.child(
                     div()
@@ -7119,6 +8236,270 @@ impl ReviewWorkspace {
                     }),
             )
             .into_any_element()
+    }
+
+    fn render_comparison_picker(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> AnyElement {
+        let tab = &self.tabs[index];
+        let picker = &tab.comparison_picker;
+        let selected = tab.session.as_ref().map(|session| session.revision());
+        let canonical = &tab.canonical_full_revision;
+        let inventory_ready = picker.inventory_ready();
+        let mode = picker.mode();
+        let full = side_control("Full PR", mode == PickerMode::Full, colors)
+            .id("comparison-full")
+            .on_click(cx.listener(move |root, _, _, cx| {
+                if let Root::Review(this) = root {
+                    this.restore_full_comparison(index, cx);
+                }
+            }));
+        let commit = side_control("Commit", mode == PickerMode::Commit, colors)
+            .id("comparison-commit")
+            .when(!inventory_ready, |button| button.opacity(0.55))
+            .on_click(cx.listener(move |root, _, _, cx| {
+                if let Root::Review(this) = root {
+                    match this.tabs[index]
+                        .comparison_picker
+                        .begin_endpoint_selection(PickerMode::Commit)
+                    {
+                        Ok(()) => cx.notify(),
+                        Err(error) => {
+                            this.status = error;
+                            cx.notify();
+                        }
+                    }
+                }
+            }));
+        let range = side_control("Range", mode == PickerMode::Range, colors)
+            .id("comparison-range")
+            .when(!inventory_ready, |button| button.opacity(0.55))
+            .on_click(cx.listener(move |root, _, _, cx| {
+                if let Root::Review(this) = root {
+                    match this.tabs[index]
+                        .comparison_picker
+                        .begin_endpoint_selection(PickerMode::Range)
+                    {
+                        Ok(()) => cx.notify(),
+                        Err(error) => {
+                            this.status = error;
+                            cx.notify();
+                        }
+                    }
+                }
+            }));
+        let since = side_control("Since review", mode == PickerMode::SinceReview, colors)
+            .id("comparison-since-review")
+            .on_click(cx.listener(move |root, _, _, cx| {
+                if let Root::Review(this) = root {
+                    this.select_since_last_review(index, cx);
+                }
+            }));
+        let mut view = div()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(colors.canvas)
+            .px_5()
+            .py_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.muted)
+                            .child("COMPARE"),
+                    )
+                    .child(full)
+                    .child(commit)
+                    .child(range)
+                    .child(since)
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("toggle-comparison-commits")
+                            .text_xs()
+                            .text_color(colors.accent)
+                            .cursor_pointer()
+                            .child(if picker.expanded {
+                                "Hide commits  ⌥⌘K"
+                            } else {
+                                "Choose commit  ⌥⌘K"
+                            })
+                            .on_click(cx.listener(move |root, _, _, cx| {
+                                if let Root::Review(this) = root {
+                                    this.tabs[index].comparison_picker.expanded =
+                                        !this.tabs[index].comparison_picker.expanded;
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            )
+            .when_some(selected, |view, selected| {
+                view.child(
+                    div()
+                        .mt_2()
+                        .font_family(CODE_FONT)
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .child(format!(
+                            "Selected {} → {}   ·   canonical full {} → {}",
+                            selected.base_sha,
+                            selected.head_sha,
+                            canonical.base_sha,
+                            canonical.head_sha
+                        )),
+                )
+            })
+            .child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(if inventory_ready {
+                        colors.faint
+                    } else {
+                        colors.amber
+                    })
+                    .child(picker.inventory_reason()),
+            );
+        if let Some(notice) = picker.notice.clone() {
+            view = view.child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(colors.amber)
+                    .child(notice),
+            );
+        }
+        if let ComparisonRequest::SinceLastReview { baseline } = &picker.request {
+            let baseline = match baseline {
+                BaselineResolution::Found(baseline) => {
+                    let source = match &baseline.source {
+                        cibergit::comparisons::ReviewBaselineSource::SubmittedReview {
+                            review_id,
+                        } => format!("submitted review {review_id}"),
+                        cibergit::comparisons::ReviewBaselineSource::AcceptedLocalCompletion => {
+                            "accepted local completion".into()
+                        }
+                    };
+                    format!(
+                        "Baseline: {} · {} · {}",
+                        baseline.reviewed_head_sha, source, baseline.completed_at
+                    )
+                }
+                BaselineResolution::Unavailable(reason) => {
+                    format!("Since-review unavailable: {}", reason.notice())
+                }
+            };
+            view = view.child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(colors.amber)
+                    .child(baseline),
+            );
+        }
+        if selected.is_some_and(|selected| selected.head_sha != canonical.head_sha) {
+            view = view.child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(colors.amber)
+                    .child(
+                        "Read-only review target: this pair ends before the canonical reviewed head. Return to Full PR or choose a range ending at the current head.",
+                    ),
+            );
+        }
+        if picker.expanded {
+            let editing_mode = picker.editing_mode;
+            let rows = picker
+                .commits()
+                .iter()
+                .enumerate()
+                .map(|(commit_index, commit)| {
+                    let sha = commit.sha.clone();
+                    let short = comparison_picker::short_sha(&sha).to_owned();
+                    let headline = commit.message_headline.clone();
+                    let selected_commit = match &picker.request {
+                        ComparisonRequest::Commit { sha: selected } => *selected == sha,
+                        ComparisonRequest::CommitRange {
+                            first_sha,
+                            last_sha,
+                        } => {
+                            let commits = picker.commits();
+                            let first = commits.iter().position(|commit| commit.sha == *first_sha);
+                            let last = commits.iter().position(|commit| commit.sha == *last_sha);
+                            first
+                                .zip(last)
+                                .is_some_and(|(first, last)| (first..=last).contains(&commit_index))
+                        }
+                        _ => false,
+                    };
+                    div()
+                        .id(SharedString::from(format!(
+                            "comparison-commit-{commit_index}"
+                        )))
+                        .px_2()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(colors.border)
+                        .when(selected_commit, |row| row.bg(colors.selected))
+                        .cursor_pointer()
+                        .hover(|row| row.bg(colors.selected))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .font_family(CODE_FONT)
+                                        .text_xs()
+                                        .text_color(colors.accent)
+                                        .child(short),
+                                )
+                                .child(div().text_sm().child(headline)),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .font_family(CODE_FONT)
+                                .text_xs()
+                                .text_color(colors.faint)
+                                .child(sha),
+                        )
+                        .on_click(cx.listener(move |root, _, _, cx| {
+                            if let Root::Review(this) = root {
+                                if editing_mode == PickerMode::Range {
+                                    this.select_picker_range_endpoint(index, commit_index, cx);
+                                } else {
+                                    this.select_picker_commit(index, commit_index, cx);
+                                }
+                            }
+                        }))
+                })
+                .collect::<Vec<_>>();
+            view = view.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "comparison-commit-list-{index}"
+                    )))
+                    .mt_2()
+                    .h(px(220.))
+                    .overflow_y_scroll()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border)
+                    .children(rows),
+            );
+        }
+        view.into_any_element()
     }
 
     fn render_files(
@@ -8147,7 +9528,11 @@ impl ReviewWorkspace {
                     let placed = tab
                         .session
                         .as_ref()
-                        .map(|session| place_threads(session, details))
+                        .and_then(|session| {
+                            tab.canonical_session.as_ref().map(|canonical| {
+                                place_threads_with_canonical(session, canonical, details)
+                            })
+                        })
                         .unwrap_or_default();
                     for thread in placed.iter().take(30) {
                         let location = thread.anchor.as_ref().map_or_else(
@@ -8364,7 +9749,7 @@ impl ReviewWorkspace {
                     .map(|session| session.submission_revision().head_sha.as_str())
                     .unwrap_or("unavailable");
                 let newer = tab
-                    .session
+                    .canonical_session
                     .as_ref()
                     .and_then(|session| session.available_revision())
                     .map(|revision| revision.head_sha.as_str());
@@ -8767,6 +10152,49 @@ impl ReviewWorkspace {
                                     this.previous_file(&PreviousFile, window, cx);
                                     this.command_palette = false;
                                     cx.notify();
+                                }
+                            })),
+                    )
+                    .child(
+                        command_row("Show full pull request comparison", "⌥⌘1", colors)
+                            .id("command-comparison-full")
+                            .cursor_pointer()
+                            .hover(|row| row.bg(colors.selected))
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                if let Root::Review(this) = root
+                                    && let Some(index) = this.active_tab
+                                {
+                                    this.restore_full_comparison(index, cx);
+                                    this.command_palette = false;
+                                }
+                            })),
+                    )
+                    .child(
+                        command_row("Choose commit or contiguous range", "⌥⌘K", colors)
+                            .id("command-comparison-picker")
+                            .cursor_pointer()
+                            .hover(|row| row.bg(colors.selected))
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                if let Root::Review(this) = root
+                                    && let Some(index) = this.active_tab
+                                {
+                                    this.tabs[index].comparison_picker.expanded = true;
+                                    this.command_palette = false;
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .child(
+                        command_row("Compare since last submitted review", "⌥⌘4", colors)
+                            .id("command-comparison-since")
+                            .cursor_pointer()
+                            .hover(|row| row.bg(colors.selected))
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                if let Root::Review(this) = root
+                                    && let Some(index) = this.active_tab
+                                {
+                                    this.select_since_last_review(index, cx);
+                                    this.command_palette = false;
                                 }
                             })),
                     )
@@ -9545,6 +10973,7 @@ fn attach_inline_rows(
                 side: composer.coordinate.side,
                 start_line: composer.coordinate.start_line,
                 line: composer.coordinate.line,
+                canonical_reanchored: composer.source_coordinate.is_some(),
             });
         }
     }
@@ -9772,14 +11201,18 @@ fn render_interactive_diff_row(
             side,
             start_line,
             line,
+            canonical_reanchored,
         } => render_inline_composer(
-            *side,
-            *start_line,
-            *line,
+            LineSelection {
+                side: *side,
+                start_line: *start_line,
+                line: *line,
+            },
             split_mode,
             colors,
             root,
             composer_input,
+            *canonical_reanchored,
         ),
     }
 }
@@ -10103,14 +11536,18 @@ fn render_inline_thread(
 }
 
 fn render_inline_composer(
-    side: DiffSide,
-    start_line: u64,
-    line: u64,
+    selection: LineSelection,
     split_mode: bool,
     colors: Palette,
     root: &Entity<Root>,
     input: &Entity<TextareaState>,
+    canonical_reanchored: bool,
 ) -> AnyElement {
+    let LineSelection {
+        side,
+        start_line,
+        line,
+    } = selection;
     let range = if start_line == line {
         format!("{} line {line}", side.provider_name())
     } else {
@@ -10146,6 +11583,17 @@ fn render_inline_composer(
                     "Unified diff"
                 }),
         )
+        .when(canonical_reanchored, |composer| {
+            composer.child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(colors.muted)
+                    .child(
+                        "Shown in the selected direct pair · independently re-anchored to the retained Full PR patch",
+                    ),
+            )
+        })
         .child(
             div()
                 .mt_2()

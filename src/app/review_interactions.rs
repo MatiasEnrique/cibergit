@@ -9,6 +9,7 @@ use cibergit::{
         CanonicalPublishedPatch, DraftCoordinate, DraftStore, LineSelection, LoadOutcome,
         PublishedPosition, ReviewComposition, ReviewEvent, ReviewKey, ReviewOperation,
         ReviewOperationPayload, ReviewOperationStatus, ReviewOperationTarget,
+        map_to_canonical_published, validate_coordinate,
     },
     review::{ReviewSession, file_key},
 };
@@ -33,6 +34,9 @@ static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug)]
 pub struct ComposerState {
     pub coordinate: DraftCoordinate,
+    /// Untouched witness from a narrower displayed pair. Persisted review
+    /// drafts always retain the independently validated canonical coordinate.
+    pub source_coordinate: Option<DraftCoordinate>,
     pub draft_id: Option<String>,
     pub body: String,
     pub durable: bool,
@@ -153,17 +157,49 @@ impl ReviewInteractionController {
         })))
     }
 
-    pub fn select_line(
+    pub fn select_line_with_canonical(
         &mut self,
-        session: &ReviewSession,
+        displayed: &ReviewSession,
+        canonical: &ReviewSession,
         selection: LineSelection,
     ) -> Result<(), String> {
-        let selected = session
+        self.require_writable_display(displayed, canonical)?;
+        let selected = displayed
             .selected_file()
             .ok_or_else(|| "Select a text file before starting a discussion.".to_owned())?;
-        let coordinate =
-            cibergit::participation::validate_coordinate(session, &file_key(selected), selection)
-                .map_err(|error| error.to_string())?;
+        let source_coordinate = validate_coordinate(displayed, &file_key(selected), selection)
+            .map_err(|error| error.to_string())?;
+        let published = map_to_canonical_published(
+            &source_coordinate,
+            CanonicalPublishedPatch::new(canonical.comparison(), canonical.metadata())
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| format!("This selected line is read-only: {error}. Return to Full PR or choose a safely mappable NEW-side line."))?;
+        let canonical_file = canonical
+            .comparison()
+            .files
+            .iter()
+            .find(|file| file.path == published.path)
+            .ok_or_else(|| {
+                "The mapped file is absent from the retained full pull request.".to_owned()
+            })?;
+        let coordinate = validate_coordinate(
+            canonical,
+            &file_key(canonical_file),
+            LineSelection {
+                side: published.side,
+                start_line: published.start_line.unwrap_or(published.line),
+                line: published.line,
+            },
+        )
+        .map_err(|error| {
+            format!("The canonical full patch cannot independently validate this line: {error}")
+        })?;
+        if published.commit_sha != coordinate.reviewed_revision.head_sha
+            || published.path != coordinate.path
+        {
+            return Err("Canonical re-anchor identity changed during validation.".into());
+        }
         let existing = self.composition.drafts.iter().find(|draft| {
             draft.coordinate == coordinate
                 && draft.disposition == cibergit::participation::DraftDisposition::Pending
@@ -171,6 +207,8 @@ impl ReviewInteractionController {
         self.composer = Some(match existing {
             Some(draft) => ComposerState {
                 coordinate,
+                source_coordinate: (source_coordinate != draft.coordinate)
+                    .then_some(source_coordinate),
                 draft_id: Some(draft.id.clone()),
                 body: draft.body.clone(),
                 durable: !self.undurable_drafts.contains(&draft.id),
@@ -181,6 +219,9 @@ impl ReviewInteractionController {
             },
             None => ComposerState {
                 coordinate,
+                source_coordinate: (source_coordinate.reviewed_revision
+                    != self.composition.reviewed_revision)
+                    .then_some(source_coordinate),
                 draft_id: None,
                 body: String::new(),
                 durable: false,
@@ -190,6 +231,36 @@ impl ReviewInteractionController {
                 ),
             },
         });
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Retained for focused controller tests and full-session callers.
+    pub fn select_line(
+        &mut self,
+        session: &ReviewSession,
+        selection: LineSelection,
+    ) -> Result<(), String> {
+        self.select_line_with_canonical(session, session, selection)
+    }
+
+    fn require_writable_display(
+        &self,
+        displayed: &ReviewSession,
+        canonical: &ReviewSession,
+    ) -> Result<(), String> {
+        if canonical.revision() != &self.composition.reviewed_revision {
+            return Err(format!(
+                "Unfinished review text targets {} and was preserved. Return to that Full PR snapshot before editing or submitting.",
+                short_sha(&self.composition.reviewed_revision.head_sha)
+            ));
+        }
+        if displayed.revision().head_sha != canonical.revision().head_sha {
+            return Err(format!(
+                "This comparison ends at {}, older than the reviewed head {}. Return to Full PR or choose a range ending at the current head to comment.",
+                short_sha(&displayed.revision().head_sha),
+                short_sha(&canonical.revision().head_sha)
+            ));
+        }
         Ok(())
     }
 
@@ -207,6 +278,7 @@ impl ReviewInteractionController {
         let durable = !self.undurable_drafts.contains(&draft.id);
         let composer = ComposerState {
             coordinate: draft.coordinate.clone(),
+            source_coordinate: None,
             draft_id: Some(draft.id.clone()),
             body: draft.body.clone(),
             durable,
@@ -283,10 +355,18 @@ impl ReviewInteractionController {
         }
     }
 
-    pub fn prepare_pending(&mut self, session: &ReviewSession) -> Result<String, String> {
+    pub fn prepare_pending_with_canonical(
+        &mut self,
+        displayed: &ReviewSession,
+        canonical_session: &ReviewSession,
+    ) -> Result<String, String> {
+        self.require_writable_display(displayed, canonical_session)?;
         let draft_id = self.saved_composer_id()?;
-        let canonical = CanonicalPublishedPatch::new(session.comparison(), session.metadata())
-            .map_err(|error| error.to_string())?;
+        let canonical = CanonicalPublishedPatch::new(
+            canonical_session.comparison(),
+            canonical_session.metadata(),
+        )
+        .map_err(|error| error.to_string())?;
         let intent = self
             .composition
             .prepare_pending_comment(&draft_id, canonical)
@@ -295,16 +375,34 @@ impl ReviewInteractionController {
         Ok(intent.operation_id)
     }
 
-    pub fn prepare_immediate(&mut self, session: &ReviewSession) -> Result<String, String> {
+    #[allow(dead_code)] // Retained for focused controller tests and full-session callers.
+    pub fn prepare_pending(&mut self, session: &ReviewSession) -> Result<String, String> {
+        self.prepare_pending_with_canonical(session, session)
+    }
+
+    pub fn prepare_immediate_with_canonical(
+        &mut self,
+        displayed: &ReviewSession,
+        canonical_session: &ReviewSession,
+    ) -> Result<String, String> {
+        self.require_writable_display(displayed, canonical_session)?;
         let draft_id = self.saved_composer_id()?;
-        let canonical = CanonicalPublishedPatch::new(session.comparison(), session.metadata())
-            .map_err(|error| error.to_string())?;
+        let canonical = CanonicalPublishedPatch::new(
+            canonical_session.comparison(),
+            canonical_session.metadata(),
+        )
+        .map_err(|error| error.to_string())?;
         let intent = self
             .composition
             .prepare_immediate_comment(&draft_id, canonical)
             .map_err(|error| error.to_string())?;
         self.reconciliation_results.clear();
         Ok(intent.operation_id)
+    }
+
+    #[allow(dead_code)] // Retained for focused controller tests and full-session callers.
+    pub fn prepare_immediate(&mut self, session: &ReviewSession) -> Result<String, String> {
+        self.prepare_immediate_with_canonical(session, session)
     }
 
     pub fn prepare_submission(
@@ -319,6 +417,18 @@ impl ReviewInteractionController {
             .map_err(|error| error.to_string())?;
         self.reconciliation_results.clear();
         Ok(intent.operation_id)
+    }
+
+    pub fn prepare_submission_with_displayed(
+        &mut self,
+        displayed: &ReviewSession,
+        canonical: &ReviewSession,
+        event: ReviewEvent,
+        body: String,
+        current_head: Option<&str>,
+    ) -> Result<String, String> {
+        self.require_writable_display(displayed, canonical)?;
+        self.prepare_submission(event, body, current_head)
     }
 
     pub fn reconcile_details(&mut self, details: &PullRequestDetails) -> Result<(), String> {
@@ -1169,6 +1279,78 @@ pub fn place_threads(session: &ReviewSession, details: &PullRequestDetails) -> V
         .collect()
 }
 
+pub fn place_threads_with_canonical(
+    displayed: &ReviewSession,
+    canonical: &ReviewSession,
+    details: &PullRequestDetails,
+) -> Vec<InlineThread> {
+    if displayed.revision() == canonical.revision() {
+        return place_threads(canonical, details);
+    }
+    details
+        .review_threads
+        .iter()
+        .cloned()
+        .map(|thread| {
+            let result = (|| {
+                if displayed.revision().head_sha != canonical.revision().head_sha {
+                    return Err(
+                        "The selected comparison ends before the canonical reviewed head; return to Full PR to place this thread."
+                            .to_owned(),
+                    );
+                }
+                let canonical_anchor = place_thread(canonical, &thread)?;
+                let displayed_file = displayed
+                    .comparison()
+                    .files
+                    .iter()
+                    .find(|file| file_key(file) == canonical_anchor.file_key)
+                    .ok_or_else(|| {
+                        "The thread file is absent from the selected comparison.".to_owned()
+                    })?;
+                let source = validate_coordinate(
+                    displayed,
+                    &file_key(displayed_file),
+                    LineSelection {
+                        side: canonical_anchor.side,
+                        start_line: canonical_anchor.start_line,
+                        line: canonical_anchor.line,
+                    },
+                )
+                .map_err(|error| {
+                    format!("The thread is not selectable in this direct pair: {error}")
+                })?;
+                let mapped = map_to_canonical_published(
+                    &source,
+                    CanonicalPublishedPatch::new(canonical.comparison(), canonical.metadata())
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| format!("The thread cannot be proven against Full PR: {error}"))?;
+                if mapped.path != displayed_file.path
+                    || mapped.side != canonical_anchor.side
+                    || mapped.start_line.unwrap_or(mapped.line) != canonical_anchor.start_line
+                    || mapped.line != canonical_anchor.line
+                {
+                    return Err("The selected and canonical thread anchors differ.".into());
+                }
+                Ok(canonical_anchor)
+            })();
+            match result {
+                Ok(anchor) => InlineThread {
+                    thread,
+                    anchor: Some(anchor),
+                    unplaced_reason: None,
+                },
+                Err(reason) => InlineThread {
+                    thread,
+                    anchor: None,
+                    unplaced_reason: Some(reason),
+                },
+            }
+        })
+        .collect()
+}
+
 fn place_thread(session: &ReviewSession, thread: &ReviewThread) -> Result<InlineAnchor, String> {
     let file = session
         .comparison()
@@ -1955,6 +2137,71 @@ mod tests {
 
     fn review_key() -> ReviewKey {
         ReviewKey::for_repository("github", &repository(), 7).unwrap()
+    }
+
+    #[test]
+    fn direct_pair_comments_are_reanchored_only_after_canonical_proof() {
+        let root = tempdir().unwrap();
+        let canonical = session();
+        let mut direct_comparison = canonical.comparison().clone();
+        direct_comparison.revision.base_sha = "9999999".into();
+        let mut displayed = ReviewSession::new(direct_comparison.clone());
+        displayed.select_comparison(
+            direct_comparison,
+            cibergit::review::ComparisonMetadata {
+                mode: cibergit::review::ComparisonMode::Commit {
+                    sha: "2222222".into(),
+                },
+                requested_mode: None,
+                notice: None,
+            },
+        );
+        let mut controller =
+            match ReviewInteractionController::load(root.path(), &repository(), 7, &canonical)
+                .unwrap()
+            {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+
+        controller
+            .select_line_with_canonical(
+                &displayed,
+                &canonical,
+                LineSelection::single(DiffSide::New, 1),
+            )
+            .unwrap();
+        let composer = controller.composer.as_ref().unwrap();
+        assert_eq!(composer.coordinate.reviewed_revision, *canonical.revision());
+        assert_eq!(
+            composer
+                .source_coordinate
+                .as_ref()
+                .unwrap()
+                .reviewed_revision,
+            *displayed.revision()
+        );
+        controller.stage_composer_text("mapped".into()).unwrap();
+
+        let old_error = controller
+            .select_line_with_canonical(
+                &displayed,
+                &canonical,
+                LineSelection::single(DiffSide::Old, 1),
+            )
+            .unwrap_err();
+        assert!(old_error.contains("OLD-side"), "{old_error}");
+
+        let mut older_comparison = displayed.comparison().clone();
+        older_comparison.revision.head_sha = "3333333".into();
+        let older = ReviewSession::new(older_comparison);
+        let older_error = controller
+            .select_line_with_canonical(&older, &canonical, LineSelection::single(DiffSide::New, 1))
+            .unwrap_err();
+        assert!(
+            older_error.contains("older than the reviewed head"),
+            "{older_error}"
+        );
     }
 
     fn auxiliary_request() -> ReviewAuxiliaryRequest {
