@@ -1078,6 +1078,70 @@ fn interrupted_restore_after_completion_is_uncertain_and_retains_receipt() {
 }
 
 #[test]
+fn same_oid_finish_abort_and_unknown_terminal_events_are_distinguished() {
+    for outcome in ["finish", "abort", "unknown"] {
+        let repo = Repo::new();
+        repo.write("base", "base");
+        let base = repo.commit("base");
+        repo.write("a", "a");
+        let original = repo.commit("edit");
+        let store = repo.store();
+        let preparation = ready(&store, &base);
+        let plan = steps(&preparation.inventory, vec![(0, PlanAction::Edit)]);
+        let paused = store.start(&preparation, &plan).unwrap();
+        assert_eq!(paused.state, OperationState::PausedForEdit);
+        // External tooling can restore the identical edit-stop commit. This
+        // guarantees the unchanged-OID case regardless of elapsed seconds or
+        // Git's rewritten committer timestamp, without global environment edits.
+        run_ok(&repo.root, ["reset", "--hard", &original]);
+        run_ok(
+            &repo.root,
+            [
+                "-c",
+                "core.editor=true",
+                "rebase",
+                if outcome == "abort" {
+                    "--abort"
+                } else {
+                    "--continue"
+                },
+            ],
+        );
+        assert_eq!(repo.oid("HEAD"), original);
+        if outcome == "unknown" {
+            // Do not guess from older finish events when the latest event does
+            // not establish which operation produced the current state.
+            run_ok(&repo.root, ["reset", "--soft", "HEAD"]);
+        }
+        drop(store);
+        let reopened = repo.store();
+        let observed = reopened.observe().unwrap().unwrap();
+        assert_eq!(
+            observed.state,
+            match outcome {
+                "finish" => OperationState::Completed,
+                "abort" => OperationState::Aborted,
+                _ => OperationState::FailedUncertain,
+            }
+        );
+        if outcome == "unknown" {
+            assert!(reopened.retire_operation(&observed.operation_id).is_err());
+        } else {
+            // Once an outcome is durably verified, later ordinary work cannot
+            // reinterpret that historical operation or prevent its retirement.
+            repo.write("later", "independent work");
+            repo.commit("later independent commit");
+            assert_eq!(
+                repo.store().observe().unwrap().unwrap().state,
+                observed.state
+            );
+            let archived = reopened.retire_operation(&observed.operation_id).unwrap();
+            assert_eq!(archived.state, observed.state);
+        }
+    }
+}
+
+#[test]
 fn restart_external_continue_and_same_path_replacement_are_detected() {
     let repo = Repo::new();
     repo.write("base", "base");

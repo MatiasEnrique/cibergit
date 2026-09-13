@@ -430,6 +430,13 @@ struct EditStopRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TerminalObservation {
+    state: OperationState,
+    head_oid: String,
+    reflog_subject: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredRecord {
     operation_id: String,
     attempt: u64,
@@ -447,6 +454,8 @@ struct StoredRecord {
     edit_stop: Option<EditStopRecord>,
     split: Option<SplitRecord>,
     resulting_commits: Vec<CommitEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_observation: Option<TerminalObservation>,
     evidence: Vec<TransitionEvidence>,
 }
 
@@ -1780,37 +1789,60 @@ impl RebaseStore {
             record.state = OperationState::Prepared;
             return Ok(());
         }
-        if let Some(split) = &record.split
-            && !split.finish_validated
-            && !matches!(
-                &snapshot.head,
-                HeadState::Attached { branch, oid }
-                    if branch == &record.inventory.branch && oid == &record.inventory.head_oid
-            )
+        // A verified outcome is historical evidence. Later ordinary Git work
+        // (or stash application) must not relabel it from the current HEAD.
+        // Saved stash intents and replaced/active operations were checked above.
+        if record.action == AttemptAction::None
+            && record.split.is_none()
+            && matches!(&snapshot.head, HeadState::Attached { branch, .. } if branch == &record.inventory.branch)
+            && record
+                .terminal_observation
+                .as_ref()
+                .is_some_and(|terminal| {
+                    terminal.state == record.state
+                        && matches!(
+                            terminal.state,
+                            OperationState::Completed | OperationState::Aborted
+                        )
+                })
+        {
+            return Ok(());
+        }
+        let terminal = self.observe_terminal_reflog(record, &snapshot)?;
+        if record
+            .split
+            .as_ref()
+            .is_some_and(|split| !split.finish_validated)
+            && terminal
+                .as_ref()
+                .is_none_or(|terminal| terminal.state != OperationState::Aborted)
         {
             record.state = OperationState::FailedUncertain;
             record.evidence.push(
                 self.evidence(
-                    "rebase markers disappeared before the active split was validated and finished"
+                    "rebase markers disappeared before validated split completion or proven abort"
                         .into(),
                 )?,
             );
             return Ok(());
         }
-        match &snapshot.head {
-            HeadState::Attached { branch, oid } if branch == &record.inventory.branch => {
-                if oid == &record.inventory.head_oid {
-                    record.state = OperationState::Aborted;
-                } else if self.is_ancestor(&record.inventory.base_oid, oid)? {
-                    record.state = OperationState::Completed;
-                    record.resulting_commits = self
-                        .inventory_at(&record.inventory.base_oid, branch, oid)?
-                        .commits;
-                } else {
-                    record.state = OperationState::FailedUncertain;
-                }
+        if let Some(terminal) = terminal {
+            record.state = terminal.state;
+            if terminal.state == OperationState::Completed {
+                record.resulting_commits = self
+                    .inventory_at(
+                        &record.inventory.base_oid,
+                        &record.inventory.branch,
+                        &terminal.head_oid,
+                    )?
+                    .commits;
             }
-            _ => record.state = OperationState::FailedUncertain,
+            record.terminal_observation = Some(terminal);
+        } else {
+            record.state = OperationState::FailedUncertain;
+            record.evidence.push(self.evidence(
+                "rebase markers disappeared without matching HEAD reflog finish/abort evidence; outcome unresolved".into(),
+            )?);
         }
         if matches!(
             record.state,
@@ -1823,10 +1855,66 @@ impl RebaseStore {
         if record.state == OperationState::Completed && previous_state != OperationState::Completed
         {
             record.evidence.push(self.evidence(
-                "Git rebase markers disappeared and rewritten branch ancestry was verified".into(),
+                "Git HEAD reflog confirms rebase finish and resulting branch ancestry was verified".into(),
             )?);
         }
         Ok(())
+    }
+
+    fn observe_terminal_reflog(
+        &self,
+        record: &StoredRecord,
+        snapshot: &LocalSnapshot,
+    ) -> Result<Option<TerminalObservation>> {
+        let HeadState::Attached { branch, oid } = &snapshot.head else {
+            return Ok(None);
+        };
+        if branch != &record.inventory.branch {
+            return Ok(None);
+        }
+        // SHA equality cannot distinguish a successful no-op rewrite from an
+        // abort. Read the installed Git's actual terminal event, with no search
+        // through older events that might belong to a previous operation.
+        let raw = self.git.run_worktree_command(
+            "observe rebase terminal HEAD reflog",
+            vec![
+                "reflog".into(),
+                "-1".into(),
+                "--format=%H%x00%gs".into(),
+                "HEAD".into(),
+            ],
+            false,
+            &[0],
+        )?;
+        let raw = trim_lf(&raw);
+        let Some(separator) = raw.iter().position(|byte| *byte == 0) else {
+            return Ok(None);
+        };
+        let logged_oid = &raw[..separator];
+        let subject = &raw[separator + 1..];
+        if logged_oid != oid.as_bytes() {
+            return Ok(None);
+        }
+        let finish = format!("rebase (finish): returning to refs/heads/{branch}");
+        let abort = format!("rebase (abort): returning to refs/heads/{branch}");
+        let state =
+            if subject == finish.as_bytes() && self.is_ancestor(&record.inventory.base_oid, oid)? {
+                OperationState::Completed
+            } else if subject == abort.as_bytes() && oid == &record.inventory.head_oid {
+                OperationState::Aborted
+            } else {
+                return Ok(None);
+            };
+        // A concurrent HEAD/operation change invalidates this observation.
+        let after = self.git.snapshot()?;
+        if after.head != snapshot.head || after.operation != snapshot.operation {
+            return Ok(None);
+        }
+        Ok(Some(TerminalObservation {
+            state,
+            head_oid: oid.clone(),
+            reflog_subject: String::from_utf8_lossy(subject).into_owned(),
+        }))
     }
 
     fn inventory(&self, base_oid: &str, snapshot: &LocalSnapshot) -> Result<CommitInventory> {
@@ -1989,6 +2077,7 @@ impl RebaseStore {
             edit_stop: None,
             split: None,
             resulting_commits: Vec::new(),
+            terminal_observation: None,
             evidence: Vec::new(),
         }
     }
