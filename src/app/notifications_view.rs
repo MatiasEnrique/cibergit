@@ -699,12 +699,12 @@ impl NotificationController {
             return false;
         }
         if state.account.as_ref() == Some(&completion.account) {
-            if token_matches(&completion.token, self.lifetime, &key, state) {
-                if let Some(delay) = &completion.poll.x_poll_interval {
-                    state
-                        .server_gate
-                        .apply(delay, ServerGateReason::PollInterval, now, wall_now);
-                }
+            if token_matches(&completion.token, self.lifetime, &key, state)
+                && let Some(delay) = &completion.poll.x_poll_interval
+            {
+                state
+                    .server_gate
+                    .apply(delay, ServerGateReason::PollInterval, now, wall_now);
             }
             if let Some(delay) = &completion.poll.rate_limit {
                 state

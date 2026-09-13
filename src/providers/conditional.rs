@@ -190,13 +190,18 @@ pub(crate) fn parse_included_response(
         return Err(RestReadError::new(RestReadErrorKind::InvalidHeaders, poll));
     }
     let header = &output[..header_end];
-    let (status, fields, structural_error) = collect_header_fields(header)?;
-    let (poll, directive_error) = parse_poll_directive(status, &fields, structural_error.is_some());
-    if let Some(error) = structural_error.or(directive_error) {
+    let collected = collect_header_fields(header)?;
+    let (poll, directive_error) = parse_poll_directive(
+        collected.status,
+        &collected.fields,
+        collected.error.is_some(),
+    );
+    if let Some(error) = collected.error.or(directive_error) {
         return Err(error.with_poll(poll));
     }
-    let validators = parse_validators(&fields).map_err(|error| error.with_poll(poll.clone()))?;
-    let link = single(&fields, "link")
+    let validators =
+        parse_validators(&collected.fields).map_err(|error| error.with_poll(poll.clone()))?;
+    let link = single(&collected.fields, "link")
         .and_then(|value| {
             value
                 .map(|value| validate_visible(value, MAX_LINK_BYTES))
@@ -211,7 +216,7 @@ pub(crate) fn parse_included_response(
         poll: poll.clone(),
         body_bytes: body.len(),
     };
-    match status {
+    match collected.status {
         200 if process_success && !body.is_empty() => Ok(ConditionalGet::Modified {
             value: body.to_vec(),
             metadata,
@@ -222,9 +227,13 @@ pub(crate) fn parse_included_response(
     }
 }
 
-fn collect_header_fields(
-    header: &[u8],
-) -> Result<(u16, Vec<(String, String)>, Option<RestReadError>), RestReadError> {
+struct CollectedHeaderFields {
+    status: u16,
+    fields: Vec<(String, String)>,
+    error: Option<RestReadError>,
+}
+
+fn collect_header_fields(header: &[u8]) -> Result<CollectedHeaderFields, RestReadError> {
     let mut lines = header.split(|byte| *byte == b'\n');
     let status_bytes = lines.next().ok_or_else(|| {
         RestReadError::new(
@@ -292,14 +301,18 @@ fn collect_header_fields(
         }
         fields.push((name.to_ascii_lowercase(), value.trim().to_owned()));
     }
-    Ok((status, fields, error))
+    Ok(CollectedHeaderFields {
+        status,
+        fields,
+        error,
+    })
 }
 
 fn rejected_header_poll(prefix: &[u8]) -> RestPollDirective {
-    let Ok((status, fields, _)) = collect_header_fields(prefix) else {
+    let Ok(collected) = collect_header_fields(prefix) else {
         return RestPollDirective::default();
     };
-    parse_poll_directive(status, &fields, true).0
+    parse_poll_directive(collected.status, &collected.fields, true).0
 }
 
 fn parse_poll_directive(
@@ -313,12 +326,14 @@ fn parse_poll_directive(
     let (x_poll_interval, x_poll_error) = capture_decimal(fields, "x-poll-interval");
     let rate_limit = rate_limit_delay(
         status,
-        &retry_after,
-        retry_error.is_some(),
-        remaining,
-        remaining_error.is_some(),
-        &reset,
-        reset_error.is_some(),
+        &ParsedRateHeaders {
+            retry_after: &retry_after,
+            retry_error: retry_error.is_some(),
+            remaining,
+            remaining_error: remaining_error.is_some(),
+            reset: &reset,
+            reset_error: reset_error.is_some(),
+        },
         structural_error,
     );
     let mut poll = RestPollDirective {
@@ -470,27 +485,37 @@ fn bounded_delay(value: &ParsedDecimal) -> Option<BoundedDelay> {
     }
 }
 
+struct ParsedRateHeaders<'a> {
+    retry_after: &'a ParsedDecimal,
+    retry_error: bool,
+    remaining: Option<&'a str>,
+    remaining_error: bool,
+    reset: &'a ParsedDecimal,
+    reset_error: bool,
+}
+
 fn rate_limit_delay(
     status: u16,
-    retry_after: &ParsedDecimal,
-    retry_error: bool,
-    remaining: Option<&str>,
-    remaining_error: bool,
-    reset: &ParsedDecimal,
-    reset_error: bool,
+    rate: &ParsedRateHeaders<'_>,
     structural_error: bool,
 ) -> Option<BoundedDelay> {
     if matches!(status, 403 | 429) {
-        if let Some(delay) = bounded_delay(retry_after) {
+        if let Some(delay) = bounded_delay(rate.retry_after) {
             return Some(delay);
         }
-        if retry_error || remaining_error || reset_error || (status == 429 && structural_error) {
+        if rate.retry_error
+            || rate.remaining_error
+            || rate.reset_error
+            || (status == 429 && structural_error)
+        {
             return Some(BoundedDelay::Suspend);
         }
     }
     match status {
-        429 => Some(rate_delay(retry_after, remaining, reset)),
-        403 if remaining == Some("0") => Some(rate_delay(retry_after, remaining, reset)),
+        429 => Some(rate_delay(rate.retry_after, rate.remaining, rate.reset)),
+        403 if rate.remaining == Some("0") => {
+            Some(rate_delay(rate.retry_after, rate.remaining, rate.reset))
+        }
         _ => None,
     }
 }
@@ -536,7 +561,7 @@ fn validate_etag(value: &str) -> Result<&str, RestReadError> {
         || !opaque.ends_with('"')
         || opaque[1..opaque.len() - 1]
             .bytes()
-            .any(|byte| byte == b'"' || byte < 0x21 || byte > 0x7e)
+            .any(|byte| byte == b'"' || !(0x21..=0x7e).contains(&byte))
     {
         return Err(RestReadError::new(
             RestReadErrorKind::InvalidHeaders,

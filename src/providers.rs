@@ -1451,10 +1451,10 @@ impl<'a> Session<'a> {
             "--header",
             API_VERSION,
         ]);
-        if let Some(validators) = validators {
-            if let Some((name, value)) = validators.request_header() {
-                command.arg("--header").arg(format!("{name}: {value}"));
-            }
+        if let Some(validators) = validators
+            && let Some((name, value)) = validators.request_header()
+        {
+            command.arg("--header").arg(format!("{name}: {value}"));
         }
         command.arg(endpoint);
         let output = self
@@ -2352,10 +2352,14 @@ impl Runner {
                     }
                 }
             }
-            if status.is_some() && input_done && stdout_done && stderr_done {
+            if let Some(status) = status
+                && input_done
+                && stdout_done
+                && stderr_done
+            {
                 return Ok(RunnerOutput {
                     stdout: output.unwrap_or_default(),
-                    status: status.expect("completed subprocess has status"),
+                    status,
                 });
             }
             if !input_done && started.elapsed() >= self.input_timeout.unwrap_or(self.timeout) {
