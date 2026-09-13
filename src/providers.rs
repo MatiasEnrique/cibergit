@@ -1008,7 +1008,7 @@ const DETAILS_QUERY: &str = r#"query PullRequestDetails(
   repository(owner: $owner, name: $name) {
     nameWithOwner
     pullRequest(number: $number) {
-      number url body state isDraft maintainerCanModify canBeRebased
+      number url headRefOid body state isDraft maintainerCanModify canBeRebased
       viewerCanUpdateBranch mergeable mergeStateStatus reviewDecision
       autoMergeRequest { enabledAt }
       isInMergeQueue
@@ -1138,6 +1138,7 @@ struct DetailsRepository {
 struct DetailsPull {
     number: u64,
     url: String,
+    head_ref_oid: String,
     body: String,
     state: String,
     is_draft: bool,
@@ -1298,6 +1299,7 @@ struct DetailsOverview {
 }
 
 struct DetailsBuilder {
+    head_oid: Option<String>,
     overview: Option<DetailsOverview>,
     issue_comments: Vec<IssueComment>,
     reviews: Vec<PullRequestReview>,
@@ -1314,6 +1316,7 @@ struct DetailsBuilder {
 impl Default for DetailsBuilder {
     fn default() -> Self {
         Self {
+            head_oid: None,
             overview: None,
             issue_comments: Vec::new(),
             reviews: Vec::new(),
@@ -1338,6 +1341,15 @@ impl DetailsBuilder {
         first: bool,
     ) -> Result<DetailsCursors> {
         let number = pull.number;
+        validate_sha(&pull.head_ref_oid)?;
+        if let Some(head) = &self.head_oid {
+            ensure!(
+                head == &pull.head_ref_oid,
+                "PR head changed during collaboration pagination; refresh to retry"
+            );
+        } else {
+            self.head_oid = Some(pull.head_ref_oid.clone());
+        }
         if partial {
             self.activity_complete = false;
             self.checks_complete = false;
@@ -2336,10 +2348,10 @@ else:
         }
     }
 
-    #[test]
-    fn details_pages_activity_and_checks_and_marks_partial_history() {
-        let overview = json!({
+    fn details_overview() -> Value {
+        json!({
             "number": 1,
+            "headRefOid": "b".repeat(40),
             "url": "https://github.com/owner/repo/pull/1",
             "body": "Overview body",
             "state": "OPEN",
@@ -2355,7 +2367,42 @@ else:
             "reviewRequests": {"nodes": [{"requestedReviewer": {"login": "reviewer"}}, {"requestedReviewer": {"slug": "maintainers"}}], "pageInfo": {"hasNextPage": false, "endCursor": null}},
             "assignees": {"nodes": [{"login": "assignee"}], "pageInfo": {"hasNextPage": false, "endCursor": null}},
             "labels": {"nodes": [{"name": "bug"}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+        })
+    }
+
+    #[test]
+    fn details_rejects_check_pages_from_different_heads() {
+        let mut first = details_overview();
+        first["statusCheckRollup"] = json!({
+            "state": "SUCCESS", "contexts": { "nodes": [],
+                "pageInfo": { "hasNextPage": true, "endCursor": "old-head-checks" } }
         });
+        let mut second = details_overview();
+        second["headRefOid"] = "c".repeat(40).into();
+        second["statusCheckRollup"] = json!({
+            "state": "FAILURE", "contexts": { "nodes": [],
+                "pageInfo": { "hasNextPage": false, "endCursor": null } }
+        });
+        let response = |pull| {
+            json!({"data": {"repository": {
+                "nameWithOwner": "owner/repo", "pullRequest": pull
+            }}})
+        };
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                details_step(response(first), json!({"checksCursor": null})),
+                details_step(response(second), json!({"checksCursor": "old-head-checks"})),
+            ],
+        );
+        let error = provider.details(&repo("alice"), 1).unwrap_err();
+        assert!(error.to_string().contains("head changed"));
+        exhausted(&dir, 2);
+    }
+
+    #[test]
+    fn details_pages_activity_and_checks_and_marks_partial_history() {
+        let overview = details_overview();
         let mut first = overview.clone();
         first["comments"] = json!({
             "nodes": [{"id": "IC1", "author": {"login": "one"}, "body": "first", "createdAt": "2026-09-12T10:00:00Z", "updatedAt": "2026-09-12T10:00:00Z", "url": "https://github.com/owner/repo/pull/1#issuecomment-1"}],
