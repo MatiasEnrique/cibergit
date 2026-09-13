@@ -37,6 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod notifications;
 mod pr_lifecycle;
 mod stacks;
 pub use pr_lifecycle::{AdmittedMutationAttempt, MutationAdmission};
