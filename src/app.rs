@@ -783,6 +783,9 @@ impl ActionJournalCompletionToken {
     }
 }
 
+type ActionJournalReconciliationResult =
+    Result<(usize, Vec<String>, Vec<JournalOperation>), String>;
+
 fn issue_comment_is_editable(tab: &ReviewTab, comment: &cibergit::domain::IssueComment) -> bool {
     tab.details.is_some() && tab.lifecycle.current_user_comment(comment)
 }
@@ -5247,6 +5250,7 @@ impl ReviewWorkspace {
             .and_then(|index| self.tabs.get(index))
             .map(|tab| tab.pull_request.number)
             .unwrap_or_default();
+        let mut second_requested = false;
         if let Some(second) = second_pr.filter(|second| *second != primary_number)
             && let Some(active) = self.active_tab
             && let Some(repository_index) = self.repositories.iter().position(|runtime| {
@@ -5254,16 +5258,47 @@ impl ReviewWorkspace {
             })
         {
             self.open_pr(repository_index, second, cx);
+            second_requested = true;
         }
         let weak = cx.weak_entity();
         window
             .spawn(cx, async move |window| {
                 let started = std::time::Instant::now();
+                let readiness_satisfied: bool;
                 loop {
                     window
                         .background_executor()
                         .timer(Duration::from_millis(250))
                         .await;
+                    if !second_requested
+                        && let Some(second) = second_pr.filter(|second| *second != primary_number)
+                    {
+                        second_requested = window
+                            .update(|_, cx| {
+                                weak.update(cx, |root, cx| {
+                                    let Root::Review(this) = root else { return false };
+                                    let Some(repository_key) = this
+                                        .tabs
+                                        .iter()
+                                        .find(|tab| tab.pull_request.number == primary_number)
+                                        .map(|tab| tab.repository.cache_key())
+                                    else {
+                                        return false;
+                                    };
+                                    let Some(repository_index) =
+                                        this.repositories.iter().position(|runtime| {
+                                            runtime.repository.cache_key() == repository_key
+                                        })
+                                    else {
+                                        return false;
+                                    };
+                                    this.open_pr(repository_index, second, cx);
+                                    true
+                                })
+                                .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                    }
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
@@ -5282,11 +5317,58 @@ impl ReviewWorkspace {
                             .unwrap_or(false)
                         })
                         .unwrap_or(false);
-                    if ready || started.elapsed() > Duration::from_secs(90) {
+                    if ready {
+                        readiness_satisfied = true;
+                        break;
+                    }
+                    if started.elapsed() > Duration::from_secs(90) {
+                        readiness_satisfied = false;
                         break;
                     }
                 }
                 let _ = std::fs::create_dir_all(&output);
+                if !readiness_satisfied {
+                    let readiness = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                let Root::Review(this) = root else {
+                                    return "workspace=not-review".to_owned();
+                                };
+                                [Some(primary_number), second_pr]
+                                    .into_iter()
+                                    .flatten()
+                                    .map(|number| {
+                                        let Some(tab) = this
+                                            .tabs
+                                            .iter()
+                                            .find(|tab| tab.pull_request.number == number)
+                                        else {
+                                            return format!("PR #{number}: tab=missing");
+                                        };
+                                        format!(
+                                            "PR #{number}: tab=present details={} lifecycle_snapshot={} lifecycle_choices={} lifecycle_not_loading={} lifecycle_notice={:?}",
+                                            tab.details.is_some(),
+                                            tab.lifecycle.snapshot.is_some(),
+                                            tab.lifecycle.choices.is_some(),
+                                            !matches!(tab.lifecycle_state, LoadState::Loading(_)),
+                                            tab.lifecycle_state.notice(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_else(|error| format!("entity unavailable: {error:#}"))
+                        })
+                        .unwrap_or_else(|error| format!("window unavailable: {error:#}"));
+                    let report = format!(
+                        "Native lifecycle readiness failed before synthetic submitted-review scenes.\n{readiness}\nMutation transport: not invoked; ZERO updatePullRequestReview and zero live writes.\n"
+                    );
+                    let _ = std::fs::write(
+                        output.join("native-lifecycle-readiness-failure.txt"),
+                        &report,
+                    );
+                    panic!("native lifecycle readiness failed before synthetic scenes: {readiness}");
+                }
                 let _ = window.update(|window, cx| {
                     let _ = weak.update(cx, |root, cx| {
                         if let Root::Review(this) = root
@@ -5609,7 +5691,7 @@ impl ReviewWorkspace {
                             this.begin_submitted_summary_edit(review, window, cx);
                             let per_review_draft_routing =
                                 repeated_a_retained && a_after_b_retained && b_after_a_retained;
-                            let mut cross_tab_routing = second_pr.is_none();
+                            let mut cross_tab_editor_restore = second_pr.is_none();
                             if let Some(second) = second_pr
                                 && let Some(second_index) = this
                                     .tabs
@@ -5628,7 +5710,7 @@ impl ReviewWorkspace {
                                     .read(cx)
                                     .value()
                                     .contains("zero update mutation transport");
-                                cross_tab_routing = secondary_empty && primary_restored;
+                                cross_tab_editor_restore = secondary_empty && primary_restored;
                             }
                             this.prepare_submitted_summary_confirmation(cx);
                             let Some(NativeConfirmation::UpdateSubmittedSummary {
@@ -5647,6 +5729,7 @@ impl ReviewWorkspace {
                                 confirmation_generation: *generation,
                                 action: action.as_ref().clone(),
                             };
+                            let mut cross_tab_stale_handler = second_pr.is_none();
                             if let Some(second) = second_pr
                                 && let Some(second_index) = this
                                     .tabs
@@ -5669,11 +5752,16 @@ impl ReviewWorkspace {
                                         )
                                     });
                                 this.activate_tab(index, window, cx);
-                                cross_tab_routing &=
+                                cross_tab_stale_handler =
                                     stale_cancel_rejected && primary_confirmation_retained;
                             }
                             this.inspector_scroll.set_offset(point(px(0.), px(0.)));
-                            Ok((token, per_review_draft_routing, cross_tab_routing))
+                            Ok((
+                                token,
+                                per_review_draft_routing,
+                                cross_tab_editor_restore,
+                                cross_tab_stale_handler,
+                            ))
                         })
                         .unwrap_or_else(|error| Err(format!("smoke entity unavailable: {error:#}")))
                     })
@@ -5695,7 +5783,7 @@ impl ReviewWorkspace {
                                 .is_ok()
                         })
                         .unwrap_or(false);
-                let submitted_cancelled = if let Ok((token, _, _)) = &submitted_scene {
+                let submitted_cancelled = if let Ok((token, _, _, _)) = &submitted_scene {
                     window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
@@ -5709,7 +5797,7 @@ impl ReviewWorkspace {
                     false
                 };
                 let confirmation_aba_guard = if submitted_cancelled
-                    && let Ok((old_token, _, _)) = &submitted_scene
+                    && let Ok((old_token, _, _, _)) = &submitted_scene
                 {
                     window
                         .update(|_, cx| {
@@ -5763,10 +5851,13 @@ impl ReviewWorkspace {
                 };
                 let per_review_draft_routing = submitted_scene
                     .as_ref()
-                    .is_ok_and(|(_, routed, _)| *routed);
-                let multi_tab_routing = submitted_scene
+                    .is_ok_and(|(_, routed, _, _)| *routed);
+                let cross_tab_editor_restore = submitted_scene
                     .as_ref()
-                    .is_ok_and(|(_, _, routed)| *routed);
+                    .is_ok_and(|(_, _, restored, _)| *restored);
+                let cross_tab_stale_handler = submitted_scene
+                    .as_ref()
+                    .is_ok_and(|(_, _, _, rejected)| *rejected);
                 let submitted_draft_retained = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
@@ -5847,32 +5938,90 @@ impl ReviewWorkspace {
                     .unwrap_or(false);
                 let late_journal_callback_fenced = window
                     .update(|_, cx| {
-                        weak.read_with(cx, |root, _| {
+                        weak.update(cx, |root, _| {
                             let Root::Review(this) = root else { return false };
                             let Some(index) = this.active_tab else { return false };
-                            let tab = &this.tabs[index];
-                            let token = ActionJournalCompletionToken {
-                                workspace_instance: this.workspace_instance,
-                                tab_instance: tab.instance_generation,
-                                repository_key: tab.repository.cache_key(),
-                                pull_request: tab.pull_request.number,
+                            let workspace_instance = this.workspace_instance;
+                            let tab_instance = this.tabs[index].instance_generation;
+                            let repository_key = this.tabs[index].repository.cache_key();
+                            let pull_request = this.tabs[index].pull_request.number;
+                            let sentinel = JournalOperation {
+                                request: JournalRequest::Auxiliary(Box::new(
+                                    ReviewAuxiliaryRequest {
+                                        operation_id: "native-reconciliation-sentinel".into(),
+                                        attempt_id: "native-reconciliation-sentinel-attempt"
+                                            .into(),
+                                        action: ReviewAuxiliaryAction::Reply {
+                                            thread: cibergit::domain::ProviderCoordinates {
+                                                provider: "github".into(),
+                                                host: this.tabs[index].repository.host.clone(),
+                                                owner: this.tabs[index].repository.owner.clone(),
+                                                repository: this.tabs[index]
+                                                    .repository
+                                                    .name
+                                                    .clone(),
+                                                pull_request,
+                                                remote_id: "native-sentinel-thread".into(),
+                                            },
+                                            pending_review: None,
+                                            body: "native sentinel body".into(),
+                                        },
+                                    },
+                                )),
+                                status: JournalStatus::Uncertain {
+                                    reason: "native sentinel outcome".into(),
+                                },
                             };
-                            token.matches_values(
-                                this.workspace_instance,
-                                tab.instance_generation,
-                                &tab.repository.cache_key(),
-                                tab.pull_request.number,
-                            ) && !token.matches_values(
-                                this.workspace_instance.wrapping_add(1),
-                                tab.instance_generation,
-                                &tab.repository.cache_key(),
-                                tab.pull_request.number,
-                            ) && !token.matches_values(
-                                this.workspace_instance,
-                                tab.instance_generation.wrapping_add(1),
-                                &tab.repository.cache_key(),
-                                tab.pull_request.number,
-                            )
+                            let saved_operations = std::mem::replace(
+                                &mut this.tabs[index].journal_operations,
+                                vec![sentinel.clone()],
+                            );
+                            let saved_error = this.tabs[index]
+                                .journal_error
+                                .replace("native sentinel journal error".into());
+                            let saved_busy = std::mem::replace(
+                                &mut this.tabs[index].write_in_flight,
+                                true,
+                            );
+                            let saved_status = this.status.clone();
+                            let stale_workspace = ActionJournalCompletionToken {
+                                workspace_instance: workspace_instance.wrapping_add(1),
+                                tab_instance,
+                                repository_key: repository_key.clone(),
+                                pull_request,
+                            };
+                            let rejected_success = this
+                                .apply_action_journal_completion(
+                                    &stale_workspace,
+                                    Ok((1, Vec::new(), Vec::new())),
+                                )
+                                .is_none()
+                                && this.tabs[index].write_in_flight
+                                && this.tabs[index].journal_operations == [sentinel.clone()]
+                                && this.tabs[index].journal_error.as_deref()
+                                    == Some("native sentinel journal error")
+                                && this.status == saved_status;
+                            let stale_tab = ActionJournalCompletionToken {
+                                workspace_instance,
+                                tab_instance: tab_instance.wrapping_add(1),
+                                repository_key,
+                                pull_request,
+                            };
+                            let rejected_error = this
+                                .apply_action_journal_completion(
+                                    &stale_tab,
+                                    Err("synthetic late reconciliation error".into()),
+                                )
+                                .is_none()
+                                && this.tabs[index].write_in_flight
+                                && this.tabs[index].journal_operations == [sentinel]
+                                && this.tabs[index].journal_error.as_deref()
+                                    == Some("native sentinel journal error")
+                                && this.status == saved_status;
+                            this.tabs[index].journal_operations = saved_operations;
+                            this.tabs[index].journal_error = saved_error;
+                            this.tabs[index].write_in_flight = saved_busy;
+                            rejected_success && rejected_error
                         })
                         .unwrap_or(false)
                     })
@@ -5892,11 +6041,12 @@ impl ReviewWorkspace {
                     && submitted_draft_retained
                     && changed_source_draft_retained
                     && per_review_draft_routing
-                    && multi_tab_routing
+                    && cross_tab_editor_restore
+                    && cross_tab_stale_handler
                     && late_journal_callback_fenced
                     && unchanged;
                 let report = format!(
-                    "Native PR lifecycle and submitted-summary smoke: {}\nReal read-only provider preparation: cli/cli snapshot title {:?}, selected account {}, values_complete={}, capabilities_complete={}\nSynthetic metadata confirmation capture: {}\nSynthetic exact-ID discussion confirmation capture: {}\nClearly labelled synthetic owned-review summary confirmation capture: {}\nSubmitted-summary cancellation through exact native handler: {}\nCancelled/reprepared identical confirmation rejects the stale native handler token: {}\nPer-review A→B→A and repeated-edit typed drafts retained: {}\nCross-tab editor restore and stale handler routing rejected: {}\nChanged-source rejection plus explicit refresh retained typed draft: {}\nLate journal reconciliation completion fenced by workspace and tab lifetime: {}\nCanonical and selected comparison identities unchanged: {}\nMutation transport: not invoked; ZERO updatePullRequestReview and zero live metadata/comment/review/merge writes\nWindow focus requested: false when CIBERGIT_SMOKE_BACKGROUND=1\nPhysical input is not implied by an in-process scene render.\n",
+                    "Native PR lifecycle and submitted-summary smoke: {}\nReal read-only provider preparation: cli/cli snapshot title {:?}, selected account {}, values_complete={}, capabilities_complete={}\nSynthetic metadata confirmation capture: {}\nSynthetic exact-ID discussion confirmation capture: {}\nClearly labelled synthetic owned-review summary confirmation capture: {}\nSubmitted-summary cancellation through exact native handler: {}\nCancelled/reprepared identical confirmation rejects the stale native handler token: {}\nPer-review A→B→A and repeated-edit typed drafts retained: {}\nCross-tab editor save/restore retained exact typed draft: {}\nCross-tab stale confirmation handler rejected and original retained: {}\nChanged-source rejection plus explicit refresh retained typed draft: {}\nActual journal completion apply rejected stale success and error without changing busy/sentinel state: {}\nCanonical and selected comparison identities unchanged: {}\nMutation transport: not invoked; ZERO updatePullRequestReview and zero live metadata/comment/review/merge writes\nWindow focus requested: false when CIBERGIT_SMOKE_BACKGROUND=1\nPhysical input is not implied by an in-process scene render.\n",
                     if passed { "passed" } else { "failed" },
                     real_title,
                     viewer,
@@ -5908,7 +6058,8 @@ impl ReviewWorkspace {
                     submitted_cancelled,
                     confirmation_aba_guard,
                     submitted_draft_retained && per_review_draft_routing,
-                    multi_tab_routing,
+                    cross_tab_editor_restore,
+                    cross_tab_stale_handler,
                     changed_source_draft_retained,
                     late_journal_callback_fenced,
                     unchanged,
@@ -8832,45 +8983,54 @@ impl ReviewWorkspace {
             Ok::<_, anyhow::Error>((resolved, still_uncertain, operations))
         });
         cx.spawn(async move |root, cx| {
-            let result = task.await;
+            let result = task.await.map_err(|error| format!("{error:#}"));
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
-                let Some(index) = this.tabs.iter().position(|tab| {
-                    completion.matches_values(
-                        this.workspace_instance,
-                        tab.instance_generation,
-                        &tab.repository.cache_key(),
-                        tab.pull_request.number,
-                    )
-                }) else {
+                let Some(index) = this.apply_action_journal_completion(&completion, result) else {
                     return;
-                };
-                this.tabs[index].write_in_flight = false;
-                this.status = match result {
-                    Ok((resolved, uncertain, operations)) => {
-                        this.tabs[index].journal_operations = operations;
-                        this.tabs[index].journal_error = None;
-                        if uncertain.is_empty() {
-                            format!(
-                                "Authoritative reconciliation resolved {resolved} auxiliary / merge action(s); explicit retry is allowed only for proven NotApplied attempts."
-                            )
-                        } else {
-                            format!(
-                                "Resolved {resolved} auxiliary / merge action(s); {} remain frozen. {} No replay occurred.",
-                                uncertain.len(),
-                                uncertain.join(" | ")
-                            )
-                        }
-                    }
-                    Err(error) => format!(
-                        "Authoritative reconciliation read failed; journal remains frozen: {error:#}"
-                    ),
                 };
                 this.refresh_details(index, cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn apply_action_journal_completion(
+        &mut self,
+        completion: &ActionJournalCompletionToken,
+        result: ActionJournalReconciliationResult,
+    ) -> Option<usize> {
+        let index = self.tabs.iter().position(|tab| {
+            completion.matches_values(
+                self.workspace_instance,
+                tab.instance_generation,
+                &tab.repository.cache_key(),
+                tab.pull_request.number,
+            )
+        })?;
+        self.tabs[index].write_in_flight = false;
+        self.status = match result {
+            Ok((resolved, uncertain, operations)) => {
+                self.tabs[index].journal_operations = operations;
+                self.tabs[index].journal_error = None;
+                if uncertain.is_empty() {
+                    format!(
+                        "Authoritative reconciliation resolved {resolved} auxiliary / merge action(s); explicit retry is allowed only for proven NotApplied attempts."
+                    )
+                } else {
+                    format!(
+                        "Resolved {resolved} auxiliary / merge action(s); {} remain frozen. {} No replay occurred.",
+                        uncertain.len(),
+                        uncertain.join(" | ")
+                    )
+                }
+            }
+            Err(error) => {
+                format!("Authoritative reconciliation read failed; journal remains frozen: {error}")
+            }
+        };
+        Some(index)
     }
 
     fn reconcile_review_operations(&mut self, cx: &mut Context<Root>) {
