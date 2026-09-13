@@ -135,6 +135,21 @@ macro_rules! provider_lifecycle_tests {
             json!({"transport":"get","endpoint":endpoint,"response":response})
         }
 
+        fn update_graphql_step(
+            field: &str,
+            variables: Value,
+            fixture_before: Value,
+            fixture_after: Value,
+            response: Value,
+        ) -> Value {
+            json!({
+                "transport":"graphql", "marker":"mutation UpdatePullRequestMetadata(",
+                "variables":variables, "response":response, "write":true,
+                "update_field":field, "fixture_before":fixture_before,
+                "fixture_after":fixture_after,
+            })
+        }
+
         fn failing_write(marker: &str, variables: Value) -> Value {
             json!({
                 "transport":"graphql", "marker":marker, "variables":variables,
@@ -153,7 +168,7 @@ macro_rules! provider_lifecycle_tests {
             fs::write(
                 &executable,
                 r#"#!/usr/bin/python3
-import json, os, pathlib, sys
+import json, os, pathlib, re, sys
 root = pathlib.Path(__file__).parent
 config = json.loads((root / 'steps.json').read_text())
 args = sys.argv[1:]
@@ -184,7 +199,18 @@ elif transport == 'graphql':
     assert step['marker'] in payload['query']
     assert payload['variables'] == step['variables']
     if 'mutation UpdatePullRequestMetadata(' in query:
-        assert 'updatePullRequest(input: { pullRequestId: $pullRequestId, title: $title, body: $body, baseRefName: $baseRefName, clientMutationId: $clientMutationId })' in query
+        update_field = step['update_field']
+        match = re.search(r'updatePullRequest\(input: \{([^}]*)\}\)', query)
+        assert match is not None
+        assignments = re.findall(r'(\w+): \$(\w+)', match.group(1))
+        expected = [('pullRequestId', 'pullRequestId'), (update_field, update_field), ('clientMutationId', 'clientMutationId')]
+        assert assignments == expected, assignments
+        assert set(payload['variables']) == {name for name, _ in expected}
+        for candidate in ['title', 'body', 'baseRefName']:
+            assert (f'${candidate}:' in query) == (candidate == update_field)
+        applied = dict(step['fixture_before'])
+        applied[update_field] = payload['variables'][update_field]
+        assert applied == step['fixture_after'], applied
     if 'mutation ConvertPullRequestToDraftLifecycle(' in query:
         assert 'convertPullRequestToDraft(input: { pullRequestId: $pullRequestId, clientMutationId: $clientMutationId })' in query
     if 'mutation MarkPullRequestReadyForReviewLifecycle(' in query:
@@ -380,6 +406,21 @@ else:
             json!({"data":{field:{"clientMutationId":operation,"pullRequest":{"id":id}}}})
         }
 
+        fn issue_ack(assignees: &[&str]) -> Value {
+            json!({
+                "number":7,
+                "html_url":"https://github.com/owner/repo/issues/7",
+                "pull_request":{
+                    "url":"https://api.github.com/repos/owner/repo/pulls/7",
+                    "html_url":"https://github.com/owner/repo/pull/7",
+                    "diff_url":"https://github.com/owner/repo/pull/7.diff",
+                    "patch_url":"https://github.com/owner/repo/pull/7.patch",
+                    "merged_at":null
+                },
+                "assignees":assignees.iter().map(|login| json!({"login":login})).collect::<Vec<_>>()
+            })
+        }
+
         #[test]
         fn lifecycle_snapshot_binds_account_node_and_reports_incomplete_values() {
             let _serial = lifecycle_test_lock();
@@ -440,17 +481,17 @@ else:
             let under_lock = lifecycle_response("alice", "OPEN", false, "old title", "body-b", "main", &[], &[], &[]);
             let observed = lifecycle_response("alice", "OPEN", false, "new title", "body-b", "main", &[], &[], &[]);
             let variables = json!({
-                "pullRequestId":"PR_node","title":"new title","body":null,
-                "baseRefName":null,"clientMutationId":"op-title"
+                "pullRequestId":"PR_node","title":"new title","clientMutationId":"op-title"
             });
             let steps = vec![
                 lifecycle_step(initial),
                 lifecycle_step(under_lock),
-                graphql_step(
-                    "mutation UpdatePullRequestMetadata(",
+                update_graphql_step(
+                    "title",
                     variables,
+                    json!({"title":"old title","body":"body-b","baseRefName":"main"}),
+                    json!({"title":"new title","body":"body-b","baseRefName":"main"}),
                     lifecycle_ack("updatePullRequest", "op-title", "PR_node"),
-                    true,
                 ),
                 lifecycle_step(observed),
             ];
@@ -467,10 +508,84 @@ else:
             assert_eq!(state.contexts.len(), 1);
             assert_eq!(state.records.len(), 1);
             assert!(matches!(state.records[0], MutationTerminalRecord::Acknowledged { .. }));
-            assert_eq!(
-                state.contexts[0].payload.pointer("/dispatch/variables/body"),
-                Some(&Value::Null)
-            );
+            let dispatched = state.contexts[0]
+                .payload
+                .pointer("/dispatch/variables")
+                .and_then(Value::as_object)
+                .unwrap();
+            assert_eq!(dispatched.len(), 3);
+            assert!(!dispatched.contains_key("body"));
+            assert!(!dispatched.contains_key("baseRefName"));
+        }
+
+        #[test]
+        fn body_clear_and_base_update_each_send_only_the_requested_delta() {
+            let _serial = lifecycle_test_lock();
+            let body_request = PullRequestLifecycleRequest {
+                operation_id: "op-body".into(),
+                attempt_id: "attempt-body".into(),
+                target: mutation_target("OPEN"),
+                action: PullRequestLifecycleAction::UpdateBody {
+                    observed: "old body".into(),
+                    value: String::new(),
+                },
+            };
+            let body_steps = vec![
+                lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "old body", "main", &[], &[], &[])),
+                lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "old body", "main", &[], &[], &[])),
+                update_graphql_step(
+                    "body",
+                    json!({"pullRequestId":"PR_node","body":"","clientMutationId":"op-body"}),
+                    json!({"title":"title","body":"old body","baseRefName":"main"}),
+                    json!({"title":"title","body":"","baseRefName":"main"}),
+                    lifecycle_ack("updatePullRequest", "op-body", "PR_node"),
+                ),
+                lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "", "main", &[], &[], &[])),
+            ];
+            let (body_dir, body_provider) = lifecycle_fixture("alice", body_steps);
+            let mut body_admission = FakeAdmission::new();
+            assert!(matches!(
+                body_provider.execute_pr_lifecycle(
+                    &lifecycle_repo("alice"),
+                    &body_request,
+                    &mut body_admission,
+                ),
+                ProviderMutationOutcome::Acknowledged(_)
+            ));
+            assert_eq!(file_count(&body_dir, "writes"), 1);
+
+            let base_request = PullRequestLifecycleRequest {
+                operation_id: "op-base".into(),
+                attempt_id: "attempt-base".into(),
+                target: mutation_target("OPEN"),
+                action: PullRequestLifecycleAction::UpdateBaseBranch {
+                    observed: "main".into(),
+                    value: "release".into(),
+                },
+            };
+            let base_steps = vec![
+                lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &[])),
+                lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &[])),
+                update_graphql_step(
+                    "baseRefName",
+                    json!({"pullRequestId":"PR_node","baseRefName":"release","clientMutationId":"op-base"}),
+                    json!({"title":"title","body":"body","baseRefName":"main"}),
+                    json!({"title":"title","body":"body","baseRefName":"release"}),
+                    lifecycle_ack("updatePullRequest", "op-base", "PR_node"),
+                ),
+                lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "release", &[], &[], &[])),
+            ];
+            let (base_dir, base_provider) = lifecycle_fixture("alice", base_steps);
+            let mut base_admission = FakeAdmission::new();
+            assert!(matches!(
+                base_provider.execute_pr_lifecycle(
+                    &lifecycle_repo("alice"),
+                    &base_request,
+                    &mut base_admission,
+                ),
+                ProviderMutationOutcome::Acknowledged(_)
+            ));
+            assert_eq!(file_count(&base_dir, "writes"), 1);
         }
 
         #[test]
@@ -667,7 +782,13 @@ else:
             let steps = vec![
                 lifecycle_step(lifecycle_response("alice", "OPEN", false, "old title", "body", "main", &[], &[], &[])),
                 lifecycle_step(lifecycle_response("alice", "OPEN", false, "old title", "body", "main", &[], &[], &[])),
-                graphql_step("mutation UpdatePullRequestMetadata(", json!({"pullRequestId":"PR_node","title":"new title","body":null,"baseRefName":null,"clientMutationId":"op-title"}), lifecycle_ack("updatePullRequest", "op-title", "PR_node"), true),
+                update_graphql_step(
+                    "title",
+                    json!({"pullRequestId":"PR_node","title":"new title","clientMutationId":"op-title"}),
+                    json!({"title":"old title","body":"body","baseRefName":"main"}),
+                    json!({"title":"new title","body":"body","baseRefName":"main"}),
+                    lifecycle_ack("updatePullRequest", "op-title", "PR_node"),
+                ),
                 lifecycle_step(lifecycle_response("alice", "OPEN", false, "new title", "body", "main", &[], &[], &[])),
             ];
             let (dir, provider) = lifecycle_fixture("alice", steps);
@@ -705,16 +826,150 @@ else:
             assert!(matches!(admission.state.borrow().records.as_slice(), [MutationTerminalRecord::Uncertain { .. }]));
         }
 
-        fn comment_response(id: &str, number: u64, author: &str, body: &str) -> Value {
-            json!({"data":{"viewer":{"login":"alice"},"node":{
+        fn comment_ack_node(id: &str, number: u64, author: &str, body: &str) -> Value {
+            json!({
                 "id":id,"body":body,"createdAt":"2026-09-13T10:00:00Z",
                 "updatedAt":"2026-09-13T11:00:00Z","url":format!("https://GITHUB.com/OWNER/REPO/pull/{number}#issuecomment-1"),
-                "author":{"login":author},"viewerCanUpdate":true,"viewerCanDelete":true,
+                "author":{"login":author},
                 "repository":{"nameWithOwner":"OWNER/REPO"},
                 "pullRequest":{"id":"PR_node","number":number,
                     "url":format!("https://GITHUB.com/OWNER/REPO/pull/{number}"),
                     "repository":{"nameWithOwner":"OWNER/REPO"}}
-            }}})
+            })
+        }
+
+        fn comment_response(id: &str, number: u64, author: &str, body: &str) -> Value {
+            let mut node = comment_ack_node(id, number, author, body);
+            node["viewerCanUpdate"] = json!(true);
+            node["viewerCanDelete"] = json!(true);
+            json!({"data":{"viewer":{"login":"alice"},"node":node}})
+        }
+
+        #[test]
+        fn production_shaped_comment_create_and_edit_acknowledgements_need_no_capabilities() {
+            let _serial = lifecycle_test_lock();
+            let create_request = PullRequestDiscussionRequest {
+                operation_id: "op-create-comment".into(),
+                attempt_id: "attempt-create-comment".into(),
+                target: mutation_target("OPEN"),
+                action: PullRequestDiscussionAction::Create { body: "hello".into() },
+            };
+            let create_ack = json!({"data":{"addComment":{
+                "clientMutationId":"op-create-comment",
+                "subject":{"id":"PR_node","number":7,
+                    "url":"https://github.com/owner/repo/pull/7",
+                    "repository":{"nameWithOwner":"owner/repo"}},
+                "commentEdge":{"node":comment_ack_node("COMMENT_2", 7, "alice", "hello")}
+            }}});
+            assert!(create_ack.pointer("/data/addComment/commentEdge/node/viewerCanUpdate").is_none());
+            assert!(create_ack.pointer("/data/addComment/commentEdge/node/viewerCanDelete").is_none());
+            let create_steps = vec![
+                lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &[])),
+                lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &[])),
+                graphql_step(
+                    "mutation AddTopLevelPullRequestComment(",
+                    json!({"subjectId":"PR_node","body":"hello","clientMutationId":"op-create-comment"}),
+                    create_ack,
+                    true,
+                ),
+            ];
+            let (create_dir, create_provider) = lifecycle_fixture("alice", create_steps);
+            let mut create_admission = FakeAdmission::new();
+            let ProviderMutationOutcome::Acknowledged(create) = create_provider
+                .execute_pr_discussion(
+                    &lifecycle_repo("alice"),
+                    &create_request,
+                    &mut create_admission,
+                )
+            else {
+                panic!("expected create acknowledgement");
+            };
+            assert_eq!(create.comment.remote_id, "COMMENT_2");
+            assert_eq!(file_count(&create_dir, "writes"), 1);
+
+            let edit_request = PullRequestDiscussionRequest {
+                operation_id: "op-edit-comment".into(),
+                attempt_id: "attempt-edit-comment".into(),
+                target: mutation_target("OPEN"),
+                action: PullRequestDiscussionAction::Edit {
+                    comment: ProviderCoordinates { remote_id:"COMMENT_1".into(), ..mutation_target("OPEN").pull_request },
+                    selected_author: "alice".into(), observed_body: "old".into(),
+                    observed_updated_at: "2026-09-13T11:00:00Z".into(), body: "new".into(),
+                },
+            };
+            let edit_ack = json!({"data":{"updateIssueComment":{
+                "clientMutationId":"op-edit-comment",
+                "issueComment":comment_ack_node("COMMENT_1", 7, "alice", "new")
+            }}});
+            assert!(edit_ack.pointer("/data/updateIssueComment/issueComment/viewerCanUpdate").is_none());
+            assert!(edit_ack.pointer("/data/updateIssueComment/issueComment/viewerCanDelete").is_none());
+            let edit_steps = vec![
+                lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &[])),
+                graphql_step("query TopLevelPullRequestComment", json!({"id":"COMMENT_1"}), comment_response("COMMENT_1", 7, "alice", "old"), false),
+                lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &[])),
+                graphql_step("query TopLevelPullRequestComment", json!({"id":"COMMENT_1"}), comment_response("COMMENT_1", 7, "alice", "old"), false),
+                graphql_step(
+                    "mutation UpdateTopLevelPullRequestComment(",
+                    json!({"commentId":"COMMENT_1","body":"new","clientMutationId":"op-edit-comment"}),
+                    edit_ack,
+                    true,
+                ),
+            ];
+            let (edit_dir, edit_provider) = lifecycle_fixture("alice", edit_steps);
+            let mut edit_admission = FakeAdmission::new();
+            assert!(matches!(
+                edit_provider.execute_pr_discussion(
+                    &lifecycle_repo("alice"),
+                    &edit_request,
+                    &mut edit_admission,
+                ),
+                ProviderMutationOutcome::Acknowledged(_)
+            ));
+            assert_eq!(file_count(&edit_dir, "writes"), 1);
+        }
+
+        #[test]
+        fn missing_comment_preflight_capability_refuses_before_admission_or_write() {
+            let _serial = lifecycle_test_lock();
+            for missing in ["viewerCanUpdate", "viewerCanDelete"] {
+                let action = if missing == "viewerCanUpdate" {
+                    PullRequestDiscussionAction::Edit {
+                        comment: ProviderCoordinates { remote_id:"COMMENT_1".into(), ..mutation_target("OPEN").pull_request },
+                        selected_author:"alice".into(), observed_body:"old".into(),
+                        observed_updated_at:"2026-09-13T11:00:00Z".into(), body:"new".into(),
+                    }
+                } else {
+                    PullRequestDiscussionAction::Delete {
+                        comment: ProviderCoordinates { remote_id:"COMMENT_1".into(), ..mutation_target("OPEN").pull_request },
+                        selected_author:"alice".into(), observed_body:"old".into(),
+                        observed_updated_at:"2026-09-13T11:00:00Z".into(),
+                    }
+                };
+                let request = PullRequestDiscussionRequest {
+                    operation_id: format!("op-missing-{missing}"),
+                    attempt_id: format!("attempt-missing-{missing}"),
+                    target: mutation_target("OPEN"),
+                    action,
+                };
+                let mut response = comment_response("COMMENT_1", 7, "alice", "old");
+                response["data"]["node"].as_object_mut().unwrap().remove(missing);
+                let steps = vec![
+                    lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &[])),
+                    graphql_step("query TopLevelPullRequestComment", json!({"id":"COMMENT_1"}), response, false),
+                ];
+                let (dir, provider) = lifecycle_fixture("alice", steps);
+                let mut admission = FakeAdmission::new();
+                assert!(matches!(
+                    provider.execute_pr_discussion(
+                        &lifecycle_repo("alice"),
+                        &request,
+                        &mut admission,
+                    ),
+                    ProviderMutationOutcome::PreflightRejected { .. }
+                ));
+                assert_eq!(file_count(&dir, "writes"), 0);
+                assert!(admission.state.borrow().contexts.is_empty());
+            }
         }
 
         #[test]
@@ -791,7 +1046,7 @@ else:
                 },
             };
             let mutation_response = json!({"data":{"updateIssueComment":{
-                "clientMutationId":"op-edit","issueComment":comment_response("COMMENT_OTHER",7,"alice","new")["data"]["node"].clone()
+                "clientMutationId":"op-edit","issueComment":comment_ack_node("COMMENT_OTHER",7,"alice","new")
             }}});
             let steps = vec![
                 lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &[])),
@@ -864,7 +1119,13 @@ else:
             let steps = vec![
                 lifecycle_step(lifecycle_response("alice", "OPEN", false, "old title", "body", "main", &[], &[], &[])),
                 lifecycle_step(lifecycle_response("alice", "OPEN", false, "old title", "body", "main", &[], &[], &[])),
-                graphql_step("mutation UpdatePullRequestMetadata(", json!({"pullRequestId":"PR_node","title":"new title","body":null,"baseRefName":null,"clientMutationId":"op-title"}), json!({"data":{}}), true),
+                update_graphql_step(
+                    "title",
+                    json!({"pullRequestId":"PR_node","title":"new title","clientMutationId":"op-title"}),
+                    json!({"title":"old title","body":"body","baseRefName":"main"}),
+                    json!({"title":"new title","body":"body","baseRefName":"main"}),
+                    json!({"data":{}}),
+                ),
             ];
             let (dir, provider) = lifecycle_fixture("alice", steps);
             let mut admission = FakeAdmission::new();
@@ -893,7 +1154,7 @@ else:
         }
 
         #[test]
-        fn draft_transition_uses_primary_schema_and_assignee_is_delta_only() {
+        fn draft_transition_uses_primary_schema_and_assignee_acks_use_issue_shape() {
             let _serial = lifecycle_test_lock();
             let draft_request = PullRequestLifecycleRequest {
                 operation_id:"op-draft".into(), attempt_id:"attempt-draft".into(),
@@ -917,13 +1178,72 @@ else:
             let assignee_steps = vec![
                 lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &[])),
                 lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &[])),
-                rest_step("POST", "repos/owner/repo/issues/7/assignees", json!({"assignees":["bob"]}), json!({"number":7,"html_url":"https://github.com/owner/repo/pull/7","pull_request":{},"assignees":[{"login":"bob"}]}), true),
+                rest_step("POST", "repos/owner/repo/issues/7/assignees", json!({"assignees":["bob"]}), issue_ack(&["bob"]), true),
                 lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &["bob"])),
             ];
             let (assignee_dir, assignee_provider) = lifecycle_fixture("alice", assignee_steps);
             let mut assignee_admission = FakeAdmission::new();
             assert!(matches!(assignee_provider.execute_pr_lifecycle(&lifecycle_repo("alice"), &assignee_request, &mut assignee_admission), ProviderMutationOutcome::Acknowledged(_)));
             assert_eq!(file_count(&assignee_dir, "writes"), 1);
+
+            let remove_request = PullRequestLifecycleRequest {
+                operation_id:"op-remove-assignee".into(), attempt_id:"attempt-remove-assignee".into(),
+                target:mutation_target("OPEN"), action:PullRequestLifecycleAction::RemoveAssignee("bob".into()),
+            };
+            let remove_steps = vec![
+                lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &["bob"])),
+                lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &["bob"])),
+                rest_step("DELETE", "repos/owner/repo/issues/7/assignees", json!({"assignees":["bob"]}), issue_ack(&[]), true),
+                lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &[])),
+            ];
+            let (remove_dir, remove_provider) = lifecycle_fixture("alice", remove_steps);
+            let mut remove_admission = FakeAdmission::new();
+            assert!(matches!(remove_provider.execute_pr_lifecycle(&lifecycle_repo("alice"), &remove_request, &mut remove_admission), ProviderMutationOutcome::Acknowledged(_)));
+            assert_eq!(file_count(&remove_dir, "writes"), 1);
+        }
+
+        #[test]
+        fn assignee_ack_rejects_wrong_issue_or_pull_target_after_one_dispatch() {
+            let _serial = lifecycle_test_lock();
+            for (suffix, mutate) in [
+                ("issue-repo", 0_u8),
+                ("number", 1),
+                ("missing-pull", 2),
+                ("pull-repo", 3),
+                ("pull-number", 4),
+            ] {
+                let request = PullRequestLifecycleRequest {
+                    operation_id:format!("op-assignee-{suffix}"),
+                    attempt_id:format!("attempt-assignee-{suffix}"),
+                    target:mutation_target("OPEN"),
+                    action:PullRequestLifecycleAction::AddAssignee("bob".into()),
+                };
+                let mut ack = issue_ack(&["bob"]);
+                match mutate {
+                    0 => ack["html_url"] = json!("https://github.com/other/repo/issues/7"),
+                    1 => ack["number"] = json!(8),
+                    2 => { ack.as_object_mut().unwrap().remove("pull_request"); }
+                    3 => ack["pull_request"]["html_url"] = json!("https://github.com/other/repo/pull/7"),
+                    4 => ack["pull_request"]["html_url"] = json!("https://github.com/owner/repo/pull/8"),
+                    _ => unreachable!(),
+                }
+                let steps = vec![
+                    lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &[])),
+                    lifecycle_step(lifecycle_response("alice", "OPEN", false, "title", "body", "main", &[], &[], &[])),
+                    rest_step("POST", "repos/owner/repo/issues/7/assignees", json!({"assignees":["bob"]}), ack, true),
+                ];
+                let (dir, provider) = lifecycle_fixture("alice", steps);
+                let mut admission = FakeAdmission::new();
+                assert!(matches!(
+                    provider.execute_pr_lifecycle(
+                        &lifecycle_repo("alice"),
+                        &request,
+                        &mut admission,
+                    ),
+                    ProviderMutationOutcome::Uncertain { .. }
+                ));
+                assert_eq!(file_count(&dir, "writes"), 1);
+            }
         }
 
         #[test]
@@ -946,11 +1266,12 @@ else:
                 vec![
                     lifecycle_step(lifecycle_response(login, "OPEN", false, "old title", "body", "main", &[], &[], &[])),
                     lifecycle_step(lifecycle_response(login, "OPEN", false, "old title", "body", "main", &[], &[], &[])),
-                    graphql_step(
-                        "mutation UpdatePullRequestMetadata(",
-                        json!({"pullRequestId":"PR_node","title":"new title","body":null,"baseRefName":null,"clientMutationId":operation}),
+                    update_graphql_step(
+                        "title",
+                        json!({"pullRequestId":"PR_node","title":"new title","clientMutationId":operation}),
+                        json!({"title":"old title","body":"body","baseRefName":"main"}),
+                        json!({"title":"new title","body":"body","baseRefName":"main"}),
                         lifecycle_ack("updatePullRequest", operation, "PR_node"),
-                        true,
                     ),
                     lifecycle_step(lifecycle_response(login, "OPEN", false, "new title", "body", "main", &[], &[], &[])),
                 ]

@@ -633,7 +633,7 @@ impl<'a> Session<'a> {
         repo: &Repository,
         number: u64,
         id: &str,
-    ) -> Result<TopLevelComment> {
+    ) -> Result<PermissionedTopLevelComment> {
         validate_node_id(id)?;
         let response: GraphqlResult<CommentNodeData> =
             self.graphql(COMMENT_NODE_QUERY, json!({"id": id}))?;
@@ -653,7 +653,7 @@ impl<'a> Session<'a> {
             .data
             .node
             .context("GitHub issue comment ID is unavailable or has the wrong type")?;
-        comment.validate(repo, number, id)?;
+        comment.comment.validate(repo, number, id)?;
         Ok(comment)
     }
 
@@ -1259,18 +1259,18 @@ fn prepare_lifecycle_mutation(
     Ok(match &request.action {
         PullRequestLifecycleAction::UpdateTitle { value, .. } => graphql(
             "update-pr-title",
-            UPDATE_PULL_REQUEST_MUTATION,
-            json!({"pullRequestId": id, "title": value, "body": Value::Null, "baseRefName": Value::Null, "clientMutationId": operation}),
+            UPDATE_PULL_REQUEST_TITLE_MUTATION,
+            json!({"pullRequestId": id, "title": value, "clientMutationId": operation}),
         ),
         PullRequestLifecycleAction::UpdateBody { value, .. } => graphql(
             "update-pr-body",
-            UPDATE_PULL_REQUEST_MUTATION,
-            json!({"pullRequestId": id, "title": Value::Null, "body": value, "baseRefName": Value::Null, "clientMutationId": operation}),
+            UPDATE_PULL_REQUEST_BODY_MUTATION,
+            json!({"pullRequestId": id, "body": value, "clientMutationId": operation}),
         ),
         PullRequestLifecycleAction::UpdateBaseBranch { value, .. } => graphql(
             "update-pr-base",
-            UPDATE_PULL_REQUEST_MUTATION,
-            json!({"pullRequestId": id, "title": Value::Null, "body": Value::Null, "baseRefName": value, "clientMutationId": operation}),
+            UPDATE_PULL_REQUEST_BASE_MUTATION,
+            json!({"pullRequestId": id, "baseRefName": value, "clientMutationId": operation}),
         ),
         PullRequestLifecycleAction::Close => graphql(
             "close-pr",
@@ -1355,13 +1355,30 @@ fn reviewer_variables(reviewer: &PullRequestReviewer) -> (Value, Value) {
     }
 }
 
-const UPDATE_PULL_REQUEST_MUTATION: &str = r#"mutation UpdatePullRequestMetadata(
-  $pullRequestId: ID!, $title: String, $body: String, $baseRefName: String,
-  $clientMutationId: String!
+const UPDATE_PULL_REQUEST_TITLE_MUTATION: &str = r#"mutation UpdatePullRequestMetadata(
+  $pullRequestId: ID!, $title: String!, $clientMutationId: String!
 ) {
   updatePullRequest(input: {
-    pullRequestId: $pullRequestId, title: $title, body: $body,
-    baseRefName: $baseRefName, clientMutationId: $clientMutationId
+    pullRequestId: $pullRequestId, title: $title,
+    clientMutationId: $clientMutationId
+  }) { clientMutationId pullRequest { id } }
+}"#;
+
+const UPDATE_PULL_REQUEST_BODY_MUTATION: &str = r#"mutation UpdatePullRequestMetadata(
+  $pullRequestId: ID!, $body: String!, $clientMutationId: String!
+) {
+  updatePullRequest(input: {
+    pullRequestId: $pullRequestId, body: $body,
+    clientMutationId: $clientMutationId
+  }) { clientMutationId pullRequest { id } }
+}"#;
+
+const UPDATE_PULL_REQUEST_BASE_MUTATION: &str = r#"mutation UpdatePullRequestMetadata(
+  $pullRequestId: ID!, $baseRefName: String!, $clientMutationId: String!
+) {
+  updatePullRequest(input: {
+    pullRequestId: $pullRequestId, baseRefName: $baseRefName,
+    clientMutationId: $clientMutationId
   }) { clientMutationId pullRequest { id } }
 }"#;
 
@@ -1563,8 +1580,11 @@ fn validate_rest_issue_target(
         || !value
             .get("html_url")
             .and_then(Value::as_str)
+            .is_some_and(|url| issue_url_matches(url, repo, number))
+        || !value
+            .pointer("/pull_request/html_url")
+            .and_then(Value::as_str)
             .is_some_and(|url| pull_url_matches(url, repo, number))
-        || !value.get("pull_request").is_some_and(Value::is_object)
     {
         return Err("GitHub REST acknowledgement returned another issue or pull request".into());
     }
@@ -1572,6 +1592,19 @@ fn validate_rest_issue_target(
 }
 
 fn pull_url_matches(url: &str, repo: &Repository, number: u64) -> bool {
+    repository_number_url_matches(url, repo, "pull", number)
+}
+
+fn issue_url_matches(url: &str, repo: &Repository, number: u64) -> bool {
+    repository_number_url_matches(url, repo, "issues", number)
+}
+
+fn repository_number_url_matches(
+    url: &str,
+    repo: &Repository,
+    resource: &str,
+    number: u64,
+) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
     };
@@ -1589,7 +1622,7 @@ fn pull_url_matches(url: &str, repo: &Repository, number: u64) -> bool {
         && components
             .next()
             .is_some_and(|name| name.eq_ignore_ascii_case(&repo.name))
-        && components.next() == Some("pull")
+        && components.next() == Some(resource)
         && components.next() == Some(expected_number.as_str())
         && components.next().is_none()
 }
@@ -1623,7 +1656,7 @@ fn preflight_discussion(
     repo: &Repository,
     request: &PullRequestDiscussionRequest,
     fresh: &PullRequestLifecycleSnapshot,
-) -> std::result::Result<Option<TopLevelComment>, String> {
+) -> std::result::Result<Option<PermissionedTopLevelComment>, String> {
     validate_snapshot_target(&request.target, fresh)?;
     if !fresh.can_comment.available {
         return Err(fresh
@@ -1689,7 +1722,7 @@ fn validate_selected_comment(
     observed_body: &str,
     observed_updated_at: &str,
     editing: bool,
-) -> std::result::Result<TopLevelComment, String> {
+) -> std::result::Result<PermissionedTopLevelComment, String> {
     if !coordinates_match(repo, number, coordinates) {
         return Err("top-level comment belongs to another provider, repository, or PR".into());
     }
@@ -1699,15 +1732,22 @@ fn validate_selected_comment(
     let comment = Session::new(provider)
         .top_level_comment(repo, number, &coordinates.remote_id)
         .map_err(|error| error.to_string())?;
-    if comment.pull_request.as_ref().map(|pull| pull.id.as_str()) != Some(pull_request_id) {
+    if comment
+        .comment
+        .pull_request
+        .as_ref()
+        .map(|pull| pull.id.as_str())
+        != Some(pull_request_id)
+    {
         return Err("top-level comment is linked to another pull request node".into());
     }
     if !comment
+        .comment
         .author
         .as_ref()
         .is_some_and(|value| value.login.eq_ignore_ascii_case(selected_author))
-        || comment.body != observed_body
-        || comment.updated_at != observed_updated_at
+        || comment.comment.body != observed_body
+        || comment.comment.updated_at != observed_updated_at
     {
         return Err(
             "top-level comment author or affected fields changed since confirmation".into(),
@@ -1753,7 +1793,7 @@ impl PreparedDiscussionMutation {
 fn prepare_discussion_mutation(
     request: &PullRequestDiscussionRequest,
     fresh: &PullRequestLifecycleSnapshot,
-    comment: Option<&TopLevelComment>,
+    comment: Option<&PermissionedTopLevelComment>,
 ) -> std::result::Result<PreparedDiscussionMutation, String> {
     Ok(match &request.action {
         PullRequestDiscussionAction::Create { body } => PreparedDiscussionMutation {
@@ -1769,7 +1809,7 @@ fn prepare_discussion_mutation(
             action: "edit-pr-discussion-comment",
             query: UPDATE_TOP_LEVEL_COMMENT_MUTATION,
             variables: json!({
-                "commentId": comment.ok_or_else(|| "missing exact comment preflight".to_owned())?.id,
+                "commentId": comment.ok_or_else(|| "missing exact comment preflight".to_owned())?.comment.id,
                 "body": body,
                 "clientMutationId": request.operation_id,
             }),
@@ -1778,7 +1818,7 @@ fn prepare_discussion_mutation(
             action: "delete-pr-discussion-comment",
             query: DELETE_TOP_LEVEL_COMMENT_MUTATION,
             variables: json!({
-                "commentId": comment.ok_or_else(|| "missing exact comment preflight".to_owned())?.id,
+                "commentId": comment.ok_or_else(|| "missing exact comment preflight".to_owned())?.comment.id,
                 "clientMutationId": request.operation_id,
             }),
         },
@@ -1832,7 +1872,16 @@ const COMMENT_NODE_QUERY: &str = r#"query TopLevelPullRequestComment($id: ID!) {
 #[serde(rename_all = "camelCase")]
 struct CommentNodeData {
     viewer: LifecycleActor,
-    node: Option<TopLevelComment>,
+    node: Option<PermissionedTopLevelComment>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PermissionedTopLevelComment {
+    #[serde(flatten)]
+    comment: TopLevelComment,
+    viewer_can_update: bool,
+    viewer_can_delete: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1844,10 +1893,14 @@ struct TopLevelComment {
     updated_at: String,
     url: String,
     author: Option<LifecycleActor>,
-    viewer_can_update: bool,
-    viewer_can_delete: bool,
     repository: NameWithOwner,
     pull_request: Option<DiscussionSubject>,
+}
+
+impl PermissionedTopLevelComment {
+    fn into_domain(self, repo: &Repository, number: u64) -> IssueComment {
+        self.comment.into_domain(repo, number)
+    }
 }
 
 impl TopLevelComment {
