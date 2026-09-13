@@ -325,6 +325,63 @@ fn two_layers_return_one_net_tree_diff_without_patch_concatenation() {
 }
 
 #[test]
+fn advanced_lower_head_cannot_be_omitted_from_a_proven_net_diff() {
+    let dir = init();
+    let base = commit_file(dir.path(), "base.txt", b"base\n", "base");
+    let first_lower = commit_file(dir.path(), "lower.txt", b"first\n", "first lower");
+    let advanced_lower = commit_file(dir.path(), "required.txt", b"required\n", "lower advance");
+    git(dir.path(), &["checkout", "-q", "--detach", &first_lower]);
+    let tip = commit_file(dir.path(), "upper.txt", b"upper\n", "upper");
+    let layers = vec![
+        layer(
+            1,
+            "lower",
+            "main",
+            base,
+            advanced_lower.clone(),
+            StackLayerState::Open,
+        ),
+        layer(
+            2,
+            "upper",
+            "lower",
+            advanced_lower,
+            tip,
+            StackLayerState::Open,
+        ),
+    ];
+    let native_read = native(layers.clone(), 2);
+    let native_resolution = resolve_stack(&repo(), &id(2), &[], &native_read, None).unwrap();
+    let corrections = PersonalStackCorrections {
+        schema_version: PERSONAL_CORRECTIONS_SCHEMA_VERSION,
+        repository_key: repo().cache_key(),
+        account: repo().account,
+        edges: vec![StackEdge {
+            parent: id(1),
+            child: id(2),
+            provenance: StackEdgeProvenance::Personal,
+        }],
+    };
+    let personal = resolve_stack(
+        &repo(),
+        &id(2),
+        &layers,
+        &NativeStackRead::not_member(),
+        Some(&corrections),
+    )
+    .unwrap();
+    for resolution in [inferred(&layers, 2), native_resolution, personal] {
+        let result = select_local_stack_net(dir.path(), &resolution, &id(2)).unwrap();
+        assert!(
+            matches!(result.effective_boundary, EffectiveBoundary::Unavailable { ref reason }
+            if reason.contains("head is absent")),
+            "A proven net diff must not omit the frozen lower layer's required.txt change"
+        );
+        assert!(result.comparison.is_none());
+    }
+}
+
+#[test]
 fn merged_lower_original_head_becomes_the_boundary() {
     let dir = init();
     let base = commit_file(dir.path(), "lower.txt", b"base\n", "base");

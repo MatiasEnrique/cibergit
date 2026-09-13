@@ -663,6 +663,37 @@ pub(crate) fn unavailable_selection(plan: StackNetPlan, reasons: Vec<String>) ->
     }
 }
 
+/// Every remaining layer must be represented by its frozen head in the same
+/// ordered history that will be displayed. Branch relationships alone do not
+/// prove this after a lower branch advances or is rewritten.
+pub(crate) fn validate_remaining_layer_heads(
+    plan: &StackNetPlan,
+    ordered_history: &[String],
+) -> Result<()> {
+    let positions: HashMap<_, _> = ordered_history
+        .iter()
+        .enumerate()
+        .map(|(position, oid)| (oid.as_str(), position))
+        .collect();
+    let mut previous = 0;
+    for layer in plan
+        .frozen_layers
+        .iter()
+        .filter(|layer| layer.state != StackLayerState::Merged)
+    {
+        let position = *positions.get(layer.revision.head_sha.as_str()).with_context(|| {
+            format!("Frozen unmerged pull request {} head is absent from the selected tip history; refresh or update the dependent branch before reviewing the stack", layer.id.number)
+        })?;
+        ensure!(
+            position >= previous,
+            "Frozen unmerged pull request {} head precedes its dependency in the selected tip history",
+            layer.id.number
+        );
+        previous = position;
+    }
+    Ok(())
+}
+
 pub(crate) fn completed_selection(
     plan: StackNetPlan,
     boundary_sha: String,
@@ -719,7 +750,9 @@ pub fn select_local_stack_net(
             ));
             continue;
         }
-        match prove_local_linear_pair(path, &candidate.boundary_sha, &tip) {
+        match prove_local_linear_pair(path, &candidate.boundary_sha, &tip)
+            .and_then(|history| validate_remaining_layer_heads(&plan, &history))
+        {
             Ok(()) => {
                 let revision = Revision {
                     base_sha: candidate.boundary_sha.clone(),
@@ -784,11 +817,11 @@ fn prove_local_ancestor(path: &Path, ancestor: &str, descendant: &str) -> Result
     bail!("Required commit is not an ancestor of the frozen base")
 }
 
-fn prove_local_linear_pair(path: &Path, boundary: &str, tip: &str) -> Result<()> {
+fn prove_local_linear_pair(path: &Path, boundary: &str, tip: &str) -> Result<Vec<String>> {
     validate_object_id(boundary)?;
     validate_object_id(tip)?;
     if boundary == tip {
-        return Ok(());
+        return Ok(vec![boundary.to_owned()]);
     }
     let revision = Revision {
         base_sha: boundary.to_owned(),
@@ -810,6 +843,7 @@ fn prove_local_linear_pair(path: &Path, boundary: &str, tip: &str) -> Result<()>
     );
     let mut current = tip;
     let mut visited = HashSet::new();
+    let mut history = Vec::new();
     loop {
         let entry = by_sha
             .get(current)
@@ -818,6 +852,7 @@ fn prove_local_linear_pair(path: &Path, boundary: &str, tip: &str) -> Result<()>
             visited.insert(current),
             "Direct ancestry proof contains a cycle"
         );
+        history.push(current.to_owned());
         ensure!(
             entry.parent_shas.len() == 1,
             "Internal merge or root commit makes the direct path unprovable"
@@ -832,7 +867,9 @@ fn prove_local_linear_pair(path: &Path, boundary: &str, tip: &str) -> Result<()>
         visited.len() == inventory.commits.len(),
         "Direct ancestry proof contains commits outside one linear path"
     );
-    Ok(())
+    history.push(boundary.to_owned());
+    history.reverse();
+    Ok(history)
 }
 
 fn valid_text_identity(value: &str) -> bool {

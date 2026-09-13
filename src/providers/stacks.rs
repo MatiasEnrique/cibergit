@@ -7,6 +7,7 @@ use crate::{
         BoundaryProof, EffectiveBoundary, NativeStackAvailability, NativeStackRead, StackLayer,
         StackLayerState, StackNetPlan, StackNetSelection, StackPullRequestId, StackRef,
         StackRepository, completed_selection, plan_stack_net, unavailable_selection,
+        validate_remaining_layer_heads,
     },
 };
 use anyhow::{Context, Result, ensure};
@@ -96,7 +97,10 @@ impl GithubProvider {
                 ));
                 continue;
             }
-            if let Err(error) = self.prove_remote_pair(repo, &candidate.boundary_sha, &tip, true) {
+            if let Err(error) = self
+                .prove_remote_pair(repo, &candidate.boundary_sha, &tip, true)
+                .and_then(|history| validate_remaining_layer_heads(&plan, &history))
+            {
                 reasons.push(format!(
                     "Boundary {} is unavailable: {error}",
                     short_oid(&candidate.boundary_sha)
@@ -363,11 +367,11 @@ impl GithubProvider {
         ancestor: &str,
         descendant: &str,
         require_linear: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         validate_sha(ancestor)?;
         validate_sha(descendant)?;
         if ancestor == descendant {
-            return Ok(());
+            return Ok(vec![ancestor.to_owned()]);
         }
         let mut session = Session::new(self);
         let endpoint = |page| {
@@ -432,7 +436,10 @@ impl GithubProvider {
                 expected_parent = &commit.sha;
             }
         }
-        Ok(())
+        let mut history = Vec::with_capacity(commits.len() + 1);
+        history.push(ancestor.to_owned());
+        history.extend(commits.into_iter().map(|commit| commit.sha));
+        Ok(history)
     }
 }
 
@@ -1231,5 +1238,65 @@ print(json.dumps(step['response']))
         ));
         assert!(selection.comparison.is_none());
         exhausted(dir.path(), 1);
+    }
+
+    #[test]
+    fn remote_net_refuses_a_frozen_lower_head_missing_from_the_tip_history() {
+        let base = oid('a');
+        let old_lower = oid('b');
+        let advanced_lower = oid('d');
+        let tip = oid('c');
+        let layers = vec![
+            layer(
+                1,
+                "lower",
+                "main",
+                &base,
+                &advanced_lower,
+                StackLayerState::Open,
+                None,
+            ),
+            layer(
+                2,
+                "upper",
+                "lower",
+                &advanced_lower,
+                &tip,
+                StackLayerState::Open,
+                None,
+            ),
+        ];
+        let resolution = resolve_stack(
+            &repo(),
+            &layers[1].id,
+            &layers,
+            &NativeStackRead::not_member(),
+            None,
+        )
+        .unwrap();
+        let (dir, provider) = fixture(vec![
+            get("repos/owner/repo/pulls/1", rest_pull(&layers[0], None)),
+            get("repos/owner/repo/pulls/2", rest_pull(&layers[1], None)),
+            get(
+                &format!("repos/owner/repo/compare/{base}...{tip}?per_page=100&page=1"),
+                json!({
+                    "base_commit": {"sha": base}, "merge_base_commit": {"sha": base},
+                    "total_commits": 2, "commits": [
+                        {"sha": old_lower, "parents": [{"sha": base}]},
+                        {"sha": tip, "parents": [{"sha": old_lower}]}
+                    ]
+                }),
+            ),
+        ]);
+        let selection = provider
+            .select_stack_net(&repo(), &resolution, &layers[1].id)
+            .unwrap();
+        assert!(
+            matches!(selection.effective_boundary, EffectiveBoundary::Unavailable { ref reason }
+            if reason.contains("head is absent"))
+        );
+        assert!(selection.comparison.is_none());
+        // Refusal happens before loading a direct file comparison.
+        exhausted(dir.path(), 3);
     }
 }
