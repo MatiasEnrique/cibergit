@@ -95,6 +95,11 @@ impl PollCompletion {
 
     pub(super) fn failed(&self) -> bool {
         self.error.is_some()
+            || self
+                .snapshot
+                .repository_completeness
+                .iter()
+                .any(|repository| !repository.complete)
     }
 }
 
@@ -160,6 +165,7 @@ struct MarkToken {
     lifetime: u64,
     account_key: String,
     selection: String,
+    selection_generation: u64,
     generation: u64,
 }
 
@@ -327,6 +333,7 @@ impl BootstrapWork {
 struct AccountViewState {
     account: Option<Account>,
     selection: String,
+    selected_repositories: HashSet<NotificationRepositoryScope>,
     generation: u64,
     selection_generation: u64,
     mark_generation: u64,
@@ -446,7 +453,16 @@ impl NotificationController {
             .unwrap_or(0)
     }
 
+    #[cfg(any(test, feature = "ui-smoke"))]
     pub(super) fn begin_polls(&mut self, repositories: &[Repository]) -> Vec<PollWork> {
+        self.begin_polls_when(repositories, |_| true)
+    }
+
+    pub(super) fn begin_polls_when(
+        &mut self,
+        repositories: &[Repository],
+        mut is_due: impl FnMut(&Account) -> bool,
+    ) -> Vec<PollWork> {
         let Some(runtime) = self.runtime.clone() else {
             return Vec::new();
         };
@@ -463,6 +479,7 @@ impl NotificationController {
         for (key, state) in &mut self.accounts {
             if !selected_keys.contains(key) {
                 state.selection.clear();
+                state.selected_repositories.clear();
                 state.selection_generation = state.selection_generation.saturating_add(1);
                 state.generation = state.generation.saturating_add(1);
                 state.in_flight = false;
@@ -484,6 +501,7 @@ impl NotificationController {
                 .get(&key)
                 .copied()
                 .unwrap_or(state.consent_enabled);
+            state.selected_repositories = repositories.iter().map(repository_scope).collect();
             if state.selection != selection {
                 state.selection = selection.clone();
                 state.selection_generation = state.selection_generation.saturating_add(1);
@@ -493,7 +511,7 @@ impl NotificationController {
                 state.snapshot = None;
                 self.queued.retain(|queued| queued.account_key != key);
             }
-            if state.in_flight || repositories.is_empty() {
+            if state.in_flight || repositories.is_empty() || !is_due(&account) {
                 continue;
             }
             state.generation = state.generation.saturating_add(1);
@@ -514,7 +532,17 @@ impl NotificationController {
         work
     }
 
-    pub(super) fn complete_poll(&mut self, completion: PollCompletion) -> Option<AdmissionWork> {
+    pub(super) fn accepts_poll(&self, completion: &PollCompletion) -> bool {
+        let key = account_key(&completion.account);
+        self.accounts
+            .get(&key)
+            .is_some_and(|state| token_matches(&completion.token, self.lifetime, &key, state))
+    }
+
+    pub(super) fn complete_poll(
+        &mut self,
+        mut completion: PollCompletion,
+    ) -> Option<AdmissionWork> {
         let key = account_key(&completion.account);
         let selection = completion.token.selection.clone();
         let (consent_enabled, consent_transition, consent_generation, selection_generation) =
@@ -530,6 +558,10 @@ impl NotificationController {
                     state.in_flight = false;
                     return None;
                 }
+                project_snapshot(&mut completion.snapshot, &state.selected_repositories);
+                completion.newly_admitted.retain(|event| {
+                    selected_target(&event.identity.target, &state.selected_repositories)
+                });
                 state.snapshot = Some(completion.snapshot);
                 state.stale_notice = completion.error;
                 state.page = state.page.min(max_page(state.snapshot.as_ref()));
@@ -705,6 +737,7 @@ impl NotificationController {
                 lifetime: self.lifetime,
                 account_key: key,
                 selection: state.selection.clone(),
+                selection_generation: state.selection_generation,
                 generation: state.mark_generation,
             },
             account: account.clone(),
@@ -721,12 +754,14 @@ impl NotificationController {
         if completion.token.lifetime != self.lifetime
             || completion.token.account_key != key
             || completion.token.selection != state.selection
+            || completion.token.selection_generation != state.selection_generation
             || completion.token.generation != state.mark_generation
         {
             return false;
         }
         match completion.result {
-            Ok(snapshot) => {
+            Ok(mut snapshot) => {
+                project_snapshot(&mut snapshot, &state.selected_repositories);
                 if state
                     .snapshot
                     .as_ref()
@@ -1263,6 +1298,37 @@ fn combine_batches(
         complete,
         notices,
     })
+}
+
+fn selected_target(
+    target: &NotificationPullRequest,
+    selected: &HashSet<NotificationRepositoryScope>,
+) -> bool {
+    selected.iter().any(|scope| {
+        scope.provider == target.provider
+            && scope.host.eq_ignore_ascii_case(&target.host)
+            && scope.account.eq_ignore_ascii_case(&target.account)
+            && scope.owner.eq_ignore_ascii_case(&target.owner)
+            && scope.repository.eq_ignore_ascii_case(&target.repository)
+    })
+}
+
+fn project_snapshot(
+    snapshot: &mut NotificationSnapshot,
+    selected: &HashSet<NotificationRepositoryScope>,
+) {
+    snapshot
+        .unread_by_pull_request
+        .retain(|summary| selected_target(&summary.target, selected));
+    snapshot
+        .repository_completeness
+        .retain(|repository| selected.contains(&repository.target));
+    snapshot.incomplete_candidates.retain(|candidate| {
+        candidate
+            .target
+            .as_ref()
+            .is_none_or(|target| selected_target(target, selected))
+    });
 }
 
 fn snapshot_from_outcome(outcome: &NotificationReconcileOutcome) -> NotificationSnapshot {
@@ -1934,6 +2000,154 @@ mod tests {
     }
 
     #[test]
+    fn polling_respects_each_accounts_due_time_and_invalidates_removed_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = NotificationController::new(dir.path().into());
+        assert!(controller.complete_bootstrap(controller.begin_bootstrap().run()));
+        let repositories = [repo("alice", 0), repo("bob", 0)];
+        let mut schedule = cibergit::workspace::PollSchedule::default();
+        schedule.failed(&schedule_key(&account("bob")));
+        let work = controller.begin_polls_when(&repositories, |account| {
+            super::super::poll_due(4, schedule.delay(&schedule_key(account), false, true))
+        });
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].account.login, "alice");
+        assert!(
+            !controller.accounts[&account_key(&account("bob"))]
+                .selection
+                .is_empty()
+        );
+        let completion = PollCompletion {
+            token: work[0].token.clone(),
+            account: account("alice"),
+            snapshot: empty_snapshot("old selection".into()),
+            newly_admitted: vec![],
+            error: None,
+        };
+        assert!(controller.accepts_poll(&completion));
+        assert!(
+            controller
+                .begin_polls_when(&[repo("bob", 0)], |_| false)
+                .is_empty()
+        );
+        assert!(!controller.accepts_poll(&completion));
+        assert!(
+            controller
+                .begin_polls_when(&repositories, |_| false)
+                .is_empty()
+        );
+        assert!(
+            !controller.accepts_poll(&completion),
+            "returning to the same selection cannot revive an old completion"
+        );
+    }
+
+    #[test]
+    fn partial_success_retains_failure_backoff() {
+        let mut completion = PollCompletion {
+            token: ControllerToken {
+                lifetime: 1,
+                account_key: account_key(&account("alice")),
+                selection: String::new(),
+                generation: 1,
+            },
+            account: account("alice"),
+            snapshot: empty_snapshot(String::new()),
+            newly_admitted: vec![],
+            error: None,
+        };
+        completion.snapshot.repository_completeness = vec![RepositoryNotificationCompleteness {
+            target: repository_scope(&repo("alice", 0)),
+            complete: false,
+            reasons: vec!["hydration bound reached".into()],
+        }];
+        assert!(
+            completion.failed(),
+            "an HTTP success with incomplete evidence must back off"
+        );
+        completion.snapshot.repository_completeness[0].complete = true;
+        assert!(!completion.failed());
+    }
+
+    #[test]
+    fn removed_repository_is_hidden_from_fresh_poll_and_mark_without_erasing_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = NotificationController::new(dir.path().into());
+        assert!(controller.complete_bootstrap(controller.begin_bootstrap().run()));
+        let store = controller.runtime.as_ref().unwrap().store.clone();
+        let alice = account("alice");
+        store
+            .reconcile(&alice, &batch("alice", vec![], true))
+            .unwrap();
+        store
+            .reconcile(
+                &alice,
+                &batch("alice", vec![event("alice", "retained", 7)], true),
+            )
+            .unwrap();
+        let mut selected_batch = batch("alice", vec![], true);
+        selected_batch.repositories[0].target = repository_scope(&repo("alice", 1));
+        selected_batch.observations.clear();
+        store.reconcile(&alice, &selected_batch).unwrap();
+        let work = controller.begin_polls(&[repo("alice", 1)]).pop().unwrap();
+        let completion = PollCompletion {
+            token: work.token,
+            account: alice.clone(),
+            snapshot: store.list_unread(&alice).unwrap(),
+            newly_admitted: vec![],
+            error: None,
+        };
+        controller.complete_poll(completion);
+        assert_eq!(controller.unread_count(), 0);
+        controller.toggle_open();
+        assert!(controller.begin_mark_displayed(&alice).is_none());
+        let state = controller.accounts.get(&account_key(&alice)).unwrap();
+        let mark = MarkReadCompletion {
+            token: MarkToken {
+                lifetime: controller.lifetime,
+                account_key: account_key(&alice),
+                selection: state.selection.clone(),
+                selection_generation: state.selection_generation,
+                generation: state.mark_generation,
+            },
+            account: alice.clone(),
+            result: Ok(store.list_unread(&alice).unwrap()),
+        };
+        assert!(controller.complete_mark_displayed(mark));
+        assert_eq!(controller.unread_count(), 0);
+        assert_eq!(
+            unread_count(&store.list_unread(&alice).unwrap()),
+            1,
+            "projection must preserve durable unread for re-selection"
+        );
+    }
+
+    #[test]
+    fn mark_completion_cannot_reappear_after_selection_away_and_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = NotificationController::new(dir.path().into());
+        assert!(controller.complete_bootstrap(controller.begin_bootstrap().run()));
+        let alice = account("alice");
+        controller.begin_polls(&[repo("alice", 0)]);
+        let state = controller.accounts.get(&account_key(&alice)).unwrap();
+        let completion = MarkReadCompletion {
+            token: MarkToken {
+                lifetime: controller.lifetime,
+                account_key: account_key(&alice),
+                selection: state.selection.clone(),
+                selection_generation: state.selection_generation,
+                generation: state.mark_generation,
+            },
+            account: alice.clone(),
+            result: Ok(empty_snapshot("stale mark".into())),
+        };
+        controller.begin_polls(&[repo("alice", 1)]);
+        controller.begin_polls(&[repo("alice", 0)]);
+        assert!(!controller.complete_mark_displayed(completion));
+        assert!(controller.accounts[&account_key(&alice)].snapshot.is_none());
+    }
+
+    #[test]
     fn registry_is_default_off_private_stable_and_deduplicates_across_restart() {
         let dir = tempfile::tempdir().unwrap();
         let registry = NotificationRegistry::open(dir.path().join("ui")).unwrap();
@@ -2234,6 +2448,7 @@ mod tests {
                 lifetime: controller.lifetime,
                 account_key: key,
                 selection,
+                selection_generation: 0,
                 generation: 4,
             },
             account: alice,

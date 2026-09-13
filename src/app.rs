@@ -1340,13 +1340,7 @@ impl ReviewWorkspace {
                         for index in repositories {
                             this.refresh_repository_with_intent(index, false, cx);
                         }
-                        let notifications_due = this.repositories.iter().any(|runtime| {
-                            let key = notifications_view::schedule_key(&runtime.repository.account);
-                            poll_due(tick, this.schedule.delay(&key, false, this.focused))
-                        });
-                        if notifications_due {
-                            this.refresh_notifications(cx);
-                        }
+                        this.refresh_notifications_when(Some(tick), cx);
                     })
                     .is_err()
                 {
@@ -1374,6 +1368,10 @@ impl ReviewWorkspace {
     }
 
     fn refresh_notifications(&mut self, cx: &mut Context<Root>) {
+        self.refresh_notifications_when(None, cx);
+    }
+
+    fn refresh_notifications_when(&mut self, tick: Option<u64>, cx: &mut Context<Root>) {
         if !self.notifications.is_ready() {
             return;
         }
@@ -1382,12 +1380,29 @@ impl ReviewWorkspace {
             .iter()
             .map(|runtime| runtime.repository.clone())
             .collect::<Vec<_>>();
-        for work in self.notifications.begin_polls(&repositories) {
+        let polls = self
+            .notifications
+            .begin_polls_when(&repositories, |account| {
+                tick.is_none_or(|tick| {
+                    poll_due(
+                        tick,
+                        self.schedule.delay(
+                            &notifications_view::schedule_key(account),
+                            false,
+                            self.focused,
+                        ),
+                    )
+                })
+            });
+        for work in polls {
             let task = cx.background_spawn(async move { work.run() });
             cx.spawn(async move |root, cx| {
                 let completion = task.await;
                 let _ = root.update(cx, |root, cx| {
                     let Root::Review(this) = root else { return };
+                    if !this.notifications.accepts_poll(&completion) {
+                        return;
+                    }
                     let schedule_key = completion.schedule_key();
                     if completion.failed() {
                         this.schedule.failed(&schedule_key);
