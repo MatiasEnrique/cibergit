@@ -10,7 +10,7 @@ mod local_workspace;
 use cibergit::{
     document::DocumentStatus,
     domain::{Account, Repository},
-    local_git::{GitPath, LocalGit, OperationState},
+    local_git::{GitPath, HeadState, LocalGit, OperationState},
     rebase::{OperationState as RebaseState, PlanAction},
     worktrees::{
         AssociationKey, CheckoutAssociation, CheckoutOwnership, CheckoutView, FilesystemIdentity,
@@ -32,6 +32,12 @@ use std::{
     process::Command,
 };
 
+struct SmokeFixture {
+    checkout: PathBuf,
+    data_root: PathBuf,
+    rebase_base_oid: String,
+}
+
 fn run_git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .current_dir(root)
@@ -52,6 +58,23 @@ fn identity(path: &Path) -> FilesystemIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
     }
+}
+
+fn retained_started_action(data_root: &Path) -> String {
+    let actions = data_root.join("local-workspace/actions");
+    let Ok(entries) = fs::read_dir(&actions) else {
+        return format!("none under {}", actions.display());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path().join("started-local-action.json");
+        if path.is_file() {
+            return match fs::read_to_string(&path) {
+                Ok(payload) => format!("{} :: {}", path.display(), payload.trim()),
+                Err(error) => format!("{} :: unreadable: {error}", path.display()),
+            };
+        }
+    }
+    format!("none under {}", actions.display())
 }
 
 fn fixture(base: &Path) -> (Repository, CheckoutView, PathBuf, String) {
@@ -156,6 +179,7 @@ fn main() {
         });
     let (repository, checkout, data_root, rebase_base_oid) = fixture(&base);
     let checkout_root = checkout.association.path.clone();
+    let smoke_data_root = data_root.clone();
     println!(
         "temporary checkout: {}",
         checkout.association.path.display()
@@ -210,8 +234,11 @@ fn main() {
                 if let Some(output) = std::env::var_os("CIBERGIT_LOCAL_WORKSPACE_SMOKE_DIR") {
                     start_smoke(
                         workspace.downgrade(),
-                        checkout_root.clone(),
-                        rebase_base_oid.clone(),
+                        SmokeFixture {
+                            checkout: checkout_root.clone(),
+                            data_root: smoke_data_root.clone(),
+                            rebase_base_oid: rebase_base_oid.clone(),
+                        },
                         PathBuf::from(output),
                         dark,
                         window,
@@ -228,13 +255,17 @@ fn main() {
 
 fn start_smoke(
     workspace: gpui::WeakEntity<LocalWorkspace>,
-    checkout: PathBuf,
-    rebase_base_oid: String,
+    fixture: SmokeFixture,
     output: PathBuf,
     dark: bool,
     window: &mut gpui::Window,
     cx: &mut gpui::App,
 ) {
+    let SmokeFixture {
+        checkout,
+        data_root,
+        rebase_base_oid,
+    } = fixture;
     window
         .spawn(cx, async move |window| {
             let started = std::time::Instant::now();
@@ -665,26 +696,29 @@ fn start_smoke(
                     break;
                 }
             }
-            let clean_refresh_confirmation_started = window
+            let clean_create_request = window
                 .update(|_, cx| {
                     workspace
                         .update(cx, |workspace, cx| {
                             workspace.refresh_all(cx);
-                            let Some(request_id) = workspace.request_action(
+                            let request_id = workspace.request_action(
                                 LocalAction::CreateBranch {
                                     branch: "smoke-clean-checkout".into(),
                                     start_oid: None,
                                 },
                                 cx,
-                            ) else {
-                                return false;
-                            };
+                            )?;
                             workspace.confirm_action(request_id, cx);
-                            workspace.in_flight_action_id() == Some(request_id)
+                            Some((
+                                request_id,
+                                workspace.in_flight_action_id() == Some(request_id),
+                            ))
                         })
-                        .unwrap_or(false)
+                        .unwrap_or(None)
                 })
-                .unwrap_or(false);
+                .unwrap_or(None);
+            let clean_refresh_confirmation_started = clean_create_request
+                .is_some_and(|(_, dispatched)| dispatched);
             let clean_confirmation_at = std::time::Instant::now();
             let clean_refresh_confirmation_finished = loop {
                 window
@@ -695,8 +729,16 @@ fn start_smoke(
                     .update(|_, cx| {
                         workspace
                             .read_with(cx, |workspace, _| {
-                                workspace.in_flight_action_id().is_none()
+                                clean_refresh_confirmation_started
+                                    && workspace.in_flight_action_id().is_none()
                                     && workspace.status_message().contains("Completed")
+                                    && workspace.local_snapshot().is_some_and(|snapshot| {
+                                        matches!(
+                                            &snapshot.head,
+                                            HeadState::Attached { branch, .. }
+                                                if branch == "smoke-clean-checkout"
+                                        )
+                                    })
                             })
                             .unwrap_or(false)
                     })
@@ -708,6 +750,238 @@ fn start_smoke(
                     break finished;
                 }
             };
+            let clean_create_status = window
+                .update(|_, cx| {
+                    workspace
+                        .read_with(cx, |workspace, _| workspace.status_message().to_owned())
+                        .unwrap_or_else(|error| format!("workspace read failed: {error}"))
+                })
+                .unwrap_or_else(|error| format!("window update failed: {error}"));
+            if !clean_refresh_confirmation_finished {
+                let journal = window
+                    .background_executor()
+                    .spawn({
+                        let data_root = data_root.clone();
+                        async move { retained_started_action(&data_root) }
+                    })
+                    .await;
+                let report = format!(
+                    "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nCreateBranch request outcome: {:?}\nCreateBranch dispatched: {}\nCreateBranch completed: {}\nCreateBranch terminal status/error: {}\nretained started-action journal: {}\nsmoke stopped after failed CreateBranch; SwitchBranch and dependent local-action probes were not run\n",
+                    if dark { "dark" } else { "light" },
+                    clean_create_request.map(|(request_id, _)| request_id),
+                    clean_refresh_confirmation_started,
+                    clean_refresh_confirmation_finished,
+                    clean_create_status,
+                    journal,
+                );
+                window
+                    .background_executor()
+                    .spawn({
+                        let report_path = output.join(if dark {
+                            "smoke-dark.txt"
+                        } else {
+                            "smoke-light.txt"
+                        });
+                        async move { fs::write(report_path, report).expect("write failed smoke report") }
+                    })
+                    .await;
+                let _ = window.update(|_, cx| cx.quit());
+                return;
+            }
+
+            let clean_switch_request = window
+                .update(|_, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            let request_id = workspace.request_action(
+                                LocalAction::SwitchBranch {
+                                    branch: "feature/local-ui".into(),
+                                },
+                                cx,
+                            )?;
+                            workspace.confirm_action(request_id, cx);
+                            Some((
+                                request_id,
+                                workspace.in_flight_action_id() == Some(request_id),
+                            ))
+                        })
+                        .unwrap_or(None)
+                })
+                .unwrap_or(None);
+            let clean_switch_dispatched =
+                clean_switch_request.is_some_and(|(_, dispatched)| dispatched);
+            let clean_switch_at = std::time::Instant::now();
+            let clean_switch_finished = loop {
+                window
+                    .background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let finished = window
+                    .update(|_, cx| {
+                        workspace
+                            .read_with(cx, |workspace, _| {
+                                clean_switch_dispatched
+                                    && workspace.in_flight_action_id().is_none()
+                                    && workspace.status_message().contains("Completed")
+                                    && workspace.local_snapshot().is_some_and(|snapshot| {
+                                        matches!(
+                                            &snapshot.head,
+                                            HeadState::Attached { branch, .. }
+                                                if branch == "feature/local-ui"
+                                        )
+                                    })
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if finished
+                    || !clean_switch_dispatched
+                    || clean_switch_at.elapsed() > std::time::Duration::from_secs(20)
+                {
+                    break finished;
+                }
+            };
+            let clean_switch_status = window
+                .update(|_, cx| {
+                    workspace
+                        .read_with(cx, |workspace, _| workspace.status_message().to_owned())
+                        .unwrap_or_else(|error| format!("workspace read failed: {error}"))
+                })
+                .unwrap_or_else(|error| format!("window update failed: {error}"));
+            if !clean_switch_finished {
+                let journal = window
+                    .background_executor()
+                    .spawn({
+                        let data_root = data_root.clone();
+                        async move { retained_started_action(&data_root) }
+                    })
+                    .await;
+                let report = format!(
+                    "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nCreateBranch request outcome: {:?}\nCreateBranch dispatched: {}\nCreateBranch completed: {}\nCreateBranch terminal status/error: {}\nSwitchBranch request outcome: {:?}\nSwitchBranch dispatched: {}\nSwitchBranch completed: {}\nSwitchBranch terminal status/error: {}\nretained started-action journal: {}\nsmoke stopped after failed clean SwitchBranch; same-current and dependent local-action probes were not run\n",
+                    if dark { "dark" } else { "light" },
+                    clean_create_request.map(|(request_id, _)| request_id),
+                    clean_refresh_confirmation_started,
+                    clean_refresh_confirmation_finished,
+                    clean_create_status,
+                    clean_switch_request.map(|(request_id, _)| request_id),
+                    clean_switch_dispatched,
+                    clean_switch_finished,
+                    clean_switch_status,
+                    journal,
+                );
+                window
+                    .background_executor()
+                    .spawn({
+                        let report_path = output.join(if dark {
+                            "smoke-dark.txt"
+                        } else {
+                            "smoke-light.txt"
+                        });
+                        async move { fs::write(report_path, report).expect("write failed smoke report") }
+                    })
+                    .await;
+                let _ = window.update(|_, cx| cx.quit());
+                return;
+            }
+
+            let same_branch_request = window
+                .update(|_, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            let request_id = workspace.request_action(
+                                LocalAction::SwitchBranch {
+                                    branch: "feature/local-ui".into(),
+                                },
+                                cx,
+                            )?;
+                            workspace.confirm_action(request_id, cx);
+                            Some((
+                                request_id,
+                                workspace.in_flight_action_id() == Some(request_id),
+                            ))
+                        })
+                        .unwrap_or(None)
+                })
+                .unwrap_or(None);
+            let same_branch_dispatched =
+                same_branch_request.is_some_and(|(_, dispatched)| dispatched);
+            let same_branch_at = std::time::Instant::now();
+            let same_branch_finished = loop {
+                window
+                    .background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let finished = window
+                    .update(|_, cx| {
+                        workspace
+                            .read_with(cx, |workspace, _| {
+                                same_branch_dispatched
+                                    && workspace.in_flight_action_id().is_none()
+                                    && workspace.status_message().contains("Completed")
+                                    && workspace.local_snapshot().is_some_and(|snapshot| {
+                                        matches!(
+                                            &snapshot.head,
+                                            HeadState::Attached { branch, .. }
+                                                if branch == "feature/local-ui"
+                                        )
+                                    })
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if finished
+                    || !same_branch_dispatched
+                    || same_branch_at.elapsed() > std::time::Duration::from_secs(20)
+                {
+                    break finished;
+                }
+            };
+            let same_branch_status = window
+                .update(|_, cx| {
+                    workspace
+                        .read_with(cx, |workspace, _| workspace.status_message().to_owned())
+                        .unwrap_or_else(|error| format!("workspace read failed: {error}"))
+                })
+                .unwrap_or_else(|error| format!("window update failed: {error}"));
+            if !same_branch_finished {
+                let journal = window
+                    .background_executor()
+                    .spawn({
+                        let data_root = data_root.clone();
+                        async move { retained_started_action(&data_root) }
+                    })
+                    .await;
+                let report = format!(
+                    "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nCreateBranch request outcome: {:?}\nCreateBranch dispatched: {}\nCreateBranch completed: {}\nCreateBranch terminal status/error: {}\nSwitchBranch request outcome: {:?}\nSwitchBranch dispatched: {}\nSwitchBranch completed: {}\nSwitchBranch terminal status/error: {}\nsame-current SwitchBranch request outcome: {:?}\nsame-current SwitchBranch dispatched: {}\nsame-current SwitchBranch completed: {}\nsame-current SwitchBranch terminal status/error: {}\nretained started-action journal: {}\nsmoke stopped after failed same-current SwitchBranch; dependent local-action probes were not run\n",
+                    if dark { "dark" } else { "light" },
+                    clean_create_request.map(|(request_id, _)| request_id),
+                    clean_refresh_confirmation_started,
+                    clean_refresh_confirmation_finished,
+                    clean_create_status,
+                    clean_switch_request.map(|(request_id, _)| request_id),
+                    clean_switch_dispatched,
+                    clean_switch_finished,
+                    clean_switch_status,
+                    same_branch_request.map(|(request_id, _)| request_id),
+                    same_branch_dispatched,
+                    same_branch_finished,
+                    same_branch_status,
+                    journal,
+                );
+                window
+                    .background_executor()
+                    .spawn({
+                        let report_path = output.join(if dark {
+                            "smoke-dark.txt"
+                        } else {
+                            "smoke-light.txt"
+                        });
+                        async move { fs::write(report_path, report).expect("write failed smoke report") }
+                    })
+                    .await;
+                let _ = window.update(|_, cx| cx.quit());
+                return;
+            }
             let save_in_flight_confirmation_paused = window
                 .update(|window, cx| {
                     workspace
@@ -961,7 +1235,7 @@ fn start_smoke(
                 }
             };
             let report = format!(
-                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nrebase prepare requested: {}\npopulated three-commit plan ready: {}\nplan normal capture: {}\nedit plan Start requested through confirmation: {}\nPausedForEdit observed: {}\nedit wide capture: {}\nexpanded operation details capture: {}\nexplicit Continue requested through confirmation: {}\nCompleted observed: {}\nresult normal capture: {}\nsafe archive requested and second prepare enabled: {}\nreordered conflict plan prepared: {}\nconflicting Start requested through confirmation: {}\nConflicted observed from real Git: {}\nconflict narrow capture: {}\nexplicit Abort requested through confirmation: {}\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nclean checkout confirmation dispatched while no-op refresh pending: {}\nclean refresh-time confirmation completed authoritatively: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
+                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nrebase prepare requested: {}\npopulated three-commit plan ready: {}\nplan normal capture: {}\nedit plan Start requested through confirmation: {}\nPausedForEdit observed: {}\nedit wide capture: {}\nexpanded operation details capture: {}\nexplicit Continue requested through confirmation: {}\nCompleted observed: {}\nresult normal capture: {}\nsafe archive requested and second prepare enabled: {}\nreordered conflict plan prepared: {}\nconflicting Start requested through confirmation: {}\nConflicted observed from real Git: {}\nconflict narrow capture: {}\nexplicit Abort requested through confirmation: {}\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nCreateBranch request outcome: {:?}\nCreateBranch dispatched while no-op refresh pending: {}\nCreateBranch completed authoritatively: {}\nCreateBranch terminal status/error: {}\nSwitchBranch request outcome: {:?}\nSwitchBranch dispatched: {}\nSwitchBranch completed authoritatively: {}\nSwitchBranch terminal status/error: {}\nsame-current SwitchBranch request outcome: {:?}\nsame-current SwitchBranch dispatched: {}\nsame-current SwitchBranch completed authoritatively: {}\nsame-current SwitchBranch terminal status/error: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
                 if dark { "dark" } else { "light" },
                 prepare_requested,
                 plan_ready,
@@ -984,8 +1258,18 @@ fn start_smoke(
                 readback.contains("highlighted local edit") && readback.contains("verified"),
                 highlighted_capture,
                 invalid_prestart_refused,
+                clean_create_request.map(|(request_id, _)| request_id),
                 clean_refresh_confirmation_started,
                 clean_refresh_confirmation_finished,
+                clean_create_status,
+                clean_switch_request.map(|(request_id, _)| request_id),
+                clean_switch_dispatched,
+                clean_switch_finished,
+                clean_switch_status,
+                same_branch_request.map(|(request_id, _)| request_id),
+                same_branch_dispatched,
+                same_branch_finished,
+                same_branch_status,
                 save_in_flight_confirmation_paused,
                 checkout_action_edit_race_paused,
                 checkout_action_edit_race_paused && document_conflict_requested,
