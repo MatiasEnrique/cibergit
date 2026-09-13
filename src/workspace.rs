@@ -95,8 +95,8 @@ impl Filter {
             && self.draft.is_none_or(|draft| pr.draft == draft)
             && equals(&pr.review_status, &self.review_status)
             && equals(&pr.check_status, &self.check_status)
-            && equals(&pr.target_branch, &self.target_branch)
-            && equals(&pr.source_branch, &self.source_branch)
+            && (self.target_branch.is_empty() || pr.target_branch == self.target_branch)
+            && (self.source_branch.is_empty() || pr.source_branch == self.source_branch)
             && match self.personal {
                 PersonalFilter::All => true,
                 PersonalFilter::ReviewRequested => {

@@ -137,7 +137,7 @@ fn search_covers_title_number_and_both_branches() {
 }
 
 #[test]
-fn attribute_filters_and_personal_identity_are_case_insensitive() {
+fn collaboration_attributes_ignore_case_but_exact_git_branches_do_not() {
     let item = PullRequest {
         title: "Ship it".into(),
         number: 4,
@@ -161,11 +161,25 @@ fn attribute_filters_and_personal_identity_are_case_insensitive() {
         draft: Some(true),
         review_status: "changesrequested".into(),
         check_status: "failing".into(),
-        source_branch: "FEAT/bug".into(),
-        target_branch: "main".into(),
+        source_branch: "feat/bug".into(),
+        target_branch: "Main".into(),
         ..Default::default()
     };
     assert!(matching.matches(&item, "ada"));
+    assert!(
+        !Filter {
+            source_branch: "FEAT/bug".into(),
+            ..matching.clone()
+        }
+        .matches(&item, "ada")
+    );
+    assert!(
+        !Filter {
+            target_branch: "main".into(),
+            ..matching.clone()
+        }
+        .matches(&item, "ada")
+    );
     assert!(
         !Filter {
             draft: Some(false),

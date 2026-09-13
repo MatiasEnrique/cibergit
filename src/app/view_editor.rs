@@ -333,6 +333,7 @@ pub(super) fn compose_sidebar_rows(
                 .iter()
                 .map(|part| part.to_lowercase())
                 .collect::<Vec<_>>(),
+            pull.path.clone(),
             pull.repository_key.to_lowercase(),
             Reverse(pull.pull_request.number),
         )
@@ -344,7 +345,7 @@ pub(super) fn compose_sidebar_rows(
         let common = previous_path
             .iter()
             .zip(&pull.path)
-            .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
+            .take_while(|(left, right)| left == right)
             .count();
         for (depth, label) in pull.path.iter().enumerate().skip(common) {
             rows.push(SidebarRow::Group {
@@ -398,6 +399,49 @@ mod tests {
             check_status: "PASSING".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn case_distinct_git_branches_keep_separate_groups_and_exact_filters() {
+        let repository = repo("one", "ada");
+        let pulls = [
+            pr(1, "Feature/parser", "Main"),
+            pr(2, "feature/parser", "main"),
+        ];
+        let repositories = [RepositoryPulls {
+            index: 0,
+            repository: &repository,
+            pull_requests: &pulls,
+        }];
+        let view = SavedView {
+            groups: vec![GroupBy::TargetBranch],
+            ..Default::default()
+        };
+        let rows = compose_sidebar_rows(&repositories, &view);
+        let groups = rows
+            .iter()
+            .filter_map(|row| match row {
+                SidebarRow::Group { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(groups, ["Main", "main"]);
+        let exact = SavedView {
+            filter: Filter {
+                source_branch: "Feature/parser".into(),
+                target_branch: "Main".into(),
+                ..Default::default()
+            },
+            ..view
+        };
+        let numbers = compose_sidebar_rows(&repositories, &exact)
+            .into_iter()
+            .filter_map(|row| match row {
+                SidebarRow::Pull { pull_request, .. } => Some(pull_request.number),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, [1]);
     }
 
     #[test]
