@@ -1299,6 +1299,8 @@ impl LocalWorkspace {
 
         let mut content = div()
             .id("rebase-scroll")
+            .w_full()
+            .min_w_0()
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -1440,7 +1442,9 @@ impl LocalWorkspace {
             );
         }
         div()
-            .size_full()
+            .flex_1()
+            .min_w_0()
+            .h_full()
             .flex()
             .flex_col()
             .bg(colors.canvas)
