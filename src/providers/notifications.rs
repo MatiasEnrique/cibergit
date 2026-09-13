@@ -94,6 +94,13 @@ pub enum NotificationAlertKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NotificationEvidence {
+    /// Native `mentioned` timeline events identify the body-mention recipient
+    /// in `actor`; this does not infer a mention from comment text or a sticky
+    /// notification reason, and does not identify the person who wrote it.
+    MentionedInBody {
+        timeline_event_id: String,
+        mentioned_user: String,
+    },
     ReviewRequested {
         timeline_event_id: String,
         requested_reviewer: String,
@@ -564,7 +571,7 @@ fn hydrate_candidate(
             target: Some(exact_target),
             provider_notification_id: Some(notification.id.clone()),
             kind: IncompleteCandidateKind::Mention,
-            reason: "GitHub notification reason is sticky and REST comments expose text but no authoritative mention-recipient identity; no mention was classified".into(),
+            reason: "Comment/team mention evidence remains unavailable from sticky notification reasons or body text; any exact native PR-body mention events are classified separately".into(),
         });
     }
     Ok(timeline_complete && replies_complete && checks_complete)
@@ -591,6 +598,20 @@ fn read_timeline(
         ensure!(values.len() <= PAGE_SIZE, "Invalid timeline page size");
         let last = values.len() < PAGE_SIZE;
         for value in values {
+            if value.event.as_deref() == Some("mentioned") {
+                let id = value
+                    .id
+                    .context("mentioned event omitted immutable numeric ID")?;
+                ensure!(id > 0, "Invalid mentioned event identity");
+                ensure!(
+                    seen.insert(id.to_string()),
+                    "Timeline changed during pagination; refresh to retry"
+                );
+                if let Some(event) = prove_body_mention(provider, repo, number, value)? {
+                    events.push(event);
+                }
+                continue;
+            }
             if value.event.as_deref() != Some("review_requested") {
                 continue;
             }
@@ -661,12 +682,67 @@ fn read_timeline(
                 &target,
                 notification,
                 IncompleteCandidateKind::ReviewRequest,
-                "timeline page bound reached; review-request absence is unknown",
+                "timeline page bound reached; review-request and body-mention absence is unknown",
             ));
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// GitHub documents `mentioned` as the actor being mentioned in an issue or
+/// PR body: https://docs.github.com/en/rest/using-the-rest-api/issue-event-types#mentioned
+/// The enclosing exact PR timeline and this event's repository URL bind the
+/// event. No comment-body search, reason matching or author inference is used.
+fn prove_body_mention(
+    provider: &GithubProvider,
+    repo: &Repository,
+    number: u64,
+    event: ApiTimelineEvent,
+) -> Result<Option<ProviderNotificationEvent>> {
+    let recipient = event
+        .actor
+        .context("mentioned event omitted recipient identity")?
+        .login;
+    validate_login(&recipient)?;
+    if !recipient.eq_ignore_ascii_case(&provider.account.login) {
+        return Ok(None);
+    }
+    let id = event
+        .id
+        .context("mentioned event omitted immutable numeric ID")?;
+    ensure!(id > 0, "Invalid mentioned event identity");
+    let (event_repository, event_id) = event
+        .url
+        .as_deref()
+        .and_then(|url| url.strip_prefix("https://api.github.com/repos/"))
+        .and_then(|path| path.split_once("/issues/events/"))
+        .context("Mentioned event URL is not a canonical GitHub issue-event URL")?;
+    ensure!(
+        event_repository.eq_ignore_ascii_case(&repo.full_name()) && event_id == id.to_string(),
+        "Mentioned event URL does not bind the selected repository and event ID"
+    );
+    let occurred_at = event
+        .created_at
+        .context("mentioned event omitted timestamp")?;
+    validate_timestamp(&occurred_at)?;
+    Ok(Some(ProviderNotificationEvent {
+        identity: NotificationEventIdentity {
+            target: target(provider, repo, number),
+            source: NotificationEventSource::Timeline,
+            remote_event_id: id.to_string(),
+        },
+        occurred_at,
+        // `actor` is the recipient for this event type, not its author.
+        actor: None,
+        alert_kind: NotificationAlertKind::Mention,
+        summary: "You were mentioned in the pull request body".into(),
+        url: pull_url(repo, number),
+        evidence: NotificationEvidence::MentionedInBody {
+            timeline_event_id: id.to_string(),
+            mentioned_user: provider.account.login.clone(),
+        },
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1149,6 +1225,7 @@ struct ApiHead {
 #[derive(Deserialize)]
 struct ApiTimelineEvent {
     id: Option<u64>,
+    url: Option<String>,
     node_id: Option<String>,
     event: Option<String>,
     actor: Option<ApiUser>,

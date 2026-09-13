@@ -235,6 +235,87 @@ print(json.dumps(responses[endpoint]))
             assert!(fs::read_to_string(dir.path().join("calls")).unwrap().lines().all(|line| !line.contains("mark") && !line.contains("subscriptions")));
         }
 
+        fn body_mention(id: u64, recipient: &str) -> Value {
+            json!({
+                "id": id, "node_id": format!("mentioned-{id}"), "event": "mentioned",
+                "url": format!("https://api.github.com/repos/OWNER/Repo/issues/events/{id}"),
+                "actor": { "login": recipient }, "created_at": "2026-09-13T11:00:00Z"
+            })
+        }
+
+        #[test]
+        fn native_body_mention_uses_recipient_event_and_dedupes_after_restart() {
+            // Sticky mention reason with no native event is still not proof.
+            let responses = complete_responses("mention", "success");
+            let (fixture, provider) = provider_fixture("alice", responses.clone());
+            let store_root = tempfile::tempdir().unwrap();
+            let store = NotificationStore::open(store_root.path(), NotificationStoreLimits::default()).unwrap();
+            let baseline = provider.notification_observations(&[provider_repo("alice")], None, NotificationReadLimits::default()).unwrap();
+            assert!(baseline.complete);
+            assert!(!baseline.observations[0].events.iter().any(|event| event.alert_kind == NotificationAlertKind::Mention));
+            assert!(store.reconcile(&provider_account("alice"), &baseline).unwrap().newly_admitted_alerts.is_empty());
+
+            let mut changed = responses;
+            changed.get_mut("repos/owner/repo/issues/7/timeline?per_page=100&page=1").unwrap().as_array_mut().unwrap().extend([
+                body_mention(71, "ALICE"), body_mention(72, "someone-else")
+            ]);
+            fs::write(fixture.path().join("responses.json"), serde_json::to_vec(&changed).unwrap()).unwrap();
+            let later = provider.notification_observations(&[provider_repo("alice")], None, NotificationReadLimits::default()).unwrap();
+            assert!(later.complete);
+            let mentions: Vec<_> = later.observations[0].events.iter().filter(|event| event.alert_kind == NotificationAlertKind::Mention).collect();
+            assert_eq!(mentions.len(), 1);
+            assert_eq!(mentions[0].identity.remote_event_id, "71");
+            assert_eq!(mentions[0].identity.source, NotificationEventSource::Timeline);
+            assert_eq!(mentions[0].identity.target.pull_request, 7);
+            assert_eq!(mentions[0].actor, None, "recipient must not be attributed as mention author");
+            assert_eq!(mentions[0].evidence, NotificationEvidence::MentionedInBody {
+                timeline_event_id: "71".into(), mentioned_user: "alice".into(),
+            });
+            assert_eq!(store.reconcile(&provider_account("alice"), &later).unwrap().newly_admitted_alerts.len(), 1);
+            drop(store);
+            let store = NotificationStore::open(store_root.path(), NotificationStoreLimits::default()).unwrap();
+            assert!(store.reconcile(&provider_account("alice"), &later).unwrap().newly_admitted_alerts.is_empty());
+            assert!(store.list_unread(&provider_account("alice")).unwrap().unread_by_pull_request.iter().flat_map(|pr| &pr.unread_events).any(|event| event.identity.remote_event_id == "71"));
+            assert!(later.incomplete_candidates.iter().any(|item| item.kind == IncompleteCandidateKind::Mention), "comment/team mention gap remains explicit");
+        }
+
+        #[test]
+        fn body_mention_refuses_missing_or_foreign_native_evidence() {
+            let (_fixture, provider) = provider_fixture("alice", HashMap::new());
+            let repository = provider_repo("alice");
+            for (field, wrong) in [
+                ("id", Value::Null), ("id", json!(0)),
+                ("actor", Value::Null), ("created_at", Value::Null),
+                ("created_at", json!("not-a-time")), ("url", Value::Null),
+                ("url", json!("https://api.github.com/repos/other/repo/issues/events/71")),
+                ("url", json!("https://api.github.com/repos/owner/repo/issues/events/99")),
+                ("url", json!("https://api.github.com/repos/owner/repo/issues/events/71?x=1")),
+                ("url", json!("https://api.github.com/repos/owner/repo/Issues/Events/71")),
+                ("url", json!("http://api.github.com/repos/owner/repo/issues/events/71")),
+            ] {
+                let mut event = body_mention(71, "alice");
+                event[field] = wrong;
+                let parsed: ApiTimelineEvent = serde_json::from_value(event).unwrap();
+                assert!(prove_body_mention(&provider, &repository, 7, parsed).is_err(), "invalid {field} must not become a mention");
+            }
+            let other: ApiTimelineEvent = serde_json::from_value(body_mention(71, "bob")).unwrap();
+            assert!(prove_body_mention(&provider, &repository, 7, other).unwrap().is_none());
+        }
+
+        #[test]
+        fn malformed_body_mention_marks_provider_read_incomplete() {
+            let mut responses = complete_responses("mention", "success");
+            let mut event = body_mention(71, "alice");
+            event["url"] = json!("https://api.github.com/repos/foreign/repo/issues/events/71");
+            responses.get_mut("repos/owner/repo/issues/7/timeline?per_page=100&page=1").unwrap().as_array_mut().unwrap().push(event);
+            let (_fixture, provider) = provider_fixture("alice", responses);
+            let batch = provider.notification_observations(&[provider_repo("alice")], None, NotificationReadLimits::default()).unwrap();
+            assert!(!batch.complete);
+            assert!(!batch.repositories[0].complete);
+            assert!(batch.incomplete_candidates.iter().any(|candidate| candidate.reason.contains("Mentioned event URL does not bind")), "the exact mention identity check must cause incompleteness: {:?}", batch.incomplete_candidates);
+            assert!(!batch.observations.iter().flat_map(|item| &item.events).any(|event| event.alert_kind == NotificationAlertKind::Mention));
+        }
+
         #[test]
         fn known_non_pull_subjects_preserve_pr_baseline_and_do_not_consume_hydration() {
             let mut baseline_responses = complete_responses("review_requested", "success");
