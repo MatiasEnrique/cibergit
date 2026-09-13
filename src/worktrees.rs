@@ -11,12 +11,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
+    ffi::c_int,
     fmt, fs,
     io::{ErrorKind, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const SCHEMA_VERSION: u32 = 1;
@@ -24,6 +28,26 @@ const STORE_FILE: &str = "worktree-associations.json";
 const MAX_STORE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RECORDS: usize = 4_096;
 const MAX_TEXT_BYTES: usize = 4_096;
+const STORE_LOCK_FILE: &str = "worktree-associations.lock";
+const STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+// Darwin constants; the application supports macOS only.
+const O_NONBLOCK: c_int = 0x0004;
+const O_CLOEXEC: c_int = 0x0100_0000;
+const O_NOFOLLOW_ANY: c_int = 0x2000_0000;
+const LOCK_EX: c_int = 0x02;
+const LOCK_NB: c_int = 0x04;
+
+unsafe extern "C" {
+    fn flock(fd: c_int, operation: c_int) -> c_int;
+    fn geteuid() -> u32;
+}
+
+struct StoreAuthorityGuard<'a> {
+    _process_guard: MutexGuard<'a, ()>,
+    // The persistent lock inode is never unlinked. Closing the descriptor also
+    // releases authority on process death, without stale PID-file recovery.
+    _descriptor: fs::File,
+}
 // A full initial public clone exceeded the local-action 30s limit in native
 // validation. Network setup remains bounded and never runs on the UI thread.
 const NETWORK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
@@ -1327,10 +1351,80 @@ impl WorktreeManager {
         Ok(())
     }
 
-    fn lock_store(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
-        self.store_lock
-            .lock()
-            .map_err(|_| WorktreeError::Store("worktree store lock is unavailable".into()))
+    fn lock_store(&self) -> Result<StoreAuthorityGuard<'_>> {
+        let started = Instant::now();
+        let busy = || WorktreeError::Store("worktree store is busy in another operation".into());
+        let process_guard = loop {
+            match self.store_lock.try_lock() {
+                Ok(guard) => break guard,
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(WorktreeError::Store(
+                        "worktree store lock is unavailable".into(),
+                    ));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    if started.elapsed() >= STORE_LOCK_TIMEOUT {
+                        return Err(busy());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        let path = self.store_path.with_file_name(STORE_LOCK_FILE);
+        let descriptor = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW_ANY)
+            .open(&path)
+            .map_err(io("open worktree store authority"))?;
+        let metadata = descriptor
+            .metadata()
+            .map_err(io("inspect worktree store authority"))?;
+        // SAFETY: geteuid takes no pointers and reports this process's identity.
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { geteuid() }
+            || metadata.mode() & 0o777 != 0o600
+        {
+            return Err(WorktreeError::Store(
+                "worktree store authority must be a private single-link regular file".into(),
+            ));
+        }
+        loop {
+            // SAFETY: the open descriptor remains owned by the returned guard;
+            // LOCK_NB makes contention subject to the userspace deadline.
+            if unsafe { flock(descriptor.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+                let current =
+                    fs::symlink_metadata(&path).map_err(io("recheck worktree store authority"))?;
+                if current.file_type().is_symlink()
+                    || current.dev() != metadata.dev()
+                    || current.ino() != metadata.ino()
+                    || current.nlink() != 1
+                {
+                    return Err(WorktreeError::Store(
+                        "worktree store authority identity changed".into(),
+                    ));
+                }
+                return Ok(StoreAuthorityGuard {
+                    _process_guard: process_guard,
+                    _descriptor: descriptor,
+                });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != ErrorKind::WouldBlock && error.kind() != ErrorKind::Interrupted {
+                return Err(WorktreeError::Io {
+                    context: "acquire worktree store authority",
+                    source: error,
+                });
+            }
+            if started.elapsed() >= STORE_LOCK_TIMEOUT {
+                return Err(busy());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn claim_path(&self, operation: &StoredOperation) -> PathBuf {

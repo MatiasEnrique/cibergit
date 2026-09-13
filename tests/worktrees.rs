@@ -1115,3 +1115,150 @@ fn wait_for(path: &Path) {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+#[test]
+#[ignore = "subprocess entry point invoked by store authority tests"]
+fn worktree_store_authority_child() {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    let mode = std::env::var("CIBERGIT_STORE_TEST_MODE").unwrap();
+    let state = PathBuf::from(std::env::var_os("CIBERGIT_STORE_TEST_STATE").unwrap());
+    if mode == "hold" {
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(state.join("worktree-associations.lock"))
+            .unwrap();
+        // SAFETY: the owned descriptor stays open until the subprocess dies.
+        assert_eq!(unsafe { flock(lock.as_raw_fd(), 2) }, 0);
+        fs::write(state.join("holder-ready"), b"locked").unwrap();
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+    let managed = PathBuf::from(std::env::var_os("CIBERGIT_STORE_TEST_MANAGED").unwrap());
+    let source = PathBuf::from(std::env::var_os("CIBERGIT_STORE_TEST_SOURCE").unwrap());
+    let number: u64 = mode.parse().unwrap();
+    let manager = WorktreeManager::open(&state, managed).unwrap();
+    manager
+        .create_from_local(CreateFromLocalRequest {
+            key: key("one", number),
+            object_repository: source.clone(),
+            start_oid: git(&source, &["rev-parse", "HEAD"]),
+            local_branch: format!("process-{number}"),
+            intended_remote_branch: Some(format!("process-{number}")),
+            published_head: None,
+        })
+        .unwrap();
+}
+
+struct StoreTestChild(std::process::Child);
+
+impl Drop for StoreTestChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn store_child(fixture: &Fixture, source: &Path, mode: &str) -> StoreTestChild {
+    StoreTestChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worktree_store_authority_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("CIBERGIT_STORE_TEST_MODE", mode)
+            .env("CIBERGIT_STORE_TEST_STATE", &fixture.state)
+            .env("CIBERGIT_STORE_TEST_MANAGED", &fixture.managed)
+            .env("CIBERGIT_STORE_TEST_SOURCE", source)
+            .spawn()
+            .unwrap(),
+    )
+}
+
+#[test]
+fn store_authority_is_cross_process_bounded_and_released_after_process_death() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let mut holder = store_child(&fixture, &fixture.source, "hold");
+    wait_for(&fixture.state.join("holder-ready"));
+    let lock_path = fixture.state.join("worktree-associations.lock");
+    let original_inode = fs::metadata(&lock_path).unwrap().ino();
+    let started = Instant::now();
+    let refusal = manager.create_from_local(fixture.request(81, "must-not-start"));
+    assert!(matches!(refusal, Err(WorktreeError::Store(ref reason)) if reason.contains("busy")));
+    assert!(started.elapsed() >= Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert!(!fixture.state.join("worktree-associations.json").exists());
+    assert!(
+        !git_output(
+            &fixture.source,
+            &["show-ref", "--verify", "refs/heads/must-not-start"]
+        )
+        .status
+        .success()
+    );
+    holder.0.kill().unwrap();
+    holder.0.wait().unwrap();
+    manager
+        .create_from_local(fixture.request(81, "must-not-start"))
+        .unwrap();
+    assert_eq!(fs::metadata(lock_path).unwrap().ino(), original_inode);
+    assert!(fixture.manager().reopen(&key("one", 81)).unwrap().is_some());
+
+    let other_source = fixture._temp.path().join("other-source");
+    init_at(&other_source);
+    let mut first = store_child(&fixture, &fixture.source, "82");
+    let mut second = store_child(&fixture, &other_source, "83");
+    assert!(first.0.wait().unwrap().success());
+    assert!(second.0.wait().unwrap().success());
+    let fresh = fixture.manager();
+    for number in [81, 82, 83] {
+        assert!(fresh.reopen(&key("one", number)).unwrap().is_some());
+    }
+}
+
+#[test]
+fn store_authority_rejects_linked_and_nonregular_targets_without_touching_them() {
+    use std::os::unix::fs::symlink;
+    for kind in ["symlink", "hardlink", "fifo", "public"] {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let lock = fixture.state.join("worktree-associations.lock");
+        let sentinel = fixture._temp.path().join("sentinel");
+        fs::write(&sentinel, b"preserve").unwrap();
+        match kind {
+            "symlink" => symlink(&sentinel, &lock).unwrap(),
+            "hardlink" => fs::hard_link(&sentinel, &lock).unwrap(),
+            "fifo" => assert!(
+                Command::new("mkfifo")
+                    .arg(&lock)
+                    .status()
+                    .unwrap()
+                    .success()
+            ),
+            _ => {
+                fs::write(&lock, b"preserve").unwrap();
+                fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+        let started = Instant::now();
+        assert!(
+            manager
+                .create_from_local(fixture.request(90, "refused"))
+                .is_err(),
+            "{kind}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "{kind} blocked");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve");
+        assert!(!fixture.state.join("worktree-associations.json").exists());
+    }
+}
