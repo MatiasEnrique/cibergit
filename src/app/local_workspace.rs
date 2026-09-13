@@ -4602,7 +4602,7 @@ mod tests {
         );
         // The older save callback arrives after the newer callback. Its
         // cumulative worker view has only A, so replacement would lose B.
-        assert!(merge_retained_paths(&mut visible, &[retained_a.clone()]).is_empty());
+        assert!(merge_retained_paths(&mut visible, std::slice::from_ref(&retained_a)).is_empty());
         assert_eq!(visible, vec![retained_a, retained_b]);
         assert_eq!(newer_message, "Conflict from newer reply");
         assert_eq!(newer_status, DocumentStatus::Conflict);

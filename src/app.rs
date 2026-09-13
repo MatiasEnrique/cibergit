@@ -778,7 +778,7 @@ impl ReviewWorkspace {
         let interaction_root = data_root.join("review-interactions");
         cx.bind_keys([
             KeyBinding::new("cmd-shift-e", local_checkout::EditLocally, None),
-            KeyBinding::new("cmd-shift-r", local_checkout::ReturnToReview, None),
+            KeyBinding::new("cmd-alt-shift-e", local_checkout::ReturnToReview, None),
             KeyBinding::new("cmd-s", local_workspace::LocalSave, Some("LocalWorkspace")),
             KeyBinding::new("cmd-f", local_workspace::LocalFind, Some("LocalWorkspace")),
             KeyBinding::new(
@@ -6309,7 +6309,7 @@ impl ReviewWorkspace {
                                 .id("return-to-published-review")
                                 .cursor_pointer()
                                 .text_color(colors.accent)
-                                .child("← Published review  ⇧⌘R")
+                                .child("← Published review  ⌥⇧⌘E")
                                 .on_click(cx.listener(move |root, _, _, cx| {
                                     if let Root::Review(this) = root {
                                         this.tabs[index].local_visible = false;
