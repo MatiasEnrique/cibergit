@@ -454,6 +454,11 @@ pub(super) fn source_panel(
                             div()
                                 .h(px(18.))
                                 .line_height(px(18.))
+                                // UniformList measures outside its inherited text
+                                // style. Bind the row font for identical measuring
+                                // and painting, including horizontal end bounds.
+                                .font_family(CODE_FONT)
+                                .text_size(px(12.))
                                 .whitespace_nowrap()
                                 .child(if line.is_empty() {
                                     " ".into()
