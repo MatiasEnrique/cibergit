@@ -71,6 +71,7 @@ const O_CLOEXEC: c_int = 0x0100_0000;
 const O_NOFOLLOW_ANY: c_int = 0x2000_0000;
 const LOCK_EX: c_int = 0x02;
 const LOCK_NB: c_int = 0x04;
+const LOCK_UN: c_int = 0x08;
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
@@ -2359,12 +2360,21 @@ fn prepare_private_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("protect action journal directory: {error}"))
 }
 
+#[derive(Debug)]
 struct ActionJournalLock {
-    _file: File,
+    file: File,
+    locked: bool,
 }
 
 impl ActionJournalLock {
     fn acquire(journal: &Path) -> Result<Self, String> {
+        Self::acquire_with_post_lock_hook(journal, |_| Ok(()))
+    }
+
+    fn acquire_with_post_lock_hook(
+        journal: &Path,
+        after_lock: impl FnOnce(c_int) -> Result<(), String>,
+    ) -> Result<Self, String> {
         let parent = journal
             .parent()
             .ok_or_else(|| "action journal has no parent".to_owned())?;
@@ -2400,7 +2410,7 @@ impl ActionJournalLock {
                 std::io::Error::last_os_error()
             ));
         }
-        let mut file = unsafe { File::from_raw_fd(lock_fd) };
+        let file = unsafe { File::from_raw_fd(lock_fd) };
         let metadata = file
             .metadata()
             .map_err(|error| format!("inspect action journal lock descriptor: {error}"))?;
@@ -2415,6 +2425,11 @@ impl ActionJournalLock {
                 std::io::Error::last_os_error()
             ));
         }
+        // Closing one descriptor does not release a BSD flock while a forked or
+        // duplicated descriptor still references the same open-file description.
+        // Activate an explicit unlock guard before any later fallible work.
+        let mut guard = Self { file, locked: true };
+        after_lock(guard.file.as_raw_fd())?;
         let path = canonical_parent.join(".started-local-action.lock");
         let path_metadata = fs::symlink_metadata(&path)
             .map_err(|error| format!("inspect action journal lock path: {error}"))?;
@@ -2424,14 +2439,32 @@ impl ActionJournalLock {
         {
             return Err("action journal lock path changed while it was acquired".into());
         }
-        file.set_len(0)
-            .and_then(|()| file.write_all(format!("pid={}\n", std::process::id()).as_bytes()))
-            .and_then(|()| file.sync_all())
+        guard
+            .file
+            .set_len(0)
+            .and_then(|()| {
+                guard
+                    .file
+                    .write_all(format!("pid={}\n", std::process::id()).as_bytes())
+            })
+            .and_then(|()| guard.file.sync_all())
             .map_err(|error| format!("sync action journal lock owner: {error}"))?;
         parent_fd
             .sync_all()
             .map_err(|error| format!("sync action journal lock directory: {error}"))?;
-        Ok(Self { _file: file })
+        Ok(guard)
+    }
+}
+
+impl Drop for ActionJournalLock {
+    fn drop(&mut self) {
+        if self.locked {
+            // Best effort is the only option in Drop. Unlocking before `File`
+            // closes is what prevents inherited duplicates from extending the
+            // critical section past this guard's lifetime.
+            let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+            self.locked = false;
+        }
     }
 }
 
@@ -4626,6 +4659,80 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn duplicated_descriptor_reproduces_lock_retention_after_original_close() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let journal = temporary.path().join("actions/started.json");
+        prepare_private_directory(journal.parent().expect("journal parent"))
+            .expect("private directory");
+        drop(ActionJournalLock::acquire(&journal).expect("create persistent lock file"));
+        let lock_path = journal
+            .parent()
+            .expect("journal parent")
+            .join(".started-local-action.lock");
+        let original = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_CLOEXEC)
+            .open(&lock_path)
+            .expect("open raw lock descriptor");
+        assert_eq!(unsafe { flock(original.as_raw_fd(), LOCK_EX | LOCK_NB) }, 0);
+        let duplicate_fd = unsafe { dup(original.as_raw_fd()) };
+        assert!(duplicate_fd >= 0, "duplicate raw lock descriptor");
+        let duplicate = unsafe { File::from_raw_fd(duplicate_fd) };
+        drop(original);
+
+        let refusal = ActionJournalLock::acquire(&journal)
+            .expect_err("a duplicated open-file description must retain flock after close");
+        assert!(refusal.contains("another live process"));
+
+        assert_eq!(unsafe { flock(duplicate.as_raw_fd(), LOCK_UN) }, 0);
+        drop(ActionJournalLock::acquire(&journal).expect("explicit raw unlock releases contender"));
+    }
+
+    #[test]
+    fn journal_guard_drop_unlocks_while_duplicated_descriptor_remains_open() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let journal = temporary.path().join("actions/started.json");
+        prepare_private_directory(journal.parent().expect("journal parent"))
+            .expect("private directory");
+        let guard = ActionJournalLock::acquire(&journal).expect("guard lock");
+        let duplicate_fd = unsafe { dup(guard.file.as_raw_fd()) };
+        assert!(duplicate_fd >= 0, "duplicate guard descriptor");
+        let duplicate = unsafe { File::from_raw_fd(duplicate_fd) };
+
+        drop(guard);
+        drop(
+            ActionJournalLock::acquire(&journal)
+                .expect("guard Drop must explicitly unlock before descriptor close"),
+        );
+        drop(duplicate);
+    }
+
+    #[test]
+    fn post_flock_acquisition_error_unlocks_with_duplicate_still_open() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let journal = temporary.path().join("actions/started.json");
+        prepare_private_directory(journal.parent().expect("journal parent"))
+            .expect("private directory");
+        let mut duplicate_fd = -1;
+        let result = ActionJournalLock::acquire_with_post_lock_hook(&journal, |fd| {
+            duplicate_fd = unsafe { dup(fd) };
+            if duplicate_fd < 0 {
+                return Err("duplicate post-flock descriptor failed".into());
+            }
+            Err("forced post-flock acquisition failure".into())
+        });
+        assert_eq!(result.unwrap_err(), "forced post-flock acquisition failure");
+        let duplicate = unsafe { File::from_raw_fd(duplicate_fd) };
+
+        drop(
+            ActionJournalLock::acquire(&journal)
+                .expect("error return must run explicit unlock before File closes"),
+        );
+        drop(duplicate);
     }
 
     #[test]
