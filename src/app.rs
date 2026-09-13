@@ -6407,6 +6407,7 @@ impl ReviewWorkspace {
                         div()
                             .mt_2()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap_2()
                             .text_sm()
