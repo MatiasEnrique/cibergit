@@ -1,3 +1,4 @@
+pub mod document;
 pub mod domain;
 pub mod participation;
 pub mod providers;
