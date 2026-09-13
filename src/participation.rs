@@ -15,7 +15,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     error::Error,
     fmt,
     fs::{self, File, OpenOptions},
@@ -29,6 +29,7 @@ pub const MAX_DRAFT_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_REVIEW_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_DRAFTS: usize = 256;
 pub const MAX_OPERATIONS: usize = 512;
+pub const MAX_RETIRED_REVIEWS: usize = 2048;
 pub const MAX_COMMENT_RANGE_LINES: u64 = 100;
 pub const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 const FORMAT_VERSION: u64 = 1;
@@ -691,6 +692,9 @@ pub struct ReviewComposition {
     pub observed_pending_review_id: Option<String>,
     /// Provider identity returned by an acknowledged local operation.
     pub acknowledged_pending_review_id: Option<String>,
+    /// Terminal review identities survive refresh, late replies and restart.
+    #[serde(default)]
+    pub retired_review_ids: BTreeSet<String>,
     next_draft_number: u64,
     next_operation_number: u64,
 }
@@ -706,6 +710,7 @@ impl ReviewComposition {
             operations: Vec::new(),
             observed_pending_review_id: None,
             acknowledged_pending_review_id: None,
+            retired_review_ids: BTreeSet::new(),
             next_draft_number: 1,
             next_operation_number: 1,
         })
@@ -1098,7 +1103,29 @@ impl ReviewComposition {
                 remote_comment_id: Some(remote_comment_id.clone()),
             };
         }
+        let retired = remote_review_id
+            .as_ref()
+            .is_some_and(|id| self.retired_review_ids.contains(id));
         let draft = self.draft_mut(&draft_id)?;
+        if disposition == DraftDisposition::Pending && retired {
+            if draft.body == remote_body {
+                draft.remote = Some(RemoteDraftIds {
+                    review_id: remote_review_id,
+                    comment_id: remote_comment_id,
+                });
+                draft.observed_remote_body = Some(remote_body);
+                draft.dirty = false;
+                draft.disposition = DraftDisposition::Submitted;
+            } else {
+                // The server finished an old payload. Current unsent text is
+                // a new draft and must not be attached back to that review.
+                draft.remote = None;
+                draft.observed_remote_body = None;
+                draft.dirty = true;
+                draft.disposition = DraftDisposition::Pending;
+            }
+            return Ok(());
+        }
         draft.remote = Some(RemoteDraftIds {
             review_id: remote_review_id.clone(),
             comment_id: remote_comment_id,
@@ -1122,6 +1149,13 @@ impl ReviewComposition {
         remote_review_id: String,
     ) -> Result<(), ParticipationError> {
         validate_nonempty_id("remote_review_id", &remote_review_id)?;
+        if !self.retired_review_ids.contains(&remote_review_id)
+            && self.retired_review_ids.len() >= MAX_RETIRED_REVIEWS
+        {
+            return Err(ParticipationError::OperationState(
+                "retired review history reached its recovery bound".into(),
+            ));
+        }
         let operation = self.operation_mut(operation_id)?;
         if !matches!(operation.target, ReviewOperationTarget::SubmitReview { .. }) {
             return Err(ParticipationError::OperationState(
@@ -1148,11 +1182,20 @@ impl ReviewComposition {
             remote_review_id: Some(remote_review_id.clone()),
             remote_comment_id: None,
         };
-        self.retire_pending_review(&remote_review_id);
+        self.retire_pending_review(&remote_review_id)?;
         Ok(())
     }
 
-    fn retire_pending_review(&mut self, remote_review_id: &str) {
+    fn retire_pending_review(&mut self, remote_review_id: &str) -> Result<(), ParticipationError> {
+        validate_nonempty_id("retired review", remote_review_id)?;
+        if !self.retired_review_ids.contains(remote_review_id)
+            && self.retired_review_ids.len() >= MAX_RETIRED_REVIEWS
+        {
+            return Err(ParticipationError::OperationState(
+                "retired review history reached its recovery bound".into(),
+            ));
+        }
+        self.retired_review_ids.insert(remote_review_id.to_owned());
         for draft in &mut self.drafts {
             if draft.disposition == DraftDisposition::Pending
                 && draft
@@ -1176,6 +1219,7 @@ impl ReviewComposition {
         if self.acknowledged_pending_review_id.as_deref() == Some(remote_review_id) {
             self.acknowledged_pending_review_id = None;
         }
+        Ok(())
     }
 
     fn operation_mut(&mut self, id: &str) -> Result<&mut ReviewOperation, ParticipationError> {
@@ -1202,6 +1246,9 @@ impl ReviewComposition {
             .iter()
             .filter(|review| {
                 review.state == "PENDING"
+                    && !self
+                        .retired_review_ids
+                        .contains(&review.coordinates.remote_id)
                     && review
                         .author
                         .as_deref()
@@ -1230,7 +1277,7 @@ impl ReviewComposition {
             .map(|review| review.coordinates.remote_id.clone())
             .collect();
         for remote_id in completed {
-            self.retire_pending_review(&remote_id);
+            self.retire_pending_review(&remote_id)?;
         }
         let previous = self.observed_pending_review_id.clone();
         self.observed_pending_review_id = pending
@@ -1279,6 +1326,27 @@ impl ReviewComposition {
     fn validate_bounds(&self) -> Result<(), ParticipationError> {
         self.key.validate()?;
         validate_revision(&self.reviewed_revision)?;
+        if self.retired_review_ids.len() > MAX_RETIRED_REVIEWS {
+            return Err(ParticipationError::OperationState(
+                "retired review history exceeds its recovery bound".into(),
+            ));
+        }
+        for id in &self.retired_review_ids {
+            validate_nonempty_id("retired review", id)?;
+        }
+        if self
+            .observed_pending_review_id
+            .as_ref()
+            .is_some_and(|id| self.retired_review_ids.contains(id))
+            || self
+                .acknowledged_pending_review_id
+                .as_ref()
+                .is_some_and(|id| self.retired_review_ids.contains(id))
+        {
+            return Err(ParticipationError::OperationState(
+                "retired review cannot remain an active pending target".into(),
+            ));
+        }
         if self.drafts.len() > MAX_DRAFTS {
             return Err(ParticipationError::TooManyDrafts { limit: MAX_DRAFTS });
         }

@@ -700,3 +700,66 @@ fn operation_payload_survives_draft_edit_timeout_and_restart() {
             .is_err()
     );
 }
+
+#[test]
+fn late_comment_ack_cannot_resurrect_review_submitted_in_browser() {
+    for edit_while_in_flight in [false, true] {
+        let directory = tempdir().unwrap();
+        let store = DraftStore::open(directory.path()).unwrap();
+        let canonical = comparison("base", "head", file("src/lib.rs"));
+        let coordinate = coordinate_for(canonical.clone(), DiffSide::New, 11, 11);
+        let mut state = ReviewComposition::new(key("alice"), revision("base", "head")).unwrap();
+        let draft = state.add_draft(coordinate, "sent text").unwrap().id.clone();
+        let intent = state
+            .prepare_pending_comment(&draft, published(&canonical))
+            .unwrap();
+        state
+            .mark_in_flight(&intent.operation_id, "posting")
+            .unwrap();
+        if edit_while_in_flight {
+            state.edit_draft(&draft, "unsent new text").unwrap();
+        }
+        let mut terminal = details(Some("review-1"), None, "");
+        terminal.reviews[0].state = "COMMENTED".into();
+        state.reconcile_remote_pending(&terminal).unwrap();
+        store.save(&state).unwrap();
+        let LoadOutcome::Loaded(mut state) = store.load(&key("alice")).unwrap() else {
+            panic!("recovery missing")
+        };
+        state
+            .reconcile_observed_comment_success(
+                &intent.operation_id,
+                Some("review-1".into()),
+                "comment-1".into(),
+                "sent text".into(),
+            )
+            .unwrap();
+        // An older in-flight metadata read also cannot reinstate PENDING.
+        state
+            .reconcile_remote_pending(&details(Some("review-1"), None, ""))
+            .unwrap();
+        assert!(state.retired_review_ids.contains("review-1"));
+        assert!(state.observed_pending_review_id.is_none());
+        assert!(state.acknowledged_pending_review_id.is_none());
+        if edit_while_in_flight {
+            assert_eq!(state.draft(&draft).unwrap().body, "unsent new text");
+            assert!(state.draft(&draft).unwrap().remote.is_none());
+            let next = state
+                .prepare_pending_comment(&draft, published(&canonical))
+                .unwrap();
+            assert!(next.pending_review_id.is_none());
+            assert!(next.existing_comment_id.is_none());
+        } else {
+            assert_eq!(
+                state.draft(&draft).unwrap().disposition,
+                DraftDisposition::Submitted
+            );
+            assert!(
+                state
+                    .prepare_pending_comment(&draft, published(&canonical))
+                    .is_err()
+            );
+        }
+        store.save(&state).unwrap();
+    }
+}
