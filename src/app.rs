@@ -7,6 +7,9 @@ use crate::{
     ToggleFileTree, ToggleInspector, TogglePalette, ToggleSidebar,
 };
 mod file_tree;
+mod local_checkout;
+#[allow(dead_code)] // Public component surface also serves standalone native verification.
+mod local_workspace;
 mod review_interactions;
 mod view_editor;
 
@@ -557,6 +560,7 @@ struct ReviewTab {
     editing_pending_summary: bool,
     #[allow(dead_code)] // Reserved opaque presentation slot; this slice does not provision it.
     local_workspace: Option<AnyView>,
+    local_visible: bool,
 }
 
 enum InteractionState {
@@ -663,6 +667,44 @@ pub struct ReviewWorkspace {
 }
 
 impl ReviewWorkspace {
+    fn edit_locally(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        use std::os::unix::ffi::OsStringExt;
+        let Some(index) = self.active_tab else { return };
+        self.capture_scroll(index);
+        let tab = &mut self.tabs[index];
+        let Some(session) = &tab.session else {
+            self.status = "Load a published revision before opening local editing.".into();
+            cx.notify();
+            return;
+        };
+        let path = session.selected_file().map(|file| match &file.raw_path {
+            Some(raw) => PathBuf::from(std::ffi::OsString::from_vec(raw.clone())),
+            None => PathBuf::from(&file.path),
+        });
+        if let Some(view) = tab.local_workspace.clone()
+            && let Ok(local) = view.downcast::<local_checkout::LocalCheckout>()
+        {
+            local.update(cx, |local, cx| local.open_relative_path(path, window, cx));
+        } else {
+            let repository = tab.repository.clone();
+            let pull = tab.pull_request.clone();
+            let revision = session.revision().clone();
+            let root = self
+                .interaction_root
+                .parent()
+                .expect("interaction root has parent")
+                .to_owned();
+            let local = cx.new(|cx| {
+                local_checkout::LocalCheckout::new(
+                    repository, pull, revision, path, root, window, cx,
+                )
+            });
+            tab.local_workspace = Some(local.into());
+        }
+        tab.local_visible = true;
+        cx.notify();
+    }
+
     fn resolved_panel_widths(&self, window: &Window) -> (f32, f32, f32) {
         resolved_panel_widths_for(
             &self.panel_layout,
@@ -727,6 +769,17 @@ impl ReviewWorkspace {
                 .join("Library/Application Support/cibergit")
         });
         let interaction_root = data_root.join("review-interactions");
+        cx.bind_keys([
+            KeyBinding::new("cmd-shift-e", local_checkout::EditLocally, None),
+            KeyBinding::new("cmd-shift-r", local_checkout::ReturnToReview, None),
+            KeyBinding::new("cmd-s", local_workspace::LocalSave, Some("LocalWorkspace")),
+            KeyBinding::new("cmd-f", local_workspace::LocalFind, Some("LocalWorkspace")),
+            KeyBinding::new(
+                "cmd-alt-f",
+                local_workspace::LocalReplace,
+                Some("LocalWorkspace"),
+            ),
+        ]);
         let store_result = startup
             .data_dir
             .clone()
@@ -1008,6 +1061,10 @@ impl ReviewWorkspace {
         let Some(output) = std::env::var_os("CIBERGIT_SMOKE_DIR").map(PathBuf::from) else {
             return;
         };
+        if std::env::var_os("CIBERGIT_SMOKE_LOCAL_CHECKOUT").is_some() {
+            local_checkout::start_smoke(cx.weak_entity(), output, window, cx);
+            return;
+        }
         let second_pr = std::env::var("CIBERGIT_SMOKE_SECOND_PR")
             .ok()
             .and_then(|value| value.parse::<u64>().ok());
@@ -2817,6 +2874,7 @@ impl ReviewWorkspace {
             reply_thread: None,
             editing_pending_summary: false,
             local_workspace: None,
+            local_visible: false,
         });
         let index = self.tabs.len() - 1;
         self.active_tab = Some(index);
@@ -4461,6 +4519,23 @@ impl ReviewWorkspace {
         div()
             .id("review-workspace")
             .track_focus(&self.focus)
+            .on_action(
+                cx.listener(|root, _: &local_checkout::EditLocally, window, cx| {
+                    if let Root::Review(this) = root {
+                        this.edit_locally(window, cx);
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|root, _: &local_checkout::ReturnToReview, _, cx| {
+                    if let Root::Review(this) = root {
+                        if let Some(index) = this.active_tab {
+                            this.tabs[index].local_visible = false;
+                        }
+                        cx.notify();
+                    }
+                }),
+            )
             .on_action(cx.listener(|root, action: &Refresh, window, cx| {
                 if let Root::Review(this) = root {
                     this.refresh(action, window, cx)
@@ -5717,8 +5792,44 @@ impl ReviewWorkspace {
         colors: Palette,
         window: &Window,
         cx: &mut Context<Root>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let tab = &self.tabs[index];
+        if tab.local_visible
+            && let Some(local) = tab.local_workspace.clone()
+        {
+            return div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .bg(colors.surface)
+                .child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .border_b_1()
+                        .border_color(colors.border)
+                        .child(
+                            div()
+                                .id("return-to-published-review")
+                                .cursor_pointer()
+                                .text_color(colors.accent)
+                                .child("← Published review  ⇧⌘R")
+                                .on_click(cx.listener(move |root, _, _, cx| {
+                                    if let Root::Review(this) = root {
+                                        this.tabs[index].local_visible = false;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                        .child(format!("#{} · Local Changes", tab.pull_request.number)),
+                )
+                .child(div().flex_1().min_h_0().child(local))
+                .into_any_element();
+        }
         let session = tab.session.as_ref();
         let revision = session
             .map(|session| session.revision().head_sha.as_str())
@@ -5839,6 +5950,18 @@ impl ReviewWorkspace {
                             .child(div().flex_1())
                             .child(
                                 div()
+                                    .id("edit-selected-file-locally")
+                                    .cursor_pointer()
+                                    .text_color(colors.accent)
+                                    .child("Edit locally  ⇧⌘E")
+                                    .on_click(cx.listener(|root, _, window, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.edit_locally(window, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
                                     .id("diff-mode")
                                     .cursor_pointer()
                                     .text_color(colors.accent)
@@ -5924,6 +6047,7 @@ impl ReviewWorkspace {
                             .child(self.render_inspector(index, colors, window, cx))
                     }),
             )
+            .into_any_element()
     }
 
     fn render_files(
