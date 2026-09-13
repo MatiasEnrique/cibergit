@@ -13,3 +13,13 @@ The pinned gpui-pre-macros 0.3.1 crate contains a helper that references its ins
 The first optimized checkpoint was built from clean source `f3cec8ba61c1e8e9bce5090f8cffc4f01b89ec84`; its profile correction is integrated as `a401860e7310f9d5daa8900cea385495f14e4622`. Extracted bundle files matched the manifest, strict ad-hoc signature verification passed, and the binary reported arm64 with macOS 15.0 minimum deployment metadata. CLI help and application cfg inspection passed. Evidence is stored in artifact `art_5d45f3c0-34d0-45fb-950b-91159d7abc51`, version `av_7ca15477-7651-4262-ad5c-804d46cd2799`.
 
 That checkpoint contains a known native reconciliation defect being corrected and is not a V1 release candidate. Its validation establishes compilation, package integrity, architecture and CLI behavior. It does not establish macOS 15 runtime compatibility, Finder/Gatekeeper distribution, physical input, desktop acrylic compositing, final icon, performance or completion of the feature inventory. Rebuild and validate the final integrated source before distribution.
+
+## App icon
+
+The original branch-graph icon is bundled as `Contents/Resources/cibergit.icns` and declared by `CFBundleIconFile`. Its AppKit vector drawing lives in `scripts/render-app-icon.swift`; the committed PNG is a 1024-pixel preview. To regenerate all ten standard icon representations without replacing existing output:
+
+```sh
+swift scripts/render-app-icon.swift /tmp/cibergit-icon-new
+```
+
+The drawing uses system AppKit and `iconutil`, with no external artwork or build dependency. The source and generated artwork use cibergit's MIT license.
