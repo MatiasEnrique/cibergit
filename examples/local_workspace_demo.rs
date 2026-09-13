@@ -11,6 +11,7 @@ use cibergit::{
     document::DocumentStatus,
     domain::{Account, Repository},
     local_git::{GitPath, LocalGit, OperationState},
+    rebase::{OperationState as RebaseState, PlanAction},
     worktrees::{
         AssociationKey, CheckoutAssociation, CheckoutOwnership, CheckoutView, FilesystemIdentity,
     },
@@ -53,7 +54,7 @@ fn identity(path: &Path) -> FilesystemIdentity {
     }
 }
 
-fn fixture(base: &Path) -> (Repository, CheckoutView, PathBuf) {
+fn fixture(base: &Path) -> (Repository, CheckoutView, PathBuf, String) {
     let checkout = base.join("checkout");
     let data = base.join("data");
     fs::create_dir_all(checkout.join("src")).expect("fixture directories");
@@ -69,12 +70,30 @@ fn fixture(base: &Path) -> (Repository, CheckoutView, PathBuf) {
     run_git(&checkout, &["config", "user.name", "cibergit demo"]);
     run_git(&checkout, &["config", "user.email", "demo@invalid"]);
     run_git(&checkout, &["add", "."]);
-    run_git(&checkout, &["commit", "-m", "fixture"]);
+    run_git(&checkout, &["commit", "-m", "base fixture"]);
+    let base_oid = Command::new("git")
+        .current_dir(&checkout)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("read base")
+        .stdout;
+    let base_oid = String::from_utf8(base_oid)
+        .expect("base UTF-8")
+        .trim()
+        .to_owned();
+    fs::write(checkout.join("workflow.txt"), "first replay\n").expect("first replay");
+    run_git(&checkout, &["add", "."]);
+    run_git(&checkout, &["commit", "-m", "first replay"]);
+    fs::write(checkout.join("workflow.txt"), "second replay\n").expect("second replay");
+    run_git(&checkout, &["add", "."]);
+    run_git(&checkout, &["commit", "-m", "second replay"]);
     fs::write(
-        checkout.join("README.md"),
-        "# Local workspace demo\n\nExternal tools remain welcome.\n",
+        checkout.join("src/lib.rs"),
+        "// unchanged file visible in quick-open\n\npub struct LocalDemo {\n    pub ready: bool,\n    pub lifecycle: bool,\n}\n",
     )
-    .expect("local change");
+    .expect("tail source");
+    run_git(&checkout, &["add", "."]);
+    run_git(&checkout, &["commit", "-m", "tail source"]);
     let git = LocalGit::open(&checkout).expect("open temporary checkout");
     let snapshot = git.snapshot().expect("temporary snapshot");
     let checkout_root = git.root().to_owned();
@@ -113,7 +132,7 @@ fn fixture(base: &Path) -> (Repository, CheckoutView, PathBuf) {
         actual_head: snapshot.head,
         operation: OperationState::default(),
     };
-    (repository, checkout_view, data)
+    (repository, checkout_view, data, base_oid)
 }
 
 fn load_fonts(cx: &gpui::App) {
@@ -135,7 +154,7 @@ fn main() {
                 .expect("temporary demo root")
                 .keep()
         });
-    let (repository, checkout, data_root) = fixture(&base);
+    let (repository, checkout, data_root, rebase_base_oid) = fixture(&base);
     let checkout_root = checkout.association.path.clone();
     println!(
         "temporary checkout: {}",
@@ -192,6 +211,7 @@ fn main() {
                     start_smoke(
                         workspace.downgrade(),
                         checkout_root.clone(),
+                        rebase_base_oid.clone(),
                         PathBuf::from(output),
                         dark,
                         window,
@@ -209,6 +229,7 @@ fn main() {
 fn start_smoke(
     workspace: gpui::WeakEntity<LocalWorkspace>,
     checkout: PathBuf,
+    rebase_base_oid: String,
     output: PathBuf,
     dark: bool,
     window: &mut gpui::Window,
@@ -229,6 +250,197 @@ fn start_smoke(
                     break;
                 }
             }
+            window
+                .background_executor()
+                .spawn({
+                    let output = output.clone();
+                    async move { fs::create_dir_all(output).expect("prepare smoke evidence") }
+                })
+                .await;
+
+            let prepare_requested = window
+                .update(|window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.toggle_rebase(cx);
+                            workspace.set_rebase_base_candidate(
+                                rebase_base_oid.clone(),
+                                window,
+                                cx,
+                            );
+                            workspace.prepare_rebase(cx);
+                        })
+                        .is_ok()
+                })
+                .unwrap_or(false);
+            let plan_at = std::time::Instant::now();
+            let plan_ready = loop {
+                window
+                    .background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let ready = window
+                    .update(|_, cx| {
+                        workspace
+                            .read_with(cx, |workspace, _| workspace.rebase_plan_len() == 3)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if ready || plan_at.elapsed() > std::time::Duration::from_secs(20) {
+                    break ready;
+                }
+            };
+            let _ = window.update(|window, _| window.resize(size(px(1440.), px(900.))));
+            let plan_capture = window
+                .update(|window, _| {
+                    window
+                        .render_to_image()
+                        .and_then(|image| {
+                            image
+                                .save(output.join(if dark {
+                                    "rebase-plan-dark-normal.png"
+                                } else {
+                                    "rebase-plan-light-normal.png"
+                                }))
+                                .map_err(Into::into)
+                        })
+                        .is_ok()
+                })
+                .unwrap_or(false);
+
+            let start_edit_requested = window
+                .update(|_, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.set_rebase_step_action(0, PlanAction::Edit, cx);
+                            workspace.request_start_rebase(cx);
+                            let Some(id) = workspace.rebase_pending_action_id() else {
+                                return false;
+                            };
+                            workspace.confirm_rebase_action(id, cx);
+                            true
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let edit_at = std::time::Instant::now();
+            let edit_ready = loop {
+                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                let ready = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
+                    workspace.rebase_operation().is_some_and(|operation| operation.state == RebaseState::PausedForEdit)
+                }).unwrap_or(false)).unwrap_or(false);
+                if ready || edit_at.elapsed() > std::time::Duration::from_secs(20) { break ready; }
+            };
+            let _ = window.update(|window, _| window.resize(size(px(1680.), px(900.))));
+            let edit_capture = window.update(|window, _| {
+                window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-edit-dark-wide.png" } else { "rebase-edit-light-wide.png" })).map_err(Into::into)).is_ok()
+            }).unwrap_or(false);
+
+            let continue_requested = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
+                workspace.request_continue_rebase(cx);
+                let Some(id) = workspace.rebase_pending_action_id() else { return false; };
+                workspace.confirm_rebase_action(id, cx);
+                true
+            }).unwrap_or(false)).unwrap_or(false);
+            let completed_at = std::time::Instant::now();
+            let rebase_completed = loop {
+                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                let ready = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
+                    workspace.rebase_operation().is_some_and(|operation| operation.state == RebaseState::Completed)
+                }).unwrap_or(false)).unwrap_or(false);
+                if ready || completed_at.elapsed() > std::time::Duration::from_secs(20) { break ready; }
+            };
+            let _ = window.update(|window, _| window.resize(size(px(1440.), px(900.))));
+            let result_capture = window.update(|window, _| {
+                window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-result-dark-normal.png" } else { "rebase-result-light-normal.png" })).map_err(Into::into)).is_ok()
+            }).unwrap_or(false);
+
+            let archived = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
+                workspace.request_retire_rebase(cx);
+                let Some(id) = workspace.rebase_pending_action_id() else { return false; };
+                workspace.confirm_rebase_action(id, cx);
+                true
+            }).unwrap_or(false)).unwrap_or(false);
+            let archived_at = std::time::Instant::now();
+            loop {
+                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                let done = window.update(|_, cx| workspace.read_with(cx, |workspace, _| workspace.rebase_operation().is_none()).unwrap_or(false)).unwrap_or(false);
+                if done || archived_at.elapsed() > std::time::Duration::from_secs(20) { break; }
+            }
+
+            let conflict_requested = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
+                workspace.prepare_rebase(cx);
+                true
+            }).unwrap_or(false)).unwrap_or(false);
+            let second_plan_at = std::time::Instant::now();
+            loop {
+                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                let ready = window.update(|_, cx| workspace.read_with(cx, |workspace, _| workspace.rebase_plan_len() == 3).unwrap_or(false)).unwrap_or(false);
+                if ready || second_plan_at.elapsed() > std::time::Duration::from_secs(20) { break; }
+            }
+            let conflict_started = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
+                workspace.move_rebase_plan_step(1, -1, cx);
+                workspace.request_start_rebase(cx);
+                let Some(id) = workspace.rebase_pending_action_id() else { return false; };
+                workspace.confirm_rebase_action(id, cx);
+                true
+            }).unwrap_or(false)).unwrap_or(false);
+            let conflict_at = std::time::Instant::now();
+            let rebase_conflict = loop {
+                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                let ready = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
+                    workspace.rebase_operation().is_some_and(|operation| operation.state == RebaseState::Conflicted)
+                }).unwrap_or(false)).unwrap_or(false);
+                if ready || conflict_at.elapsed() > std::time::Duration::from_secs(20) { break ready; }
+            };
+            let _ = window.update(|window, _| window.resize(size(px(1040.), px(760.))));
+            let conflict_capture = window.update(|window, _| {
+                window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-conflict-dark-narrow.png" } else { "rebase-conflict-light-narrow.png" })).map_err(Into::into)).is_ok()
+            }).unwrap_or(false);
+            let abort_requested = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
+                workspace.request_abort_rebase(cx);
+                let Some(id) = workspace.rebase_pending_action_id() else { return false; };
+                workspace.confirm_rebase_action(id, cx);
+                true
+            }).unwrap_or(false)).unwrap_or(false);
+            let abort_at = std::time::Instant::now();
+            loop {
+                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                let done = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
+                    workspace.rebase_operation().is_some_and(|operation| operation.state == RebaseState::Aborted)
+                }).unwrap_or(false)).unwrap_or(false);
+                if done || abort_at.elapsed() > std::time::Duration::from_secs(20) { break; }
+            }
+            window.background_executor().spawn({
+                let readme = checkout.join("README.md");
+                async move {
+                    fs::write(readme, "# Local workspace demo\n\nStaged only in the disposable smoke repository.\n")
+                        .expect("create local change for stage smoke");
+                }
+            }).await;
+            let post_rebase_guard = window.background_executor().spawn({
+                let checkout = checkout.clone();
+                async move {
+                    LocalGit::open(checkout)
+                        .expect("post-rebase local git")
+                        .snapshot()
+                        .expect("post-rebase snapshot")
+                        .guard
+                }
+            }).await;
+            let _ = window.update(|_, cx| {
+                let _ = workspace.update(cx, |workspace, cx| workspace.refresh_all(cx));
+            });
+            let post_rebase_refresh_at = std::time::Instant::now();
+            loop {
+                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                let refreshed = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
+                    workspace.local_snapshot().is_some_and(|snapshot| snapshot.guard == post_rebase_guard)
+                }).unwrap_or(false)).unwrap_or(false);
+                if refreshed || post_rebase_refresh_at.elapsed() > std::time::Duration::from_secs(20) { break; }
+            }
+            let _ = window.update(|_, cx| { let _ = workspace.update(cx, |workspace, cx| workspace.toggle_rebase(cx)); });
+            let _ = window.update(|window, _| window.resize(size(px(1440.), px(900.))));
             let opened = window
                 .update(|window, cx| {
                     workspace
@@ -322,13 +534,6 @@ fn start_smoke(
                 .spawn({
                     let path = checkout.join("src/lib.rs");
                     async move { fs::read_to_string(path).unwrap_or_default() }
-                })
-                .await;
-            window
-                .background_executor()
-                .spawn({
-                    let output = output.clone();
-                    async move { fs::create_dir_all(output).expect("prepare smoke evidence") }
                 })
                 .await;
             let highlighted_capture = window
@@ -535,7 +740,7 @@ fn start_smoke(
                     }
                 })
                 .await;
-            let conflict_requested = window
+            let document_conflict_requested = window
                 .update(|_, cx| {
                     workspace
                         .update(cx, |workspace, cx| {
@@ -653,8 +858,23 @@ fn start_smoke(
                 }
             };
             let report = format!(
-                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nclean checkout confirmation dispatched while no-op refresh pending: {}\nclean refresh-time confirmation completed authoritatively: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
+                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nrebase prepare requested: {}\npopulated three-commit plan ready: {}\nplan normal capture: {}\nedit plan Start requested through confirmation: {}\nPausedForEdit observed: {}\nedit wide capture: {}\nexplicit Continue requested through confirmation: {}\nCompleted observed: {}\nresult normal capture: {}\nsafe archive requested and second prepare enabled: {}\nreordered conflict plan prepared: {}\nconflicting Start requested through confirmation: {}\nConflicted observed from real Git: {}\nconflict narrow capture: {}\nexplicit Abort requested through confirmation: {}\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nclean checkout confirmation dispatched while no-op refresh pending: {}\nclean refresh-time confirmation completed authoritatively: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
                 if dark { "dark" } else { "light" },
+                prepare_requested,
+                plan_ready,
+                plan_capture,
+                start_edit_requested,
+                edit_ready,
+                edit_capture,
+                continue_requested,
+                rebase_completed,
+                result_capture,
+                archived,
+                conflict_requested,
+                conflict_started,
+                rebase_conflict,
+                conflict_capture,
+                abort_requested,
                 opened,
                 edited,
                 readback.contains("highlighted local edit") && readback.contains("verified"),
@@ -664,7 +884,7 @@ fn start_smoke(
                 clean_refresh_confirmation_finished,
                 save_in_flight_confirmation_paused,
                 checkout_action_edit_race_paused,
-                checkout_action_edit_race_paused && conflict_requested,
+                checkout_action_edit_race_paused && document_conflict_requested,
                 window
                     .update(|_, cx| workspace.read_with(cx, |workspace, _| workspace.active_document_status() == Some(DocumentStatus::Conflict)).unwrap_or(false))
                     .unwrap_or(false),

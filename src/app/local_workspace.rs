@@ -5,6 +5,9 @@
 //! gesture here. All checkout and Git I/O is started on GPUI's background executor;
 //! editor changes are serialized by one FIFO worker per open document.
 
+#[path = "local_workspace/rebase_panel.rs"]
+mod rebase_panel;
+
 use cibergit::{
     document::{
         ConflictKind, DiskState, DiskVersion, Document, DocumentLimits, DocumentStatus,
@@ -16,12 +19,13 @@ use cibergit::{
         MutationReceipt, OperationState, OutcomeCertainty, RemoteBranchObservation, SelectedDiff,
         SnapshotGuard,
     },
+    rebase::{OperationView as RebaseOperationView, RebaseAssociation, RebaseStore},
     worktrees::{CheckoutView, FilesystemIdentity},
 };
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, EventEmitter, FontWeight,
-    HighlightStyle, Render, Rgba, SharedString, Stateful, Subscription, Window, WindowAppearance,
-    actions, div, prelude::*, px, rgba,
+    HighlightStyle, KeyDownEvent, Render, Rgba, SharedString, Stateful, Subscription, Window,
+    WindowAppearance, actions, div, prelude::*, px, rgba,
 };
 use gpui_base::input::{
     Editor, EditorState, FoldRange, HighlightStyleResolver, Input, InputEditorStyle, InputEvent,
@@ -475,6 +479,9 @@ struct DocumentTab {
     worker: DocumentWorker,
     view: DocumentView,
     generation: u64,
+    /// Advances only for user-originated editor changes. Background refreshes
+    /// may advance `generation` without invalidating a material confirmation.
+    edit_generation: u64,
     persisted_generation: u64,
     pending_checkout_operations: usize,
     message: String,
@@ -498,6 +505,7 @@ impl PendingProgrammaticReload {
 struct Backend {
     documents: DocumentStore,
     git: LocalGit,
+    rebase: RebaseStore,
     browser: BrowserSnapshot,
     journal_path: PathBuf,
     checkout_generation: u64,
@@ -505,7 +513,7 @@ struct Backend {
 
 enum BackendState {
     Loading,
-    Ready(Backend),
+    Ready(Box<Backend>),
     Failed(String),
 }
 
@@ -531,6 +539,7 @@ pub struct LocalWorkspace {
     branch_name: Entity<InputState>,
     proposed_merge: Entity<EditorState>,
     proposed_seed: Option<(PathBuf, String)>,
+    rebase: rebase_panel::RebasePanel,
     status: String,
     focused: bool,
     _subscriptions: Vec<Subscription>,
@@ -553,6 +562,7 @@ impl LocalWorkspace {
             state.set_editor_style(editor_style(colors));
             state
         });
+        let rebase = rebase_panel::RebasePanel::new(colors, window, cx);
         let mut this = Self {
             context,
             backend: BackendState::Loading,
@@ -575,6 +585,7 @@ impl LocalWorkspace {
             branch_name,
             proposed_merge,
             proposed_seed: None,
+            rebase,
             status: "Preparing safe local workspace…".into(),
             focused: window.is_window_active(),
             _subscriptions: Vec::new(),
@@ -594,6 +605,8 @@ impl LocalWorkspace {
             }
             this.proposed_merge
                 .update(cx, |editor, _| editor.set_editor_style(style));
+            this.rebase
+                .update_appearance(palette(this.context.appearance.dark), cx);
             cx.notify();
         });
         this._subscriptions.extend([activation, appearance]);
@@ -747,6 +760,14 @@ impl LocalWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !document_open_allowed(self.rebase.is_running()) {
+            self.report_error(
+                "Document open paused while a rebase transition is running; retry after the exact effect is observed"
+                    .into(),
+                cx,
+            );
+            return;
+        }
         let path = match validate_relative_path(path.as_ref()) {
             Ok(path) => path,
             Err(error) => {
@@ -807,6 +828,13 @@ impl LocalWorkspace {
         if self.in_flight_action.is_some() || self.reconciliation_clear_in_flight.is_some() {
             self.report_error(
                 "A local action or its durable reconciliation is still running".into(),
+                cx,
+            );
+            return None;
+        }
+        if self.rebase.has_pending_or_running() {
+            self.report_error(
+                "A rebase transition or confirmation is active; finish or cancel it first".into(),
                 cx,
             );
             return None;
@@ -1110,6 +1138,7 @@ impl LocalWorkspace {
 
     pub fn refresh_all(&mut self, cx: &mut Context<Self>) {
         self.refresh_git(cx);
+        self.observe_rebase(cx);
         let paths = self.documents.keys().cloned().collect::<Vec<_>>();
         for path in paths {
             self.refresh_document(&path, cx);
@@ -1117,6 +1146,13 @@ impl LocalWorkspace {
     }
 
     pub fn save_active(&mut self, cx: &mut Context<Self>) {
+        if self.rebase.is_running() {
+            self.report_error(
+                "Document save paused while a rebase transition is running".into(),
+                cx,
+            );
+            return;
+        }
         let Some(path) = self.active_document.clone() else {
             self.report_error("No local document is open".into(), cx);
             return;
@@ -1142,6 +1178,13 @@ impl LocalWorkspace {
     }
 
     pub fn reload_active_from_disk(&mut self, cx: &mut Context<Self>) {
+        if self.rebase.is_running() {
+            self.report_error(
+                "Document reload paused while a rebase transition is running".into(),
+                cx,
+            );
+            return;
+        }
         let Some(path) = self.active_document.clone() else {
             return;
         };
@@ -1167,6 +1210,13 @@ impl LocalWorkspace {
         proposed: String,
         cx: &mut Context<Self>,
     ) {
+        if self.rebase.is_running() {
+            self.report_error(
+                "Document reconciliation paused while a rebase transition is running".into(),
+                cx,
+            );
+            return;
+        }
         let Some(path) = self.active_document.clone() else {
             return;
         };
@@ -1200,7 +1250,7 @@ impl LocalWorkspace {
                 let result = task.await;
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |this, cx| match result {
-                        Ok((backend, snapshot, started)) => {
+                        Ok((backend, snapshot, started, rebase_operation)) => {
                             this.snapshot = Some(snapshot);
                             this.unresolved_started_action = started;
                             this.unresolved_refresh_required = false;
@@ -1210,7 +1260,8 @@ impl LocalWorkspace {
                             } else {
                                 "Local workspace ready · Review remains pinned and read-only".into()
                             };
-                            this.backend = BackendState::Ready(backend);
+                            this.backend = BackendState::Ready(Box::new(backend));
+                            this.rebase.install_observed(rebase_operation);
                             cx.emit(LocalWorkspaceEvent::LocalSnapshotChanged);
                             cx.notify();
                         }
@@ -1257,6 +1308,7 @@ impl LocalWorkspace {
             let mut state = EditorState::new(window, cx)
                 .language(language)
                 .replaceable(true);
+            state.set_disabled(self.rebase.is_running(), cx);
             state.set_editor_style(editor_style(colors));
             state.set_highlighter_factory(highlighter_factory(), cx);
             // Initial/recovery load is the one intentional programmatic reload.
@@ -1277,6 +1329,7 @@ impl LocalWorkspace {
             // A user edit always wins over a reload reply waiting for a Window.
             tab.pending_programmatic_reload = None;
             tab.generation = tab.generation.wrapping_add(1);
+            tab.edit_generation = tab.edit_generation.wrapping_add(1);
             let generation = tab.generation;
             let text = editor.read(cx).value().to_string();
             let (reply, receiver) = mpsc::channel();
@@ -1304,6 +1357,7 @@ impl LocalWorkspace {
                 worker,
                 view,
                 generation: 0,
+                edit_generation: 0,
                 persisted_generation: 0,
                 pending_checkout_operations: 0,
                 message: "Recovered/opened through DocumentStore".into(),
@@ -1582,7 +1636,15 @@ fn merge_retained_paths(target: &mut Vec<PathBuf>, incoming: &[PathBuf]) -> Vec<
 
 fn initialize_backend(
     context: &LocalWorkspaceContext,
-) -> Result<(Backend, LocalSnapshot, Option<StartedAction>), String> {
+) -> Result<
+    (
+        Backend,
+        LocalSnapshot,
+        Option<StartedAction>,
+        Option<RebaseOperationView>,
+    ),
+    String,
+> {
     if context.data_root.as_os_str().is_empty() {
         return Err("local workspace data root is empty".into());
     }
@@ -1627,16 +1689,34 @@ fn initialize_backend(
     let journal_path = action_root.join(ACTION_JOURNAL);
     let started = read_started_action(&journal_path)?;
     let snapshot = git.snapshot().map_err(|error| error.to_string())?;
+    let association = &context.checkout.association.key;
+    let rebase = RebaseStore::open(
+        context.data_root.join("rebase-private"),
+        RebaseAssociation {
+            provider: association.provider.clone(),
+            host: association.host.clone(),
+            account: association.account.clone(),
+            repository: association.repository.clone(),
+            change: association.pull_request.to_string(),
+        },
+        &context.checkout.association.path,
+    )
+    .map_err(|error| format!("open rebase lifecycle store: {error}"))?;
+    let rebase_operation = rebase
+        .observe()
+        .map_err(|error| format!("observe rebase lifecycle: {error}"))?;
     Ok((
         Backend {
             documents,
             git,
+            rebase,
             browser,
             journal_path,
             checkout_generation: 1,
         },
         snapshot,
         started,
+        rebase_operation,
     ))
 }
 
@@ -2966,8 +3046,19 @@ impl Render for LocalWorkspace {
                 )
             });
 
-        let editor_panel = self.render_editor_panel(colors, window, cx);
-        let changes_panel = self.render_changes_panel(colors, cx);
+        let rebase_open = self.rebase.open;
+        let workspace_content = if rebase_open {
+            self.render_rebase_panel(colors, window, cx)
+        } else {
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .child(self.render_editor_panel(colors, window, cx))
+                .child(self.render_changes_panel(colors, cx))
+                .into_any_element()
+        };
 
         div()
             .id("local-workspace")
@@ -3028,6 +3119,11 @@ impl Render for LocalWorkspace {
             .on_action(cx.listener(|this, _: &LocalReloadDisk, _, cx| {
                 this.reload_active_from_disk(cx)
             }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.handle_rebase_key(event, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .child(
                 div()
                     .h(px(48.))
@@ -3045,9 +3141,20 @@ impl Render for LocalWorkspace {
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(colors.muted)
-                            .child("Published Review stays pinned · Git auth/authorship come from installed Git"),
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors.muted)
+                                    .child("Published Review stays pinned · Git auth/authorship come from installed Git"),
+                            )
+                            .child(action_button(
+                                if rebase_open { "Workspace" } else { "Rebase" },
+                                colors,
+                                cx.listener(|this, _, _, cx| this.toggle_rebase(cx)),
+                            )),
                     ),
             )
             .child(
@@ -3056,8 +3163,7 @@ impl Render for LocalWorkspace {
                     .min_h_0()
                     .flex()
                     .child(browser_panel)
-                    .child(editor_panel)
-                    .child(changes_panel),
+                    .child(workspace_content),
             )
             .child(
                 div()
@@ -3724,6 +3830,10 @@ fn operation_is_active(operation: &OperationState) -> bool {
         || operation.revert
 }
 
+fn document_open_allowed(rebase_effect_in_flight: bool) -> bool {
+    !rebase_effect_in_flight
+}
+
 fn remote_observation_matches(
     observation: Option<&RemoteBranchObservation>,
     remote: &str,
@@ -4382,6 +4492,12 @@ mod tests {
             active = delayed_path;
         }
         assert_eq!(active, Path::new("new.rs"));
+    }
+
+    #[test]
+    fn document_open_admission_closes_for_the_exact_rebase_effect_lane() {
+        assert!(document_open_allowed(false));
+        assert!(!document_open_allowed(true));
     }
 
     #[test]
