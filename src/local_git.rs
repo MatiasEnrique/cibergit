@@ -1009,23 +1009,37 @@ impl LocalGit {
         expected_remote_oid: &str,
         guard: &SnapshotGuard,
     ) -> Result<MutationReceipt> {
+        self.force_push_branch_with_lease(remote, branch, branch, expected_remote_oid, guard)
+    }
+
+    /// Publish an explicitly selected local branch to a separately named remote
+    /// branch. Managed PR checkouts need not use the published source name.
+    /// The caller owns target/remote selection and durable explicit admission;
+    /// this method never infers a PR destination or changes Git authentication.
+    pub fn force_push_branch_with_lease(
+        &self,
+        remote: &str,
+        local_branch: &str,
+        remote_branch: &str,
+        expected_remote_oid: &str,
+        guard: &SnapshotGuard,
+    ) -> Result<MutationReceipt> {
         self.validate_remote(remote)?;
-        self.validate_branch(branch)?;
+        self.validate_branch(local_branch)?;
+        self.validate_branch(remote_branch)?;
         validate_oid(expected_remote_oid)?;
-        let remote_ref = format!("refs/heads/{branch}");
+        let remote_ref = format!("refs/heads/{remote_branch}");
         let lease = format!("--force-with-lease={remote_ref}:{expected_remote_oid}");
         self.guarded(
             guard,
             MutationAction::ForcePushWithLease,
             Some(expected_remote_oid.to_owned()),
             |snapshot| {
-                let local_oid =
-                    snapshot
-                        .local_branch_oids
-                        .get(branch)
-                        .ok_or(LocalGitError::InvalidInput(
-                            "local branch does not exist in the guarded snapshot",
-                        ))?;
+                let local_oid = snapshot.local_branch_oids.get(local_branch).ok_or(
+                    LocalGitError::InvalidInput(
+                        "local branch does not exist in the guarded snapshot",
+                    ),
+                )?;
                 let refspec = format!("{local_oid}:{remote_ref}");
                 self.run(
                     "force push with lease",

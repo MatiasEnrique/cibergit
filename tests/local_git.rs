@@ -600,6 +600,116 @@ fn push_and_force_lease_pin_the_guarded_local_oid_across_a_pre_push_ref_move() {
 }
 
 #[test]
+fn mapped_branch_publish_uses_only_the_guarded_oid_and_exact_destination_lease() {
+    let directory = init();
+    let root = directory.path();
+    fs::write(root.join("file"), "base\n").unwrap();
+    let base = commit_all(root, "base");
+    let bare = TempDir::new().unwrap();
+    git(bare.path(), &["init", "--bare", "-q"]);
+    git(
+        root,
+        &["remote", "add", "pr-source", bare.path().to_str().unwrap()],
+    );
+    git(
+        root,
+        &[
+            "push",
+            "-q",
+            "pr-source",
+            "main:refs/heads/feature/published",
+        ],
+    );
+    let selected_oid = commit_tree(root, &base, "reviewed rewritten history");
+    let moved_oid = commit_tree(root, &selected_oid, "newer unreviewed history");
+    git(root, &["branch", "cibergit/private-123", &selected_oid]);
+    let backend = LocalGit::open(root).unwrap();
+    let hook = backend.git_dir().join("hooks/pre-push");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ngit update-ref refs/heads/cibergit/private-123 {moved_oid} {selected_oid}\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let selected = backend.snapshot().unwrap();
+    backend
+        .force_push_branch_with_lease(
+            "pr-source",
+            "cibergit/private-123",
+            "feature/published",
+            &base,
+            &selected.guard,
+        )
+        .unwrap();
+    assert_eq!(
+        git(bare.path(), &["rev-parse", "refs/heads/feature/published"]),
+        selected_oid
+    );
+    assert_eq!(
+        git(
+            bare.path(),
+            &["for-each-ref", "--format=%(refname)", "refs/heads/"]
+        ),
+        "refs/heads/feature/published"
+    );
+    assert_eq!(
+        git(root, &["rev-parse", "refs/heads/cibergit/private-123"]),
+        moved_oid
+    );
+    assert_eq!(git(root, &["rev-parse", "main"]), base);
+
+    fs::remove_file(&hook).unwrap();
+    let current = backend.snapshot().unwrap();
+    let error = backend
+        .force_push_branch_with_lease(
+            "pr-source",
+            "cibergit/private-123",
+            "feature/published",
+            &base,
+            &current.guard,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        LocalGitError::MutationCommandFailed {
+            certainty: OutcomeCertainty::Uncertain,
+            ..
+        }
+    ));
+    assert_eq!(
+        git(bare.path(), &["rev-parse", "refs/heads/feature/published"]),
+        selected_oid
+    );
+    assert!(matches!(
+        backend.force_push_branch_with_lease(
+            "pr-source",
+            "missing-local",
+            "feature/published",
+            &selected_oid,
+            &current.guard,
+        ),
+        Err(LocalGitError::InvalidInput(_))
+    ));
+    assert!(
+        backend
+            .force_push_branch_with_lease(
+                "pr-source",
+                "cibergit/private-123",
+                "bad:ref",
+                &selected_oid,
+                &current.guard,
+            )
+            .is_err()
+    );
+    assert_eq!(
+        git(bare.path(), &["rev-parse", "refs/heads/feature/published"]),
+        selected_oid
+    );
+}
+
+#[test]
 fn failed_ff_pull_reports_uncertainty_after_fetching_remote_state() {
     let directory = init();
     let root = directory.path();
