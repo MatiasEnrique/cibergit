@@ -107,6 +107,12 @@ fn main() {
     gpui_platform::application().run(move |cx| {
         gpui_base::init(cx);
         load_interface_fonts(cx);
+        #[cfg(feature = "ui-smoke")]
+        match std::env::var("CIBERGIT_SMOKE_APPEARANCE").as_deref() {
+            Ok("dark") => cx.set_window_appearance(Some(gpui::WindowAppearance::Dark)),
+            Ok("light") => cx.set_window_appearance(Some(gpui::WindowAppearance::Light)),
+            _ => {}
+        }
         cx.bind_keys([
             KeyBinding::new("cmd-s", Save, None),
             KeyBinding::new("cmd-q", Quit, None),

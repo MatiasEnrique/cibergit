@@ -14,9 +14,13 @@ use cibergit::{
     },
 };
 use gpui::{prelude::*, *};
-use gpui_base::input::{Editor, EditorState, Input, InputEditorStyle, InputState};
+use gpui_base::{
+    TextView, TextViewStyle,
+    input::{Editor, EditorState, Input, InputEditorStyle, InputState},
+};
 use std::{
     cmp::Reverse,
+    collections::HashMap,
     ops::Range,
     path::PathBuf,
     sync::{
@@ -46,13 +50,13 @@ pub struct Startup {
 }
 
 pub enum Root {
-    Review(ReviewWorkspace),
+    Review(Box<ReviewWorkspace>),
     Editor(EditorWorkspace),
 }
 
 impl Root {
     pub fn review(window: &mut Window, cx: &mut Context<Self>, startup: Startup) -> Self {
-        Self::Review(ReviewWorkspace::new(window, cx, startup))
+        Self::Review(Box::new(ReviewWorkspace::new(window, cx, startup)))
     }
 
     pub fn editor(window: &mut Window, cx: &mut Context<Self>, path: PathBuf) -> Self {
@@ -95,7 +99,7 @@ fn palette(dark: bool) -> Palette {
             sidebar: rgba(0x17181abe),
             elevated: rgba(0x292b2fff),
             text: rgba(0xf1f2f3ff),
-            muted: rgba(0xa8abb1ff),
+            muted: rgba(0xb8bbc1ff),
             faint: rgba(0x777b83ff),
             border: rgba(0x36383dff),
             selected: rgba(0xffffff13),
@@ -109,10 +113,10 @@ fn palette(dark: bool) -> Palette {
         Palette {
             canvas: rgba(0xfafaf9ff),
             surface: rgba(0xffffffff),
-            sidebar: rgba(0xf0f0eecc),
+            sidebar: rgba(0xf8f8f7b5),
             elevated: rgba(0xf2f2f0ff),
             text: rgba(0x202124ff),
-            muted: rgba(0x64676cff),
+            muted: rgba(0x56595eff),
             faint: rgba(0x8b8e93ff),
             border: rgba(0xdedfdcff),
             selected: rgba(0x0000000a),
@@ -200,6 +204,21 @@ struct ReviewTab {
     details_generation: u64,
 }
 
+#[cfg(feature = "ui-smoke")]
+struct SmokeExpectation {
+    repository: Repository,
+    number: u64,
+    file_key: String,
+    viewed: bool,
+}
+
+#[cfg(feature = "ui-smoke")]
+struct SmokeActions {
+    primary_number: u64,
+    report: String,
+    expectations: Vec<SmokeExpectation>,
+}
+
 #[derive(Clone)]
 enum DiffRow {
     Hunk(String),
@@ -236,8 +255,8 @@ pub struct ReviewWorkspace {
     status: String,
     schedule: PollSchedule,
     startup_pr: Option<u64>,
-    session_save_latest: Arc<AtomicU64>,
-    session_save_lock: Arc<Mutex<()>>,
+    session_save_latest: HashMap<String, Arc<AtomicU64>>,
+    session_save_locks: HashMap<String, Arc<Mutex<()>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -329,8 +348,8 @@ impl ReviewWorkspace {
             status: "Read-only review workspace".into(),
             schedule: PollSchedule::default(),
             startup_pr: startup.pull_request,
-            session_save_latest: Arc::new(AtomicU64::new(0)),
-            session_save_lock: Arc::new(Mutex::new(())),
+            session_save_latest: HashMap::new(),
+            session_save_locks: HashMap::new(),
             _subscriptions: Vec::new(),
         };
         let activation = cx.observe_window_activation(window, |root, window, cx| {
@@ -441,11 +460,30 @@ impl ReviewWorkspace {
                     .update(cx, |root, cx| {
                         let Root::Review(this) = root else { return };
                         tick += 1;
-                        if this.focused || tick.is_multiple_of(4) {
+                        let active_due = this.active_tab.is_some_and(|index| {
+                            let tab = &this.tabs[index];
+                            let key = format!(
+                                "pr:{}:{}",
+                                tab.repository.cache_key(),
+                                tab.pull_request.number
+                            );
+                            poll_due(tick, this.schedule.delay(&key, true, this.focused))
+                        });
+                        if active_due {
                             this.refresh_active(cx);
                         }
-                        if (this.focused && tick.is_multiple_of(4)) || tick.is_multiple_of(16) {
-                            this.refresh_all(cx);
+                        let repositories = this
+                            .repositories
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, runtime)| {
+                                let key = format!("sidebar:{}", runtime.repository.cache_key());
+                                poll_due(tick, this.schedule.delay(&key, false, this.focused))
+                                    .then_some(index)
+                            })
+                            .collect::<Vec<_>>();
+                        for index in repositories {
+                            this.refresh_repository(index, cx);
                         }
                     })
                     .is_err()
@@ -462,6 +500,10 @@ impl ReviewWorkspace {
         let Some(output) = std::env::var_os("CIBERGIT_SMOKE_DIR").map(PathBuf::from) else {
             return;
         };
+        let second_pr = std::env::var("CIBERGIT_SMOKE_SECOND_PR")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok());
+        let expect_restore = std::env::var_os("CIBERGIT_SMOKE_EXPECT_RESTORE").is_some();
         let weak = cx.weak_entity();
         window
             .spawn(cx, async move |window| {
@@ -474,7 +516,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.tabs.iter().any(|tab| tab.session.is_some()))
+                                matches!(root, Root::Review(this) if this.smoke_ready())
                             })
                             .unwrap_or(false)
                         })
@@ -484,32 +526,87 @@ impl ReviewWorkspace {
                     }
                 }
                 let _ = std::fs::create_dir_all(&output);
-                let _ = window.update(|window, cx| {
-                    let details = weak
-                        .read_with(cx, |root, _| {
-                            if let Root::Review(this) = root
-                                && let Some(tab) =
-                                    this.active_tab.and_then(|index| this.tabs.get(index))
-                                && let Some(session) = &tab.session
-                            {
-                                return format!(
-                                    "Real read complete\nRepository: {}\nPR: #{} {}\nBranches: {} -> {}\nRevision: {}\nFiles: {}\nSelected: {}\nRemote writes: none\n",
-                                    tab.repository.full_name(),
-                                    tab.pull_request.number,
-                                    tab.pull_request.title,
-                                    tab.pull_request.source_branch,
-                                    tab.pull_request.target_branch,
-                                    session.revision().head_sha,
-                                    session.comparison().files.len(),
-                                    session
-                                        .selected_file()
-                                        .map(|file| file.path.as_str())
-                                        .unwrap_or("none")
-                                );
-                            }
-                            "Smoke timed out before a real PR comparison loaded.\n".into()
+                let actions = window
+                    .update(|window, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err("smoke started outside review workspace".to_owned());
+                            };
+                            this.run_primary_smoke_actions(
+                                second_pr,
+                                expect_restore,
+                                window,
+                                cx,
+                            )
                         })
-                        .unwrap_or_else(|_| "Smoke view unavailable.\n".into());
+                        .unwrap_or_else(|error| Err(format!("smoke entity unavailable: {error:#}")))
+                    })
+                    .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")));
+
+                if actions.is_ok() && second_pr.is_some() {
+                    let second_started = std::time::Instant::now();
+                    loop {
+                        window
+                            .background_executor()
+                            .timer(Duration::from_millis(250))
+                            .await;
+                        let ready = window
+                            .update(|_, cx| {
+                                weak.read_with(cx, |root, _| {
+                                    matches!(root, Root::Review(this) if this.tabs.len() >= 2 && this.smoke_ready())
+                                })
+                                .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if ready || second_started.elapsed() > Duration::from_secs(90) {
+                            break;
+                        }
+                    }
+                }
+
+                let actions = match actions {
+                    Ok(mut actions) => window
+                        .update(|window, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                this.run_tab_smoke_actions(
+                                    second_pr,
+                                    &mut actions,
+                                    window,
+                                    cx,
+                                )?;
+                                Ok(actions)
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}"))),
+                    Err(error) => Err(error),
+                };
+
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(750))
+                    .await;
+                let _ = window.update(|window, cx| {
+                    let validation = actions.and_then(|mut actions| {
+                        weak.update(cx, |root, _| {
+                            let Root::Review(this) = root else {
+                                return Err("smoke left review workspace".to_owned());
+                            };
+                            this.validate_smoke_persistence(&actions.expectations)?;
+                            actions.report.push_str(
+                                "Persistence: selected/viewed state read back after queued two-tab saves\n",
+                            );
+                            Ok(actions)
+                        })
+                        .unwrap_or_else(|error| {
+                            Err(format!("smoke entity unavailable: {error:#}"))
+                        })
+                    });
                     let captured = window
                         .render_to_image()
                         .and_then(|image| {
@@ -518,8 +615,13 @@ impl ReviewWorkspace {
                                 .map_err(Into::into)
                         })
                         .is_ok();
+                    let passed = validation.is_ok() && captured;
+                    let details = validation
+                        .map(|actions| actions.report)
+                        .unwrap_or_else(|error| format!("Smoke failed: {error}\n"));
                     let report = format!(
-                        "{details}Scene capture: {}\nNative backdrop blending: not established by in-process capture\n",
+                        "{details}Programmatic native actions: {}\nScene capture: {}\nNative backdrop blending and physical input: not established by in-process capture\nRemote writes: none\n",
+                        if passed { "passed" } else { "failed" },
                         if captured {
                             "native-pr-review.png"
                         } else {
@@ -527,10 +629,229 @@ impl ReviewWorkspace {
                         }
                     );
                     let _ = std::fs::write(output.join("native-pr-smoke.txt"), report);
+                    if !passed {
+                        panic!("native UI smoke assertions failed");
+                    }
                     cx.quit();
                 });
             })
             .detach();
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn smoke_ready(&self) -> bool {
+        let repositories_finished = self
+            .repositories
+            .iter()
+            .all(|runtime| !matches!(runtime.state, LoadState::Loading(_)));
+        let tabs_finished = self.tabs.iter().all(|tab| {
+            tab.session.is_some()
+                && !matches!(tab.state, LoadState::Loading(_))
+                && !matches!(tab.details_state, LoadState::Loading(_))
+        });
+        repositories_finished && !self.tabs.is_empty() && tabs_finished
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn run_primary_smoke_actions(
+        &mut self,
+        second_pr: Option<u64>,
+        expect_restore: bool,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) -> Result<SmokeActions, String> {
+        let index = self
+            .active_tab
+            .ok_or_else(|| "no active pull request".to_owned())?;
+        let tab = &self.tabs[index];
+        let session = tab
+            .session
+            .as_ref()
+            .ok_or_else(|| "active comparison is not loaded".to_owned())?;
+        let restored =
+            matches!(&tab.state, LoadState::Cached(notice) if notice.contains("Restored"));
+        if expect_restore && !restored {
+            return Err("expected a persisted review session to restore".to_owned());
+        }
+        let original_key = session
+            .selected_file()
+            .map(file_key)
+            .ok_or_else(|| "comparison has no selected file".to_owned())?;
+        let file_count = session.comparison().files.len();
+        if file_count < 2 {
+            return Err("native navigation smoke requires a multi-file pull request".to_owned());
+        }
+        let repository = tab.repository.clone();
+        let number = tab.pull_request.number;
+        let title = tab.pull_request.title.clone();
+        let branches = format!(
+            "{} -> {}",
+            tab.pull_request.source_branch, tab.pull_request.target_branch
+        );
+        let revision = session.revision().head_sha.clone();
+
+        self.next_file(&NextFile, window, cx);
+        let next_key = self.tabs[index]
+            .session
+            .as_ref()
+            .and_then(ReviewSession::selected_file)
+            .map(file_key)
+            .ok_or_else(|| "next-file handler cleared selection".to_owned())?;
+        if next_key == original_key {
+            return Err("next-file handler did not advance selection".to_owned());
+        }
+        self.previous_file(&PreviousFile, window, cx);
+        let returned_key = self.tabs[index]
+            .session
+            .as_ref()
+            .and_then(ReviewSession::selected_file)
+            .map(file_key)
+            .ok_or_else(|| "previous-file handler cleared selection".to_owned())?;
+        if returned_key != original_key {
+            return Err("previous-file handler did not restore selection".to_owned());
+        }
+
+        if self.tabs[index]
+            .session
+            .as_ref()
+            .is_some_and(|session| session.diff_mode() == DiffMode::Auto)
+        {
+            self.cycle_diff(&CycleDiffMode, window, cx);
+        }
+        window.resize(size(px(980.), px(720.)));
+        if self.tabs[index]
+            .session
+            .as_ref()
+            .is_none_or(|session| session.diff_mode() == DiffMode::Auto)
+        {
+            return Err("diff mode was not explicit before resize".to_owned());
+        }
+
+        if let Some(second) = second_pr
+            && second != number
+        {
+            let repo_index = self
+                .repositories
+                .iter()
+                .position(|runtime| runtime.repository.cache_key() == repository.cache_key())
+                .ok_or_else(|| "active repository is absent from sidebar".to_owned())?;
+            self.open_pr(repo_index, second, cx);
+        }
+
+        Ok(SmokeActions {
+            primary_number: number,
+            report: format!(
+                "Real read complete\nRepository: {}\nPR: #{number} {title}\nBranches: {branches}\nRevision: {revision}\nFiles: {file_count}\nSelected: {}\nSidebar and details reads: settled\nRestart restore observed: {restored}\nNext/previous handlers: {original_key} -> {next_key} -> {returned_key}\nExplicit diff mode survived narrow resize\n",
+                repository.full_name(),
+                self.tabs[index]
+                    .session
+                    .as_ref()
+                    .and_then(ReviewSession::selected_file)
+                    .map(|file| file.path.as_str())
+                    .unwrap_or("none"),
+            ),
+            expectations: Vec::new(),
+        })
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn run_tab_smoke_actions(
+        &mut self,
+        second_pr: Option<u64>,
+        actions: &mut SmokeActions,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) -> Result<(), String> {
+        let primary_number = actions.primary_number;
+        let primary = self
+            .tabs
+            .iter()
+            .position(|tab| tab.pull_request.number == primary_number)
+            .unwrap_or(0);
+        let original_key = self.tabs[primary]
+            .session
+            .as_ref()
+            .and_then(ReviewSession::selected_file)
+            .map(file_key)
+            .ok_or_else(|| "primary tab has no selected file".to_owned())?;
+
+        let mut indices = vec![primary];
+        if let Some(second) = second_pr
+            && second != self.tabs[primary].pull_request.number
+        {
+            let secondary = self
+                .tabs
+                .iter()
+                .position(|tab| tab.pull_request.number == second)
+                .ok_or_else(|| format!("second PR #{second} did not load"))?;
+            self.activate_tab(secondary, cx);
+            self.activate_tab(primary, cx);
+            let restored_key = self.tabs[primary]
+                .session
+                .as_ref()
+                .and_then(ReviewSession::selected_file)
+                .map(file_key)
+                .ok_or_else(|| "tab switch cleared primary selection".to_owned())?;
+            if restored_key != original_key {
+                return Err("tab switch did not restore primary selection".to_owned());
+            }
+            indices.push(secondary);
+            actions
+                .report
+                .push_str(&format!("Tab switch/restore: passed with PR #{second}\n"));
+        }
+
+        for index in indices {
+            self.activate_tab(index, cx);
+            let key = self.tabs[index]
+                .session
+                .as_ref()
+                .and_then(ReviewSession::selected_file)
+                .map(file_key)
+                .ok_or_else(|| "tab has no selected file".to_owned())?;
+            let previous = self.tabs[index]
+                .session
+                .as_ref()
+                .is_some_and(|session| session.is_viewed(&key));
+            self.toggle_viewed(&key, cx);
+            actions.expectations.push(SmokeExpectation {
+                repository: self.tabs[index].repository.clone(),
+                number: self.tabs[index].pull_request.number,
+                file_key: key,
+                viewed: !previous,
+            });
+        }
+        self.activate_tab(primary, cx);
+        window.resize(size(px(1440.), px(900.)));
+        if self.tabs[primary]
+            .session
+            .as_ref()
+            .is_none_or(|session| session.diff_mode() == DiffMode::Auto)
+        {
+            return Err("explicit diff mode was lost after wide resize".to_owned());
+        }
+        self.save_workspace();
+        Ok(())
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn validate_smoke_persistence(&self, expectations: &[SmokeExpectation]) -> Result<(), String> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| "smoke requires an isolated persistent store".to_owned())?;
+        for expected in expectations {
+            let session = store
+                .load_review_session(&expected.repository, expected.number)
+                .map_err(|error| format!("cannot reload PR #{}: {error:#}", expected.number))?;
+            if session.is_viewed(&expected.file_key) != expected.viewed {
+                return Err(format!(
+                    "queued save for PR #{} did not preserve its latest viewed state",
+                    expected.number
+                ));
+            }
+        }
+        Ok(())
     }
 
     #[cfg(not(feature = "ui-smoke"))]
@@ -600,11 +921,21 @@ impl ReviewWorkspace {
         if self.persistence_error.is_some() {
             return;
         }
-        self.workspace.tabs = self
-            .tabs
-            .iter()
-            .filter_map(|tab| {
-                tab.session.as_ref().map(|session| TabState {
+        let active_identity = self.active_tab.and_then(|index| {
+            self.tabs
+                .get(index)
+                .map(|tab| (tab.repository.cache_key(), tab.pull_request.number))
+        });
+        let mut active_tab = None;
+        let mut tabs = Vec::new();
+        for tab in &self.tabs {
+            if let Some(session) = &tab.session {
+                if active_identity.as_ref().is_some_and(|(key, number)| {
+                    *key == tab.repository.cache_key() && *number == tab.pull_request.number
+                }) {
+                    active_tab = Some(tabs.len());
+                }
+                tabs.push(TabState {
                     repository_key: tab.repository.cache_key(),
                     number: tab.pull_request.number,
                     revision: session.revision().clone(),
@@ -616,10 +947,11 @@ impl ReviewWorkspace {
                         DiffMode::SideBySide => "side-by-side",
                     }
                     .into(),
-                })
-            })
-            .collect();
-        self.workspace.active_tab = self.active_tab;
+                });
+            }
+        }
+        self.workspace.tabs = tabs;
+        self.workspace.active_tab = active_tab;
         if let Some(store) = &self.store
             && let Err(error) = store.save_workspace(&self.workspace)
         {
@@ -643,8 +975,17 @@ impl ReviewWorkspace {
         let repository = tab.repository.clone();
         let number = tab.pull_request.number;
         let key = repository.cache_key();
-        let latest = self.session_save_latest.clone();
-        let lock = self.session_save_lock.clone();
+        let save_key = format!("{key}\n{number}");
+        let latest = self
+            .session_save_latest
+            .entry(save_key.clone())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        let lock = self
+            .session_save_locks
+            .entry(save_key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
         let sequence = latest.fetch_add(1, Ordering::AcqRel) + 1;
         let task = cx.background_spawn(async move {
             let _guard = lock
@@ -872,6 +1213,14 @@ impl ReviewWorkspace {
         .detach();
     }
 
+    fn activate_tab(&mut self, index: usize, cx: &mut Context<Root>) {
+        if index < self.tabs.len() {
+            self.active_tab = Some(index);
+            self.setup_open = false;
+            cx.notify();
+        }
+    }
+
     fn install_tab(
         &mut self,
         repository: Repository,
@@ -941,7 +1290,7 @@ impl ReviewWorkspace {
         self.active_tab = Some(index);
         self.setup_open = false;
         if self.tabs[index].session.is_some() {
-            self.rebuild_diff(index, false);
+            self.rebuild_diff(index, self.wide);
             if self.tabs[index].local_inventory
                 && self.tabs[index]
                     .session
@@ -1038,7 +1387,7 @@ impl ReviewWorkspace {
                             LoadState::Ready
                         };
                         this.tabs[tab_index].local_inventory = local_inventory;
-                        this.rebuild_diff(tab_index, false);
+                        this.rebuild_diff(tab_index, this.wide);
                         this.schedule.succeeded(&format!("pr:{key}:{number}"));
                         this.save_workspace();
                         if local_inventory {
@@ -1813,9 +2162,7 @@ impl ReviewWorkspace {
                 )
                 .on_click(cx.listener(move |root, _, _, cx| {
                     if let Root::Review(this) = root {
-                        this.active_tab = Some(index);
-                        this.setup_open = false;
-                        cx.notify();
+                        this.activate_tab(index, cx);
                     }
                 }))
         });
@@ -2380,100 +2727,108 @@ impl ReviewWorkspace {
                     }
                 }))
         };
-        let content =
-            match current {
-                InspectorSection::Overview => {
-                    let mut fields = vec![
-                        detail("Author", &tab.pull_request.author, colors),
-                        detail("State", &tab.pull_request.state, colors),
-                        detail(
-                            "Review",
-                            empty_unknown(&tab.pull_request.review_status),
-                            colors,
+        let content = match current {
+            InspectorSection::Overview => {
+                let mut fields = vec![
+                    detail("Author", &tab.pull_request.author, colors),
+                    detail("State", &tab.pull_request.state, colors),
+                    detail(
+                        "Review",
+                        empty_unknown(&tab.pull_request.review_status),
+                        colors,
+                    ),
+                    detail(
+                        "Labels",
+                        if tab.pull_request.labels.is_empty() {
+                            "None".into()
+                        } else {
+                            tab.pull_request.labels.join(", ")
+                        },
+                        colors,
+                    ),
+                ];
+                if let Some(details) = &tab.details {
+                    fields.push(detail(
+                        "Requested reviewers",
+                        if details.requested_reviewers.is_empty() {
+                            "None".into()
+                        } else {
+                            details.requested_reviewers.join(", ")
+                        },
+                        colors,
+                    ));
+                    fields.push(detail(
+                        "Merge state",
+                        format!(
+                            "{} · {}",
+                            details.merge_eligibility.mergeable,
+                            details.merge_eligibility.merge_state_status
                         ),
-                        detail(
-                            "Labels",
-                            if tab.pull_request.labels.is_empty() {
-                                "None".into()
-                            } else {
-                                tab.pull_request.labels.join(", ")
-                            },
-                            colors,
-                        ),
-                    ];
-                    if let Some(details) = &tab.details {
-                        fields.push(detail(
-                            "Requested reviewers",
-                            if details.requested_reviewers.is_empty() {
-                                "None".into()
-                            } else {
-                                details.requested_reviewers.join(", ")
-                            },
+                        colors,
+                    ));
+                    if !details.body.trim().is_empty() {
+                        fields.push(markdown_detail(
+                            format!("pr-description-{}", tab.pull_request.number),
+                            "Description",
+                            &details.body,
                             colors,
                         ));
-                        fields.push(detail(
-                            "Merge state",
-                            format!(
-                                "{} · {}",
-                                details.merge_eligibility.mergeable,
-                                details.merge_eligibility.merge_state_status
-                            ),
-                            colors,
-                        ));
-                        if !details.body.trim().is_empty() {
-                            fields.push(detail("Description", details.body.clone(), colors));
-                        }
                     }
-                    div().children(fields).into_any_element()
                 }
-                InspectorSection::Activity => {
-                    let mut activity = Vec::new();
-                    if let Some(details) = &tab.details {
-                        for comment in details.issue_comments.iter().take(20) {
-                            activity.push(activity_item(
-                                comment.author.as_deref().unwrap_or("Unknown author"),
-                                &comment.body,
-                                &comment.created_at,
-                                colors,
-                            ));
-                        }
-                        for review in details.reviews.iter().take(20) {
-                            activity.push(activity_item(
-                                review.author.as_deref().unwrap_or("Unknown reviewer"),
-                                if review.body.is_empty() {
-                                    &review.state
-                                } else {
-                                    &review.body
-                                },
-                                review.submitted_at.as_deref().unwrap_or("Pending"),
-                                colors,
-                            ));
-                        }
-                        if !details.activity_complete {
-                            activity.push(div().text_color(colors.amber).child(
-                                "Activity is incomplete; GitHub response limits were reached.",
-                            ));
-                        }
+                div().children(fields).into_any_element()
+            }
+            InspectorSection::Activity => {
+                let mut activity = Vec::new();
+                if let Some(details) = &tab.details {
+                    for (position, comment) in details.issue_comments.iter().take(20).enumerate() {
+                        activity.push(activity_item(
+                            format!("issue-comment-{position}"),
+                            comment.author.as_deref().unwrap_or("Unknown author"),
+                            &comment.body,
+                            &comment.created_at,
+                            colors,
+                        ));
                     }
-                    if activity.is_empty() {
+                    for (position, review) in details.reviews.iter().take(20).enumerate() {
+                        activity.push(activity_item(
+                            format!("review-{position}"),
+                            review.author.as_deref().unwrap_or("Unknown reviewer"),
+                            if review.body.is_empty() {
+                                &review.state
+                            } else {
+                                &review.body
+                            },
+                            review.submitted_at.as_deref().unwrap_or("Pending"),
+                            colors,
+                        ));
+                    }
+                    if !details.activity_complete {
                         activity.push(
-                            div()
-                                .text_color(colors.muted)
-                                .child("No activity returned for this pull request."),
+                            div().text_color(colors.amber).child(
+                                "Activity is incomplete; GitHub response limits were reached.",
+                            ),
                         );
                     }
-                    div().children(activity).into_any_element()
                 }
-                InspectorSection::Checks => {
-                    let mut checks = vec![detail(
-                        "Status",
-                        empty_unknown(&tab.pull_request.check_status),
-                        colors,
-                    )];
-                    if let Some(details) = &tab.details {
-                        for check in details.checks.iter().take(40) {
-                            checks.push(div().mb_3().child(check.name.clone()).child(
-                                div().text_xs().text_color(colors.muted).child(format!(
+                if activity.is_empty() {
+                    activity.push(
+                        div()
+                            .text_color(colors.muted)
+                            .child("No activity returned for this pull request."),
+                    );
+                }
+                div().children(activity).into_any_element()
+            }
+            InspectorSection::Checks => {
+                let mut checks = vec![detail(
+                    "Status",
+                    empty_unknown(&tab.pull_request.check_status),
+                    colors,
+                )];
+                if let Some(details) = &tab.details {
+                    for check in details.checks.iter().take(40) {
+                        checks.push(div().mb_3().child(check.name.clone()).child(
+                            div().text_xs().text_color(colors.muted).child(format!(
                                             "{}{}",
                                             check.status,
                                             check
@@ -2482,19 +2837,19 @@ impl ReviewWorkspace {
                                                 .map(|value| format!(" · {value}"))
                                                 .unwrap_or_default()
                                         )),
-                            ));
-                        }
-                        if !details.checks_complete {
-                            checks.push(
-                                div()
-                                    .text_color(colors.amber)
-                                    .child("Check results are incomplete."),
-                            );
-                        }
+                        ));
                     }
-                    div().children(checks).into_any_element()
+                    if !details.checks_complete {
+                        checks.push(
+                            div()
+                                .text_color(colors.amber)
+                                .child("Check results are incomplete."),
+                        );
+                    }
                 }
-            };
+                div().children(checks).into_any_element()
+            }
+        };
         div()
             .w(px(274.))
             .min_w(px(240.))
@@ -2752,7 +3107,23 @@ fn detail(label: &str, value: impl Into<String>, colors: Palette) -> Div {
         .child(div().mt_1().child(value.into()))
 }
 
-fn activity_item(author: &str, body: &str, timestamp: &str, colors: Palette) -> Div {
+fn markdown_detail(id: String, label: &str, body: &str, colors: Palette) -> Div {
+    div()
+        .mb_4()
+        .child(
+            div()
+                .text_xs()
+                .text_color(colors.muted)
+                .child(label.to_owned()),
+        )
+        .child(
+            div()
+                .mt_1()
+                .child(markdown_text(id, body, colors).text_size(px(12.))),
+        )
+}
+
+fn activity_item(id: String, author: &str, body: &str, timestamp: &str, colors: Palette) -> Div {
     div()
         .mb_4()
         .child(
@@ -2768,7 +3139,52 @@ fn activity_item(author: &str, body: &str, timestamp: &str, colors: Palette) -> 
                         .child(timestamp.to_owned()),
                 ),
         )
-        .child(div().mt_1().text_color(colors.muted).child(body.to_owned()))
+        .child(
+            div()
+                .mt_1()
+                .child(markdown_text(id, body, colors).text_size(px(12.))),
+        )
+}
+
+fn markdown_text(id: String, source: &str, colors: Palette) -> TextView {
+    TextView::markdown(SharedString::from(id), media_free_markdown(source))
+        .style(
+            TextViewStyle::default()
+                .with_foreground(colors.muted.into())
+                .with_muted_foreground(colors.faint.into())
+                .with_link(colors.accent.into())
+                .with_code_background(colors.elevated.into())
+                .with_border(colors.border.into())
+                .with_heading_base_font_size(px(13.))
+                .with_dark(colors.dark),
+        )
+        .selectable(true)
+}
+
+/// Keep GitHub prose readable without allowing rich text to resolve media URIs.
+fn media_free_markdown(source: &str) -> String {
+    let mut without_comments = String::with_capacity(source.len());
+    let mut remaining = source;
+    while let Some(start) = remaining.find("<!--") {
+        without_comments.push_str(&remaining[..start]);
+        let after_start = &remaining[start + 4..];
+        if let Some(end) = after_start.find("-->") {
+            remaining = &after_start[end + 3..];
+        } else {
+            remaining = "";
+            break;
+        }
+    }
+    without_comments.push_str(remaining);
+    without_comments
+        .replace("![", "[Image: ")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn poll_due(tick: u64, delay: Duration) -> bool {
+    let periods = (delay.as_secs() / 15).max(1);
+    tick.is_multiple_of(periods)
 }
 
 fn empty_unknown(value: &str) -> String {
