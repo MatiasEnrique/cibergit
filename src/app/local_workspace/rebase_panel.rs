@@ -158,6 +158,7 @@ pub(super) struct RebasePanel {
     pending: Option<PendingRebaseCommand>,
     in_flight: Option<u64>,
     read_generation: u64,
+    show_operation_details: bool,
     status: String,
 }
 
@@ -190,6 +191,7 @@ impl RebasePanel {
             pending: None,
             in_flight: None,
             read_generation: 0,
+            show_operation_details: false,
             status: "Choose an immutable local base candidate".into(),
         }
     }
@@ -239,6 +241,11 @@ impl RebasePanel {
         operation: Option<RebaseOperationView>,
         conflicts: Vec<ConflictFile>,
     ) {
+        if self.operation.as_ref().map(|view| &view.operation_id)
+            != operation.as_ref().map(|view| &view.operation_id)
+        {
+            self.show_operation_details = false;
+        }
         self.operation = operation;
         self.conflicts = conflicts;
     }
@@ -272,6 +279,11 @@ impl LocalWorkspace {
 
     pub fn rebase_plan_len(&self) -> usize {
         self.rebase.steps.len()
+    }
+
+    pub fn set_rebase_operation_details(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.rebase.show_operation_details = visible;
+        cx.notify();
     }
 
     pub fn set_rebase_step_action(
@@ -1083,7 +1095,7 @@ impl LocalWorkspace {
                         .child(plan_rows)
                         .child(self.render_plan_editor(colors, cx))
                         .child(action_button(
-                            "Review and Start",
+                            "Review and start rebase",
                             colors,
                             cx.listener(|this, _, _, cx| this.request_start_rebase(cx)),
                         ));
@@ -1170,7 +1182,7 @@ impl LocalWorkspace {
                                 div()
                                     .text_xs()
                                     .text_color(colors.muted)
-                                    .child("Local-only · guarded · explicit transitions"),
+                                    .child("Rebase this branch"),
                             ),
                     )
                     .child(action_button(
@@ -1264,7 +1276,22 @@ impl LocalWorkspace {
         colors: LocalPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let state = format!("{:?}", operation.state);
+        let state = operation_state_label(operation.state);
+        let stopped = operation.active.as_ref().and_then(|active| {
+            active.stopped_oid.as_ref().map(|oid| {
+                let headline = self.rebase_inventory().and_then(|inventory| {
+                    inventory
+                        .commits
+                        .iter()
+                        .find(|commit| &commit.oid == oid)
+                        .map(|commit| first_line(&commit.message))
+                });
+                match headline {
+                    Some(headline) => format!("stopped {} · {headline}", short_oid(oid)),
+                    None => format!("stopped {}", short_oid(oid)),
+                }
+            })
+        });
         let mut body = div()
             .flex()
             .flex_col()
@@ -1294,11 +1321,23 @@ impl LocalWorkspace {
                     .flex_col()
                     .gap_1()
                     .child(format!("branch {}", operation.original_branch))
-                    .child(format!("base {}", operation.base_oid))
-                    .child(format!("operation {}", operation.operation_id)),
-            );
-        if let Some(active) = &operation.active {
-            body = body.child(active_identity_box(active, colors));
+                    .child(format!("base {}", short_oid(&operation.base_oid)))
+                    .children(stopped),
+            )
+            .child(action_button(
+                if self.rebase.show_operation_details {
+                    "Hide operation details"
+                } else {
+                    "Show operation details"
+                },
+                colors,
+                cx.listener(|this, _, _, cx| {
+                    this.rebase.show_operation_details = !this.rebase.show_operation_details;
+                    cx.notify();
+                }),
+            ));
+        if self.rebase.show_operation_details {
+            body = body.child(operation_details_box(&operation, colors));
         }
         if let Some(split) = &operation.split {
             body = body.child(render_split(split, colors));
@@ -1306,14 +1345,14 @@ impl LocalWorkspace {
         if !self.rebase.conflicts.is_empty() {
             body = body.child(div().font_weight(FontWeight::SEMIBOLD).child("CONFLICTS"));
             for (index, conflict) in self.rebase.conflicts.clone().into_iter().enumerate() {
-                let detail = conflict_reason(&conflict);
+                let detail = conflict_reason(&conflict, self.rebase.show_operation_details);
                 body = body.child(div().p_2().border_1().border_color(colors.border).rounded_md()
                     .child(div().font_family(CODE_FONT).child(conflict.path.display.clone()))
                     .child(div().mt_1().text_xs().text_color(colors.muted).child(detail))
                     .child(div().mt_1().text_xs().child("Rebase orientation: ours = already rebased series; theirs = replayed original commit."))
                     .child(div().mt_2().flex().gap_2()
-                        .child(action_button("Open safe result", colors, cx.listener(move |this, _, window, cx| this.open_rebase_conflict(index, window, cx))))
-                        .child(action_button("Stage exact saved result", colors, cx.listener(move |this, _, _, cx| this.request_stage_rebase_conflict(index, cx))))));
+                        .child(action_button("Open result", colors, cx.listener(move |this, _, window, cx| this.open_rebase_conflict(index, window, cx))))
+                        .child(action_button("Stage saved result", colors, cx.listener(move |this, _, _, cx| this.request_stage_rebase_conflict(index, cx))))));
             }
         }
         if let Some(stash) = &operation.stash {
@@ -1736,7 +1775,8 @@ fn notice_box(
         )
 }
 
-fn active_identity_box(active: &ActiveOperationIdentity, colors: LocalPalette) -> Div {
+fn operation_details_box(operation: &RebaseOperationView, colors: LocalPalette) -> Div {
+    let active = operation.active.as_ref();
     div()
         .p_3()
         .rounded_md()
@@ -1746,7 +1786,7 @@ fn active_identity_box(active: &ActiveOperationIdentity, colors: LocalPalette) -
         .child(
             div()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child("Guard-bound active identity"),
+                .child("Operation details"),
         )
         .child(
             div()
@@ -1755,14 +1795,21 @@ fn active_identity_box(active: &ActiveOperationIdentity, colors: LocalPalette) -
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(format!("onto {}", active.onto_oid))
-                .child(format!("original {}", active.original_head_oid))
-                .child(format!(
-                    "stopped {}",
-                    active.stopped_oid.as_deref().unwrap_or("none")
-                ))
-                .child(format!("todo {}", active.todo_sha256))
-                .child(format!("done {}", active.done_sha256)),
+                .child(format!("operation {}", operation.operation_id))
+                .child(format!("base {}", operation.base_oid))
+                .child(format!("original {}", operation.original_head_oid))
+                .children(active.map(|active| format!("onto {}", active.onto_oid)))
+                .children(active.map(|active| {
+                    format!(
+                        "stopped {}",
+                        active.stopped_oid.as_deref().unwrap_or("none")
+                    )
+                }))
+                .children(active.map(|active| format!("todo {}", active.todo_sha256)))
+                .children(active.map(|active| format!("done {}", active.done_sha256)))
+                .children(
+                    active.map(|active| format!("ownership {}", active.ownership_marker_sha256)),
+                ),
         )
 }
 
@@ -1798,17 +1845,43 @@ fn conflict_is_editor_candidate(conflict: &ConflictFile) -> bool {
     .all(|content| matches!(content, BlobContent::Utf8(_) | BlobContent::Deleted))
 }
 
-fn conflict_reason(conflict: &ConflictFile) -> String {
+fn conflict_reason(conflict: &ConflictFile, show_details: bool) -> String {
     let support = if conflict_is_editor_candidate(conflict) {
         "regular UTF-8 result can be opened safely"
     } else {
         "binary/media/non-UTF8/missing/type result requires an external workflow; cibergit will not create or delete it"
     };
-    format!(
-        "{:?} · {support} · disk {}",
-        conflict.kind,
-        disk_label(&conflict.disk)
-    )
+    let kind = match &conflict.kind {
+        cibergit::rebase::ConflictKind::BothModified => "Both sides modified this file".into(),
+        cibergit::rebase::ConflictKind::AddedByBoth => "Both sides added this file".into(),
+        cibergit::rebase::ConflictKind::DeletedByOurs => {
+            "Deleted in the already-rebased changes and modified by the replayed commit".into()
+        }
+        cibergit::rebase::ConflictKind::DeletedByTheirs => {
+            "Modified in the already-rebased changes and deleted by the replayed commit".into()
+        }
+        cibergit::rebase::ConflictKind::RenameOrDelete { explanation, .. } => {
+            format!("Rename or delete conflict: {explanation}")
+        }
+        cibergit::rebase::ConflictKind::TypeChange => "The file type changed across sides".into(),
+    };
+    if show_details {
+        format!("{kind} · {support} · disk {}", disk_label(&conflict.disk))
+    } else {
+        format!("{kind} · {support}")
+    }
+}
+
+fn operation_state_label(state: RebaseState) -> &'static str {
+    match state {
+        RebaseState::Prepared => "Ready to start",
+        RebaseState::Running => "Rebase running",
+        RebaseState::PausedForEdit => "Paused for editing",
+        RebaseState::Conflicted => "Conflicts to resolve",
+        RebaseState::Completed => "Rebase completed",
+        RebaseState::Aborted => "Rebase aborted",
+        RebaseState::FailedUncertain => "Outcome uncertain",
+    }
 }
 
 fn disk_label(disk: &cibergit::rebase::DiskGeneration) -> String {

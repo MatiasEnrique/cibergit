@@ -339,6 +339,41 @@ fn start_smoke(
             let edit_capture = window.update(|window, _| {
                 window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-edit-dark-wide.png" } else { "rebase-edit-light-wide.png" })).map_err(Into::into)).is_ok()
             }).unwrap_or(false);
+            let edit_details_visible = window
+                .update(|_, cx| {
+                    workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.set_rebase_operation_details(true, cx)
+                    })
+                    .is_ok()
+                })
+                .unwrap_or(false);
+            window
+                .background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            let edit_details_capture = edit_details_visible
+                && window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join(if dark {
+                                        "rebase-operation-details-dark-wide.png"
+                                    } else {
+                                        "rebase-operation-details-light-wide.png"
+                                    }))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+            let _ = window.update(|_, cx| {
+                let _ = workspace.update(cx, |workspace, cx| {
+                    workspace.set_rebase_operation_details(false, cx)
+                });
+            });
 
             let continue_requested = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
                 workspace.request_continue_rebase(cx);
@@ -636,8 +671,9 @@ fn start_smoke(
                         .update(cx, |workspace, cx| {
                             workspace.refresh_all(cx);
                             let Some(request_id) = workspace.request_action(
-                                LocalAction::SwitchBranch {
-                                    branch: "feature/local-ui".into(),
+                                LocalAction::CreateBranch {
+                                    branch: "smoke-clean-checkout".into(),
+                                    start_oid: None,
                                 },
                                 cx,
                             ) else {
@@ -925,7 +961,7 @@ fn start_smoke(
                 }
             };
             let report = format!(
-                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nrebase prepare requested: {}\npopulated three-commit plan ready: {}\nplan normal capture: {}\nedit plan Start requested through confirmation: {}\nPausedForEdit observed: {}\nedit wide capture: {}\nexplicit Continue requested through confirmation: {}\nCompleted observed: {}\nresult normal capture: {}\nsafe archive requested and second prepare enabled: {}\nreordered conflict plan prepared: {}\nconflicting Start requested through confirmation: {}\nConflicted observed from real Git: {}\nconflict narrow capture: {}\nexplicit Abort requested through confirmation: {}\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nclean checkout confirmation dispatched while no-op refresh pending: {}\nclean refresh-time confirmation completed authoritatively: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
+                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nrebase prepare requested: {}\npopulated three-commit plan ready: {}\nplan normal capture: {}\nedit plan Start requested through confirmation: {}\nPausedForEdit observed: {}\nedit wide capture: {}\nexpanded operation details capture: {}\nexplicit Continue requested through confirmation: {}\nCompleted observed: {}\nresult normal capture: {}\nsafe archive requested and second prepare enabled: {}\nreordered conflict plan prepared: {}\nconflicting Start requested through confirmation: {}\nConflicted observed from real Git: {}\nconflict narrow capture: {}\nexplicit Abort requested through confirmation: {}\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nclean checkout confirmation dispatched while no-op refresh pending: {}\nclean refresh-time confirmation completed authoritatively: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
                 if dark { "dark" } else { "light" },
                 prepare_requested,
                 plan_ready,
@@ -933,6 +969,7 @@ fn start_smoke(
                 start_edit_requested,
                 edit_ready,
                 edit_capture,
+                edit_details_capture,
                 continue_requested,
                 rebase_completed,
                 result_capture,
