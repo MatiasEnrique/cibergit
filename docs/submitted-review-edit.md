@@ -14,15 +14,19 @@ read-only; old saved records deserialize without capability evidence and cannot
 enable the control.
 
 The editor is distinct from pending-review and new-submission summary inputs.
-Its text is retained per tab and per selected review while navigating. If a
-refresh changes or removes the source review, the typed text remains visible or
-is disclosed as retained, but confirmation is refused until editing restarts
-from fresh evidence.
+Its drafts are keyed by exact review coordinates within each tab. Reopening the
+same review resumes its typed text, and switching A → B → A retains both review
+drafts. If a refresh changes the source review, confirmation is refused until
+the user chooses Edit again; that explicit refresh replaces the expected source
+tuple while preserving the typed new body. A removed source is disclosed as a
+retained draft that cannot be confirmed.
 
 Confirmation freezes and shows the repository, pull request, opaque review node
 ID, selected author, submitted state, reviewed commit, exact previous body, and
 exact requested body. An empty requested body is allowed. Cancellation retains
-the local draft and sends zero writes.
+the local draft and sends zero writes. Each prepared confirmation has a unique
+monotonic generation, so a handler captured for a cancelled confirmation cannot
+confirm or cancel a later byte-identical confirmation.
 
 GitHub rechecks the exact review before saving, but another edit can happen
 between that read and the write because the API has no atomic previous-body

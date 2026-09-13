@@ -872,7 +872,8 @@ struct ReviewTab {
     write_in_flight: bool,
     reply_thread: Option<cibergit::domain::ProviderCoordinates>,
     editing_pending_summary: bool,
-    editing_submitted_review: Option<SubmittedSummaryDraft>,
+    submitted_summary_editor: SubmittedSummaryEditor,
+    submitted_confirmation_generation: u64,
     recovery_details_expanded: bool,
     lifecycle_details_expanded: bool,
     lifecycle_choice_pages: [usize; 3],
@@ -897,6 +898,7 @@ enum NativeConfirmation {
         event: ReviewEvent,
     },
     UpdateSubmittedSummary {
+        generation: u64,
         action: Box<ReviewAuxiliaryAction>,
     },
     Merge {
@@ -912,12 +914,82 @@ struct SubmittedSummaryDraft {
     body: String,
 }
 
+#[derive(Default)]
+struct SubmittedSummaryEditor {
+    active_review: Option<cibergit::domain::ProviderCoordinates>,
+    drafts: Vec<SubmittedSummaryDraft>,
+}
+
+impl SubmittedSummaryEditor {
+    fn active_draft(&self) -> Option<&SubmittedSummaryDraft> {
+        let active = self.active_review.as_ref()?;
+        self.drafts
+            .iter()
+            .find(|draft| &draft.review.coordinates == active)
+    }
+
+    fn active_draft_mut(&mut self) -> Option<&mut SubmittedSummaryDraft> {
+        let active = self.active_review.as_ref()?;
+        self.drafts
+            .iter_mut()
+            .find(|draft| &draft.review.coordinates == active)
+    }
+
+    fn draft_for(
+        &self,
+        coordinates: &cibergit::domain::ProviderCoordinates,
+    ) -> Option<&SubmittedSummaryDraft> {
+        self.drafts
+            .iter()
+            .find(|draft| &draft.review.coordinates == coordinates)
+    }
+
+    fn store_active_body(&mut self, body: String) {
+        if let Some(draft) = self.active_draft_mut() {
+            draft.body = body;
+        }
+    }
+
+    /// Selects an exact review draft. Existing text is retained; a newer fresh
+    /// source tuple replaces only the expected source used by preflight.
+    fn begin(&mut self, fresh: cibergit::domain::PullRequestReview) -> (String, bool, bool) {
+        let coordinates = fresh.coordinates.clone();
+        let existing = self
+            .drafts
+            .iter_mut()
+            .find(|draft| draft.review.coordinates == coordinates);
+        let (body, source_refreshed, resumed) = if let Some(draft) = existing {
+            let source_refreshed = draft.review != fresh;
+            draft.review = fresh;
+            (draft.body.clone(), source_refreshed, true)
+        } else {
+            let body = fresh.body.clone();
+            self.drafts.push(SubmittedSummaryDraft {
+                review: fresh,
+                body: body.clone(),
+            });
+            (body, false, false)
+        };
+        self.active_review = Some(coordinates);
+        (body, source_refreshed, resumed)
+    }
+
+    fn clear(&mut self, coordinates: &cibergit::domain::ProviderCoordinates) {
+        self.drafts
+            .retain(|draft| &draft.review.coordinates != coordinates);
+        if self.active_review.as_ref() == Some(coordinates) {
+            self.active_review = None;
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SubmittedConfirmationToken {
     workspace_instance: u64,
     tab_instance: u64,
     repository_key: String,
     pull_request: u64,
+    confirmation_generation: u64,
     action: ReviewAuxiliaryAction,
 }
 
@@ -936,8 +1008,9 @@ impl SubmittedConfirmationToken {
             && pull_request == self.pull_request
             && matches!(
                 confirmation,
-                Some(NativeConfirmation::UpdateSubmittedSummary { action })
-                    if action.as_ref() == &self.action
+                Some(NativeConfirmation::UpdateSubmittedSummary { generation, action })
+                    if *generation == self.confirmation_generation
+                        && action.as_ref() == &self.action
             )
     }
 }
@@ -1467,9 +1540,9 @@ impl ReviewWorkspace {
                     && let Some(index) = this.active_tab
                 {
                     let body = this.submitted_summary_input.read(cx).value().to_string();
-                    if let Some(draft) = &mut this.tabs[index].editing_submitted_review {
-                        draft.body = body;
-                    }
+                    this.tabs[index]
+                        .submitted_summary_editor
+                        .store_active_body(body);
                 }
             },
         );
@@ -5461,15 +5534,19 @@ impl ReviewWorkspace {
                                 ),
                                 url: String::new(),
                             };
+                            let mut second_review = review.clone();
+                            second_review.coordinates.remote_id =
+                                "SYNTHETIC_SECOND_OWNED_REVIEW_NO_DISPATCH".into();
+                            second_review.body = "Synthetic second original summary.".into();
                             this.tabs[index]
                                 .details
                                 .as_mut()
                                 .ok_or_else(|| "real details read unavailable".to_owned())?
                                 .reviews
-                                .insert(0, review.clone());
+                                .splice(0..0, [review.clone(), second_review.clone()]);
                             this.tabs[index].inspector_section = InspectorSection::Activity;
                             this.tabs[index].review_page = 0;
-                            this.begin_submitted_summary_edit(review, window, cx);
+                            this.begin_submitted_summary_edit(review.clone(), window, cx);
                             this.submitted_summary_input.update(cx, |input, cx| {
                                 input.set_value(
                                     "Synthetic requested submitted summary. Confirmation and cancellation only; zero update mutation transport.",
@@ -5477,6 +5554,35 @@ impl ReviewWorkspace {
                                     cx,
                                 )
                             });
+                            this.begin_submitted_summary_edit(review.clone(), window, cx);
+                            let repeated_a_retained = this
+                                .submitted_summary_input
+                                .read(cx)
+                                .value()
+                                .contains("zero update mutation transport");
+                            this.begin_submitted_summary_edit(second_review.clone(), window, cx);
+                            this.submitted_summary_input.update(cx, |input, cx| {
+                                input.set_value(
+                                    "Synthetic typed draft B; zero transport.",
+                                    window,
+                                    cx,
+                                )
+                            });
+                            this.begin_submitted_summary_edit(review.clone(), window, cx);
+                            let a_after_b_retained = this
+                                .submitted_summary_input
+                                .read(cx)
+                                .value()
+                                .contains("zero update mutation transport");
+                            this.begin_submitted_summary_edit(second_review, window, cx);
+                            let b_after_a_retained = this
+                                .submitted_summary_input
+                                .read(cx)
+                                .value()
+                                .contains("typed draft B");
+                            this.begin_submitted_summary_edit(review, window, cx);
+                            let per_review_draft_routing =
+                                repeated_a_retained && a_after_b_retained && b_after_a_retained;
                             let mut multi_tab_routing = second_pr.is_none();
                             if let Some(second) = second_pr
                                 && let Some(second_index) = this
@@ -5498,8 +5604,12 @@ impl ReviewWorkspace {
                                     .contains("zero update mutation transport");
                                 multi_tab_routing = secondary_empty && primary_restored;
                             }
+                            multi_tab_routing &= per_review_draft_routing;
                             this.prepare_submitted_summary_confirmation(cx);
-                            let Some(NativeConfirmation::UpdateSubmittedSummary { action }) =
+                            let Some(NativeConfirmation::UpdateSubmittedSummary {
+                                generation,
+                                action,
+                            }) =
                                 this.tabs[index].confirmation.as_ref()
                             else {
                                 return Err(this.status.clone());
@@ -5509,6 +5619,7 @@ impl ReviewWorkspace {
                                 tab_instance: this.tabs[index].instance_generation,
                                 repository_key: repository.cache_key(),
                                 pull_request: number,
+                                confirmation_generation: *generation,
                                 action: action.as_ref().clone(),
                             };
                             if let Some(second) = second_pr
@@ -5572,6 +5683,59 @@ impl ReviewWorkspace {
                 } else {
                     false
                 };
+                let confirmation_aba_guard = if submitted_cancelled
+                    && let Ok((old_token, _)) = &submitted_scene
+                {
+                    window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else { return false };
+                                let Some(index) = this.active_tab else { return false };
+                                this.prepare_submitted_summary_confirmation(cx);
+                                let Some(NativeConfirmation::UpdateSubmittedSummary {
+                                    generation,
+                                    action,
+                                }) = this.tabs[index].confirmation.as_ref()
+                                else {
+                                    return false;
+                                };
+                                let new_token = SubmittedConfirmationToken {
+                                    workspace_instance: this.workspace_instance,
+                                    tab_instance: this.tabs[index].instance_generation,
+                                    repository_key: this.tabs[index].repository.cache_key(),
+                                    pull_request: this.tabs[index].pull_request.number,
+                                    confirmation_generation: *generation,
+                                    action: action.as_ref().clone(),
+                                };
+                                let generation_advanced = new_token.confirmation_generation
+                                    > old_token.confirmation_generation;
+                                let stale_cancel_rejected =
+                                    !this.cancel_submitted_summary_confirmation(old_token, cx);
+                                let new_confirmation_retained = this.tabs[index]
+                                    .confirmation
+                                    .as_ref()
+                                    .is_some_and(|confirmation| {
+                                        new_token.matches_values(
+                                            this.workspace_instance,
+                                            this.tabs[index].instance_generation,
+                                            &this.tabs[index].repository.cache_key(),
+                                            this.tabs[index].pull_request.number,
+                                            Some(confirmation),
+                                        )
+                                    });
+                                let new_cancelled =
+                                    this.cancel_submitted_summary_confirmation(&new_token, cx);
+                                generation_advanced
+                                    && stale_cancel_rejected
+                                    && new_confirmation_retained
+                                    && new_cancelled
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
                 let multi_tab_routing = submitted_scene
                     .as_ref()
                     .is_ok_and(|(_, routed)| *routed);
@@ -5582,8 +5746,8 @@ impl ReviewWorkspace {
                             let Some(index) = this.active_tab else { return false };
                             this.tabs[index].confirmation.is_none()
                                 && this.tabs[index]
-                                    .editing_submitted_review
-                                    .as_ref()
+                                    .submitted_summary_editor
+                                    .active_draft()
                                     .is_some_and(|draft| {
                                         draft.body.contains("zero update mutation transport")
                                     })
@@ -5592,7 +5756,7 @@ impl ReviewWorkspace {
                     })
                     .unwrap_or(false);
                 let changed_source_draft_retained = window
-                    .update(|_, cx| {
+                    .update(|window, cx| {
                         weak.update(cx, |root, cx| {
                             let Root::Review(this) = root else { return false };
                             let Some(index) = this.active_tab else { return false };
@@ -5606,14 +5770,29 @@ impl ReviewWorkspace {
                                 return false;
                             };
                             review.body = "Synthetic source changed after editing began.".into();
+                            let refreshed_review = review.clone();
                             this.prepare_submitted_summary_confirmation(cx);
-                            this.tabs[index].confirmation.is_none()
+                            let rejected_with_draft = this.tabs[index].confirmation.is_none()
                                 && this.tabs[index]
-                                    .editing_submitted_review
-                                    .as_ref()
+                                    .submitted_summary_editor
+                                    .active_draft()
                                     .is_some_and(|draft| {
                                         draft.body.contains("zero update mutation transport")
-                                    })
+                                    });
+                            this.begin_submitted_summary_edit(refreshed_review, window, cx);
+                            let adopted_with_draft = this
+                                .submitted_summary_input
+                                .read(cx)
+                                .value()
+                                .contains("zero update mutation transport")
+                                && this.tabs[index]
+                                    .submitted_summary_editor
+                                    .active_draft()
+                                    .is_some_and(|draft| {
+                                        draft.review.body
+                                            == "Synthetic source changed after editing began."
+                                    });
+                            rejected_with_draft && adopted_with_draft
                         })
                         .unwrap_or(false)
                     })
@@ -5649,12 +5828,13 @@ impl ReviewWorkspace {
                     && activity_captured
                     && submitted_captured
                     && submitted_cancelled
+                    && confirmation_aba_guard
                     && submitted_draft_retained
                     && changed_source_draft_retained
                     && multi_tab_routing
                     && unchanged;
                 let report = format!(
-                    "Native PR lifecycle and submitted-summary smoke: {}\nReal read-only provider preparation: cli/cli snapshot title {:?}, selected account {}, values_complete={}, capabilities_complete={}\nSynthetic metadata confirmation capture: {}\nSynthetic exact-ID discussion confirmation capture: {}\nClearly labelled synthetic owned-review summary confirmation capture: {}\nSubmitted-summary cancellation through exact native handler: {}\nPer-target typed submitted-summary draft retained after cancellation: {}\nChanged-source confirmation rejection retained typed draft: {}\nMulti-tab editor restore and stale confirmation rejection through native handlers: {}\nCanonical and selected comparison identities unchanged: {}\nMutation transport: not invoked; ZERO updatePullRequestReview and zero live metadata/comment/review/merge writes\nWindow focus requested: false when CIBERGIT_SMOKE_BACKGROUND=1\nPhysical input is not implied by an in-process scene render.\n",
+                    "Native PR lifecycle and submitted-summary smoke: {}\nReal read-only provider preparation: cli/cli snapshot title {:?}, selected account {}, values_complete={}, capabilities_complete={}\nSynthetic metadata confirmation capture: {}\nSynthetic exact-ID discussion confirmation capture: {}\nClearly labelled synthetic owned-review summary confirmation capture: {}\nSubmitted-summary cancellation through exact native handler: {}\nCancelled/reprepared identical confirmation rejects the stale native handler token: {}\nPer-review A→B→A, repeated-edit, and cross-tab typed drafts retained: {}\nChanged-source rejection plus explicit refresh retained typed draft: {}\nCanonical and selected comparison identities unchanged: {}\nMutation transport: not invoked; ZERO updatePullRequestReview and zero live metadata/comment/review/merge writes\nWindow focus requested: false when CIBERGIT_SMOKE_BACKGROUND=1\nPhysical input is not implied by an in-process scene render.\n",
                     if passed { "passed" } else { "failed" },
                     real_title,
                     viewer,
@@ -5664,9 +5844,9 @@ impl ReviewWorkspace {
                     activity_captured,
                     submitted_captured,
                     submitted_cancelled,
-                    submitted_draft_retained,
+                    confirmation_aba_guard,
+                    submitted_draft_retained && multi_tab_routing,
                     changed_source_draft_retained,
-                    multi_tab_routing,
                     unchanged,
                 );
                 let _ = std::fs::write(output.join("native-lifecycle-smoke.txt"), report);
@@ -7097,9 +7277,9 @@ impl ReviewWorkspace {
                 let body = self.discussion_input.read(cx).value().to_string();
                 self.tabs[previous].lifecycle.stage_discussion_body(body);
                 let submitted_body = self.submitted_summary_input.read(cx).value().to_string();
-                if let Some(draft) = &mut self.tabs[previous].editing_submitted_review {
-                    draft.body = submitted_body;
-                }
+                self.tabs[previous]
+                    .submitted_summary_editor
+                    .store_active_body(submitted_body);
             }
             if let Some(previous) = self.active_tab {
                 self.capture_scroll(previous);
@@ -7132,8 +7312,8 @@ impl ReviewWorkspace {
             self.review_summary_input
                 .update(cx, |input, cx| input.set_disabled(disabled, cx));
             let submitted_body = self.tabs[index]
-                .editing_submitted_review
-                .as_ref()
+                .submitted_summary_editor
+                .active_draft()
                 .map(|draft| draft.body.clone())
                 .unwrap_or_default();
             self.submitted_summary_input.update(cx, |input, cx| {
@@ -7328,7 +7508,8 @@ impl ReviewWorkspace {
             write_in_flight: false,
             reply_thread: None,
             editing_pending_summary: false,
-            editing_submitted_review: None,
+            submitted_summary_editor: SubmittedSummaryEditor::default(),
+            submitted_confirmation_generation: 0,
             recovery_details_expanded: false,
             lifecycle_details_expanded: false,
             lifecycle_choice_pages: [0; 3],
@@ -8211,12 +8392,16 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) {
         let Some(index) = self.active_tab else { return };
+        let staged_body = self.submitted_summary_input.read(cx).value().to_string();
+        self.tabs[index]
+            .submitted_summary_editor
+            .store_active_body(staged_body);
         let tab = &self.tabs[index];
         let fresh = tab.details.as_ref().and_then(|details| {
             details
                 .reviews
                 .iter()
-                .find(|candidate| **candidate == review)
+                .find(|candidate| candidate.coordinates == review.coordinates)
         });
         let Some(fresh) = fresh.cloned() else {
             self.status =
@@ -8234,17 +8419,20 @@ impl ReviewWorkspace {
             cx.notify();
             return;
         }
-        let body = fresh.body.clone();
         self.tabs[index].editing_pending_summary = false;
-        self.tabs[index].editing_submitted_review = Some(SubmittedSummaryDraft {
-            review: fresh,
-            body: body.clone(),
-        });
+        let (body, source_refreshed, resumed) =
+            self.tabs[index].submitted_summary_editor.begin(fresh);
         self.submitted_summary_input.update(cx, |input, cx| {
             input.set_value(body, window, cx);
             input.focus(window, cx);
         });
-        self.status = "Editing a fresh author-owned submitted review summary.".into();
+        self.status = if source_refreshed {
+            "Fresh review source adopted; your typed summary draft was retained.".into()
+        } else if resumed {
+            "Resumed the retained draft for this submitted review.".into()
+        } else {
+            "Editing a fresh author-owned submitted review summary.".into()
+        };
         cx.notify();
     }
 
@@ -8254,7 +8442,11 @@ impl ReviewWorkspace {
             self.status = "Another mutation is still in progress.".into();
             return;
         }
-        let Some(draft) = self.tabs[index].editing_submitted_review.clone() else {
+        let Some(draft) = self.tabs[index]
+            .submitted_summary_editor
+            .active_draft()
+            .cloned()
+        else {
             self.status = "Choose an author-owned submitted review first.".into();
             return;
         };
@@ -8266,19 +8458,19 @@ impl ReviewWorkspace {
                 details
                     .reviews
                     .iter()
-                    .find(|candidate| **candidate == frozen_review)
+                    .find(|candidate| candidate.coordinates == frozen_review.coordinates)
             })
             .cloned();
-        let Some(current) = current else {
+        let Some(current) = current.filter(|current| current == &frozen_review) else {
             self.status =
-                "Fresh submitted-review evidence changed; zero writes sent. Refresh Activity."
+                "Fresh submitted-review evidence changed; zero writes sent. Choose Edit again to adopt the new source while retaining your typed draft."
                     .into();
             return;
         };
         let body = self.submitted_summary_input.read(cx).value().to_string();
-        if let Some(draft) = &mut self.tabs[index].editing_submitted_review {
-            draft.body = body.clone();
-        }
+        self.tabs[index]
+            .submitted_summary_editor
+            .store_active_body(body.clone());
         match submitted_review_edit_action(
             &self.tabs[index].repository,
             self.tabs[index].pull_request.number,
@@ -8286,7 +8478,13 @@ impl ReviewWorkspace {
             body,
         ) {
             Ok(action) => {
+                self.tabs[index].submitted_confirmation_generation = self.tabs[index]
+                    .submitted_confirmation_generation
+                    .checked_add(1)
+                    .expect("submitted confirmation generation overflow");
+                let generation = self.tabs[index].submitted_confirmation_generation;
                 self.tabs[index].confirmation = Some(NativeConfirmation::UpdateSubmittedSummary {
+                    generation,
                     action: Box::new(action),
                 });
                 self.inspector_open = true;
@@ -8363,6 +8561,10 @@ impl ReviewWorkspace {
             &action,
             ReviewAuxiliaryAction::UpdateSubmittedSummary { .. }
         );
+        let submitted_summary_target = match &action {
+            ReviewAuxiliaryAction::UpdateSubmittedSummary { review, .. } => Some(review.clone()),
+            _ => None,
+        };
         let repository = self.tabs[index].repository.clone();
         let number = self.tabs[index].pull_request.number;
         let tab_instance = self.tabs[index].instance_generation;
@@ -8427,7 +8629,9 @@ impl ReviewWorkspace {
                 this.status = match outcome {
                     ProviderMutationOutcome::Acknowledged(_) => {
                         this.tabs[index].editing_pending_summary = false;
-                        this.tabs[index].editing_submitted_review = None;
+                        if let Some(target) = &submitted_summary_target {
+                            this.tabs[index].submitted_summary_editor.clear(target);
+                        }
                         this.tabs[index].reply_thread = None;
                         if submitted_summary_edit {
                             "Submitted review summary edit acknowledged exactly; refreshing authoritative activity."
@@ -14873,7 +15077,7 @@ impl ReviewWorkspace {
                                 }),
                         );
                     }
-                    if let Some(draft) = &tab.editing_submitted_review {
+                    if let Some(draft) = tab.submitted_summary_editor.active_draft() {
                         match details
                             .reviews
                             .iter()
@@ -14988,20 +15192,30 @@ impl ReviewWorkspace {
                                 }
                             }
                         }
-                        if let Some(draft) = tab
-                            .editing_submitted_review
-                            .as_ref()
-                            .filter(|draft| draft.review.coordinates == review.coordinates)
+                        if let Some(draft) =
+                            tab.submitted_summary_editor.draft_for(&review.coordinates)
                         {
                             let source_changed = draft.review != *review;
-                            card = card
+                            let active = tab.submitted_summary_editor.active_review.as_ref()
+                                == Some(&review.coordinates);
+                            card = card.when(!active, |card| {
+                                card.child(
+                                    div()
+                                        .mt_2()
+                                        .text_xs()
+                                        .text_color(colors.amber)
+                                        .child("A typed draft is retained for this review. Choose Edit to resume it."),
+                                )
+                            });
+                            if active {
+                                card = card
                                 .when(source_changed, |card| {
                                     card.child(
                                         div()
                                             .mt_2()
                                             .text_xs()
                                             .text_color(colors.amber)
-                                            .child("The fresh review changed after editing began. Your typed draft is retained; refresh and restart from the new source before confirmation."),
+                                            .child("The fresh review changed after editing began. Your typed draft is retained; choose Edit again to adopt the new source before confirmation."),
                                     )
                                 })
                                 .child(
@@ -15023,6 +15237,7 @@ impl ReviewWorkspace {
                                         }),
                                     ),
                                 ));
+                            }
                         }
                         activity.push(card);
                     }
@@ -15378,7 +15593,7 @@ impl ReviewWorkspace {
                         .into_any_element(),
                 )
             }
-            NativeConfirmation::UpdateSubmittedSummary { action } => {
+            NativeConfirmation::UpdateSubmittedSummary { generation, action } => {
                 let ReviewAuxiliaryAction::UpdateSubmittedSummary {
                     review,
                     selected_author,
@@ -15395,6 +15610,7 @@ impl ReviewWorkspace {
                     tab_instance: tab.instance_generation,
                     repository_key: tab.repository.cache_key(),
                     pull_request: tab.pull_request.number,
+                    confirmation_generation: *generation,
                     action: action.as_ref().clone(),
                 };
                 Some(
@@ -17761,7 +17977,7 @@ mod layout_tests {
         DiffLineKind, DiffMode, DiffRow, EXCEPTIONAL_LINE_CHUNK_BYTES, JournalOperation,
         JournalRequest, JournalStatus, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
         MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
-        SubmittedConfirmationToken, available_diff_width_for, bounded_page,
+        SubmittedConfirmationToken, SubmittedSummaryEditor, available_diff_width_for, bounded_page,
         collaboration_completion_matches, diff_content_width, display_columns,
         journal_operation_description, journal_operation_summary, line_text_chunks,
         media_free_markdown, observe_auxiliary, resolved_panel_widths_for,
@@ -17874,10 +18090,49 @@ mod layout_tests {
     }
 
     #[test]
+    fn submitted_editor_retains_per_review_text_and_rebases_only_the_fresh_source() {
+        let (_, review_a) = submitted_review_fixture();
+        let mut review_b = review_a.clone();
+        review_b.coordinates.remote_id = "REVIEW_second".into();
+        review_b.body = "second before".into();
+        let mut editor = SubmittedSummaryEditor::default();
+
+        assert_eq!(
+            editor.begin(review_a.clone()),
+            ("before".into(), false, false)
+        );
+        editor.store_active_body("typed A".into());
+        assert_eq!(
+            editor.begin(review_a.clone()),
+            ("typed A".into(), false, true)
+        );
+
+        assert_eq!(
+            editor.begin(review_b.clone()),
+            ("second before".into(), false, false)
+        );
+        editor.store_active_body("typed B".into());
+        assert_eq!(
+            editor.begin(review_a.clone()),
+            ("typed A".into(), false, true)
+        );
+        assert_eq!(editor.begin(review_b), ("typed B".into(), false, true));
+
+        let mut changed_a = review_a;
+        changed_a.body = "remote changed".into();
+        assert_eq!(editor.begin(changed_a), ("typed A".into(), true, true));
+        let active = editor.active_draft().expect("A draft remains active");
+        assert_eq!(active.body, "typed A");
+        assert_eq!(active.review.body, "remote changed");
+        assert_eq!(editor.drafts.len(), 2);
+    }
+
+    #[test]
     fn submitted_confirmation_token_rejects_tab_workspace_account_and_payload_changes() {
         let (repository, review) = submitted_review_fixture();
         let action = submitted_review_edit_action(&repository, 7, &review, "after".into()).unwrap();
         let confirmation = NativeConfirmation::UpdateSubmittedSummary {
+            generation: 30,
             action: Box::new(action.clone()),
         };
         let token = SubmittedConfirmationToken {
@@ -17885,6 +18140,7 @@ mod layout_tests {
             tab_instance: 20,
             repository_key: repository.cache_key(),
             pull_request: 7,
+            confirmation_generation: 30,
             action: action.clone(),
         };
         assert!(token.matches_values(10, 20, &repository.cache_key(), 7, Some(&confirmation)));
@@ -17892,7 +18148,13 @@ mod layout_tests {
         assert!(!token.matches_values(10, 21, &repository.cache_key(), 7, Some(&confirmation)));
         assert!(!token.matches_values(10, 20, "other-account", 7, Some(&confirmation)));
         assert!(!token.matches_values(10, 20, &repository.cache_key(), 8, Some(&confirmation)));
+        let repeated_payload = NativeConfirmation::UpdateSubmittedSummary {
+            generation: 31,
+            action: Box::new(action.clone()),
+        };
+        assert!(!token.matches_values(10, 20, &repository.cache_key(), 7, Some(&repeated_payload)));
         let changed = NativeConfirmation::UpdateSubmittedSummary {
+            generation: 30,
             action: Box::new(
                 submitted_review_edit_action(&repository, 7, &review, "changed".into()).unwrap(),
             ),
