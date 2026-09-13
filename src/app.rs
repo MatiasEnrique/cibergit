@@ -6970,7 +6970,7 @@ impl ReviewWorkspace {
         let task = cx.background_spawn(async move {
             let provider = GithubProvider::new(repository.account.clone());
             let details = provider.details(&repository, number)?;
-            let pending = provider.pending_review(&repository, number)?;
+            let pending = provider.pending_review(&repository, number);
             let journal = ReviewKey::for_repository("github", &repository, number)
                 .map_err(|error| error.to_string())
                 .and_then(|key| ActionJournal::open(&journal_root, key))
@@ -6990,6 +6990,31 @@ impl ReviewWorkspace {
                 };
                 match result {
                     Ok((details, pending, journal)) => {
+                        let pending = match pending {
+                            Ok(pending) => pending,
+                            Err(error) => {
+                                let tab = &mut this.tabs[tab_index];
+                                tab.details = Some(details);
+                                let notice = format!(
+                                    "PR details updated; pending review could not be refreshed: {error:#}. Previous pending data is retained and no review linkage was changed."
+                                );
+                                tab.details_state = LoadState::Cached(notice.clone());
+                                match journal {
+                                    Ok(operations) => {
+                                        tab.journal_operations = operations;
+                                        tab.journal_error = None;
+                                    }
+                                    Err(error) => tab.journal_error = Some(error),
+                                }
+                                if let InteractionState::Ready(controller) = &mut tab.interactions {
+                                    controller.pending_complete = false;
+                                    controller.notice = Some(notice);
+                                }
+                                this.rebuild_diff(tab_index, this.wide);
+                                cx.notify();
+                                return;
+                            }
+                        };
                         let save = {
                             let tab = &mut this.tabs[tab_index];
                             tab.details = Some(details);
