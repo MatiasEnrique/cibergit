@@ -5245,7 +5245,7 @@ impl ReviewWorkspace {
         output: PathBuf,
         second_pr: Option<u64>,
     ) {
-        let primary_number = self
+        let mut primary_number = self
             .active_tab
             .and_then(|index| self.tabs.get(index))
             .map(|tab| tab.pull_request.number)
@@ -5270,6 +5270,20 @@ impl ReviewWorkspace {
                         .background_executor()
                         .timer(Duration::from_millis(250))
                         .await;
+                    if primary_number == 0 {
+                        primary_number = window
+                            .update(|_, cx| {
+                                weak.read_with(cx, |root, _| {
+                                    let Root::Review(this) = root else { return 0 };
+                                    this.active_tab
+                                        .and_then(|index| this.tabs.get(index))
+                                        .map(|tab| tab.pull_request.number)
+                                        .unwrap_or_default()
+                                })
+                                .unwrap_or_default()
+                            })
+                            .unwrap_or_default();
+                    }
                     if !second_requested
                         && let Some(second) = second_pr.filter(|second| *second != primary_number)
                     {
