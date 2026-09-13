@@ -106,14 +106,14 @@ fn fixture(base: &Path) -> (Repository, CheckoutView, PathBuf, String) {
         .to_owned();
     fs::write(
         checkout.join("workflow.txt"),
-        "first-source-token\nfirst-end-of-long-line-END\n",
+        conflict_source_fixture("first"),
     )
     .expect("first replay");
     run_git(&checkout, &["add", "."]);
     run_git(&checkout, &["commit", "-m", "first replay"]);
     fs::write(
         checkout.join("workflow.txt"),
-        "second-source-token\nsecond-end-of-long-line-END\n",
+        conflict_source_fixture("second"),
     )
     .expect("second replay");
     run_git(&checkout, &["add", "."]);
@@ -164,6 +164,18 @@ fn fixture(base: &Path) -> (Repository, CheckoutView, PathBuf, String) {
         operation: OperationState::default(),
     };
     (repository, checkout_view, data, base_oid)
+}
+
+fn conflict_source_fixture(prefix: &str) -> String {
+    let mut text = format!("{prefix}-source-token\n");
+    for row in 0..5000 {
+        text.push_str(&format!("{prefix} source line {row}\n"));
+    }
+    text.push_str(&format!(
+        "{}{prefix}-end-of-long-line-END\n",
+        "long source ".repeat(100)
+    ));
+    text
 }
 
 fn load_fonts(cx: &gpui::App) {
@@ -560,6 +572,20 @@ fn start_smoke(
             let conflict_sources_wide_capture = window.update(|window, _| {
                 window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-conflict-sources-dark-wide.png" } else { "rebase-conflict-sources-light-wide.png" })).map_err(Into::into)).is_ok()
             }).unwrap_or(false);
+            let _ = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
+                workspace.rebase_conflict_virtualization_probe(true);
+                cx.notify();
+            }));
+            window.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            let source_virtualization = window.update(|window, cx| {
+                let capture = window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-conflict-source-end-dark.png" } else { "rebase-conflict-source-end-light.png" })).map_err(Into::into)).is_ok();
+                let probes = workspace.read_with(cx, |workspace, _| workspace.rebase_conflict_virtualization_probe(false)).unwrap().unwrap();
+                let valid = capture && probes.iter().filter(|(count, _, _)| *count > 5000).count() == 2
+                    && probes.iter().all(|(_, batch, end)| *batch > 0 && *batch <= 64 && *end);
+                fs::write(output.join("source-virtualization.txt"), format!("all source rows reachable with bounded visible rendering: {valid}\n(count, largest rendered batch, at vertical and horizontal end): {probes:?}\n")).unwrap();
+                valid
+            }).unwrap_or(false);
+            assert!(source_virtualization, "native conflict source virtualization/end proof failed");
             let _ = window.update(|window, _| window.resize(size(px(1040.), px(820.))));
             window.background_executor().timer(std::time::Duration::from_millis(250)).await;
             let conflict_sources_narrow_capture = window.update(|window, _| {

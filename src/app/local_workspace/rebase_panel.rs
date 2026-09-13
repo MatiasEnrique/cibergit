@@ -360,6 +360,19 @@ impl LocalWorkspace {
         self.rebase.conflicts.len()
     }
 
+    #[cfg(feature = "ui-smoke")]
+    pub fn rebase_conflict_virtualization_probe(
+        &self,
+        scroll_to_end: bool,
+    ) -> Option<[(usize, usize, bool); 3]> {
+        Some(
+            self.rebase
+                .conflict_view
+                .as_ref()?
+                .source_virtualization_probe(scroll_to_end),
+        )
+    }
+
     pub fn rebase_conflict_source_proof(&self) -> Option<Vec<(String, Option<String>, String)>> {
         let view = self.rebase.conflict_view.as_ref()?;
         Some(
@@ -1841,18 +1854,10 @@ impl LocalWorkspace {
         };
         for source in ConflictSource::ALL {
             if wide || source == view.selected() {
-                let (label, stage) = view.source(source);
                 sources = sources.child(
-                    source_panel(
-                        source,
-                        label,
-                        stage,
-                        source == view.selected(),
-                        view.show_details(),
-                        colors,
-                    )
-                    .when(wide, |panel| panel.flex_1())
-                    .when(!wide, |panel| panel.w_full()),
+                    source_panel(source, &view, colors)
+                        .when(wide, |panel| panel.flex_1())
+                        .when(!wide, |panel| panel.w_full()),
                 );
             }
         }

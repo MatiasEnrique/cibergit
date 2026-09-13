@@ -106,7 +106,9 @@ impl ConflictContextState {
 
 #[derive(Clone, Debug)]
 pub(super) struct ConflictPresentation {
-    identity: ConflictContextIdentity,
+    identity: Rc<ConflictContextIdentity>,
+    sources: [Rc<SourceLines>; 3],
+    scrolls: [gpui::UniformListScrollHandle; 3],
     selected: ConflictSource,
     show_details: bool,
     state: ConflictContextState,
@@ -114,11 +116,14 @@ pub(super) struct ConflictPresentation {
 
 impl ConflictPresentation {
     pub(super) fn new(operation: &RebaseOperationView, conflict: ConflictFile) -> Option<Self> {
+        let sources = indexed_sources(&conflict);
         Some(Self {
-            identity: ConflictContextIdentity {
+            identity: Rc::new(ConflictContextIdentity {
                 operation: ConflictOperationIdentity::from_operation(operation)?,
                 conflict,
-            },
+            }),
+            sources,
+            scrolls: std::array::from_fn(|_| gpui::UniformListScrollHandle::new()),
             selected: ConflictSource::Ours,
             show_details: false,
             state: ConflictContextState::Current,
@@ -190,7 +195,12 @@ impl ConflictPresentation {
         if !self.can_refresh_from(operation, &conflict) {
             return false;
         }
-        self.identity.conflict = conflict;
+        self.sources = indexed_sources(&conflict);
+        self.scrolls = std::array::from_fn(|_| gpui::UniformListScrollHandle::new());
+        self.identity = Rc::new(ConflictContextIdentity {
+            operation: self.identity.operation.clone(),
+            conflict,
+        });
         self.state = ConflictContextState::Current;
         true
     }
@@ -239,6 +249,95 @@ impl ConflictPresentation {
             ConflictSource::Theirs => ("Replayed commit (theirs)", &self.identity.conflict.theirs),
         }
     }
+
+    #[cfg(feature = "ui-smoke")]
+    pub(super) fn source_virtualization_probe(
+        &self,
+        scroll_to_end: bool,
+    ) -> [(usize, usize, bool); 3] {
+        std::array::from_fn(|index| {
+            let lines = &self.sources[index];
+            if scroll_to_end {
+                self.scrolls[index]
+                    .scroll_to_item_strict(lines.count - 1, gpui::ScrollStrategy::Bottom);
+                let handle = &self.scrolls[index].0.borrow().base_handle;
+                handle.set_offset(gpui::point(-handle.max_offset().x, handle.offset().y));
+            }
+            let handle = &self.scrolls[index].0.borrow().base_handle;
+            let at_end = (handle.offset().y + handle.max_offset().y).abs() <= px(1.)
+                && (handle.offset().x + handle.max_offset().x).abs() <= px(1.);
+            (lines.count, lines.largest_render_batch.get(), at_end)
+        })
+    }
+}
+
+/// Sparse offsets keep even a two-megabyte newline-only source bounded without
+/// creating a String or a UI element per line. A visible row scans at most 64
+/// lines from its checkpoint; this cache is shared by every render.
+#[derive(Debug)]
+struct SourceLines {
+    text: String,
+    checkpoints: Vec<usize>,
+    count: usize,
+    widest: usize,
+    #[cfg(feature = "ui-smoke")]
+    largest_render_batch: std::cell::Cell<usize>,
+}
+
+impl SourceLines {
+    fn new(text: String) -> Self {
+        let mut checkpoints = vec![0];
+        let mut count = 1;
+        for (offset, byte) in text.bytes().enumerate() {
+            if byte == b'\n' {
+                if count % 64 == 0 {
+                    checkpoints.push(offset + 1);
+                }
+                count += 1;
+            }
+        }
+        let widest = text
+            .split('\n')
+            .enumerate()
+            .max_by_key(|(_, line)| {
+                line.chars()
+                    .map(|ch| {
+                        if ch == '\t' {
+                            4
+                        } else if ch.is_ascii() {
+                            1
+                        } else {
+                            2
+                        }
+                    })
+                    .sum::<usize>()
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        Self {
+            text,
+            checkpoints,
+            count,
+            widest,
+            #[cfg(feature = "ui-smoke")]
+            largest_render_batch: std::cell::Cell::new(0),
+        }
+    }
+
+    fn line(&self, index: usize) -> &str {
+        if index >= self.count {
+            return "";
+        }
+        self.text[self.checkpoints[index / 64]..]
+            .split('\n')
+            .nth(index % 64)
+            .unwrap_or("")
+    }
+}
+
+fn indexed_sources(conflict: &ConflictFile) -> [Rc<SourceLines>; 3] {
+    [&conflict.base, &conflict.ours, &conflict.theirs]
+        .map(|stage| Rc::new(SourceLines::new(source_text(stage))))
 }
 
 pub(super) fn source_summary(stage: &ConflictStage) -> String {
@@ -279,33 +378,25 @@ pub(super) fn source_text(stage: &ConflictStage) -> String {
 
 pub(super) fn source_panel(
     source: ConflictSource,
-    label: &'static str,
-    stage: &ConflictStage,
-    selected: bool,
-    show_details: bool,
+    view: &ConflictPresentation,
     colors: LocalPalette,
 ) -> Div {
+    let (label, stage) = view.source(source);
+    let selected = source == view.selected();
+    let show_details = view.show_details();
+    let source_index = match source {
+        ConflictSource::Base => 0,
+        ConflictSource::Ours => 1,
+        ConflictSource::Theirs => 2,
+    };
+    let lines = view.sources[source_index].clone();
     let source_id = match source {
         ConflictSource::Base => "base",
         ConflictSource::Ours => "ours",
         ConflictSource::Theirs => "theirs",
     };
-    let lines = source_text(stage)
-        .split('\n')
-        .enumerate()
-        .map(|(index, line)| {
-            div()
-                .id(ElementId::Name(
-                    format!("conflict-source-{source_id}-line-{index}").into(),
-                ))
-                .whitespace_nowrap()
-                .child(if line.is_empty() {
-                    " ".into()
-                } else {
-                    line.to_owned()
-                })
-        })
-        .collect::<Vec<_>>();
+    let count = lines.count;
+    let widest = lines.widest;
     div()
         .min_w_0()
         .h(px(220.))
@@ -349,18 +440,39 @@ pub(super) fn source_panel(
             )
         })
         .child(
-            div()
-                .id(ElementId::Name(
-                    format!("conflict-source-{source_id}-scroll").into(),
-                ))
-                .flex_1()
-                .min_h_0()
-                .overflow_x_scroll()
-                .overflow_y_scroll()
-                .p_2()
-                .font_family(CODE_FONT)
-                .text_xs()
-                .children(lines),
+            gpui::uniform_list(
+                SharedString::from(format!("conflict-source-{source_id}-scroll")),
+                count,
+                move |range: Range<usize>, _, _| {
+                    #[cfg(feature = "ui-smoke")]
+                    lines
+                        .largest_render_batch
+                        .set(lines.largest_render_batch.get().max(range.len()));
+                    range
+                        .map(|index| {
+                            let line = lines.line(index);
+                            div()
+                                .h(px(18.))
+                                .line_height(px(18.))
+                                .whitespace_nowrap()
+                                .child(if line.is_empty() {
+                                    " ".into()
+                                } else {
+                                    line.to_owned()
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                },
+            )
+            .track_scroll(&view.scrolls[source_index])
+            .with_width_from_item(Some(widest))
+            .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::Unconstrained)
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .p_2()
+            .font_family(CODE_FONT)
+            .text_xs(),
         )
 }
 
@@ -389,6 +501,38 @@ mod tests {
         local_git::GitPath,
         rebase::{ConflictKind, DiskGeneration, OperationState},
     };
+
+    #[test]
+    fn sparse_sources_cover_boundaries_and_large_newline_only_blobs() {
+        let text = (0..5000)
+            .map(|index| format!("line {index}: λ\n"))
+            .collect::<String>();
+        let lines = SourceLines::new(text.clone());
+        let expected = text.split('\n').collect::<Vec<_>>();
+        for index in [0, 1, 63, 64, 65, 127, 4999, 5000] {
+            assert_eq!(lines.line(index), expected[index]);
+        }
+        assert_eq!(lines.count, expected.len());
+        assert!(lines.checkpoints.len() <= lines.count / 64 + 1);
+
+        let maximum = SourceLines::new("\n".repeat(2 * 1024 * 1024));
+        assert_eq!(maximum.count, 2 * 1024 * 1024 + 1);
+        assert_eq!(maximum.checkpoints.len(), maximum.count / 64 + 1);
+        assert_eq!(maximum.line(maximum.count - 1), "");
+        assert_eq!(maximum.line(maximum.count - 2), "");
+    }
+
+    #[test]
+    fn rendering_snapshot_clones_share_source_content_and_indexes() {
+        let operation = operation("shared", '5');
+        let conflict = conflict(b"workflow.txt", '1', '2', '3');
+        let view = ConflictPresentation::new(&operation, conflict).unwrap();
+        let copied = view.clone();
+        assert!(Rc::ptr_eq(&view.identity, &copied.identity));
+        for index in 0..3 {
+            assert!(Rc::ptr_eq(&view.sources[index], &copied.sources[index]));
+        }
+    }
 
     fn oid(value: char) -> String {
         std::iter::repeat_n(value, 40).collect()
