@@ -442,7 +442,7 @@ print(json.dumps(responses[endpoint]))
             assert_eq!(batch.incomplete_candidates.len(), 1);
             assert!(batch.incomplete_candidates[0]
                 .reason
-                .contains("Unknown notification subject type"));
+                .contains("Unknown notification subject type"), "unexpected incomplete reason: {:?}", batch.incomplete_candidates);
             assert_eq!(
                 fs::read_to_string(dir.path().join("calls"))
                     .unwrap()
