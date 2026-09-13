@@ -33,6 +33,12 @@ actions!(
         ToggleInspector,
         CycleDiffMode,
         OpenRepositorySetup,
+        ComposeInlineComment,
+        SaveReviewDraft,
+        AddPendingComment,
+        PostImmediateComment,
+        SubmitReview,
+        MergePullRequest,
     ]
 );
 actions!(
@@ -154,6 +160,16 @@ fn main() {
             KeyBinding::new("cmd-shift-i", ToggleInspector, None),
             KeyBinding::new("cmd-shift-d", CycleDiffMode, None),
             KeyBinding::new("cmd-o", OpenRepositorySetup, None),
+            KeyBinding::new("c", ComposeInlineComment, Some("DiffPane")),
+            KeyBinding::new("cmd-enter", SaveReviewDraft, Some("ReviewComposer")),
+            KeyBinding::new("cmd-shift-enter", AddPendingComment, Some("ReviewComposer")),
+            KeyBinding::new(
+                "cmd-alt-enter",
+                PostImmediateComment,
+                Some("ReviewComposer"),
+            ),
+            KeyBinding::new("cmd-shift-r", SubmitReview, None),
+            KeyBinding::new("cmd-shift-m", MergePullRequest, None),
             KeyBinding::new("up", FileTreeUp, Some("FileTree")),
             KeyBinding::new("down", FileTreeDown, Some("FileTree")),
             KeyBinding::new("left", FileTreeLeft, Some("FileTree")),

@@ -1,15 +1,22 @@
 use crate::{
-    CloseTab, CycleDiffMode, DetailsNarrower, DetailsWider, DiffScrollEnd, DiffScrollHome,
-    DiffScrollLeft, DiffScrollRight, FileTreeActivate, FileTreeDown, FileTreeLeft,
-    FileTreeNarrower, FileTreeRight, FileTreeUp, FileTreeWider, NextFile, OpenRepositorySetup,
-    PreviousFile, Refresh, ResetLayout, Save, SidebarNarrower, SidebarWider, ToggleFileTree,
-    ToggleInspector, TogglePalette, ToggleSidebar,
+    AddPendingComment, CloseTab, ComposeInlineComment, CycleDiffMode, DetailsNarrower,
+    DetailsWider, DiffScrollEnd, DiffScrollHome, DiffScrollLeft, DiffScrollRight, FileTreeActivate,
+    FileTreeDown, FileTreeLeft, FileTreeNarrower, FileTreeRight, FileTreeUp, FileTreeWider,
+    MergePullRequest, NextFile, OpenRepositorySetup, PostImmediateComment, PreviousFile, Refresh,
+    ResetLayout, Save, SaveReviewDraft, SidebarNarrower, SidebarWider, SubmitReview,
+    ToggleFileTree, ToggleInspector, TogglePalette, ToggleSidebar,
 };
 mod file_tree;
+mod review_interactions;
 mod view_editor;
 
 use cibergit::{
-    domain::{PullRequest, PullRequestDetails, Repository, Revision},
+    domain::{
+        MergeAction, MergeExecutionRequest, MergeMethod, MergePreparation, PendingReviewSnapshot,
+        ProviderMutationOutcome, PullRequest, PullRequestDetails, Repository,
+        ReviewAuxiliaryAction, ReviewAuxiliaryRequest, Revision,
+    },
+    participation::{DiffSide, LineSelection, ReviewEvent, ReviewKey},
     providers::GithubProvider,
     review::{
         AlignedRow, DiffLine, DiffLineKind, DiffMode, ParsedDiff, PatchStatus, ReviewSession,
@@ -21,7 +28,12 @@ use file_tree::{FileTree, TreeRowKind};
 use gpui::{prelude::*, *};
 use gpui_base::{
     Scrollbar, TextView, TextViewStyle,
-    input::{Editor, EditorState, Input, InputEditorStyle, InputState},
+    input::{Editor, EditorState, Input, InputEditorStyle, InputState, Textarea, TextareaState},
+};
+use review_interactions::{
+    ActionJournal, ComposerState, ControllerLoad, InlineThread, JournalRequest, JournalStatus,
+    ReviewInteractionController, dispatch_auxiliary, dispatch_merge, load_merge_preference,
+    next_attempt_id, place_threads, save_merge_preference,
 };
 use std::{
     cell::Cell,
@@ -96,6 +108,42 @@ impl Root {
 
     pub fn editor(window: &mut Window, cx: &mut Context<Self>, path: PathBuf) -> Self {
         Self::Editor(EditorWorkspace::new(window, cx, path))
+    }
+
+    /// Presentation-only integration point for the separately owned local
+    /// workspace. The review controller never provisions or drives this view.
+    #[allow(dead_code)] // Consumed by the parent-owned local-workspace embedding commit.
+    pub fn attach_pr_local_workspace(
+        &mut self,
+        repository_key: &str,
+        pull_request: u64,
+        view: AnyView,
+    ) -> bool {
+        let Self::Review(workspace) = self else {
+            return false;
+        };
+        let Some(tab) = workspace.tabs.iter_mut().find(|tab| {
+            tab.repository.cache_key() == repository_key && tab.pull_request.number == pull_request
+        }) else {
+            return false;
+        };
+        tab.local_workspace = Some(view);
+        true
+    }
+
+    #[allow(dead_code)] // Consumed by the parent-owned local-workspace embedding commit.
+    pub fn pr_local_workspace(&self, repository_key: &str, pull_request: u64) -> Option<AnyView> {
+        let Self::Review(workspace) = self else {
+            return None;
+        };
+        workspace
+            .tabs
+            .iter()
+            .find(|tab| {
+                tab.repository.cache_key() == repository_key
+                    && tab.pull_request.number == pull_request
+            })
+            .and_then(|tab| tab.local_workspace.clone())
     }
 }
 
@@ -191,6 +239,23 @@ fn new_input(
     let colors = palette(is_dark(window));
     cx.new(|cx| {
         let mut editor = InputState::new(window, cx);
+        editor.set_editor_style(input_style(colors));
+        editor.set_value(value, window, cx);
+        editor.set_placeholder(placeholder, window, cx);
+        editor
+    })
+}
+
+fn new_textarea(
+    value: impl Into<String>,
+    placeholder: &'static str,
+    window: &mut Window,
+    cx: &mut Context<Root>,
+) -> Entity<TextareaState> {
+    let value = value.into();
+    let colors = palette(is_dark(window));
+    cx.new(|cx| {
+        let mut editor = TextareaState::new(window, cx).auto_grow(3, 8);
         editor.set_editor_style(input_style(colors));
         editor.set_value(value, window, cx);
         editor.set_placeholder(placeholder, window, cx);
@@ -471,7 +536,7 @@ struct ReviewTab {
     generation: u64,
     metadata_generation: u64,
     diff_rows: Vec<DiffRow>,
-    diff_scroll: UniformListScrollHandle,
+    diff_scroll: ListState,
     diff_horizontal: ScrollHandle,
     horizontal_positions: HashMap<String, f32>,
     diff_content_width: f32,
@@ -481,8 +546,44 @@ struct ReviewTab {
     local_inventory: bool,
     session_persistence_error: Option<String>,
     details: Option<PullRequestDetails>,
+    pending_snapshot: Option<PendingReviewSnapshot>,
     details_state: LoadState,
     details_generation: u64,
+    interactions: InteractionState,
+    interaction_generation: u64,
+    confirmation: Option<NativeConfirmation>,
+    write_in_flight: bool,
+    reply_thread: Option<cibergit::domain::ProviderCoordinates>,
+    editing_pending_summary: bool,
+    #[allow(dead_code)] // Reserved opaque presentation slot; this slice does not provision it.
+    local_workspace: Option<AnyView>,
+}
+
+enum InteractionState {
+    Loading,
+    Ready(Box<ReviewInteractionController>),
+    RecoveryRequired(String),
+}
+
+#[derive(Clone)]
+enum NativeConfirmation {
+    Submit {
+        event: ReviewEvent,
+    },
+    Merge {
+        preparation: MergePreparation,
+        method: MergeMethod,
+        action: MergeConfirmationAction,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MergeConfirmationAction {
+    Merge,
+    EnableAutoMerge,
+    DisableAutoMerge,
+    Enqueue,
+    Dequeue,
 }
 
 #[cfg(feature = "ui-smoke")]
@@ -505,6 +606,12 @@ enum DiffRow {
     Hunk(String),
     Unified(DiffLine),
     Split(AlignedRow),
+    Thread(InlineThread),
+    Composer {
+        side: DiffSide,
+        start_line: u64,
+        line: u64,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -516,6 +623,7 @@ enum InspectorSection {
 
 pub struct ReviewWorkspace {
     store: Option<Store>,
+    interaction_root: PathBuf,
     workspace: WorkspaceState,
     persistence_error: Option<String>,
     accounts: Vec<cibergit::domain::Account>,
@@ -534,6 +642,11 @@ pub struct ReviewWorkspace {
     panel_layout: PanelLayout,
     view_editor_scroll: ScrollHandle,
     query: Entity<InputState>,
+    composer_input: Entity<TextareaState>,
+    review_summary_input: Entity<TextareaState>,
+    merge_title_input: Entity<InputState>,
+    merge_body_input: Entity<TextareaState>,
+    reply_input: Entity<TextareaState>,
     view_editor: ViewEditorController,
     view_inputs: ViewEditorInputs,
     repository_input: Entity<InputState>,
@@ -544,6 +657,8 @@ pub struct ReviewWorkspace {
     startup_pr: Option<u64>,
     session_save_latest: HashMap<String, Arc<AtomicU64>>,
     session_save_locks: HashMap<String, Arc<Mutex<()>>>,
+    review_state_latest: HashMap<String, Arc<AtomicU64>>,
+    review_state_locks: HashMap<String, Arc<Mutex<()>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -605,8 +720,16 @@ impl ReviewWorkspace {
     }
 
     fn new(window: &mut Window, cx: &mut Context<Root>, startup: Startup) -> Self {
+        let data_root = startup.data_dir.clone().unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Library/Application Support/cibergit")
+        });
+        let interaction_root = data_root.join("review-interactions");
         let store_result = startup
             .data_dir
+            .clone()
             .map(Store::open)
             .unwrap_or_else(Store::open_default);
         let (store, workspace, persistence_error) = match store_result {
@@ -632,6 +755,11 @@ impl ReviewWorkspace {
             window,
             cx,
         );
+        let composer_input = new_textarea("", "Write a revision-bound review comment…", window, cx);
+        let review_summary_input = new_textarea("", "Review summary (optional)", window, cx);
+        let merge_title_input = new_input("", "Merge headline", window, cx);
+        let merge_body_input = new_textarea("", "Merge message", window, cx);
+        let reply_input = new_textarea("", "Reply to this review thread…", window, cx);
         let view_inputs = ViewEditorInputs::new(&workspace.view(), window, cx);
         let repository_input = new_input(
             startup.repository.clone().unwrap_or_default(),
@@ -674,6 +802,7 @@ impl ReviewWorkspace {
             .collect();
         let mut this = Self {
             store,
+            interaction_root,
             workspace,
             persistence_error,
             accounts: Vec::new(),
@@ -692,6 +821,11 @@ impl ReviewWorkspace {
             panel_layout: PanelLayout::default(),
             view_editor_scroll: ScrollHandle::new(),
             query,
+            composer_input,
+            review_summary_input,
+            merge_title_input,
+            merge_body_input,
+            reply_input,
             view_editor: ViewEditorController::new(),
             view_inputs,
             repository_input,
@@ -702,6 +836,8 @@ impl ReviewWorkspace {
             startup_pr: startup.pull_request,
             session_save_latest: HashMap::new(),
             session_save_locks: HashMap::new(),
+            review_state_latest: HashMap::new(),
+            review_state_locks: HashMap::new(),
             _subscriptions: Vec::new(),
         };
         this.wide = this.available_diff_width(window) >= MIN_SPLIT_DIFF_WIDTH;
@@ -717,10 +853,23 @@ impl ReviewWorkspace {
         let appearance = cx.observe_window_appearance(window, |root, window, cx| {
             let Root::Review(this) = root else { return };
             let style = input_style(palette(is_dark(window)));
-            for editor in [&this.query, &this.repository_input, &this.pr_input]
-                .into_iter()
-                .chain(this.view_inputs.all())
+            for editor in [
+                &this.query,
+                &this.repository_input,
+                &this.pr_input,
+                &this.merge_title_input,
+            ]
+            .into_iter()
+            .chain(this.view_inputs.all())
             {
+                editor.update(cx, |editor, _| editor.set_editor_style(style.clone()));
+            }
+            for editor in [
+                &this.composer_input,
+                &this.review_summary_input,
+                &this.merge_body_input,
+                &this.reply_input,
+            ] {
                 editor.update(cx, |editor, _| editor.set_editor_style(style.clone()));
             }
             cx.notify();
@@ -738,6 +887,9 @@ impl ReviewWorkspace {
                 {
                     this.rebuild_diff(index, wide);
                 }
+                cx.notify();
+            } else if let Some(index) = this.active_tab {
+                this.tabs[index].diff_scroll.remeasure();
                 cx.notify();
             }
         });
@@ -1387,10 +1539,284 @@ impl ReviewWorkspace {
             .all(|runtime| !matches!(runtime.state, LoadState::Loading(_)));
         let tabs_finished = self.tabs.iter().all(|tab| {
             tab.session.is_some()
+                && tab.details.is_some()
                 && !matches!(tab.state, LoadState::Loading(_))
                 && !matches!(tab.details_state, LoadState::Loading(_))
+                && matches!(tab.interactions, InteractionState::Ready(_))
         });
         repositories_finished && !self.tabs.is_empty() && tabs_finished
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn install_review_interaction_smoke(
+        &mut self,
+        mode: DiffMode,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) -> Result<(), String> {
+        let index = self
+            .active_tab
+            .ok_or_else(|| "interaction smoke has no active tab".to_owned())?;
+        let (path, head, selections) = {
+            let session = self.tabs[index]
+                .session
+                .as_ref()
+                .ok_or_else(|| "interaction smoke has no immutable session".to_owned())?;
+            let file = session
+                .selected_file()
+                .ok_or_else(|| "interaction smoke has no selected file".to_owned())?;
+            let mut selections = Vec::new();
+            for row in build_rows(parse_file(file), DiffMode::Unified) {
+                let coordinate = match row {
+                    DiffRow::Unified(line) => line
+                        .new_line
+                        .map(|line| (DiffSide::New, line))
+                        .or_else(|| line.old_line.map(|line| (DiffSide::Old, line))),
+                    DiffRow::Hunk(_)
+                    | DiffRow::Split(_)
+                    | DiffRow::Thread(_)
+                    | DiffRow::Composer { .. } => None,
+                };
+                if let Some(coordinate) = coordinate
+                    && !selections.contains(&coordinate)
+                {
+                    selections.push(coordinate);
+                }
+                if selections.len() == 3 {
+                    break;
+                }
+            }
+            if selections.len() < 2 {
+                return Err("interaction smoke needs two provider-selectable diff lines".into());
+            }
+            (
+                file.path.clone(),
+                session.revision().head_sha.clone(),
+                selections,
+            )
+        };
+        let repository = self.tabs[index].repository.clone();
+        let number = self.tabs[index].pull_request.number;
+        let coordinates = |remote_id: &str| cibergit::domain::ProviderCoordinates {
+            provider: "github".into(),
+            host: repository.host.clone(),
+            owner: repository.owner.clone(),
+            repository: repository.name.clone(),
+            pull_request: number,
+            remote_id: remote_id.into(),
+        };
+        let make_thread = |remote_id: &str, selection: (DiffSide, u64), bodies: &[&str]| {
+            let side = match selection.0 {
+                DiffSide::Old => "LEFT",
+                DiffSide::New => "RIGHT",
+            };
+            let comments = bodies
+                .iter()
+                .enumerate()
+                .map(|(position, body)| cibergit::domain::ReviewComment {
+                    coordinates: coordinates(&format!("{remote_id}-comment-{position}")),
+                    author: Some(if position == 0 { "reviewer" } else { "author" }.into()),
+                    body: (*body).into(),
+                    created_at: "2026-09-13T12:00:00Z".into(),
+                    updated_at: "2026-09-13T12:00:00Z".into(),
+                    url: String::new(),
+                    path: path.clone(),
+                    line: Some(selection.1),
+                    original_line: Some(selection.1),
+                    start_line: None,
+                    original_start_line: None,
+                    side: Some(side.into()),
+                    diff_hunk: "@@ native review interaction smoke @@".into(),
+                    commit_sha: Some(head.clone()),
+                    original_commit_sha: Some(head.clone()),
+                    outdated: false,
+                })
+                .collect();
+            cibergit::domain::ReviewThread {
+                coordinates: coordinates(remote_id),
+                path: path.clone(),
+                line: Some(selection.1),
+                original_line: Some(selection.1),
+                start_line: None,
+                original_start_line: None,
+                side: Some(side.into()),
+                start_side: None,
+                resolved: false,
+                outdated: false,
+                comments,
+                comments_complete: true,
+            }
+        };
+        let first = make_thread(
+            "cibergit-smoke-thread-a",
+            selections[0],
+            &[
+                "This is a deliberately wrapped inline discussion associated with the exact displayed diff row. The prose is long enough to exercise measured variable-height virtualization after a narrow resize.",
+                "Actual prose omits ![remote media](https://example.invalid/image.png) and escapes <unsafe tags>, while the code fixture below remains literal.\n\n```rust\nlet literal = `tick`; <!-- keep --> <tag> ![inside](asset.png)\n```",
+            ],
+        );
+        let second_selection = selections.get(2).copied().unwrap_or(selections[1]);
+        let second = make_thread(
+            "cibergit-smoke-thread-b",
+            second_selection,
+            &[
+                "A second wrapped thread proves two expanded discussion rows retain their own measured heights and remain attached to the intended source line.",
+            ],
+        );
+        let details = self.tabs[index]
+            .details
+            .as_mut()
+            .ok_or_else(|| "interaction smoke has no real details response".to_owned())?;
+        details.review_threads.retain(|thread| {
+            !thread
+                .coordinates
+                .remote_id
+                .starts_with("cibergit-smoke-thread-")
+        });
+        details.review_threads.extend([first, second]);
+        self.tabs[index]
+            .session
+            .as_mut()
+            .expect("session checked above")
+            .set_diff_mode(mode);
+        let session = self.tabs[index]
+            .session
+            .clone()
+            .expect("session checked above");
+        let selection = LineSelection::single(selections[1].0, selections[1].1);
+        let InteractionState::Ready(controller) = &mut self.tabs[index].interactions else {
+            return Err("interaction controller did not finish loading".into());
+        };
+        controller.select_line(&session, selection)?;
+        let body = "Focused multiline composer bound to this exact reviewed revision.\nSecond line remains visible between actual diff rows after resize.";
+        if let Some(composer) = &mut controller.composer {
+            composer.body = body.into();
+            composer.durable = false;
+        }
+        self.composer_input.update(cx, |input, cx| {
+            input.set_value(body, window, cx);
+            input.focus(window, cx);
+        });
+        self.rebuild_diff(index, self.wide);
+        let long = "review-interaction-horizontal-smoke-".repeat(150);
+        match mode {
+            DiffMode::SideBySide => self.tabs[index].diff_rows.push(DiffRow::Split(AlignedRow {
+                old: Some(DiffLine {
+                    kind: DiffLineKind::Deletion,
+                    old_line: Some(99_999),
+                    new_line: None,
+                    text: format!("OLD {long}"),
+                }),
+                new: Some(DiffLine {
+                    kind: DiffLineKind::Addition,
+                    old_line: None,
+                    new_line: Some(99_999),
+                    text: format!("NEW {long}"),
+                }),
+            })),
+            DiffMode::Auto | DiffMode::Unified => {
+                self.tabs[index].diff_rows.push(DiffRow::Unified(DiffLine {
+                    kind: DiffLineKind::Addition,
+                    old_line: None,
+                    new_line: Some(99_999),
+                    text: long,
+                }));
+            }
+        }
+        self.tabs[index].diff_content_width = diff_content_width(&self.tabs[index].diff_rows, mode);
+        self.tabs[index].diff_scroll = ListState::new(
+            self.tabs[index].diff_rows.len(),
+            ListAlignment::Top,
+            px(480.),
+        );
+        self.tabs[index].diff_horizontal = ScrollHandle::new();
+        let composer_row = self.tabs[index]
+            .diff_rows
+            .iter()
+            .position(|row| matches!(row, DiffRow::Composer { .. }))
+            .ok_or_else(|| "composer was not attached to its exact diff row".to_owned())?;
+        if self.tabs[index]
+            .diff_rows
+            .iter()
+            .filter(|row| matches!(row, DiffRow::Thread(_)))
+            .count()
+            < 2
+        {
+            return Err("wrapped review threads were not attached to diff rows".into());
+        }
+        self.tabs[index]
+            .diff_scroll
+            .scroll_to_reveal_item(composer_row);
+        cx.notify();
+        Ok(())
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn validate_review_interaction_smoke(&self, mode: DiffMode) -> Result<(), String> {
+        let index = self
+            .active_tab
+            .ok_or_else(|| "interaction smoke has no active tab".to_owned())?;
+        let tab = &self.tabs[index];
+        if tab
+            .session
+            .as_ref()
+            .is_none_or(|session| session.diff_mode() != mode)
+        {
+            return Err(format!(
+                "interaction scene did not retain explicit {mode:?} mode"
+            ));
+        }
+        let thread_rows = tab
+            .diff_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| matches!(row, DiffRow::Thread(_)).then_some(index))
+            .collect::<Vec<_>>();
+        let composer_row = tab
+            .diff_rows
+            .iter()
+            .position(|row| matches!(row, DiffRow::Composer { .. }))
+            .ok_or_else(|| "interaction scene has no inline composer".to_owned())?;
+        if thread_rows.len() < 2 {
+            return Err("interaction scene has fewer than two inline thread rows".into());
+        }
+        let composer_bounds = tab
+            .diff_scroll
+            .bounds_for_item(composer_row)
+            .ok_or_else(|| {
+                "focused composer was not measured in the variable-height list".to_owned()
+            })?;
+        if composer_bounds.size.height < px(160.) {
+            return Err(format!(
+                "composer row measured only {}px",
+                composer_bounds.size.height.as_f32()
+            ));
+        }
+        let measured_thread = thread_rows.iter().find_map(|row| {
+            tab.diff_scroll
+                .bounds_for_item(*row)
+                .filter(|bounds| bounds.size.height > px(72.))
+        });
+        if measured_thread.is_none() {
+            return Err("wrapped discussion rows were not measured above base row height".into());
+        }
+        let mut previous_bottom = None;
+        for row in 0..tab.diff_rows.len() {
+            if let Some(bounds) = tab.diff_scroll.bounds_for_item(row) {
+                if previous_bottom.is_some_and(|bottom| bounds.top() < bottom) {
+                    return Err(format!("variable-height rows overlap at list item {row}"));
+                }
+                previous_bottom = Some(bounds.bottom());
+            }
+        }
+        let maximum = tab.diff_horizontal.max_offset().x.as_f32();
+        let offset = tab.diff_horizontal.offset().x.as_f32();
+        if maximum < 1_000. || (offset + maximum).abs() > 1. {
+            return Err(format!(
+                "interaction scene is not at meaningful horizontal end (offset={offset}, maximum={maximum})"
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(feature = "ui-smoke")]
@@ -1440,11 +1866,13 @@ impl ReviewWorkspace {
         }
         self.tabs[index].diff_content_width = diff_content_width(&rows, mode);
         self.tabs[index].diff_rows = rows;
-        self.tabs[index].diff_scroll = UniformListScrollHandle::new();
+        self.tabs[index].diff_scroll = ListState::new(
+            self.tabs[index].diff_rows.len(),
+            ListAlignment::Top,
+            px(480.),
+        );
         self.tabs[index].diff_horizontal = ScrollHandle::new();
-        self.tabs[index]
-            .diff_scroll
-            .scroll_to_item(1, ScrollStrategy::Nearest);
+        self.tabs[index].diff_scroll.scroll_to_reveal_item(1);
         cx.notify();
         Ok(())
     }
@@ -1811,8 +2239,8 @@ impl ReviewWorkspace {
                 .iter()
                 .position(|tab| tab.pull_request.number == second)
                 .ok_or_else(|| format!("second PR #{second} did not load"))?;
-            self.activate_tab(secondary, cx);
-            self.activate_tab(primary, cx);
+            self.activate_tab(secondary, window, cx);
+            self.activate_tab(primary, window, cx);
             let restored_key = self.tabs[primary]
                 .session
                 .as_ref()
@@ -1829,7 +2257,7 @@ impl ReviewWorkspace {
         }
 
         for index in indices {
-            self.activate_tab(index, cx);
+            self.activate_tab(index, window, cx);
             let key = self.tabs[index]
                 .session
                 .as_ref()
@@ -1848,7 +2276,7 @@ impl ReviewWorkspace {
                 viewed: !previous,
             });
         }
-        self.activate_tab(primary, cx);
+        self.activate_tab(primary, window, cx);
         window.resize(size(px(1440.), px(900.)));
         if self.tabs[primary]
             .session
@@ -2040,6 +2468,26 @@ impl ReviewWorkspace {
             });
         })
         .detach();
+    }
+
+    fn next_review_state_write(
+        &mut self,
+        repository_key: &str,
+        pull_request: u64,
+    ) -> (Arc<AtomicU64>, Arc<Mutex<()>>, u64) {
+        let save_key = format!("{repository_key}\n{pull_request}");
+        let latest = self
+            .review_state_latest
+            .entry(save_key.clone())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        let lock = self
+            .review_state_locks
+            .entry(save_key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let sequence = latest.fetch_add(1, Ordering::AcqRel) + 1;
+        (latest, lock, sequence)
     }
 
     fn load_selected_local_file(&mut self, index: usize, cx: &mut Context<Root>) {
@@ -2240,12 +2688,38 @@ impl ReviewWorkspace {
         .detach();
     }
 
-    fn activate_tab(&mut self, index: usize, cx: &mut Context<Root>) {
+    fn activate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Root>) {
         if index < self.tabs.len() {
             if let Some(previous) = self.active_tab {
                 self.capture_scroll(previous);
+                let current = self.composer_input.read(cx).value().to_string();
+                let unsaved = match &self.tabs[previous].interactions {
+                    InteractionState::Ready(controller) => controller
+                        .composer
+                        .as_ref()
+                        .is_some_and(|composer| composer.body != current),
+                    _ => false,
+                };
+                if unsaved {
+                    self.persist_composer(cx);
+                }
             }
             self.active_tab = Some(index);
+            let body = match &self.tabs[index].interactions {
+                InteractionState::Ready(controller) => controller
+                    .composer
+                    .as_ref()
+                    .map(|composer| composer.body.clone())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            self.composer_input
+                .update(cx, |input, cx| input.set_value(body, window, cx));
+            let disabled = self.tabs[index].write_in_flight;
+            self.composer_input
+                .update(cx, |input, cx| input.set_disabled(disabled, cx));
+            self.review_summary_input
+                .update(cx, |input, cx| input.set_disabled(disabled, cx));
             if let Some(key) = self.tabs[index]
                 .session
                 .as_ref()
@@ -2323,7 +2797,7 @@ impl ReviewWorkspace {
             generation: 0,
             metadata_generation: 0,
             diff_rows: Vec::new(),
-            diff_scroll: UniformListScrollHandle::new(),
+            diff_scroll: ListState::new(0, ListAlignment::Top, px(480.)),
             diff_horizontal: ScrollHandle::new(),
             horizontal_positions: HashMap::new(),
             diff_content_width: 0.,
@@ -2333,14 +2807,23 @@ impl ReviewWorkspace {
             local_inventory,
             session_persistence_error,
             details: None,
+            pending_snapshot: None,
             details_state: LoadState::Loading("Loading PR details…".into()),
             details_generation: 0,
+            interactions: InteractionState::Loading,
+            interaction_generation: 0,
+            confirmation: None,
+            write_in_flight: false,
+            reply_thread: None,
+            editing_pending_summary: false,
+            local_workspace: None,
         });
         let index = self.tabs.len() - 1;
         self.active_tab = Some(index);
         self.setup_open = false;
         if self.tabs[index].session.is_some() {
             self.rebuild_diff(index, self.wide);
+            self.load_interactions(index, cx);
             if self.tabs[index].local_inventory
                 && self.tabs[index]
                     .session
@@ -2355,6 +2838,932 @@ impl ReviewWorkspace {
             self.load_comparison(index, revision, false, cx);
             self.refresh_details(index, cx);
         }
+    }
+
+    fn load_interactions(&mut self, index: usize, cx: &mut Context<Root>) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let Some(session) = tab.session.clone() else {
+            return;
+        };
+        if !matches!(tab.interactions, InteractionState::Loading) {
+            return;
+        }
+        tab.interaction_generation += 1;
+        let generation = tab.interaction_generation;
+        let repository = tab.repository.clone();
+        let number = tab.pull_request.number;
+        let identity = repository.cache_key();
+        let root = self.interaction_root.clone();
+        let task = cx.background_spawn(async move {
+            ReviewInteractionController::load(&root, &repository, number, &session)
+        });
+        cx.spawn(async move |entity, cx| {
+            let result = task.await;
+            let _ = entity.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(index) = this.tabs.iter().position(|tab| {
+                    tab.repository.cache_key() == identity
+                        && tab.pull_request.number == number
+                        && tab.interaction_generation == generation
+                }) else {
+                    return;
+                };
+                this.tabs[index].interactions = match result {
+                    Ok(ControllerLoad::Ready(mut controller)) => {
+                        if let Some(details) = &this.tabs[index].details
+                            && let Err(error) = controller.reconcile_details(details)
+                        {
+                            controller.notice = Some(format!(
+                                "Pending-review refresh could not be reconciled: {error}"
+                            ));
+                        }
+                        controller
+                            .install_pending_snapshot(this.tabs[index].pending_snapshot.clone());
+                        InteractionState::Ready(Box::new(controller))
+                    }
+                    Ok(ControllerLoad::RecoveryRequired(reason)) | Err(reason) => {
+                        InteractionState::RecoveryRequired(reason)
+                    }
+                };
+                this.rebuild_diff(index, this.wide);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_inline_composer(
+        &mut self,
+        side: DiffSide,
+        line: u64,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "This review state is frozen until the started write is reconciled.".into();
+            return;
+        }
+        let Some(session) = self.tabs[index].session.clone() else {
+            self.status = "The immutable comparison is still loading.".into();
+            return;
+        };
+        let selection = match &self.tabs[index].interactions {
+            InteractionState::Ready(controller) if extend => controller
+                .composer
+                .as_ref()
+                .filter(|composer| composer.coordinate.side == side)
+                .map(|composer| LineSelection {
+                    side,
+                    start_line: composer.coordinate.start_line.min(line),
+                    line: composer.coordinate.line.max(line),
+                })
+                .unwrap_or_else(|| LineSelection::single(side, line)),
+            _ => LineSelection::single(side, line),
+        };
+        let result = match &mut self.tabs[index].interactions {
+            InteractionState::Ready(controller) => controller.select_line(&session, selection),
+            InteractionState::Loading => Err("Review recovery is still loading.".into()),
+            InteractionState::RecoveryRequired(reason) => Err(reason.clone()),
+        };
+        match result {
+            Ok(()) => {
+                let body = match &self.tabs[index].interactions {
+                    InteractionState::Ready(controller) => controller
+                        .composer
+                        .as_ref()
+                        .map(|composer| composer.body.clone())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                self.composer_input.update(cx, |input, cx| {
+                    input.set_value(body, window, cx);
+                    input.focus(window, cx);
+                });
+                self.rebuild_diff(index, self.wide);
+                self.status = if selection.start_line == selection.line {
+                    format!("Composer bound to {} line {}", side.provider_name(), line)
+                } else {
+                    format!(
+                        "Composer bound to {} lines {}–{}",
+                        side.provider_name(),
+                        selection.start_line,
+                        selection.line
+                    )
+                };
+            }
+            Err(error) => self.status = error,
+        }
+        cx.notify();
+    }
+
+    fn compose_first_selectable(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        let selection = self.tabs[index].diff_rows.iter().find_map(|row| match row {
+            DiffRow::Unified(line) => line
+                .new_line
+                .map(|line| (DiffSide::New, line))
+                .or_else(|| line.old_line.map(|line| (DiffSide::Old, line))),
+            DiffRow::Split(row) => row
+                .new
+                .as_ref()
+                .and_then(|line| line.new_line)
+                .map(|line| (DiffSide::New, line))
+                .or_else(|| {
+                    row.old
+                        .as_ref()
+                        .and_then(|line| line.old_line)
+                        .map(|line| (DiffSide::Old, line))
+                }),
+            DiffRow::Hunk(_) | DiffRow::Thread(_) | DiffRow::Composer { .. } => None,
+        });
+        if let Some((side, line)) = selection {
+            self.open_inline_composer(side, line, false, window, cx);
+        } else {
+            self.status = "The selected file has no provider-safe selectable text line.".into();
+            cx.notify();
+        }
+    }
+
+    fn reopen_pending_draft(
+        &mut self,
+        draft_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status = "Wait for the started review action before editing this comment.".into();
+            return;
+        }
+        let result = match &mut self.tabs[index].interactions {
+            InteractionState::Ready(controller) => controller.reopen_draft(draft_id),
+            InteractionState::Loading => Err("Review recovery is still loading.".into()),
+            InteractionState::RecoveryRequired(reason) => Err(reason.clone()),
+        };
+        match result {
+            Ok(composer) => {
+                if self.tabs[index]
+                    .session
+                    .as_mut()
+                    .is_some_and(|session| session.select_file(&composer.coordinate.file_key))
+                    && let Some(row) = self.tabs[index]
+                        .file_tree
+                        .reveal_file(&composer.coordinate.file_key)
+                {
+                    self.tabs[index]
+                        .file_tree_scroll
+                        .scroll_to_item(row, ScrollStrategy::Nearest);
+                }
+                self.composer_input.update(cx, |input, cx| {
+                    input.set_value(composer.body, window, cx);
+                    input.focus(window, cx);
+                });
+                self.rebuild_diff(index, self.wide);
+                self.status = composer
+                    .notice
+                    .unwrap_or_else(|| "Pending comment opened.".into());
+            }
+            Err(error) => self.status = error,
+        }
+        cx.notify();
+    }
+
+    fn persist_composer(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status = "Wait for the started review operation to settle.".into();
+            return;
+        }
+        let body = self.composer_input.read(cx).value().to_string();
+        let (snapshot, store, authority, expected, draft_id, identity, number) = {
+            let tab = &mut self.tabs[index];
+            let InteractionState::Ready(controller) = &mut tab.interactions else {
+                self.status = "Review recovery is unavailable.".into();
+                return;
+            };
+            let snapshot = match controller.stage_composer_text(body.clone()) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.status = error;
+                    return;
+                }
+            };
+            let draft_id = controller
+                .composer
+                .as_ref()
+                .and_then(|composer| composer.draft_id.clone())
+                .expect("staging creates a draft identity");
+            (
+                snapshot,
+                controller.store.clone(),
+                controller.authority.clone(),
+                controller.durable_composition.clone(),
+                draft_id,
+                tab.repository.cache_key(),
+                tab.pull_request.number,
+            )
+        };
+        self.status = "Saving local review recovery…".into();
+        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let snapshot_for_save = snapshot.clone();
+        let task = cx.background_spawn(async move {
+            let _guard = lock
+                .lock()
+                .map_err(|_| "Review recovery save lock failed.".to_owned())?;
+            if latest.load(Ordering::Acquire) != sequence {
+                return Ok(false);
+            }
+            authority
+                .save_if_current(&store, expected.as_ref(), &snapshot_for_save)
+                .map(|()| true)
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(index) = this.tabs.iter().position(|tab| {
+                    tab.repository.cache_key() == identity && tab.pull_request.number == number
+                }) else {
+                    return;
+                };
+                if !matches!(result, Ok(false))
+                    && let InteractionState::Ready(controller) = &mut this.tabs[index].interactions
+                {
+                    controller.finish_composer_save(
+                        &snapshot,
+                        &draft_id,
+                        &body,
+                        result.clone().map(|_| ()),
+                    );
+                }
+                this.status = match result {
+                    Ok(true) => "Review text saved locally.".into(),
+                    Ok(false) => "A newer local review save superseded this completion.".into(),
+                    Err(error) => {
+                        format!("Local save failed; text remains in the open composer: {error}")
+                    }
+                };
+                this.rebuild_diff(index, this.wide);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_comment_write(&mut self, immediate: bool, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status = "A review write is already in progress.".into();
+            return;
+        }
+        let input_body = self.composer_input.read(cx).value().to_string();
+        let needs_save = match &self.tabs[index].interactions {
+            InteractionState::Ready(controller) => controller
+                .composer
+                .as_ref()
+                .is_none_or(|composer| !composer.durable || composer.body != input_body),
+            _ => true,
+        };
+        if needs_save {
+            self.persist_composer(cx);
+            self.status =
+                "The current text must finish saving locally; invoke the remote action again."
+                    .into();
+            return;
+        }
+        let (repository, number, mut composition, store, authority, expected, operation_id) = {
+            let tab = &mut self.tabs[index];
+            let Some(session) = tab.session.as_ref() else {
+                return;
+            };
+            let InteractionState::Ready(controller) = &mut tab.interactions else {
+                return;
+            };
+            let operation_id = if immediate {
+                controller.prepare_immediate(session)
+            } else {
+                controller.prepare_pending(session)
+            };
+            let operation_id = match operation_id {
+                Ok(operation_id) => operation_id,
+                Err(error) => {
+                    self.status = error;
+                    return;
+                }
+            };
+            tab.details_generation += 1;
+            tab.write_in_flight = true;
+            (
+                tab.repository.clone(),
+                tab.pull_request.number,
+                controller.composition.clone(),
+                controller.store.clone(),
+                controller.authority.clone(),
+                controller.durable_composition.clone(),
+                operation_id,
+            )
+        };
+        self.composer_input
+            .update(cx, |input, cx| input.set_disabled(true, cx));
+        let identity = repository.cache_key();
+        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let attempt_id = next_attempt_id(&operation_id);
+        let provider = GithubProvider::new(repository.account.clone());
+        let task = cx.background_spawn(async move {
+            let fallback = expected.clone();
+            let execution = match lock.lock() {
+                Err(_) => Err("Review recovery save lock failed; zero writes sent.".to_owned()),
+                Ok(_guard) if latest.load(Ordering::Acquire) != sequence => Err(
+                    "A newer review-state write superseded this preparation; zero writes sent."
+                        .to_owned(),
+                ),
+                Ok(_guard) => authority.execute_if_current(&store, expected.as_ref(), || {
+                    provider.execute_review_operation(
+                        &repository,
+                        &mut composition,
+                        &store,
+                        &operation_id,
+                        &attempt_id,
+                    )
+                }),
+            };
+            let (outcome, durable) = match execution {
+                Ok((outcome, durable)) => (outcome, durable),
+                Err(reason) => (
+                    ProviderMutationOutcome::PreflightRejected { reason },
+                    fallback,
+                ),
+            };
+            if matches!(outcome, ProviderMutationOutcome::PreflightRejected { .. }) {
+                let _ = composition.cancel_prepared(&operation_id);
+            }
+            (composition, durable, outcome)
+        });
+        cx.spawn(async move |root, cx| {
+            let (composition, durable, outcome) = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(index) = this.tabs.iter().position(|tab| {
+                    tab.repository.cache_key() == identity && tab.pull_request.number == number
+                }) else {
+                    // The provider already saved the authoritative outcome in DraftStore.
+                    return;
+                };
+                this.tabs[index].write_in_flight = false;
+                if let InteractionState::Ready(controller) = &mut this.tabs[index].interactions {
+                    controller.composition = composition;
+                    controller.durable_composition = durable;
+                    if let Some(composer) = &mut controller.composer {
+                        if let Some(draft) = composer
+                            .draft_id
+                            .as_deref()
+                            .and_then(|id| controller.composition.drafts.iter().find(|d| d.id == id))
+                        {
+                            composer.body = draft.body.clone();
+                            composer.durable = true;
+                        }
+                    }
+                }
+                if this.active_tab == Some(index) {
+                    this.composer_input
+                        .update(cx, |input, cx| input.set_disabled(false, cx));
+                }
+                this.status = match outcome {
+                    ProviderMutationOutcome::Acknowledged(_) if immediate => {
+                        "Comment posted immediately; no review was submitted.".into()
+                    }
+                    ProviderMutationOutcome::Acknowledged(_) => {
+                        "Comment added to the selected account’s pending review; review remains unsubmitted."
+                            .into()
+                    }
+                    ProviderMutationOutcome::PreflightRejected { reason } => {
+                        format!("Review action was not sent: {reason}")
+                    }
+                    ProviderMutationOutcome::Uncertain { reason, .. } => format!(
+                        "Review outcome is uncertain and will not replay automatically: {reason}"
+                    ),
+                };
+                this.rebuild_diff(index, this.wide);
+                this.refresh_details(index, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_submit_confirmation(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if !matches!(self.tabs[index].interactions, InteractionState::Ready(_)) {
+            self.status = "Review recovery must load before submission.".into();
+            return;
+        }
+        self.tabs[index].confirmation = Some(NativeConfirmation::Submit {
+            event: ReviewEvent::Comment,
+        });
+        self.inspector_open = true;
+        self.status = "Review submission requires explicit confirmation.".into();
+        cx.notify();
+    }
+
+    fn prepare_merge_confirmation(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        let tab = &mut self.tabs[index];
+        let Some(session) = tab.session.as_ref() else {
+            return;
+        };
+        if session.requires_advance_before_merge()
+            || tab.pull_request.head_sha != session.revision().head_sha
+        {
+            self.status = format!(
+                "Merge is unavailable: advance the displayed review from {} to the current remote head {}.",
+                short_sha(session.revision().head_sha.as_str()),
+                short_sha(tab.pull_request.head_sha.as_str())
+            );
+            return;
+        }
+        if tab.write_in_flight {
+            self.status = "Another mutation is still in progress.".into();
+            return;
+        }
+        tab.write_in_flight = true;
+        let repository = tab.repository.clone();
+        let number = tab.pull_request.number;
+        let reviewed_head = session.revision().head_sha.clone();
+        let identity = repository.cache_key();
+        let preference_root = self.interaction_root.clone();
+        let provider = GithubProvider::new(repository.account.clone());
+        let task = cx.background_spawn(async move {
+            let preparation = provider.prepare_merge(&repository, number, &reviewed_head)?;
+            let preference = load_merge_preference(&preference_root, &repository)
+                .ok()
+                .flatten();
+            Ok::<_, anyhow::Error>((preparation, preference))
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(index) = this.tabs.iter().position(|tab| {
+                    tab.repository.cache_key() == identity && tab.pull_request.number == number
+                }) else {
+                    return;
+                };
+                this.tabs[index].write_in_flight = false;
+                match result {
+                    Ok((preparation, preferred)) => {
+                        if preparation.current_head_sha != preparation.reviewed_head_sha {
+                            this.status = "Merge preflight refused a stale reviewed head.".into();
+                            return;
+                        }
+                        let method = preferred
+                            .filter(|method| preparation.allowed_methods.contains(method))
+                            .or_else(|| preparation.allowed_methods.first().copied());
+                        let Some(method) = method else {
+                            this.status =
+                                "Repository settings expose no supported merge method.".into();
+                            return;
+                        };
+                        let action = if preparation.merge_queue_required {
+                            MergeConfirmationAction::Enqueue
+                        } else if !preparation.blockers.is_empty()
+                            && preparation.auto_merge_allowed
+                            && preparation.can_enable_auto_merge
+                        {
+                            MergeConfirmationAction::EnableAutoMerge
+                        } else {
+                            MergeConfirmationAction::Merge
+                        };
+                        this.tabs[index].confirmation = Some(NativeConfirmation::Merge {
+                            preparation,
+                            method,
+                            action,
+                        });
+                        this.inspector_open = true;
+                        this.status =
+                            "Fresh merge preflight loaded; confirmation is required.".into();
+                    }
+                    Err(error) => {
+                        this.status = format!("Merge preflight failed; no write sent: {error:#}")
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_submission(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            return;
+        }
+        let event = match &self.tabs[index].confirmation {
+            Some(NativeConfirmation::Submit { event }) => event.clone(),
+            _ => return,
+        };
+        let body = self.review_summary_input.read(cx).value().to_string();
+        let (repository, number, mut composition, store, authority, expected, operation_id) = {
+            let tab = &mut self.tabs[index];
+            let current_head = tab.pull_request.head_sha.as_str();
+            let InteractionState::Ready(controller) = &mut tab.interactions else {
+                return;
+            };
+            let operation_id = match controller.prepare_submission(event, body, Some(current_head))
+            {
+                Ok(operation_id) => operation_id,
+                Err(error) => {
+                    self.status = format!("Review is not ready to submit: {error}");
+                    return;
+                }
+            };
+            tab.details_generation += 1;
+            tab.write_in_flight = true;
+            (
+                tab.repository.clone(),
+                tab.pull_request.number,
+                controller.composition.clone(),
+                controller.store.clone(),
+                controller.authority.clone(),
+                controller.durable_composition.clone(),
+                operation_id,
+            )
+        };
+        self.review_summary_input
+            .update(cx, |input, cx| input.set_disabled(true, cx));
+        let identity = repository.cache_key();
+        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let attempt_id = next_attempt_id(&operation_id);
+        let provider = GithubProvider::new(repository.account.clone());
+        let task = cx.background_spawn(async move {
+            let fallback = expected.clone();
+            let execution = match lock.lock() {
+                Err(_) => Err("Review recovery save lock failed; zero writes sent.".to_owned()),
+                Ok(_guard) if latest.load(Ordering::Acquire) != sequence => Err(
+                    "A newer review-state write superseded this preparation; zero writes sent."
+                        .to_owned(),
+                ),
+                Ok(_guard) => authority.execute_if_current(&store, expected.as_ref(), || {
+                    provider.execute_review_operation(
+                        &repository,
+                        &mut composition,
+                        &store,
+                        &operation_id,
+                        &attempt_id,
+                    )
+                }),
+            };
+            let (outcome, durable) = match execution {
+                Ok((outcome, durable)) => (outcome, durable),
+                Err(reason) => (
+                    ProviderMutationOutcome::PreflightRejected { reason },
+                    fallback,
+                ),
+            };
+            if matches!(outcome, ProviderMutationOutcome::PreflightRejected { .. }) {
+                let _ = composition.cancel_prepared(&operation_id);
+            }
+            (composition, durable, outcome)
+        });
+        cx.spawn(async move |root, cx| {
+            let (composition, durable, outcome) = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(index) = this.tabs.iter().position(|tab| {
+                    tab.repository.cache_key() == identity && tab.pull_request.number == number
+                }) else {
+                    return;
+                };
+                this.tabs[index].write_in_flight = false;
+                if let InteractionState::Ready(controller) = &mut this.tabs[index].interactions {
+                    controller.composition = composition;
+                    controller.durable_composition = durable;
+                }
+                if this.active_tab == Some(index) {
+                    this.review_summary_input
+                        .update(cx, |input, cx| input.set_disabled(false, cx));
+                }
+                match outcome {
+                    ProviderMutationOutcome::Acknowledged(_) => {
+                        this.tabs[index].confirmation = None;
+                        this.status = "Review submitted against the explicitly confirmed displayed head."
+                            .into();
+                    }
+                    ProviderMutationOutcome::PreflightRejected { reason } => {
+                        this.status = format!("Review submission was not sent: {reason}");
+                    }
+                    ProviderMutationOutcome::Uncertain { reason, .. } => {
+                        this.status = format!(
+                            "Submission outcome is uncertain. Authoritative reads only; explicit reconciliation is required: {reason}"
+                        );
+                    }
+                }
+                this.refresh_details(index, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_merge(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            return;
+        }
+        let (preparation, method, confirmation_action) = match self.tabs[index].confirmation.clone()
+        {
+            Some(NativeConfirmation::Merge {
+                preparation,
+                method,
+                action,
+            }) => (preparation, method, action),
+            _ => return,
+        };
+        let title = nonempty_option(self.merge_title_input.read(cx).value().to_string());
+        let body = nonempty_option(self.merge_body_input.read(cx).value().to_string());
+        let action = match confirmation_action {
+            MergeConfirmationAction::Merge => MergeAction::Merge {
+                method,
+                commit_title: title,
+                commit_message: body,
+            },
+            MergeConfirmationAction::EnableAutoMerge => MergeAction::EnableAutoMerge {
+                method,
+                commit_title: title,
+                commit_message: body,
+            },
+            MergeConfirmationAction::DisableAutoMerge => MergeAction::DisableAutoMerge,
+            MergeConfirmationAction::Enqueue => MergeAction::Enqueue,
+            MergeConfirmationAction::Dequeue => MergeAction::Dequeue,
+        };
+        let repository = self.tabs[index].repository.clone();
+        let number = self.tabs[index].pull_request.number;
+        let identity = repository.cache_key();
+        let operation_id = next_attempt_id("merge-operation");
+        let request = MergeExecutionRequest {
+            attempt_id: next_attempt_id(&operation_id),
+            operation_id,
+            action,
+        };
+        let key = match ReviewKey::for_repository("github", &repository, number) {
+            Ok(key) => key,
+            Err(error) => {
+                self.status = error.to_string();
+                return;
+            }
+        };
+        self.tabs[index].details_generation += 1;
+        self.tabs[index].write_in_flight = true;
+        let journal_root = self.interaction_root.join("action-journal");
+        let preference_root = self.interaction_root.clone();
+        let provider = GithubProvider::new(repository.account.clone());
+        let task = cx.background_spawn(async move {
+            let journal = ActionJournal::open(&journal_root, key).map_err(|reason| {
+                ProviderMutationOutcome::<cibergit::domain::MergeAcknowledgement>::PreflightRejected {
+                    reason: format!("Cannot open caller journal; zero writes sent: {reason}"),
+                }
+            });
+            let outcome = match journal {
+                Ok(journal) => dispatch_merge(
+                    &journal,
+                    &provider,
+                    &repository,
+                    &preparation,
+                    &request,
+                ),
+                Err(outcome) => outcome,
+            };
+            let preference = if matches!(
+                outcome,
+                ProviderMutationOutcome::Acknowledged(_)
+            ) {
+                save_merge_preference(&preference_root, &repository, method)
+            } else {
+                Ok(())
+            };
+            (outcome, preference)
+        });
+        cx.spawn(async move |root, cx| {
+            let (outcome, preference) = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(index) = this.tabs.iter().position(|tab| {
+                    tab.repository.cache_key() == identity && tab.pull_request.number == number
+                }) else {
+                    // The caller journal owns this completion even if the tab closed.
+                    return;
+                };
+                this.tabs[index].write_in_flight = false;
+                this.status = match outcome {
+                    ProviderMutationOutcome::Acknowledged(ack) if ack.merged => format!(
+                        "Pull request merged{}.",
+                        ack.merge_commit_sha
+                            .map(|sha| format!(" as {}", short_sha(&sha)))
+                            .unwrap_or_default()
+                    ),
+                    ProviderMutationOutcome::Acknowledged(_) => match confirmation_action {
+                        MergeConfirmationAction::EnableAutoMerge => {
+                            "Auto-merge enabled; the pull request is not yet merged.".into()
+                        }
+                        MergeConfirmationAction::Enqueue => {
+                            "Pull request queued; queue acceptance is not a completed merge.".into()
+                        }
+                        MergeConfirmationAction::DisableAutoMerge => {
+                            "Auto-merge disabled after authoritative reconciliation.".into()
+                        }
+                        MergeConfirmationAction::Dequeue => {
+                            "Pull request removed from the merge queue.".into()
+                        }
+                        MergeConfirmationAction::Merge => {
+                            "Merge acknowledged; refreshing authoritative state.".into()
+                        }
+                    },
+                    ProviderMutationOutcome::PreflightRejected { reason } => {
+                        format!("Merge action was not sent: {reason}")
+                    }
+                    ProviderMutationOutcome::Uncertain { reason, .. } => format!(
+                        "Merge outcome is uncertain and will not replay automatically: {reason}"
+                    ),
+                };
+                if let Err(error) = preference {
+                    this.status.push_str(&format!(
+                        " Preferred method was not saved and is not claimed durable: {error}"
+                    ));
+                }
+                this.tabs[index].confirmation = None;
+                this.refresh_active(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn dispatch_auxiliary_action(&mut self, action: ReviewAuxiliaryAction, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status = "Another mutation is still in progress.".into();
+            return;
+        }
+        let repository = self.tabs[index].repository.clone();
+        let number = self.tabs[index].pull_request.number;
+        let identity = repository.cache_key();
+        let operation_id = next_attempt_id("review-auxiliary");
+        let request = ReviewAuxiliaryRequest {
+            attempt_id: next_attempt_id(&operation_id),
+            operation_id,
+            action,
+        };
+        let key = match ReviewKey::for_repository("github", &repository, number) {
+            Ok(key) => key,
+            Err(error) => {
+                self.status = error.to_string();
+                return;
+            }
+        };
+        self.tabs[index].details_generation += 1;
+        self.tabs[index].write_in_flight = true;
+        let journal_root = self.interaction_root.join("action-journal");
+        let provider = GithubProvider::new(repository.account.clone());
+        let task = cx.background_spawn(async move {
+            let journal =
+                ActionJournal::open(&journal_root, key).map_err(
+                    |reason| ProviderMutationOutcome::<
+                        cibergit::domain::ReviewAuxiliaryAcknowledgement,
+                    >::PreflightRejected {
+                        reason: format!("Cannot open caller journal; zero writes sent: {reason}"),
+                    },
+                );
+            match journal {
+                Ok(journal) => {
+                    dispatch_auxiliary(&journal, &provider, &repository, number, &request)
+                }
+                Err(outcome) => outcome,
+            }
+        });
+        cx.spawn(async move |root, cx| {
+            let outcome = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(index) = this.tabs.iter().position(|tab| {
+                    tab.repository.cache_key() == identity && tab.pull_request.number == number
+                }) else {
+                    return;
+                };
+                this.tabs[index].write_in_flight = false;
+                this.status = match outcome {
+                    ProviderMutationOutcome::Acknowledged(_) => {
+                        this.tabs[index].editing_pending_summary = false;
+                        this.tabs[index].reply_thread = None;
+                        "Review action acknowledged; refreshing authoritative activity.".into()
+                    }
+                    ProviderMutationOutcome::PreflightRejected { reason } => {
+                        format!("Review action was not sent: {reason}")
+                    }
+                    ProviderMutationOutcome::Uncertain { reason, .. } => format!(
+                        "Review action outcome is uncertain and will not replay automatically: {reason}"
+                    ),
+                };
+                this.refresh_details(index, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn reconcile_action_journal(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status = "Wait for the active write before reconciling outcomes.".into();
+            return;
+        }
+        let repository = self.tabs[index].repository.clone();
+        let number = self.tabs[index].pull_request.number;
+        let identity = repository.cache_key();
+        let key = match ReviewKey::for_repository("github", &repository, number) {
+            Ok(key) => key,
+            Err(error) => {
+                self.status = error.to_string();
+                return;
+            }
+        };
+        let journal_root = self.interaction_root.join("action-journal");
+        self.tabs[index].write_in_flight = true;
+        self.status = "Reading authoritative state to reconcile started actions…".into();
+        let provider = GithubProvider::new(repository.account.clone());
+        let task = cx.background_spawn(async move {
+            let journal = ActionJournal::open(&journal_root, key).map_err(anyhow::Error::msg)?;
+            let operations = journal.operations().map_err(anyhow::Error::msg)?;
+            let details = provider.details(&repository, number)?;
+            let pending = provider.pending_review(&repository, number)?;
+            let mut resolved = 0usize;
+            let mut still_uncertain = 0usize;
+            for operation in operations.iter().filter(|operation| {
+                matches!(
+                    operation.status,
+                    JournalStatus::InFlight | JournalStatus::Uncertain { .. }
+                )
+            }) {
+                let (operation_id, attempt_id) = journal_identity(&operation.request);
+                let observation = match &operation.request {
+                    JournalRequest::Auxiliary(request) => {
+                        observe_auxiliary(&request.action, &details, pending.as_ref())
+                    }
+                    JournalRequest::Merge {
+                        preparation,
+                        request,
+                    } => provider
+                        .prepare_merge(&repository, number, &preparation.reviewed_head_sha)
+                        .ok()
+                        .and_then(|fresh| observe_merge(&request.action, preparation, &fresh)),
+                };
+                match observation {
+                    Some((true, completed, evidence)) => {
+                        journal
+                            .mark_acknowledged(operation_id, attempt_id, completed, evidence)
+                            .map_err(anyhow::Error::msg)?;
+                        resolved += 1;
+                    }
+                    Some((false, _, evidence)) => {
+                        journal
+                            .mark_not_applied(operation_id, attempt_id, evidence)
+                            .map_err(anyhow::Error::msg)?;
+                        resolved += 1;
+                    }
+                    None => still_uncertain += 1,
+                }
+            }
+            Ok::<_, anyhow::Error>((resolved, still_uncertain))
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(index) = this.tabs.iter().position(|tab| {
+                    tab.repository.cache_key() == identity && tab.pull_request.number == number
+                }) else {
+                    return;
+                };
+                this.tabs[index].write_in_flight = false;
+                this.status = match result {
+                    Ok((resolved, 0)) => format!(
+                        "Authoritative reconciliation resolved {resolved} started action(s); explicit retry is now allowed only for NotApplied attempts."
+                    ),
+                    Ok((resolved, uncertain)) => format!(
+                        "Resolved {resolved} action(s); {uncertain} remain uncertain because exact provider identity/payload could not be proven. No replay occurred."
+                    ),
+                    Err(error) => format!(
+                        "Authoritative reconciliation read failed; journal remains frozen: {error:#}"
+                    ),
+                };
+                this.refresh_details(index, cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn load_comparison(
@@ -2456,6 +3865,7 @@ impl ReviewWorkspace {
                         };
                         this.tabs[tab_index].local_inventory = local_inventory;
                         this.rebuild_diff(tab_index, this.wide);
+                        this.load_interactions(tab_index, cx);
                         this.schedule.succeeded(&format!("pr:{key}:{number}"));
                         this.save_workspace();
                         if local_inventory {
@@ -2535,13 +3945,16 @@ impl ReviewWorkspace {
             tab.details_state = LoadState::Loading("Loading PR details…".into());
         }
         let task = cx.background_spawn(async move {
-            GithubProvider::new(repository.account.clone()).details(&repository, number)
+            let provider = GithubProvider::new(repository.account.clone());
+            let details = provider.details(&repository, number)?;
+            let pending = provider.pending_review(&repository, number)?;
+            Ok::<_, anyhow::Error>((details, pending))
         });
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
-                let Some(tab) = this.tabs.iter_mut().find(|tab| {
+                let Some(tab_index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == key
                         && tab.pull_request.number == number
                         && tab.details_generation == generation
@@ -2549,11 +3962,96 @@ impl ReviewWorkspace {
                     return;
                 };
                 match result {
-                    Ok(details) => {
-                        tab.details = Some(details);
-                        tab.details_state = LoadState::Ready;
+                    Ok((details, pending)) => {
+                        let save = {
+                            let tab = &mut this.tabs[tab_index];
+                            tab.details = Some(details);
+                            tab.pending_snapshot = pending.clone();
+                            tab.details_state = LoadState::Ready;
+                            if !tab.write_in_flight
+                                && let InteractionState::Ready(controller) =
+                                    &mut tab.interactions
+                            {
+                                if let Some(details) = &tab.details
+                                    && let Err(error) = controller.reconcile_details(details)
+                                {
+                                    controller.notice = Some(format!(
+                                        "Pending-review refresh could not be reconciled: {error}"
+                                    ));
+                                }
+                                controller.install_pending_snapshot(pending);
+                                Some((
+                                    controller.composition.clone(),
+                                    controller.store.clone(),
+                                    controller.authority.clone(),
+                                    controller.durable_composition.clone(),
+                                ))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((snapshot, store, authority, expected)) = save {
+                            let (latest, lock, sequence) =
+                                this.next_review_state_write(&key, number);
+                            let saved_snapshot = snapshot.clone();
+                            let task = cx.background_spawn(async move {
+                                let _guard = lock.lock().map_err(|_| {
+                                    "Review recovery save lock failed.".to_owned()
+                                })?;
+                                if latest.load(Ordering::Acquire) != sequence {
+                                    return Ok::<bool, String>(false);
+                                }
+                                authority.save_if_current(
+                                    &store,
+                                    expected.as_ref(),
+                                    &saved_snapshot,
+                                )?;
+                                Ok::<bool, String>(true)
+                            });
+                            let saved_key = key.clone();
+                            cx.spawn(async move |root, cx| {
+                                let result = task.await;
+                                let _ = root.update(cx, |root, cx| {
+                                    let Root::Review(this) = root else { return };
+                                    let Some(index) = this.tabs.iter().position(|tab| {
+                                        tab.repository.cache_key() == saved_key
+                                            && tab.pull_request.number == number
+                                    }) else {
+                                        return;
+                                    };
+                                    match result {
+                                        Ok(true) => {
+                                            if let InteractionState::Ready(controller) =
+                                                &mut this.tabs[index].interactions
+                                                && controller.composition == snapshot
+                                            {
+                                                controller.durable_composition =
+                                                    Some(snapshot.clone());
+                                            }
+                                        }
+                                        Ok(false) => {}
+                                        Err(error) => {
+                                            if let InteractionState::Ready(controller) =
+                                                &mut this.tabs[index].interactions
+                                            {
+                                                controller.notice = Some(format!(
+                                                    "Authoritative review refresh was not saved; no durable retirement or linkage is claimed: {error}"
+                                                ));
+                                            }
+                                            this.status = format!(
+                                                "Review recovery persistence failed; reload before retry: {error}"
+                                            );
+                                        }
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
+                        }
+                        this.rebuild_diff(tab_index, this.wide);
                     }
                     Err(error) => {
+                        let tab = &mut this.tabs[tab_index];
                         tab.details_state = if tab.details.is_some() {
                             LoadState::Cached(format!("Details refresh failed · {error:#}"))
                         } else {
@@ -2584,14 +4082,22 @@ impl ReviewWorkspace {
             .copied()
             .unwrap_or(0.);
         let resolved_mode = session.diff_mode().resolve(wide);
-        tab.diff_rows = build_rows(parse_file(file), resolved_mode);
+        let base_rows = build_rows(parse_file(file), resolved_mode);
+        let threads = tab
+            .details
+            .as_ref()
+            .map(|details| place_threads(session, details))
+            .unwrap_or_default();
+        let composer = match &tab.interactions {
+            InteractionState::Ready(controller) => controller.composer.as_ref(),
+            InteractionState::Loading | InteractionState::RecoveryRequired(_) => None,
+        };
+        tab.diff_rows = attach_inline_rows(base_rows, &selected_key, &threads, composer);
         tab.diff_content_width = diff_content_width(&tab.diff_rows, resolved_mode);
-        tab.diff_scroll = UniformListScrollHandle::new();
-        tab.diff_scroll
-            .0
-            .borrow()
-            .base_handle
-            .set_offset(point(px(0.), px(-scroll_position)));
+        tab.diff_scroll = ListState::new(tab.diff_rows.len(), ListAlignment::Top, px(480.));
+        if scroll_position > 0. {
+            tab.diff_scroll.scroll_by(px(scroll_position));
+        }
         tab.diff_horizontal = ScrollHandle::new();
         tab.diff_horizontal
             .set_offset(point(px(-horizontal_position), px(0.)));
@@ -2601,7 +4107,7 @@ impl ReviewWorkspace {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
-        let position = -tab.diff_scroll.0.borrow().base_handle.offset().y.as_f32();
+        let position = tab.diff_scroll.scroll_px_offset_for_scrollbar().y.as_f32();
         if let Some(session) = &mut tab.session {
             session.set_scroll_position(position);
             if let Some(key) = session.selected_file().map(file_key) {
@@ -2613,6 +4119,17 @@ impl ReviewWorkspace {
 
     fn select_file(&mut self, key: &str, wide: bool, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "File navigation is paused while this review write is being reconciled.".into();
+            cx.notify();
+            return;
+        }
+        let current = self.composer_input.read(cx).value().to_string();
+        if matches!(&self.tabs[index].interactions, InteractionState::Ready(controller) if controller.composer.as_ref().is_some_and(|composer| composer.body != current))
+        {
+            self.persist_composer(cx);
+        }
         self.capture_scroll(index);
         if self.tabs[index]
             .session
@@ -2642,6 +4159,12 @@ impl ReviewWorkspace {
 
     fn navigate_file(&mut self, next: bool, _window: &mut Window, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "File navigation is paused while this review write is being reconciled.".into();
+            cx.notify();
+            return;
+        }
         self.capture_scroll(index);
         let changed = self.tabs[index].session.as_mut().is_some_and(|session| {
             if next {
@@ -2693,7 +4216,19 @@ impl ReviewWorkspace {
     }
 
     fn close_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Root>) {
-        if let Some(index) = self.active_tab.take() {
+        if let Some(index) = self.active_tab {
+            if self.tabs[index].write_in_flight {
+                self.status =
+                    "Keep this tab open until the started write reaches a durable outcome.".into();
+                cx.notify();
+                return;
+            }
+            let current = self.composer_input.read(cx).value().to_string();
+            if matches!(&self.tabs[index].interactions, InteractionState::Ready(controller) if controller.composer.as_ref().is_some_and(|composer| composer.body != current))
+            {
+                self.persist_composer(cx);
+            }
+            self.active_tab = None;
             self.capture_scroll(index);
             self.persist_session(index, cx);
             self.tabs.remove(index);
@@ -2976,6 +4511,36 @@ impl ReviewWorkspace {
                     this.setup_open = true;
                     this.command_palette = false;
                     cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|root, _: &ComposeInlineComment, window, cx| {
+                if let Root::Review(this) = root {
+                    this.compose_first_selectable(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &SaveReviewDraft, _, cx| {
+                if let Root::Review(this) = root {
+                    this.persist_composer(cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &AddPendingComment, _, cx| {
+                if let Root::Review(this) = root {
+                    this.start_comment_write(false, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &PostImmediateComment, _, cx| {
+                if let Root::Review(this) = root {
+                    this.start_comment_write(true, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &SubmitReview, _, cx| {
+                if let Root::Review(this) = root {
+                    this.open_submit_confirmation(cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &MergePullRequest, _, cx| {
+                if let Root::Review(this) = root {
+                    this.prepare_merge_confirmation(cx);
                 }
             }))
             .on_action(cx.listener(|root, _: &FileTreeUp, window, cx| {
@@ -3996,9 +5561,9 @@ impl ReviewWorkspace {
                             tab.repository.name, tab.pull_request.number
                         )),
                 )
-                .on_click(cx.listener(move |root, _, _, cx| {
+                .on_click(cx.listener(move |root, _, window, cx| {
                     if let Root::Review(this) = root {
-                        this.activate_tab(index, cx);
+                        this.activate_tab(index, window, cx);
                     }
                 }))
         });
@@ -4200,12 +5765,35 @@ impl ReviewWorkspace {
                             )
                             .child(
                                 div()
+                                    .id("open-review-confirmation")
                                     .px_3()
                                     .py_1()
                                     .rounded_md()
                                     .border_1()
                                     .border_color(colors.border)
-                                    .child("Review"),
+                                    .cursor_pointer()
+                                    .child("Review")
+                                    .on_click(cx.listener(|root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.open_submit_confirmation(cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("open-merge-confirmation")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .cursor_pointer()
+                                    .child("Merge…")
+                                    .on_click(cx.listener(|root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.prepare_merge_confirmation(cx);
+                                        }
+                                    })),
                             )
                             .child(
                                 div()
@@ -4709,7 +6297,7 @@ impl ReviewWorkspace {
         &self,
         index: usize,
         colors: Palette,
-        _cx: &mut Context<Root>,
+        cx: &mut Context<Root>,
     ) -> impl IntoElement {
         let tab = &self.tabs[index];
         let header = tab
@@ -4729,9 +6317,20 @@ impl ReviewWorkspace {
         let split_mode = rows.iter().any(|row| matches!(row, DiffRow::Split(_)));
         let scroll = tab.diff_scroll.clone();
         let horizontal = tab.diff_horizontal.clone();
-        let content_width = tab.diff_content_width.max(1.);
         let split_text_width = split_text_content_width(&rows);
+        let unified_text_width = unified_text_content_width(&rows);
         let focus = self.diff_focus.clone();
+        let root = cx.entity();
+        let composer = self.composer_input.clone();
+        let reply_input = self.reply_input.clone();
+        let reply_thread = tab.reply_thread.clone();
+        let pending_review = match &tab.interactions {
+            InteractionState::Ready(controller) => controller
+                .pending_review
+                .as_ref()
+                .map(|snapshot| snapshot.review.coordinates.clone()),
+            _ => None,
+        };
         div()
             .flex_1()
             .min_w_0()
@@ -4796,48 +6395,47 @@ impl ReviewWorkspace {
                 if split_mode {
                     let row_horizontal = horizontal.clone();
                     body.child(
-                        uniform_list(
-                            SharedString::from(format!("diff-rows-{index}")),
-                            count,
-                            move |range: Range<usize>, _, _| {
-                                range
-                                    .map(|index| {
-                                        render_split_diff_row(
-                                            &rows[index],
-                                            colors,
-                                            &row_horizontal,
-                                            split_text_width,
-                                        )
-                                    })
-                                    .collect::<Vec<_>>()
-                            },
-                        )
-                        .track_scroll(&scroll)
+                        list(scroll.clone(), move |index, _, _| {
+                            render_interactive_diff_row(
+                                &rows[index],
+                                colors,
+                                true,
+                                &row_horizontal,
+                                split_text_width,
+                                &root,
+                                &composer,
+                                &reply_input,
+                                reply_thread.as_ref(),
+                                pending_review.as_ref(),
+                            )
+                        })
                         .w_full()
                         .h_full(),
                     )
                     .child(diff_horizontal_scrollbar(index, &horizontal))
                     .into_any_element()
                 } else {
-                    body.overflow_x_scroll()
-                        .restrict_scroll_to_axis()
-                        .track_scroll(&horizontal)
-                        .child(
-                            uniform_list(
-                                SharedString::from(format!("diff-rows-{index}")),
-                                count,
-                                move |range: Range<usize>, _, _| {
-                                    range
-                                        .map(|index| render_diff_row(&rows[index], colors))
-                                        .collect::<Vec<_>>()
-                                },
+                    let row_horizontal = horizontal.clone();
+                    body.child(
+                        list(scroll.clone(), move |index, _, _| {
+                            render_interactive_diff_row(
+                                &rows[index],
+                                colors,
+                                false,
+                                &row_horizontal,
+                                unified_text_width,
+                                &root,
+                                &composer,
+                                &reply_input,
+                                reply_thread.as_ref(),
+                                pending_review.as_ref(),
                             )
-                            .track_scroll(&scroll)
-                            .w(px(content_width))
-                            .h_full(),
-                        )
-                        .child(diff_horizontal_scrollbar(index, &horizontal))
-                        .into_any_element()
+                        })
+                        .w_full()
+                        .h_full(),
+                    )
+                    .child(diff_horizontal_scrollbar(index, &horizontal))
+                    .into_any_element()
                 }
             })
     }
@@ -4915,6 +6513,248 @@ impl ReviewWorkspace {
             }
             InspectorSection::Activity => {
                 let mut activity = Vec::new();
+                match &tab.interactions {
+                    InteractionState::Ready(controller) => {
+                        let pending_review_id = controller
+                            .pending_review
+                            .as_ref()
+                            .map(|pending| pending.review.coordinates.remote_id.as_str())
+                            .unwrap_or("none observed");
+                        let mut pending_card = div()
+                                .mb_4()
+                                .p_3()
+                                .rounded_md()
+                                .bg(colors.elevated)
+                                .child("Your pending review")
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(colors.muted)
+                                        .child(format!(
+                                            "{} local comment(s) · remote ID {}",
+                                            controller.pending_count(), pending_review_id
+                                        )),
+                                )
+                                .when(!controller.pending_complete, |card| {
+                                    card.child(
+                                        div()
+                                            .mt_1()
+                                            .text_xs()
+                                            .text_color(colors.amber)
+                                            .child("Pending comment linkage is partial."),
+                                    )
+                                })
+                                .when(controller.unresolved_operations() > 0, |card| {
+                                    card.child(
+                                        div()
+                                            .mt_1()
+                                            .text_xs()
+                                            .text_color(colors.amber)
+                                            .child(format!(
+                                                "{} operation(s) require authoritative reconciliation before retry.",
+                                                controller.unresolved_operations()
+                                            )),
+                                    )
+                                });
+                        if let Some(snapshot) = &controller.pending_review {
+                            let edit_root = cx.entity();
+                            let edit_body = snapshot.review.body.clone();
+                            let cancel_root = cx.entity();
+                            let cancel_review = snapshot.review.coordinates.clone();
+                            pending_card = pending_card.child(
+                                div()
+                                    .mt_2()
+                                    .flex()
+                                    .gap_2()
+                                    .text_xs()
+                                    .child(action_link("Edit pending summary", colors).on_click(
+                                        move |_, window, cx| {
+                                            edit_root.update(cx, |root, cx| {
+                                                if let Root::Review(this) = root
+                                                    && let Some(index) = this.active_tab
+                                                {
+                                                    this.tabs[index].editing_pending_summary = true;
+                                                    this.review_summary_input.update(
+                                                        cx,
+                                                        |input, cx| {
+                                                            input.set_value(
+                                                                edit_body.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                            input.focus(window, cx);
+                                                        },
+                                                    );
+                                                    cx.notify();
+                                                }
+                                            });
+                                        },
+                                    ))
+                                    .child(action_link("Cancel pending review", colors).on_click(
+                                        move |_, _, cx| {
+                                            cancel_root.update(cx, |root, cx| {
+                                                if let Root::Review(this) = root {
+                                                    this.dispatch_auxiliary_action(
+                                                        ReviewAuxiliaryAction::CancelPendingReview {
+                                                            review: cancel_review.clone(),
+                                                        },
+                                                        cx,
+                                                    );
+                                                }
+                                            });
+                                        },
+                                    )),
+                            );
+                            if tab.editing_pending_summary {
+                                let save_root = cx.entity();
+                                let review = snapshot.review.coordinates.clone();
+                                pending_card = pending_card
+                                    .child(
+                                        div()
+                                            .mt_2()
+                                            .h(px(72.))
+                                            .border_1()
+                                            .border_color(colors.border)
+                                            .rounded_md()
+                                            .overflow_hidden()
+                                            .child(Textarea::new(&self.review_summary_input)),
+                                    )
+                                    .child(action_link("Save pending summary", colors).on_click(
+                                        move |_, _, cx| {
+                                            save_root.update(cx, |root, cx| {
+                                                if let Root::Review(this) = root {
+                                                    let body = this
+                                                        .review_summary_input
+                                                        .read(cx)
+                                                        .value()
+                                                        .to_string();
+                                                    this.dispatch_auxiliary_action(
+                                                        ReviewAuxiliaryAction::UpdatePendingSummary {
+                                                            review: review.clone(),
+                                                            body,
+                                                        },
+                                                        cx,
+                                                    );
+                                                }
+                                            });
+                                        },
+                                    ));
+                            }
+                            for linked in snapshot.comments.iter().take(20) {
+                                let delete_root = cx.entity();
+                                let edit_root = cx.entity();
+                                let review = snapshot.review.coordinates.clone();
+                                let comment = linked.comment.coordinates.clone();
+                                let comment_id = comment.remote_id.clone();
+                                let linked_local_draft = controller
+                                    .composition
+                                    .drafts
+                                    .iter()
+                                    .find(|draft| {
+                                        draft.remote.as_ref().is_some_and(|remote| {
+                                            remote.comment_id == comment_id
+                                        }) && draft.disposition
+                                            == cibergit::participation::DraftDisposition::Pending
+                                    })
+                                    .map(|draft| draft.id.clone());
+                                pending_card = pending_card.child(
+                                    div()
+                                        .mt_2()
+                                        .pl_2()
+                                        .border_l_2()
+                                        .border_color(colors.accent)
+                                        .child(markdown_text(
+                                            format!("pending-comment-{comment_id}"),
+                                            &linked.comment.body,
+                                            colors,
+                                        ))
+                                        .child(
+                                            div()
+                                                .mt_1()
+                                                .flex()
+                                                .gap_2()
+                                                .when_some(linked_local_draft, |row, draft_id| {
+                                                    row.child(
+                                                        action_link_with_id(
+                                                            format!("edit-pending-{comment_id}"),
+                                                            "Edit linked comment",
+                                                            colors,
+                                                        )
+                                                        .on_click(move |_, window, cx| {
+                                                            edit_root.update(cx, |root, cx| {
+                                                                if let Root::Review(this) = root {
+                                                                    this.reopen_pending_draft(
+                                                                        &draft_id,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                }
+                                                            });
+                                                        }),
+                                                    )
+                                                })
+                                                .child(
+                                                    action_link_with_id(
+                                                        format!("delete-pending-{comment_id}"),
+                                                        "Delete pending comment",
+                                                        colors,
+                                                    )
+                                                    .on_click(move |_, _, cx| {
+                                                        delete_root.update(cx, |root, cx| {
+                                                            if let Root::Review(this) = root {
+                                                                this.dispatch_auxiliary_action(
+                                                                    ReviewAuxiliaryAction::DeletePendingComment {
+                                                                        review: review.clone(),
+                                                                        comment: comment.clone(),
+                                                                    },
+                                                                    cx,
+                                                                );
+                                                            }
+                                                        });
+                                                    }),
+                                                ),
+                                        ),
+                                ).when(
+                                    controller.composition.drafts.iter().all(|draft| {
+                                        draft.remote.as_ref().is_none_or(|remote| {
+                                            remote.comment_id != linked.comment.coordinates.remote_id
+                                        })
+                                    }),
+                                    |card| {
+                                        card.child(
+                                            div()
+                                                .mt_1()
+                                                .text_xs()
+                                                .text_color(colors.muted)
+                                                .child(
+                                                    "Browser-created pending comment is authoritative but has no local recovery link; edit it in GitHub rather than guessing a draft identity.",
+                                                ),
+                                        )
+                                    },
+                                );
+                            }
+                        }
+                        activity.push(pending_card);
+                        activity.push(div().mb_4().child(
+                            action_link("Reconcile started actions", colors).on_click(cx.listener(
+                                |root, _, _, cx| {
+                                    if let Root::Review(this) = root {
+                                        this.reconcile_action_journal(cx);
+                                    }
+                                },
+                            )),
+                        ));
+                    }
+                    InteractionState::Loading => activity.push(
+                        div()
+                            .text_color(colors.muted)
+                            .child("Loading private review recovery…"),
+                    ),
+                    InteractionState::RecoveryRequired(reason) => {
+                        activity.push(div().text_color(colors.red).child(reason.clone()))
+                    }
+                }
                 if let Some(details) = &tab.details {
                     for (position, comment) in details.issue_comments.iter().take(20).enumerate() {
                         activity.push(activity_item(
@@ -4937,6 +6777,61 @@ impl ReviewWorkspace {
                             review.submitted_at.as_deref().unwrap_or("Pending"),
                             colors,
                         ));
+                    }
+                    let placed = tab
+                        .session
+                        .as_ref()
+                        .map(|session| place_threads(session, details))
+                        .unwrap_or_default();
+                    for thread in placed.iter().take(30) {
+                        let location = thread.anchor.as_ref().map_or_else(
+                            || {
+                                format!(
+                                    "Unplaced · {}",
+                                    thread
+                                        .unplaced_reason
+                                        .as_deref()
+                                        .unwrap_or("unknown reason")
+                                )
+                            },
+                            |anchor| {
+                                format!(
+                                    "{} · {} {}",
+                                    thread.thread.path,
+                                    anchor.side.provider_name(),
+                                    anchor.line
+                                )
+                            },
+                        );
+                        activity.push(
+                            div()
+                                .mb_3()
+                                .child(format!(
+                                    "Thread {} · {}{}",
+                                    thread.thread.coordinates.remote_id,
+                                    if thread.thread.resolved {
+                                        "resolved · "
+                                    } else {
+                                        ""
+                                    },
+                                    location
+                                ))
+                                .when_some(thread.thread.comments.last(), |item, comment| {
+                                    item.child(
+                                        div().mt_1().child(
+                                            markdown_text(
+                                                format!(
+                                                    "activity-thread-{}",
+                                                    thread.thread.coordinates.remote_id
+                                                ),
+                                                &comment.body,
+                                                colors,
+                                            )
+                                            .text_size(px(12.)),
+                                        ),
+                                    )
+                                }),
+                        );
                     }
                     if !details.activity_complete {
                         activity.push(
@@ -5024,7 +6919,348 @@ impl ReviewWorkspace {
                     .id("inspector-scroll")
                     .p_4()
                     .overflow_y_scroll()
+                    .when_some(
+                        self.render_confirmation(index, colors, cx),
+                        |panel, confirmation| panel.child(confirmation),
+                    )
                     .child(content),
+            )
+    }
+
+    fn render_confirmation(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> Option<AnyElement> {
+        let tab = &self.tabs[index];
+        match tab.confirmation.as_ref()? {
+            NativeConfirmation::Submit { event } => {
+                let selected = event.clone();
+                let event_button = |label: &'static str, value: ReviewEvent| {
+                    side_control(label, selected == value, colors)
+                        .id(SharedString::from(format!("submit-event-{label}")))
+                        .on_click(cx.listener(move |root, _, _, cx| {
+                            if let Root::Review(this) = root
+                                && let Some(index) = this.active_tab
+                            {
+                                this.tabs[index].confirmation = Some(NativeConfirmation::Submit {
+                                    event: value.clone(),
+                                });
+                                cx.notify();
+                            }
+                        }))
+                };
+                let pending = match &tab.interactions {
+                    InteractionState::Ready(controller) => controller.pending_count(),
+                    _ => 0,
+                };
+                let reviewed = tab
+                    .session
+                    .as_ref()
+                    .map(|session| session.submission_revision().head_sha.as_str())
+                    .unwrap_or("unavailable");
+                let newer = tab
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.available_revision())
+                    .map(|revision| revision.head_sha.as_str());
+                Some(
+                    div()
+                        .mb_5()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.accent)
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Submit review?"),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child(format!(
+                                    "{} · #{} · {} · {} pending comment(s)",
+                                    tab.repository.full_name(),
+                                    tab.pull_request.number,
+                                    tab.repository.account.login,
+                                    pending
+                                )),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .child(format!("Actually reviewed head: {reviewed}")),
+                        )
+                        .when_some(newer, |card, newer| {
+                            card.child(
+                                div()
+                                    .mt_2()
+                                    .text_xs()
+                                    .text_color(colors.amber)
+                                    .child(format!(
+                                        "Newer head {newer} exists. Confirmation still submits the displayed older head {reviewed}; it does not advance the diff."
+                                    )),
+                            )
+                        })
+                        .child(
+                            div()
+                                .mt_3()
+                                .flex()
+                                .gap_1()
+                                .child(event_button("Comment", ReviewEvent::Comment))
+                                .child(event_button("Approve", ReviewEvent::Approve))
+                                .child(event_button(
+                                    "Request changes",
+                                    ReviewEvent::RequestChanges,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .h(px(84.))
+                                .border_1()
+                                .border_color(colors.border)
+                                .rounded_md()
+                                .overflow_hidden()
+                                .child(Textarea::new(&self.review_summary_input)),
+                        )
+                        .child(self.confirmation_controls(true, colors, cx))
+                        .into_any_element(),
+                )
+            }
+            NativeConfirmation::Merge {
+                preparation,
+                method,
+                action,
+            } => {
+                let selected_method = *method;
+                let selected_action = *action;
+                let method_button = |value: MergeMethod| {
+                    let label = match value {
+                        MergeMethod::Merge => "Merge commit",
+                        MergeMethod::Squash => "Squash",
+                        MergeMethod::Rebase => "Rebase",
+                    };
+                    side_control(label, selected_method == value, colors)
+                        .id(SharedString::from(format!("merge-method-{label}")))
+                        .on_click(cx.listener(move |root, _, _, cx| {
+                            if let Root::Review(this) = root
+                                && let Some(index) = this.active_tab
+                                && let Some(NativeConfirmation::Merge { method, .. }) =
+                                    &mut this.tabs[index].confirmation
+                            {
+                                *method = value;
+                                cx.notify();
+                            }
+                        }))
+                };
+                let action_button = |label: &'static str, value: MergeConfirmationAction| {
+                    side_control(label, selected_action == value, colors)
+                        .id(SharedString::from(format!("merge-action-{label}")))
+                        .on_click(cx.listener(move |root, _, _, cx| {
+                            if let Root::Review(this) = root
+                                && let Some(index) = this.active_tab
+                                && let Some(NativeConfirmation::Merge { action, .. }) =
+                                    &mut this.tabs[index].confirmation
+                            {
+                                *action = value;
+                                cx.notify();
+                            }
+                        }))
+                };
+                let suggested_title = preparation
+                    .preferred_headlines
+                    .iter()
+                    .find(|(candidate, _)| candidate == method)
+                    .map(|(_, title)| title.as_str())
+                    .unwrap_or("Provider default");
+                let suggested_body = preparation
+                    .preferred_bodies
+                    .iter()
+                    .find(|(candidate, _)| candidate == method)
+                    .map(|(_, body)| body.as_str())
+                    .unwrap_or("Provider default");
+                Some(
+                    div()
+                        .mb_5()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.green)
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Confirm guarded merge action"),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child(format!(
+                                    "{} · #{} · account {}",
+                                    tab.repository.full_name(),
+                                    tab.pull_request.number,
+                                    tab.repository.account.login
+                                )),
+                        )
+                        .child(detail("Current head", &preparation.current_head_sha, colors))
+                        .child(detail("Mergeable", &preparation.mergeable, colors))
+                        .child(detail("Rules", &preparation.merge_state_status, colors))
+                        .child(detail("Checks", &preparation.check_status, colors))
+                        .child(detail("Reviews", &preparation.review_status, colors))
+                        .when(!preparation.blockers.is_empty(), |card| {
+                            card.child(
+                                div()
+                                    .mt_2()
+                                    .text_xs()
+                                    .text_color(colors.amber)
+                                    .child(format!(
+                                        "Blockers: {}",
+                                        preparation.blockers.join(" · ")
+                                    )),
+                            )
+                        })
+                        .child(
+                            div().mt_2().flex().gap_1().children(
+                                preparation
+                                    .allowed_methods
+                                    .iter()
+                                    .copied()
+                                    .map(method_button),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .flex()
+                                .flex_wrap()
+                                .gap_1()
+                                .when(
+                                    !preparation.merge_queue_required
+                                        && preparation.blockers.is_empty(),
+                                    |row| row.child(action_button(
+                                        "Merge now",
+                                        MergeConfirmationAction::Merge,
+                                    )),
+                                )
+                                .when(
+                                    preparation.auto_merge_allowed
+                                        && preparation.can_enable_auto_merge
+                                        && !preparation.auto_merge_enabled,
+                                    |row| row.child(action_button(
+                                        "Enable auto-merge",
+                                        MergeConfirmationAction::EnableAutoMerge,
+                                    )),
+                                )
+                                .when(preparation.can_disable_auto_merge && preparation.auto_merge_enabled, |row| {
+                                    row.child(action_button(
+                                        "Disable auto-merge",
+                                        MergeConfirmationAction::DisableAutoMerge,
+                                    ))
+                                })
+                                .when(preparation.merge_queue_required && !preparation.in_merge_queue, |row| {
+                                    row.child(action_button("Queue", MergeConfirmationAction::Enqueue))
+                                })
+                                .when(preparation.in_merge_queue, |row| {
+                                    row.child(action_button("Dequeue", MergeConfirmationAction::Dequeue))
+                                }),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child(format!("Suggested headline: {suggested_title}")),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .h(px(34.))
+                                .border_1()
+                                .border_color(colors.border)
+                                .rounded_md()
+                                .child(Input::new(&self.merge_title_input)),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child(format!("Suggested body: {suggested_body}")),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .h(px(72.))
+                                .border_1()
+                                .border_color(colors.border)
+                                .rounded_md()
+                                .overflow_hidden()
+                                .child(Textarea::new(&self.merge_body_input)),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.faint)
+                                .child("Delete branch unavailable: GitHub deleteRef has no expected-OID/CAS guard."),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child("Admin bypass is never selected automatically. Confirm dispatches exactly one guarded request."),
+                        )
+                        .child(self.confirmation_controls(false, colors, cx))
+                        .into_any_element(),
+                )
+            }
+        }
+    }
+
+    fn confirmation_controls(
+        &self,
+        submission: bool,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> Div {
+        let confirm = if submission {
+            action_link("Confirm submission", colors).on_click(cx.listener(|root, _, _, cx| {
+                if let Root::Review(this) = root {
+                    this.confirm_submission(cx);
+                }
+            }))
+        } else {
+            action_link("Confirm one action", colors).on_click(cx.listener(|root, _, _, cx| {
+                if let Root::Review(this) = root {
+                    this.confirm_merge(cx);
+                }
+            }))
+        };
+        div()
+            .mt_3()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(confirm)
+            .child(
+                action_link("Cancel", colors).on_click(cx.listener(|root, _, _, cx| {
+                    if let Root::Review(this) = root
+                        && let Some(index) = this.active_tab
+                        && !this.tabs[index].write_in_flight
+                    {
+                        this.tabs[index].confirmation = None;
+                        this.status = "Confirmation cancelled; zero writes sent.".into();
+                        cx.notify();
+                    }
+                })),
             )
     }
 
@@ -5348,6 +7584,118 @@ fn side_control(label: &str, selected: bool, colors: Palette) -> Div {
         .child(label.to_owned())
 }
 
+fn action_link(label: &'static str, colors: Palette) -> Stateful<Div> {
+    action_link_with_id(format!("action-{label}"), label, colors)
+}
+
+fn action_link_with_id(id: String, label: &'static str, colors: Palette) -> Stateful<Div> {
+    div()
+        .id(SharedString::from(id))
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(colors.border)
+        .cursor_pointer()
+        .text_color(colors.accent)
+        .hover(|button| button.bg(colors.selected))
+        .child(label)
+}
+
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
+}
+
+fn nonempty_option(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.trim().to_owned())
+}
+
+fn journal_identity(request: &JournalRequest) -> (&str, &str) {
+    match request {
+        JournalRequest::Auxiliary(request) => (&request.operation_id, &request.attempt_id),
+        JournalRequest::Merge { request, .. } => (&request.operation_id, &request.attempt_id),
+    }
+}
+
+fn observe_auxiliary(
+    action: &ReviewAuxiliaryAction,
+    details: &PullRequestDetails,
+    pending: Option<&cibergit::domain::PendingReviewSnapshot>,
+) -> Option<(bool, bool, String)> {
+    match action {
+        ReviewAuxiliaryAction::UpdatePendingSummary { review, body } => {
+            let observed = pending
+                .filter(|snapshot| snapshot.review.coordinates.remote_id == review.remote_id)?;
+            Some((
+                observed.review.body == *body,
+                true,
+                "Authoritative pending-review body compared with the exact request payload.".into(),
+            ))
+        }
+        ReviewAuxiliaryAction::DeletePendingComment { review, comment } => {
+            let observed = pending.filter(|snapshot| {
+                snapshot.review.coordinates.remote_id == review.remote_id
+                    && snapshot.comments_complete
+            })?;
+            let exists = observed
+                .comments
+                .iter()
+                .any(|linked| linked.comment.coordinates.remote_id == comment.remote_id);
+            Some((
+                !exists,
+                true,
+                "Authoritative complete pending-comment read checked the exact remote comment ID."
+                    .into(),
+            ))
+        }
+        ReviewAuxiliaryAction::CancelPendingReview { review } => Some((
+            pending
+                .is_none_or(|snapshot| snapshot.review.coordinates.remote_id != review.remote_id),
+            true,
+            "Authoritative selected-account pending-review read checked the exact review ID."
+                .into(),
+        )),
+        ReviewAuxiliaryAction::SetThreadResolved { thread, resolved } => {
+            let observed = details
+                .review_threads
+                .iter()
+                .find(|candidate| candidate.coordinates.remote_id == thread.remote_id)?;
+            Some((
+                observed.resolved == *resolved,
+                true,
+                "Authoritative thread read checked the exact ID and resolution payload.".into(),
+            ))
+        }
+        ReviewAuxiliaryAction::Reply { .. } => None,
+    }
+}
+
+fn observe_merge(
+    action: &MergeAction,
+    prepared: &MergePreparation,
+    fresh: &MergePreparation,
+) -> Option<(bool, bool, String)> {
+    if fresh.pull_request.remote_id != prepared.pull_request.remote_id {
+        return None;
+    }
+    let merged = fresh.state == "MERGED";
+    let applied = match action {
+        MergeAction::Merge { .. } => merged,
+        MergeAction::EnableAutoMerge { .. } => fresh.auto_merge_enabled || merged,
+        MergeAction::DisableAutoMerge => !fresh.auto_merge_enabled,
+        MergeAction::Enqueue => fresh.in_merge_queue || merged,
+        MergeAction::Dequeue => !fresh.in_merge_queue,
+    };
+    Some((
+        applied,
+        merged,
+        format!(
+            "Fresh provider state for exact PR/head: state={}, auto_merge={}, queued={}",
+            fresh.state, fresh.auto_merge_enabled, fresh.in_merge_queue
+        ),
+    ))
+}
+
 fn command_row(label: &str, shortcut: &str, colors: Palette) -> Div {
     div()
         .px_3()
@@ -5438,24 +7786,100 @@ fn markdown_text(id: String, source: &str, colors: Palette) -> TextView {
 
 /// Keep GitHub prose readable without allowing rich text to resolve media URIs.
 fn media_free_markdown(source: &str) -> String {
-    let mut without_comments = String::with_capacity(source.len());
-    let mut remaining = source;
-    while let Some(start) = remaining.find("<!--") {
-        without_comments.push_str(&remaining[..start]);
-        let after_start = &remaining[start + 4..];
-        if let Some(end) = after_start.find("-->") {
-            remaining = &after_start[end + 3..];
+    let mut output = String::with_capacity(source.len());
+    let mut fence: Option<(char, usize)> = None;
+    let mut in_comment = false;
+    for segment in source.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let newline = segment.ends_with('\n');
+        let trimmed = line.trim_start();
+        let marker = fence_marker(trimmed);
+        if let Some((character, length)) = fence {
+            output.push_str(line);
+            if marker.is_some_and(|candidate| candidate.0 == character && candidate.1 >= length) {
+                fence = None;
+            }
+        } else if !in_comment && marker.is_some() {
+            fence = marker;
+            output.push_str(line);
+        } else if !in_comment && (line.starts_with("    ") || line.starts_with('\t')) {
+            output.push_str(line);
         } else {
-            remaining = "";
-            break;
+            output.push_str(&sanitize_markdown_prose(line, &mut in_comment));
+        }
+        if newline {
+            output.push('\n');
         }
     }
-    without_comments.push_str(remaining);
-    let escaped_inline_code = escape_inline_code_delimiters(&without_comments);
-    escaped_inline_code
-        .replace("![", "[Image: ")
+    output
+}
+
+fn fence_marker(line: &str) -> Option<(char, usize)> {
+    let character = line.chars().next()?;
+    if character != '`' && character != '~' {
+        return None;
+    }
+    let length = line
+        .chars()
+        .take_while(|candidate| *candidate == character)
+        .count();
+    (length >= 3).then_some((character, length))
+}
+
+fn sanitize_markdown_prose(line: &str, in_comment: &mut bool) -> String {
+    let mut without_comments = String::with_capacity(line.len());
+    let mut remaining = line;
+    loop {
+        if *in_comment {
+            let Some(end) = remaining.find("-->") else {
+                return without_comments;
+            };
+            remaining = &remaining[end + 3..];
+            *in_comment = false;
+        }
+        let Some(start) = remaining.find("<!--") else {
+            without_comments.push_str(remaining);
+            break;
+        };
+        without_comments.push_str(&remaining[..start]);
+        remaining = &remaining[start + 4..];
+        *in_comment = true;
+    }
+    let without_images = remove_markdown_images(&without_comments);
+    escape_inline_code_delimiters(&without_images)
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn remove_markdown_images(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut remaining = source;
+    while let Some(start) = remaining.find("![") {
+        output.push_str(&remaining[..start]);
+        let after = &remaining[start + 2..];
+        let Some(alt_end) = after.find(']') else {
+            output.push_str("![");
+            remaining = after;
+            continue;
+        };
+        let alt = &after[..alt_end];
+        let after_alt = &after[alt_end + 1..];
+        if let Some(destination) = after_alt.strip_prefix('(')
+            && let Some(destination_end) = destination.find(')')
+        {
+            output.push_str("[Image omitted: ");
+            output.push_str(alt);
+            output.push(']');
+            remaining = &destination[destination_end + 1..];
+        } else {
+            output.push_str("![");
+            output.push_str(alt);
+            output.push(']');
+            remaining = after_alt;
+        }
+    }
+    output.push_str(remaining);
+    output
 }
 
 /// The pinned TextView switches an entire paragraph to its fragment-based
@@ -5532,6 +7956,52 @@ fn build_rows(diff: ParsedDiff, mode: DiffMode) -> Vec<DiffRow> {
     rows
 }
 
+fn attach_inline_rows(
+    rows: Vec<DiffRow>,
+    selected_file_key: &str,
+    threads: &[InlineThread],
+    composer: Option<&ComposerState>,
+) -> Vec<DiffRow> {
+    let mut attached =
+        Vec::with_capacity(rows.len() + threads.len() + usize::from(composer.is_some()));
+    for row in rows {
+        attached.push(row.clone());
+        for thread in threads.iter().filter(|thread| {
+            thread.anchor.as_ref().is_some_and(|anchor| {
+                anchor.file_key == selected_file_key
+                    && diff_row_has_line(&row, anchor.side, anchor.line)
+            })
+        }) {
+            attached.push(DiffRow::Thread(thread.clone()));
+        }
+        if let Some(composer) = composer
+            && composer.coordinate.file_key == selected_file_key
+            && diff_row_has_line(&row, composer.coordinate.side, composer.coordinate.line)
+        {
+            attached.push(DiffRow::Composer {
+                side: composer.coordinate.side,
+                start_line: composer.coordinate.start_line,
+                line: composer.coordinate.line,
+            });
+        }
+    }
+    attached
+}
+
+fn diff_row_has_line(row: &DiffRow, side: DiffSide, wanted: u64) -> bool {
+    match row {
+        DiffRow::Unified(line) => match side {
+            DiffSide::Old => line.old_line == Some(wanted),
+            DiffSide::New => line.new_line == Some(wanted),
+        },
+        DiffRow::Split(row) => match side {
+            DiffSide::Old => row.old.as_ref().and_then(|line| line.old_line) == Some(wanted),
+            DiffSide::New => row.new.as_ref().and_then(|line| line.new_line) == Some(wanted),
+        },
+        DiffRow::Hunk(_) | DiffRow::Thread(_) | DiffRow::Composer { .. } => false,
+    }
+}
+
 fn display_columns(text: &str) -> usize {
     let mut columns = 0usize;
     for character in text.chars() {
@@ -5566,6 +8036,7 @@ fn diff_content_width(rows: &[DiffRow], mode: DiffMode) -> f32 {
                     .unwrap_or(0);
                 2. * (76. + old.max(new) as f32 * DIFF_CELL_WIDTH)
             }
+            DiffRow::Thread(_) | DiffRow::Composer { .. } => 0.,
         })
         .fold(0f32, f32::max);
     let minimum = match mode {
@@ -5585,7 +8056,22 @@ fn split_text_content_width(rows: &[DiffRow]) -> f32 {
                     .map(|line| display_columns(&line.text) as f32 * DIFF_CELL_WIDTH)
                     .fold(0f32, f32::max),
             ),
-            DiffRow::Hunk(_) | DiffRow::Unified(_) => None,
+            DiffRow::Hunk(_)
+            | DiffRow::Unified(_)
+            | DiffRow::Thread(_)
+            | DiffRow::Composer { .. } => None,
+        })
+        .fold(1f32, f32::max)
+}
+
+fn unified_text_content_width(rows: &[DiffRow]) -> f32 {
+    rows.iter()
+        .filter_map(|row| match row {
+            DiffRow::Unified(line) => Some(display_columns(&line.text) as f32 * DIFF_CELL_WIDTH),
+            DiffRow::Hunk(_)
+            | DiffRow::Split(_)
+            | DiffRow::Thread(_)
+            | DiffRow::Composer { .. } => None,
         })
         .fold(1f32, f32::max)
 }
@@ -5688,7 +8174,461 @@ fn render_diff_row(row: &DiffRow, colors: Palette) -> AnyElement {
             .child(split_cell(row.old.as_ref(), true, colors))
             .child(split_cell(row.new.as_ref(), false, colors))
             .into_any_element(),
+        DiffRow::Thread(_) | DiffRow::Composer { .. } => div().into_any_element(),
     }
+}
+
+fn render_interactive_diff_row(
+    row: &DiffRow,
+    colors: Palette,
+    split_mode: bool,
+    horizontal: &ScrollHandle,
+    text_width: f32,
+    root: &Entity<Root>,
+    composer_input: &Entity<TextareaState>,
+    reply_input: &Entity<TextareaState>,
+    reply_target: Option<&cibergit::domain::ProviderCoordinates>,
+    pending_review: Option<&cibergit::domain::ProviderCoordinates>,
+) -> AnyElement {
+    match row {
+        DiffRow::Hunk(header) => render_diff_row(&DiffRow::Hunk(header.clone()), colors),
+        DiffRow::Unified(line) => {
+            render_unified_scrolled(line, colors, horizontal, text_width, root)
+        }
+        DiffRow::Split(row) => render_split_interactive(row, colors, horizontal, text_width, root),
+        DiffRow::Thread(thread) => render_inline_thread(
+            thread,
+            colors,
+            root,
+            reply_input,
+            reply_target,
+            pending_review,
+        ),
+        DiffRow::Composer {
+            side,
+            start_line,
+            line,
+        } => render_inline_composer(
+            *side,
+            *start_line,
+            *line,
+            split_mode,
+            colors,
+            root,
+            composer_input,
+        ),
+    }
+}
+
+fn render_unified_scrolled(
+    line: &DiffLine,
+    colors: Palette,
+    horizontal: &ScrollHandle,
+    text_width: f32,
+    root: &Entity<Root>,
+) -> AnyElement {
+    let (background, foreground, marker) = line_colors(line.kind, colors);
+    let side_and_line = line
+        .new_line
+        .map(|line| (DiffSide::New, line))
+        .or_else(|| line.old_line.map(|line| (DiffSide::Old, line)));
+    let mut row = div()
+        .h(px(24.))
+        .w_full()
+        .flex()
+        .items_center()
+        .bg(background)
+        .font_family(CODE_FONT)
+        .text_xs()
+        .child(line_number(line.old_line, colors))
+        .child(line_number(line.new_line, colors))
+        .child(
+            div()
+                .w(px(18.))
+                .flex_none()
+                .text_color(foreground)
+                .child(marker),
+        )
+        .child(
+            div()
+                .id("unified-source")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .overflow_x_scroll()
+                .restrict_scroll_to_axis()
+                .track_scroll(horizontal)
+                .child(line_text(&line.text, foreground).w(px(text_width)).h_full()),
+        );
+    if let Some((side, line)) = side_and_line {
+        let entity = root.clone();
+        row = row
+            .cursor_pointer()
+            .hover(|row| row.border_l_2().border_color(colors.accent))
+            .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                entity.update(cx, |root, cx| {
+                    if let Root::Review(this) = root {
+                        this.open_inline_composer(side, line, event.modifiers.shift, window, cx);
+                    }
+                });
+            });
+    }
+    row.into_any_element()
+}
+
+fn render_split_interactive(
+    row: &AlignedRow,
+    colors: Palette,
+    horizontal: &ScrollHandle,
+    text_width: f32,
+    root: &Entity<Root>,
+) -> AnyElement {
+    div()
+        .h(px(24.))
+        .w_full()
+        .flex()
+        .overflow_hidden()
+        .font_family(CODE_FONT)
+        .text_xs()
+        .child(split_cell_scrolled_interactive(
+            row.old.as_ref(),
+            true,
+            colors,
+            horizontal,
+            text_width,
+            root,
+        ))
+        .child(split_cell_scrolled_interactive(
+            row.new.as_ref(),
+            false,
+            colors,
+            horizontal,
+            text_width,
+            root,
+        ))
+        .into_any_element()
+}
+
+fn render_inline_thread(
+    thread: &InlineThread,
+    colors: Palette,
+    root: &Entity<Root>,
+    reply_input: &Entity<TextareaState>,
+    reply_target: Option<&cibergit::domain::ProviderCoordinates>,
+    pending_review: Option<&cibergit::domain::ProviderCoordinates>,
+) -> AnyElement {
+    let state = if thread.thread.resolved {
+        "Resolved"
+    } else if thread.thread.outdated {
+        "Outdated"
+    } else {
+        "Open"
+    };
+    let remote_id = thread.thread.coordinates.remote_id.clone();
+    let coordinate = thread.thread.coordinates.clone();
+    let resolved = thread.thread.resolved;
+    let entity = root.clone();
+    let reply_entity = root.clone();
+    let reply_coordinate = thread.thread.coordinates.clone();
+    let replying = reply_target == Some(&thread.thread.coordinates);
+    let mut card = div()
+        .w_full()
+        .min_h(px(72.))
+        .px_4()
+        .py_3()
+        .bg(if colors.dark {
+            rgba(0x232934ff)
+        } else {
+            rgba(0xf2f6fcff)
+        })
+        .border_y_1()
+        .border_color(colors.border)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .text_xs()
+                .child(format!("Review thread · {state}"))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            action_link_with_id(
+                                format!("thread-reply-{remote_id}"),
+                                "Reply…",
+                                colors,
+                            )
+                            .on_click(move |_, window, cx| {
+                                reply_entity.update(cx, |root, cx| {
+                                    if let Root::Review(this) = root
+                                        && let Some(index) = this.active_tab
+                                    {
+                                        this.tabs[index].reply_thread =
+                                            Some(reply_coordinate.clone());
+                                        this.reply_input.update(cx, |input, cx| {
+                                            input.set_value("", window, cx);
+                                            input.focus(window, cx);
+                                        });
+                                        this.rebuild_diff(index, this.wide);
+                                        cx.notify();
+                                    }
+                                });
+                            }),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("thread-resolve-{remote_id}")))
+                                .cursor_pointer()
+                                .text_color(colors.accent)
+                                .child(if resolved { "Unresolve" } else { "Resolve" })
+                                .on_click(move |_, _, cx| {
+                                    entity.update(cx, |root, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.dispatch_auxiliary_action(
+                                                ReviewAuxiliaryAction::SetThreadResolved {
+                                                    thread: coordinate.clone(),
+                                                    resolved: !resolved,
+                                                },
+                                                cx,
+                                            );
+                                        }
+                                    });
+                                }),
+                        ),
+                ),
+        );
+    for (position, comment) in thread.thread.comments.iter().enumerate() {
+        card = card.child(
+            div()
+                .mt_2()
+                .pl_3()
+                .border_l_2()
+                .border_color(colors.accent)
+                .child(
+                    div().text_xs().text_color(colors.muted).child(
+                        comment
+                            .author
+                            .as_deref()
+                            .unwrap_or("Unknown author")
+                            .to_owned(),
+                    ),
+                )
+                .child(markdown_text(
+                    format!("inline-thread-{remote_id}-{position}"),
+                    &comment.body,
+                    colors,
+                )),
+        );
+    }
+    if !thread.thread.comments_complete {
+        card = card.child(
+            div()
+                .mt_2()
+                .text_xs()
+                .text_color(colors.amber)
+                .child("Thread replies are partial; GitHub response limits were reached."),
+        );
+    }
+    if replying {
+        let immediate_root = root.clone();
+        let pending_root = root.clone();
+        let cancel_root = root.clone();
+        let target = thread.thread.coordinates.clone();
+        let pending_target = thread.thread.coordinates.clone();
+        let pending_review = pending_review.cloned();
+        card = card.child(
+            div()
+                .mt_3()
+                .h(px(82.))
+                .border_1()
+                .border_color(colors.border)
+                .rounded_md()
+                .overflow_hidden()
+                .child(Textarea::new(reply_input)),
+        );
+        card = card.child(
+            div()
+                .mt_2()
+                .flex()
+                .gap_2()
+                .text_xs()
+                .when_some(pending_review, |row, pending_review| {
+                    row.child(
+                        action_link_with_id(
+                            format!("thread-pending-reply-{remote_id}"),
+                            "Reply in pending review",
+                            colors,
+                        )
+                        .on_click(move |_, _, cx| {
+                            pending_root.update(cx, |root, cx| {
+                                if let Root::Review(this) = root {
+                                    let body = this.reply_input.read(cx).value().to_string();
+                                    this.dispatch_auxiliary_action(
+                                        ReviewAuxiliaryAction::Reply {
+                                            thread: pending_target.clone(),
+                                            pending_review: Some(pending_review.clone()),
+                                            body,
+                                        },
+                                        cx,
+                                    );
+                                }
+                            });
+                        }),
+                    )
+                })
+                .child(
+                    action_link_with_id(
+                        format!("thread-immediate-reply-{remote_id}"),
+                        "Reply immediately",
+                        colors,
+                    )
+                    .on_click(move |_, _, cx| {
+                        immediate_root.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                let body = this.reply_input.read(cx).value().to_string();
+                                this.dispatch_auxiliary_action(
+                                    ReviewAuxiliaryAction::Reply {
+                                        thread: target.clone(),
+                                        pending_review: None,
+                                        body,
+                                    },
+                                    cx,
+                                );
+                            }
+                        });
+                    }),
+                )
+                .child(
+                    action_link_with_id(
+                        format!("thread-cancel-reply-{remote_id}"),
+                        "Cancel reply",
+                        colors,
+                    )
+                    .on_click(move |_, _, cx| {
+                        cancel_root.update(cx, |root, cx| {
+                            if let Root::Review(this) = root
+                                && let Some(index) = this.active_tab
+                            {
+                                this.tabs[index].reply_thread = None;
+                                this.rebuild_diff(index, this.wide);
+                                cx.notify();
+                            }
+                        });
+                    }),
+                ),
+        );
+    }
+    card.into_any_element()
+}
+
+fn render_inline_composer(
+    side: DiffSide,
+    start_line: u64,
+    line: u64,
+    split_mode: bool,
+    colors: Palette,
+    root: &Entity<Root>,
+    input: &Entity<TextareaState>,
+) -> AnyElement {
+    let range = if start_line == line {
+        format!("{} line {line}", side.provider_name())
+    } else {
+        format!("{} lines {start_line}–{line}", side.provider_name())
+    };
+    let save_root = root.clone();
+    let pending_root = root.clone();
+    let immediate_root = root.clone();
+    let cancel_root = root.clone();
+    div()
+        .w_full()
+        .min_h(px(172.))
+        .px_4()
+        .py_3()
+        .bg(if colors.dark {
+            rgba(0x202a24ff)
+        } else {
+            rgba(0xf0f8f3ff)
+        })
+        .border_y_1()
+        .border_color(colors.green)
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .text_xs()
+                .text_color(colors.muted)
+                .child(format!("New inline comment · {range}"))
+                .child(if split_mode {
+                    "Split diff"
+                } else {
+                    "Unified diff"
+                }),
+        )
+        .child(
+            div()
+                .mt_2()
+                .h(px(88.))
+                .border_1()
+                .border_color(colors.border)
+                .rounded_md()
+                .overflow_hidden()
+                .child(Textarea::new(input)),
+        )
+        .child(
+            div()
+                .mt_2()
+                .flex()
+                .items_center()
+                .gap_3()
+                .text_xs()
+                .child(
+                    action_link("Save locally", colors).on_click(move |_, _, cx| {
+                        save_root.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                this.persist_composer(cx);
+                            }
+                        });
+                    }),
+                )
+                .child(
+                    action_link("Add to pending review", colors).on_click(move |_, _, cx| {
+                        pending_root.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                this.start_comment_write(false, cx);
+                            }
+                        });
+                    }),
+                )
+                .child(
+                    action_link("Post immediately", colors).on_click(move |_, _, cx| {
+                        immediate_root.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                this.start_comment_write(true, cx);
+                            }
+                        });
+                    }),
+                )
+                .child(div().flex_1())
+                .child(action_link("Close", colors).on_click(move |_, _, cx| {
+                    cancel_root.update(cx, |root, cx| {
+                        if let Root::Review(this) = root
+                            && let Some(index) = this.active_tab
+                            && !this.tabs[index].write_in_flight
+                        {
+                            if let InteractionState::Ready(controller) =
+                                &mut this.tabs[index].interactions
+                            {
+                                controller.composer = None;
+                            }
+                            this.rebuild_diff(index, this.wide);
+                            cx.notify();
+                        }
+                    });
+                })),
+        )
+        .into_any_element()
 }
 
 fn diff_horizontal_scrollbar(index: usize, horizontal: &ScrollHandle) -> Div {
@@ -5703,52 +8643,6 @@ fn diff_horizontal_scrollbar(index: usize, horizontal: &ScrollHandle) -> Div {
                 .id(SharedString::from(format!("diff-scrollbar-{index}")))
                 .viewport_from_layout(),
         )
-}
-
-fn render_split_diff_row(
-    row: &DiffRow,
-    colors: Palette,
-    horizontal: &ScrollHandle,
-    text_width: f32,
-) -> AnyElement {
-    match row {
-        DiffRow::Hunk(header) => div()
-            .h(px(26.))
-            .w_full()
-            .px_3()
-            .flex()
-            .items_center()
-            .overflow_hidden()
-            .bg(colors.elevated)
-            .text_color(colors.accent)
-            .font_family(CODE_FONT)
-            .text_xs()
-            .child(header.clone())
-            .into_any_element(),
-        DiffRow::Split(row) => div()
-            .h(px(24.))
-            .w_full()
-            .flex()
-            .overflow_hidden()
-            .font_family(CODE_FONT)
-            .text_xs()
-            .child(split_cell_scrolled(
-                row.old.as_ref(),
-                true,
-                colors,
-                horizontal,
-                text_width,
-            ))
-            .child(split_cell_scrolled(
-                row.new.as_ref(),
-                false,
-                colors,
-                horizontal,
-                text_width,
-            ))
-            .into_any_element(),
-        DiffRow::Unified(_) => render_diff_row(row, colors),
-    }
 }
 
 fn line_number(number: Option<u64>, colors: Palette) -> Div {
@@ -5862,6 +8756,33 @@ fn split_cell_scrolled(
                 .track_scroll(horizontal)
                 .child(line_text(text, foreground).w(px(text_width)).h_full()),
         )
+}
+
+fn split_cell_scrolled_interactive(
+    line: Option<&DiffLine>,
+    old: bool,
+    colors: Palette,
+    horizontal: &ScrollHandle,
+    text_width: f32,
+    root: &Entity<Root>,
+) -> Div {
+    let mut cell = split_cell_scrolled(line, old, colors, horizontal, text_width);
+    let number = line.and_then(|line| if old { line.old_line } else { line.new_line });
+    if let Some(number) = number {
+        let side = if old { DiffSide::Old } else { DiffSide::New };
+        let entity = root.clone();
+        cell = cell
+            .cursor_pointer()
+            .hover(|cell| cell.border_b_1().border_color(colors.accent))
+            .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                entity.update(cx, |root, cx| {
+                    if let Root::Review(this) = root {
+                        this.open_inline_composer(side, number, event.modifiers.shift, window, cx);
+                    }
+                });
+            });
+    }
+    cell
 }
 
 pub struct EditorWorkspace {
@@ -6058,7 +8979,31 @@ mod layout_tests {
         assert!(safe.contains("Issue fields are not currently available"));
         assert!(safe.contains("\\`gh\\`"));
         assert!(safe.contains("```sh"));
-        assert!(safe.contains("[Image: unsafe]"));
+        assert!(safe.contains("[Image omitted: unsafe]"));
         assert!(!safe.contains("!["));
+    }
+
+    #[test]
+    fn markdown_code_fixtures_are_literal_while_prose_is_sanitized() {
+        let fenced = "```text\n`literal` <!-- keep --> <tag> ![code](asset.png)\n```";
+        let indented = "    `literal` <!-- keep --> <tag> ![code](asset.png)";
+        let source = format!(
+            "Before `bounded` words <!-- remove --> <video> ![prose](asset.png)\n\n{fenced}\n\n{indented}"
+        );
+        let safe = media_free_markdown(&source);
+        assert!(safe.contains("Before \\`bounded\\` words  &lt;video&gt; [Image omitted: prose]"));
+        assert!(safe.contains(fenced));
+        assert!(safe.contains(indented));
+    }
+
+    #[test]
+    fn narrow_prose_workaround_only_escapes_short_backtick_delimiters() {
+        let source =
+            "Several ordinary words before `inline code` and several ordinary words after.";
+        let safe = media_free_markdown(source);
+        assert_eq!(
+            safe,
+            "Several ordinary words before \\`inline code\\` and several ordinary words after."
+        );
     }
 }
