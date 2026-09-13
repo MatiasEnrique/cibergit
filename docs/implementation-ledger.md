@@ -4,6 +4,18 @@ Baseline: `23db8a1ff11ccb7dead7b4c2ca9d280e7945cdb3`, recorded 2026-09-12. Sourc
 
 PLAN-1 owns this file only. Its assigned thread is `thr_germtczfdt`, branch `worker/requirements`, worktree `/Users/matias/Development/cibergit-requirements`, and base is the baseline above. Parent `thr_w6kmysabvr` owns integration, source, manifests, lockfiles, and shared contracts. Integration branch is `integration/v1` in `/Users/matias/Development/cibergit`, observed at the baseline. The PLAN-1 commit and verified artifact/version IDs belong in its durable handoff and the parent's state checkpoint; this initial file does not predict those IDs or its own commit SHA.
 
+## Execution checkpoint — 2026-09-12
+
+The initial ledger was integrated at `165b1ed` from worker commit `b4fb5df3dffaf06edf062930a0aa78562d5bb54f`. Its source coverage artifact is `art_c809ecdc-d937-4a8b-86e0-771ddffcd5b6`, version `av_ec810d11-a8a5-4f74-b223-374812676e61`.
+
+M0 native foundation is integrated at `5abd59c` and shared contracts at `2734890`. Build, native Metal-rendered text, GPUI Kit buffer edit and disk save round-trip passed. macOS 15 is the minimum deployment target; runtime validated on macOS 26.5.2 Apple Silicon. Full physical input/AX and oldest-supported-OS validation remain M5 evidence. The disposable-file editor preview does not claim M3 race-safe saving or syntax highlighting yet. Audit: `art_6e2ffc7c-6d8e-48e4-9c32-a21d024287ee`; native evidence: `art_38b8ddbc-509d-449c-bab5-85e11a1c88e4` (use latest verified revision in coordinator state).
+
+M1 work is underway. Account/provider transport: `thr_8bjg7f39hz`, branch `worker/provider`, worktree `/Users/matias/Development/cibergit-provider`, base `27348909fe5e7f8042d8501e62d73d27f169a775`. Immutable/local diff core: `thr_hdkztpg3pr`, branch `worker/review`, worktree `/Users/matias/Development/cibergit-review`, same base. These are prerequisite implementation slices of the M1 tasks; no end-to-end M1 task is accepted yet.
+
+Initial personal workspace/filter/cache source and three behavior tests are integrated at `165c3f8`. The M1-STATE backend is under independent Grok review by `thr_3sn2q2yqcx` on `worker/workspace-review`, worktree `/Users/matias/Development/cibergit-workspace-review`, base `165c3f88e654e82168a007892a59805bf4c51c56`. Per-repository account keys and separate draft files are implemented; complete offline/pending-review/session recovery awaits UI and M2 integration. JSON with atomic private-file replacement is an accepted reversible engineering choice for this early milestone, not an interview decision.
+
+The user now requests most implementation delegation to `gpt-5.6-sol` and use of Grok agents. The permanent coordinator retains integration/verification. Every original agreed behavior below remains in scope; all unanswered decisions remain open.
+
 ## Reading and maintaining the ledger
 
 Every acceptance row links an agreed requirement or a documented engineering check to an executable task. Task records supply milestone, dependencies, assignment, status, integration, and artifact fields. Evidence in the acceptance map is required future evidence, not a reported passing result. `P` means product requirements, `T` technical design, and `C` coordinator brief. Q references preserve the origins actually present in those sources.
@@ -25,9 +37,9 @@ Dependencies name tasks or `G0` through `G5`, the runnable milestone gates below
 
 | Task | Deliverable and acceptance rows | Milestone | Dependencies | Assignment | Initial status | Integration commit | Artifact IDs / versions |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| M0-ENV | Validate toolchain, compatible pins and native editor proof; F01, F02, E01 | M0 | None | C0 | running | pending | pending |
-| M0-BUILD | Reproducible build/run instructions, license inventory; F03, E02 | M0 | M0-ENV | C0 | dependent | pending | pending |
-| M0-CONTRACT | Establish only needed shared state/provider/operation contracts; E03, E04 | M0 | M0-ENV | C0 | dependent | pending | pending |
+| M0-ENV | Validate toolchain, compatible pins and native editor proof; F01, F02, E01 | M0 | None | C0 | verified | 5abd59c | art_6e2ffc7c-6d8e-48e4-9c32-a21d024287ee; art_38b8ddbc-509d-449c-bab5-85e11a1c88e4 |
+| M0-BUILD | Reproducible build/run instructions, license inventory; F03, E02 | M0 | M0-ENV | C0 | verified | 5abd59c | art_38b8ddbc-509d-449c-bab5-85e11a1c88e4 |
+| M0-CONTRACT | Establish only needed shared state/provider/operation contracts; E03, E04 | M0 | M0-ENV | C0 | verified | 2734890 | art_4093b33c-94aa-410e-88b3-3ff83175ee7e |
 | M1-ACCOUNT | Existing gh accounts, provider transport and isolation; F04, F05, W02, E05, E06 | M1 | G0 | U | dependent | pending | pending |
 | M1-REPOS | Explicit local/remote repository setup and personal persistence; F06, W01, W03 | M1 | M1-ACCOUNT, M1-STATE | U | dependent | pending | pending |
 | M1-STATE | Durable session, cache and drafts; E04, E07 | M1 | G0 | U | dependent | pending | pending |
