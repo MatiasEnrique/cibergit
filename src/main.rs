@@ -59,6 +59,18 @@ actions!(
 actions!(
     cibergit,
     [
+        OpenPullRequestCreation,
+        PreparePullRequestCreation,
+        ConfirmPullRequestCreation,
+        CancelPullRequestCreation,
+        ClosePullRequestCreation,
+        TogglePullRequestCreationDraft,
+        OpenCreatedPullRequest,
+    ]
+);
+actions!(
+    cibergit,
+    [
         FileTreeUp,
         FileTreeDown,
         FileTreeLeft,
@@ -175,6 +187,16 @@ fn main() {
             KeyBinding::new("cmd-shift-i", ToggleInspector, None),
             KeyBinding::new("cmd-shift-d", CycleDiffMode, None),
             KeyBinding::new("cmd-o", OpenRepositorySetup, None),
+            KeyBinding::new("cmd-shift-n", OpenPullRequestCreation, None),
+            KeyBinding::new("cmd-enter", PreparePullRequestCreation, Some("PrCreation")),
+            KeyBinding::new(
+                "cmd-shift-enter",
+                ConfirmPullRequestCreation,
+                Some("PrCreation"),
+            ),
+            KeyBinding::new("escape", CancelPullRequestCreation, Some("PrCreation")),
+            KeyBinding::new("cmd-escape", ClosePullRequestCreation, Some("PrCreation")),
+            KeyBinding::new("cmd-d", TogglePullRequestCreationDraft, Some("PrCreation")),
             KeyBinding::new("c", ComposeInlineComment, Some("DiffPane")),
             KeyBinding::new("cmd-enter", SaveReviewDraft, Some("ReviewComposer")),
             KeyBinding::new("cmd-shift-enter", AddPendingComment, Some("ReviewComposer")),

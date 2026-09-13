@@ -3,9 +3,10 @@ use crate::{
     ComposeInlineComment, ConfirmPrMutation, CycleDiffMode, DetailsNarrower, DetailsWider,
     DiffScrollEnd, DiffScrollHome, DiffScrollLeft, DiffScrollRight, EditPrMetadata,
     FileTreeActivate, FileTreeDown, FileTreeLeft, FileTreeNarrower, FileTreeRight, FileTreeUp,
-    FileTreeWider, MergePullRequest, NewPrDiscussion, NextFile, OpenRepositorySetup, OpenStackView,
-    PostImmediateComment, PreviousFile, Refresh, RefreshStackView, ResetLayout,
-    ReturnToPullRequest, Save, SaveReviewDraft, SelectFullComparison, SelectNextComparisonCommit,
+    FileTreeWider, MergePullRequest, NewPrDiscussion, NextFile, OpenCreatedPullRequest,
+    OpenPullRequestCreation, OpenRepositorySetup, OpenStackView, PostImmediateComment,
+    PreviousFile, Refresh, RefreshStackView, ResetLayout, ReturnToPullRequest, Save,
+    SaveReviewDraft, SelectFullComparison, SelectNextComparisonCommit,
     SelectPreviousComparisonCommit, SelectSinceLastReview, SidebarNarrower, SidebarWider,
     SubmitReview, ToggleComparisonPicker, ToggleFileTree, ToggleInspector, TogglePalette,
     ToggleSidebar, ToggleStackRelationships,
@@ -15,6 +16,7 @@ mod file_tree;
 mod local_checkout;
 #[allow(dead_code)] // Public component surface also serves standalone native verification.
 mod local_workspace;
+mod pr_creation;
 mod pr_lifecycle;
 mod review_interactions;
 mod stack_view;
@@ -730,6 +732,7 @@ pub struct ReviewWorkspace {
     active_tab: Option<usize>,
     setup_open: bool,
     command_palette: bool,
+    creation_dialog: Option<Entity<pr_creation::PrCreationDialog>>,
     inspector_open: bool,
     focused: bool,
     wide: bool,
@@ -977,6 +980,7 @@ impl ReviewWorkspace {
             active_tab: None,
             setup_open: startup.repository.is_none(),
             command_palette: false,
+            creation_dialog: None,
             inspector_open: true,
             focused: window.is_window_active(),
             wide: false,
@@ -1160,6 +1164,59 @@ impl ReviewWorkspace {
         this
     }
 
+    fn open_creation_dialog(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        if self
+            .creation_dialog
+            .as_ref()
+            .is_some_and(|dialog| !dialog.read(cx).is_closed())
+        {
+            self.status = "Finish or close the current pull-request creation form first; its pending durable save was not detached.".into();
+            cx.notify();
+            return;
+        }
+        let preferred = self
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.repository.clone());
+        let account = preferred
+            .as_ref()
+            .map(|repository| repository.account.clone())
+            .or_else(|| self.accounts.get(self.selected_account).cloned());
+        let Some(account) = account else {
+            self.status =
+                "Add a repository and choose its GitHub account before creating a pull request."
+                    .into();
+            cx.notify();
+            return;
+        };
+        let mut repositories = Vec::new();
+        for runtime in &self.repositories {
+            if runtime.repository.account == account
+                && !repositories.iter().any(|repository: &Repository| {
+                    repository.cache_key() == runtime.repository.cache_key()
+                })
+            {
+                repositories.push(runtime.repository.clone());
+            }
+        }
+        if repositories.is_empty() {
+            self.status =
+                "No explicitly added repository is available for the selected account.".into();
+            cx.notify();
+            return;
+        }
+        let root = self
+            .interaction_root
+            .parent()
+            .expect("interaction root has parent")
+            .join("pr-creation");
+        self.creation_dialog = Some(cx.new(|cx| {
+            pr_creation::PrCreationDialog::new(root, repositories, preferred, window, cx)
+        }));
+        self.command_palette = false;
+        cx.notify();
+    }
+
     fn discover_accounts(&mut self, requested: Option<String>, cx: &mut Context<Root>) {
         let task = cx.background_spawn(async { GithubProvider::accounts() });
         cx.spawn(async move |root, cx| {
@@ -1283,6 +1340,10 @@ impl ReviewWorkspace {
         }
         if std::env::var_os("CIBERGIT_SMOKE_LIFECYCLE").is_some() {
             self.start_lifecycle_smoke(window, cx, output);
+            return;
+        }
+        if std::env::var_os("CIBERGIT_SMOKE_PR_CREATION").is_some() {
+            pr_creation::start_smoke(cx.weak_entity(), output, window, cx);
             return;
         }
         let weak = cx.weak_entity();
@@ -8275,6 +8336,30 @@ impl ReviewWorkspace {
                     cx.notify();
                 }
             }))
+            .on_action(cx.listener(|root, _: &OpenPullRequestCreation, window, cx| {
+                if let Root::Review(this) = root {
+                    this.open_creation_dialog(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &OpenCreatedPullRequest, _, cx| {
+                if let Root::Review(this) = root
+                    && let Some(dialog) = this.creation_dialog.as_ref()
+                    && let Some(acknowledgement) = dialog.read(cx).acknowledgement()
+                {
+                    let key = acknowledgement.target_repository.cache_key();
+                    if let Some(index) = this
+                        .repositories
+                        .iter()
+                        .position(|runtime| runtime.repository.cache_key() == key)
+                    {
+                        this.open_pr(index, acknowledgement.pull_request.pull_request, cx);
+                        this.creation_dialog = None;
+                    } else {
+                        this.status = "The acknowledged PR belongs to a repository that is no longer explicitly selected. Exact coordinates remain in the durable creation record.".into();
+                        cx.notify();
+                    }
+                }
+            }))
             .on_action(cx.listener(|root, _: &ComposeInlineComment, window, cx| {
                 if let Root::Review(this) = root {
                     this.compose_first_selectable(window, cx);
@@ -8472,6 +8557,7 @@ impl ReviewWorkspace {
             .when(self.view_editor.is_open(), |root| {
                 root.child(self.render_view_editor(colors, cx))
             })
+            .when_some(self.creation_dialog.clone(), |root, dialog| root.child(dialog))
     }
 
     fn render_splitter(
@@ -8921,6 +9007,27 @@ impl ReviewWorkspace {
                     .py_3()
                     .border_t_1()
                     .border_color(colors.border)
+                    .child(
+                        div()
+                            .id("open-pr-creation")
+                            .h(px(32.))
+                            .px_3()
+                            .mb_2()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .bg(colors.text)
+                            .text_color(colors.canvas)
+                            .cursor_pointer()
+                            .hover(|button| button.opacity(0.9))
+                            .child("Create pull request  ⇧⌘N")
+                            .on_click(cx.listener(|root, _, window, cx| {
+                                if let Root::Review(this) = root {
+                                    this.open_creation_dialog(window, cx);
+                                }
+                            })),
+                    )
                     .child(
                         div()
                             .id("add-repository")

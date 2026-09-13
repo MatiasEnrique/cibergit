@@ -1321,14 +1321,18 @@ else:
             })
         }
 
-        fn creation_read_steps(head: &str) -> Vec<Value> {
+        fn creation_read_steps_at(base: &str, head: &str) -> Vec<Value> {
             vec![
                 get_step("user", json!({"login":"alice"})),
                 get_step("repos/owner/repo", creation_repo("owner/repo", true, false, None)),
                 get_step("repos/forker/fork", creation_repo("forker/fork", true, true, Some("owner/repo"))),
-                get_step("repos/owner/repo/git/ref/heads/main", json!({"ref":"refs/heads/main","object":{"sha":BASE}})),
+                get_step("repos/owner/repo/git/ref/heads/main", json!({"ref":"refs/heads/main","object":{"sha":base}})),
                 get_step("repos/forker/fork/git/ref/heads/feature", json!({"ref":"refs/heads/feature","object":{"sha":head}})),
             ]
+        }
+
+        fn creation_read_steps(head: &str) -> Vec<Value> {
+            creation_read_steps_at(BASE, head)
         }
 
         fn creation_input() -> PullRequestCreationInput {
@@ -1392,6 +1396,94 @@ else:
             invalid.source_branch = "feature..moved".into();
             assert!(invalid_provider.prepare_pr_creation(&invalid).is_err());
             assert_eq!(file_count(&invalid_dir, "count"), 0);
+        }
+
+        #[test]
+        fn creation_preparation_accepts_explicit_same_repository_published_refs() {
+            let _serial = lifecycle_test_lock();
+            let steps = vec![
+                get_step("user", json!({"login":"alice"})),
+                get_step("repos/owner/repo", creation_repo("owner/repo", true, true, None)),
+                get_step("repos/owner/repo", creation_repo("owner/repo", true, true, None)),
+                get_step("repos/owner/repo/git/ref/heads/main", json!({"ref":"refs/heads/main","object":{"sha":BASE}})),
+                get_step("repos/owner/repo/git/ref/heads/feature", json!({"ref":"refs/heads/feature","object":{"sha":HEAD}})),
+            ];
+            let (dir, provider) = lifecycle_fixture("alice", steps);
+            let mut input = creation_input();
+            input.source_repository = lifecycle_repo("alice");
+            input.local_branch = Some("local-name-is-only-information".into());
+            let preparation = provider.prepare_pr_creation(&input).unwrap();
+            assert_eq!(preparation.observed_base_sha, BASE);
+            assert_eq!(preparation.observed_source_head_sha, HEAD);
+            assert_eq!(preparation.input.local_branch.as_deref(), Some("local-name-is-only-information"));
+            assert_eq!(file_count(&dir, "writes"), 0);
+        }
+
+        #[test]
+        fn creation_missing_ref_foreign_account_repo_and_capability_are_read_only_refusals() {
+            let _serial = lifecycle_test_lock();
+            let missing_steps = vec![
+                get_step("user", json!({"login":"alice"})),
+                get_step("repos/owner/repo", creation_repo("owner/repo", true, false, None)),
+                get_step("repos/forker/fork", creation_repo("forker/fork", true, true, Some("owner/repo"))),
+                get_step("repos/owner/repo/git/ref/heads/main", json!({"ref":"refs/heads/main","object":{"sha":BASE}})),
+                json!({"transport":"get","endpoint":"repos/forker/fork/git/ref/heads/feature","response":null,"fail":true}),
+            ];
+            let (missing_dir, missing_provider) = lifecycle_fixture("alice", missing_steps);
+            assert!(missing_provider.prepare_pr_creation(&creation_input()).is_err());
+            assert_eq!(file_count(&missing_dir, "writes"), 0);
+
+            let foreign_account_steps = vec![get_step("user", json!({"login":"mallory"}))];
+            let (account_dir, account_provider) = lifecycle_fixture("alice", foreign_account_steps);
+            assert!(account_provider.prepare_pr_creation(&creation_input()).is_err());
+            assert_eq!(file_count(&account_dir, "writes"), 0);
+
+            let foreign_repo_steps = vec![
+                get_step("user", json!({"login":"alice"})),
+                get_step("repos/owner/repo", creation_repo("other/repo", true, false, None)),
+            ];
+            let (repo_dir, repo_provider) = lifecycle_fixture("alice", foreign_repo_steps);
+            assert!(repo_provider.prepare_pr_creation(&creation_input()).is_err());
+            assert_eq!(file_count(&repo_dir, "writes"), 0);
+
+            for (target_pull, source_push) in [(false, true), (true, false)] {
+                let steps = vec![
+                    get_step("user", json!({"login":"alice"})),
+                    get_step("repos/owner/repo", creation_repo("owner/repo", target_pull, false, None)),
+                    get_step("repos/forker/fork", creation_repo("forker/fork", true, source_push, Some("owner/repo"))),
+                    get_step("repos/owner/repo/git/ref/heads/main", json!({"ref":"refs/heads/main","object":{"sha":BASE}})),
+                    get_step("repos/forker/fork/git/ref/heads/feature", json!({"ref":"refs/heads/feature","object":{"sha":HEAD}})),
+                ];
+                let (dir, provider) = lifecycle_fixture("alice", steps);
+                let preparation = provider.prepare_pr_creation(&creation_input()).unwrap();
+                assert!(!preparation.can_create.available);
+                assert_eq!(file_count(&dir, "writes"), 0);
+            }
+        }
+
+        #[test]
+        fn creation_second_preflight_persists_not_started_for_moved_source_or_base() {
+            let _serial = lifecycle_test_lock();
+            for (label, fresh) in [
+                ("source", creation_read_steps_at(BASE, NEW_HEAD)),
+                ("base", creation_read_steps_at(NEW_HEAD, HEAD)),
+            ] {
+                let mut steps = creation_read_steps(HEAD);
+                steps.extend(creation_read_steps(HEAD));
+                steps.extend(fresh);
+                let (dir, provider) = lifecycle_fixture("alice", steps);
+                let preparation = provider.prepare_pr_creation(&creation_input()).unwrap();
+                let request = PullRequestCreationRequest {
+                    operation_id: format!("op-moved-{label}"),
+                    attempt_id: format!("attempt-moved-{label}"),
+                    preparation,
+                };
+                let mut admission = FakeAdmission::new();
+                let outcome = provider.execute_pr_creation(&request, &mut admission);
+                assert!(matches!(outcome, ProviderMutationOutcome::PreflightRejected { .. }));
+                assert_eq!(file_count(&dir, "writes"), 0);
+                assert!(matches!(admission.state.borrow().records.as_slice(), [MutationTerminalRecord::NotStarted { .. }]));
+            }
         }
 
         #[test]
