@@ -32,6 +32,7 @@ use std::{
 
 const RECORD_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_ARCHIVED_OPERATIONS: usize = 128;
 const MAX_COMMITS: usize = 4_096;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_INVENTORY_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -253,9 +254,32 @@ pub struct OperationView {
     pub resulting_commits: Vec<CommitEntry>,
     pub stash: Option<StashReceipt>,
     pub stash_restore: StashRestoreState,
+    pub split: Option<SplitState>,
     pub evidence: Vec<TransitionEvidence>,
     pub publish_warning: Option<String>,
     pub publish_handoff: Option<PublishHandoff>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitState {
+    pub stopped_oid: String,
+    /// The rewritten commit Git actually stopped on before the mixed reset.
+    /// This is optional only when reading a record written by an older build.
+    pub rewritten_stopped_oid: Option<String>,
+    pub parent_oid: String,
+    pub required_tree_oid: String,
+    /// Zero after the mixed reset, then the first-parent count from `parent_oid`.
+    pub replacement_commit_count: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchivedOperation {
+    pub operation_id: String,
+    pub state: OperationState,
+    pub stash: Option<StashReceipt>,
+    pub stash_restore: StashRestoreState,
+    /// A stable filename below this store partition's private `archive` directory.
+    pub archive_file_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,7 +387,7 @@ struct ScopeIdentity {
     common_git_dir_identity: FilesystemIdentity,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum AttemptAction {
     None,
     CreateStash,
@@ -377,11 +401,32 @@ enum AttemptAction {
     CommitSplit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlTransition {
+    Continue,
+    Skip,
+    Abort,
+    FinishSplit,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SplitRecord {
     stopped_oid: String,
+    #[serde(default)]
+    rewritten_stopped_oid: Option<String>,
     parent_oid: String,
     required_tree_oid: String,
+    #[serde(default)]
+    replacement_commit_count: Option<usize>,
+    #[serde(default)]
+    finish_validated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct EditStopRecord {
+    stopped_oid: String,
+    rewritten_head_oid: String,
+    tree_oid: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,6 +443,8 @@ struct StoredRecord {
     stash_expected_untracked: bool,
     stash: Option<StashReceipt>,
     stash_restore: StashRestoreState,
+    #[serde(default)]
+    edit_stop: Option<EditStopRecord>,
     split: Option<SplitRecord>,
     resulting_commits: Vec<CommitEntry>,
     evidence: Vec<TransitionEvidence>,
@@ -653,6 +700,25 @@ impl RebaseStore {
         }))
     }
 
+    /// Retires a conclusively inactive operation while preserving its complete,
+    /// checksummed journal as private archived evidence.
+    ///
+    /// Uncertain outcomes deliberately have no acknowledgement shortcut. A
+    /// caller must leave them live until a future API can accept authoritative
+    /// concrete outcome proof.
+    pub fn retire_operation(&self, operation_id: &str) -> Result<ArchivedOperation> {
+        let _record_guard = self.lock_record()?;
+        let mut record = self.require_record(operation_id)?;
+        self.reconcile_record(&mut record)?;
+        self.save_record(&record)?;
+        self.require_safe_retirement(&record)?;
+        record.evidence.push(self.evidence(
+            "operation was explicitly retired after authoritative inactive-state checks".into(),
+        )?);
+        self.save_record(&record)?;
+        self.archive_record(&record)
+    }
+
     pub fn create_stash(&self, preparation: &DirtyPreparation) -> Result<RebasePreparation> {
         let _record_guard = self.lock_record()?;
         self.create_stash_locked(preparation, || {})
@@ -743,6 +809,8 @@ impl RebaseStore {
                     )?,
                 );
                 self.save_record(&record)?;
+                self.require_safe_retirement(&record)?;
+                let _ = self.archive_record(&record)?;
                 return Err(RebaseError::Git(error));
             }
             Err(error) => {
@@ -814,8 +882,9 @@ impl RebaseStore {
             Some(existing)
                 if existing.operation_id == preparation.operation_id
                     && existing.state == OperationState::Prepared
-                    && existing.plan.is_none()
-                    && existing.action == AttemptAction::None =>
+                    && existing.action == AttemptAction::None
+                    && !existing.dispatch_acknowledged
+                    && !self.dispatch_proof_exists(&existing.operation_id)? =>
             {
                 existing
             }
@@ -833,7 +902,16 @@ impl RebaseStore {
         record.state = OperationState::Prepared;
         record.dispatch_acknowledged = false;
         self.save_record(&record)?;
-        self.write_helpers(&record.operation_id, &checked)?;
+        if let Err(error) = self.write_helpers(&record.operation_id, &checked) {
+            record.action = AttemptAction::None;
+            record.evidence.push(
+                self.evidence(
+                    "rebase helpers were not installed, so Git was not dispatched".into(),
+                )?,
+            );
+            self.save_record(&record)?;
+            return Err(error);
+        }
 
         let helpers = self.helper_paths(&record.operation_id);
         let environment = self.helper_environment(&record.operation_id, &helpers);
@@ -869,6 +947,31 @@ impl RebaseStore {
                 )
             });
         let proof = self.dispatch_proof_matches(&record.operation_id)?;
+        if command_result
+            .as_ref()
+            .err()
+            .is_some_and(is_certain_prestart_error)
+            && !proof
+            && !self.dispatch_proof_exists(&record.operation_id)?
+            && !self.active_identity_for_any_marker()?
+        {
+            let error =
+                command_result.expect_err("certain prestart classification requires an error");
+            record.action = AttemptAction::None;
+            record.dispatch_acknowledged = false;
+            record.state = OperationState::Prepared;
+            record.evidence.push(
+                self.evidence(
+                    "interactive rebase was conclusively refused before dispatch".into(),
+                )?,
+            );
+            self.save_record(&record)?;
+            if record.stash.is_none() {
+                self.require_safe_retirement(&record)?;
+                let _ = self.archive_record(&record)?;
+            }
+            return Err(RebaseError::Git(error));
+        }
         record.dispatch_acknowledged = command_result.is_ok() || proof;
         record.state = OperationState::Running;
         record.evidence.push(self.evidence(format!(
@@ -906,9 +1009,7 @@ impl RebaseStore {
             operation_id,
             expected_active,
             guard,
-            AttemptAction::Continue,
-            "continue rebase",
-            "--continue",
+            ControlTransition::Continue,
         )
     }
 
@@ -923,9 +1024,7 @@ impl RebaseStore {
             operation_id,
             expected_active,
             guard,
-            AttemptAction::Skip,
-            "skip rebase commit",
-            "--skip",
+            ControlTransition::Skip,
         )
     }
 
@@ -940,9 +1039,7 @@ impl RebaseStore {
             operation_id,
             expected_active,
             guard,
-            AttemptAction::Abort,
-            "abort rebase",
-            "--abort",
+            ControlTransition::Abort,
         )
     }
 
@@ -984,6 +1081,9 @@ impl RebaseStore {
             self.git
                 .run_worktree_command("amend rebase edit stop", args, true, &[0])
         });
+        if result.is_ok() {
+            record.edit_stop = Some(self.capture_edit_stop(expected_active)?);
+        }
         record.action = AttemptAction::None;
         record
             .evidence
@@ -1006,14 +1106,36 @@ impl RebaseStore {
                 "split is only available once at an edit stop".into(),
             ));
         }
+        let edit_stop = record.edit_stop.clone().ok_or_else(|| {
+            RebaseError::UnsupportedState(
+                "the rewritten edit-stop HEAD has not been durably recorded".into(),
+            )
+        })?;
+        if expected_active.stopped_oid.as_deref() != Some(edit_stop.stopped_oid.as_str()) {
+            return Err(RebaseError::StaleOperation);
+        }
         record.attempt += 1;
         record.action = AttemptAction::BeginSplit;
         self.save_record(&record)?;
         let split = self.git.with_guarded_worktree(guard, |actual| {
             require_no_local_changes(actual, true)?;
             self.require_active_identity(expected_active)?;
+            let actual_head_oid = match &actual.head {
+                HeadState::Attached { oid, .. } | HeadState::Detached { oid } => oid,
+                HeadState::Unborn { .. } => {
+                    return Err(LocalGitError::InvalidInput(
+                        "edit stop has no concrete HEAD",
+                    ));
+                }
+            };
+            let actual_tree_oid = self.rev_parse("HEAD^{tree}")?;
+            if actual_head_oid != &edit_stop.rewritten_head_oid
+                || actual_tree_oid != edit_stop.tree_oid
+            {
+                return Err(LocalGitError::StaleSnapshot);
+            }
             let parent_oid = self.rev_parse("HEAD^")?;
-            let required_tree_oid = self.rev_parse("HEAD^{tree}")?;
+            let required_tree_oid = actual_tree_oid;
             let stopped_oid =
                 expected_active
                     .stopped_oid
@@ -1023,8 +1145,11 @@ impl RebaseStore {
                     ))?;
             let split = SplitRecord {
                 stopped_oid,
+                rewritten_stopped_oid: Some(edit_stop.rewritten_head_oid.clone()),
                 parent_oid,
                 required_tree_oid,
+                replacement_commit_count: Some(0),
+                finish_validated: false,
             };
             // This transition evidence is durable before reset. If reset starts
             // but acknowledgement is lost, restart cannot repeat it blindly.
@@ -1125,12 +1250,12 @@ impl RebaseStore {
         guard: &SnapshotGuard,
     ) -> Result<OperationView> {
         let _record_guard = self.lock_record()?;
-        let record = self.require_record(operation_id)?;
+        let mut record = self.require_record(operation_id)?;
         let split = record
             .split
             .clone()
             .ok_or_else(|| RebaseError::UnsupportedState("split has not been started".into()))?;
-        self.git.with_guarded_worktree(guard, |actual| {
+        let replacement_commit_count = self.git.with_guarded_worktree(guard, |actual| {
             require_no_local_changes(actual, true)?;
             self.require_active_identity(expected_active)?;
             let actual_tree = self.rev_parse("HEAD^{tree}")?;
@@ -1145,15 +1270,21 @@ impl RebaseStore {
                     "split requires at least two replacement commits",
                 ));
             }
-            Ok(())
+            Ok(count)
         })?;
+        if let Some(split) = record.split.as_mut() {
+            split.replacement_commit_count = Some(replacement_commit_count);
+            split.finish_validated = true;
+        }
+        record.evidence.push(self.evidence(
+            "split replacement count and exact tree were validated before continue".into(),
+        )?);
+        self.save_record(&record)?;
         self.control(
             operation_id,
             expected_active,
             guard,
-            AttemptAction::Continue,
-            "continue rebase",
-            "--continue",
+            ControlTransition::FinishSplit,
         )
     }
 
@@ -1367,25 +1498,89 @@ impl RebaseStore {
         Ok(view(&record, None))
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // Called by the path-included integration test module.
+    pub(crate) fn persist_restore_stash_intent_for_test(&self, operation_id: &str) -> Result<()> {
+        let _record_guard = self.lock_record()?;
+        let mut record = self.require_record(operation_id)?;
+        if !matches!(
+            record.state,
+            OperationState::Completed | OperationState::Aborted
+        ) || record.stash.is_none()
+            || record.stash_restore != StashRestoreState::NotStarted
+        {
+            return Err(RebaseError::UnsupportedState(
+                "test restore intent requires a terminal operation with an unrestored stash".into(),
+            ));
+        }
+        record.attempt += 1;
+        record.action = AttemptAction::RestoreStash;
+        record.stash_restore = StashRestoreState::Running;
+        self.save_record(&record)
+    }
+
     fn control(
         &self,
         operation_id: &str,
         expected_active: &ActiveOperationIdentity,
         guard: &SnapshotGuard,
-        action: AttemptAction,
-        label: &'static str,
-        flag: &'static str,
+        transition: ControlTransition,
     ) -> Result<OperationView> {
+        let (action, label, flag, allow_active_split) = match transition {
+            ControlTransition::Continue => (
+                AttemptAction::Continue,
+                "continue rebase",
+                "--continue",
+                false,
+            ),
+            ControlTransition::Skip => (AttemptAction::Skip, "skip rebase commit", "--skip", false),
+            ControlTransition::Abort => (AttemptAction::Abort, "abort rebase", "--abort", true),
+            ControlTransition::FinishSplit => {
+                (AttemptAction::Continue, "finish split", "--continue", true)
+            }
+        };
         let mut record = self.require_record(operation_id)?;
         self.require_owned_active(&record, expected_active)?;
+        if record.split.is_some() && !allow_active_split {
+            return Err(RebaseError::UnsupportedState(
+                "an active split must be completed with finish_split; generic continue/skip is forbidden"
+                    .into(),
+            ));
+        }
         record.attempt += 1;
         record.action = action;
+        let split_abort_target = (action == AttemptAction::Abort)
+            .then(|| {
+                record
+                    .split
+                    .as_ref()
+                    .and_then(|split| split.rewritten_stopped_oid.clone())
+            })
+            .flatten();
+        if action == AttemptAction::Abort && record.split.is_some() && split_abort_target.is_none()
+        {
+            return Err(RebaseError::UnsupportedState(
+                "legacy split lacks the recorded rewritten stop required for safe abort".into(),
+            ));
+        }
         self.save_record(&record)?;
         let helpers = self.helper_paths(operation_id);
         let environment = self.helper_environment(operation_id, &helpers);
         let editor = shell_quote(&helpers.message_editor);
         let result = self.git.with_guarded_worktree(guard, |_| {
             self.require_active_identity(expected_active)?;
+            if let Some(rewritten_stopped_oid) = &split_abort_target {
+                self.git.run_worktree_command(
+                    "restore recorded split stop before abort",
+                    vec![
+                        "reset".into(),
+                        "--hard".into(),
+                        rewritten_stopped_oid.clone().into(),
+                    ],
+                    true,
+                    &[0],
+                )?;
+            }
             self.git.run_worktree_command_with_input_and_env(
                 label,
                 vec![
@@ -1492,13 +1687,79 @@ impl RebaseStore {
                     .push(self.evidence("branch ref moved externally during the rebase".into())?);
                 return Ok(());
             }
-            record.state = if !snapshot.conflicts.is_empty() {
-                OperationState::Conflicted
-            } else if active.stopped_oid.is_some() && active.stop_is_edit {
-                OperationState::PausedForEdit
+            if let Some(split) = record.split.as_mut()
+                && active.stopped_oid.as_deref() != Some(split.stopped_oid.as_str())
+            {
+                if !split.finish_validated {
+                    record.state = OperationState::FailedUncertain;
+                    record.evidence.push(
+                        self.evidence(
+                            "Git advanced away from an active split without validated finish_split"
+                                .into(),
+                        )?,
+                    );
+                    return Ok(());
+                }
+                record.split = None;
+                record.edit_stop = None;
+            }
+            if active.stopped_oid.is_some() && active.stop_is_edit {
+                let current = self.capture_edit_stop(&active)?;
+                if let Some(split) = record.split.as_mut() {
+                    let Some(rewritten_stopped_oid) = split.rewritten_stopped_oid.as_deref() else {
+                        record.state = OperationState::FailedUncertain;
+                        record.evidence.push(self.evidence(
+                            "active split predates rewritten edit-stop identity binding".into(),
+                        )?);
+                        return Ok(());
+                    };
+                    if current.rewritten_head_oid == rewritten_stopped_oid {
+                        split.replacement_commit_count = Some(0);
+                    } else if self.is_ancestor(&split.parent_oid, &current.rewritten_head_oid)?
+                        && !self.is_ancestor(rewritten_stopped_oid, &current.rewritten_head_oid)?
+                    {
+                        split.replacement_commit_count =
+                            Some(self.first_parent_count(
+                                &split.parent_oid,
+                                &current.rewritten_head_oid,
+                            )?);
+                    } else {
+                        record.state = OperationState::FailedUncertain;
+                        record.evidence.push(self.evidence(
+                            "active split HEAD is not the recorded stop or its replacement chain"
+                                .into(),
+                        )?);
+                        return Ok(());
+                    }
+                } else if let Some(previous) = &record.edit_stop {
+                    if previous.stopped_oid == current.stopped_oid
+                        && (previous.rewritten_head_oid != current.rewritten_head_oid
+                            || previous.tree_oid != current.tree_oid)
+                    {
+                        record.state = OperationState::FailedUncertain;
+                        record.evidence.push(self.evidence(
+                            "rewritten edit-stop HEAD changed outside an acknowledged amendment"
+                                .into(),
+                        )?);
+                        return Ok(());
+                    }
+                    record.edit_stop = Some(current);
+                } else {
+                    record.edit_stop = Some(current);
+                }
+                record.state = if snapshot.conflicts.is_empty() {
+                    OperationState::PausedForEdit
+                } else {
+                    OperationState::Conflicted
+                };
             } else {
-                OperationState::Running
-            };
+                record.edit_stop = None;
+                record.state = if snapshot.conflicts.is_empty() {
+                    OperationState::Running
+                } else {
+                    OperationState::Conflicted
+                };
+            }
             return Ok(());
         }
         if matches!(
@@ -1519,6 +1780,23 @@ impl RebaseStore {
             record.state = OperationState::Prepared;
             return Ok(());
         }
+        if let Some(split) = &record.split
+            && !split.finish_validated
+            && !matches!(
+                &snapshot.head,
+                HeadState::Attached { branch, oid }
+                    if branch == &record.inventory.branch && oid == &record.inventory.head_oid
+            )
+        {
+            record.state = OperationState::FailedUncertain;
+            record.evidence.push(
+                self.evidence(
+                    "rebase markers disappeared before the active split was validated and finished"
+                        .into(),
+                )?,
+            );
+            return Ok(());
+        }
         match &snapshot.head {
             HeadState::Attached { branch, oid } if branch == &record.inventory.branch => {
                 if oid == &record.inventory.head_oid {
@@ -1533,6 +1811,14 @@ impl RebaseStore {
                 }
             }
             _ => record.state = OperationState::FailedUncertain,
+        }
+        if matches!(
+            record.state,
+            OperationState::Completed | OperationState::Aborted
+        ) {
+            record.action = AttemptAction::None;
+            record.edit_stop = None;
+            record.split = None;
         }
         if record.state == OperationState::Completed && previous_state != OperationState::Completed
         {
@@ -1700,6 +1986,7 @@ impl RebaseStore {
             stash_expected_untracked: false,
             stash: None,
             stash_restore: StashRestoreState::NotStarted,
+            edit_stop: None,
             split: None,
             resulting_commits: Vec::new(),
             evidence: Vec::new(),
@@ -1778,6 +2065,120 @@ impl RebaseStore {
         atomic_private_write(&self.record_path, &bytes)
     }
 
+    fn require_safe_retirement(&self, record: &StoredRecord) -> Result<()> {
+        let snapshot = self.git.snapshot()?;
+        if snapshot.operation.rebase != RebaseState::None
+            || snapshot.operation.merge
+            || snapshot.operation.cherry_pick
+            || snapshot.operation.revert
+            || self.active_identity_for_any_marker()?
+        {
+            return Err(RebaseError::UnsupportedState(
+                "an active Git operation or ownership marker prevents retirement".into(),
+            ));
+        }
+        if record.split.is_some()
+            || matches!(
+                record.stash_restore,
+                StashRestoreState::Running | StashRestoreState::Conflicted
+            )
+        {
+            return Err(RebaseError::UnsupportedState(
+                "an active split or stash restoration prevents retirement".into(),
+            ));
+        }
+
+        let proof_exists = self.dispatch_proof_exists(&record.operation_id)?;
+        match record.state {
+            OperationState::Prepared
+                if !record.dispatch_acknowledged
+                    && !proof_exists
+                    && matches!(record.action, AttemptAction::None | AttemptAction::Start)
+                    && record.stash.is_none()
+                    && (!record.stash_expected_untracked
+                        || self.optional_ref_oid("refs/stash")? == record.stash_before_oid) =>
+            {
+                Ok(())
+            }
+            OperationState::Completed | OperationState::Aborted
+                if record.action == AttemptAction::None
+                    && matches!(
+                        (&record.stash, record.stash_restore),
+                        (None, StashRestoreState::NotStarted)
+                            | (Some(_), StashRestoreState::Completed)
+                    ) =>
+            {
+                Ok(())
+            }
+            OperationState::FailedUncertain => Err(RebaseError::UnsupportedState(
+                "an uncertain operation requires authoritative concrete outcome proof and cannot be retired by this API".into(),
+            )),
+            _ => Err(RebaseError::UnsupportedState(
+                "operation is active, has undisposed stash state, or lacks conclusive no-start proof"
+                    .into(),
+            )),
+        }
+    }
+
+    fn archive_record(&self, record: &StoredRecord) -> Result<ArchivedOperation> {
+        let live = self.load_record()?;
+        if live.operation_id != record.operation_id || live != *record {
+            return Err(RebaseError::StaleOperation);
+        }
+        let archive_dir = self.partition_dir.join("archive");
+        create_private_dir(&archive_dir)?;
+        let archived_count = fs::read_dir(&archive_dir)
+            .map_err(io("scan rebase archive"))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(io("scan rebase archive"))?
+            .len();
+        if archived_count >= MAX_ARCHIVED_OPERATIONS {
+            return Err(RebaseError::UnsupportedState(
+                "the bounded rebase archive is full; evidence was preserved".into(),
+            ));
+        }
+        let mut destination = None;
+        for sequence in 1..=MAX_ARCHIVED_OPERATIONS {
+            let name = format!(
+                "operation-{}-attempt-{}-{sequence:03}.json",
+                record.operation_id, record.attempt
+            );
+            let candidate = archive_dir.join(&name);
+            match fs::symlink_metadata(&candidate) {
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    destination = Some((candidate, name));
+                    break;
+                }
+                Ok(_) => {}
+                Err(source) => {
+                    return Err(RebaseError::Io {
+                        context: "inspect rebase archive slot",
+                        source,
+                    });
+                }
+            }
+        }
+        let (destination, archive_file_name) = destination.ok_or_else(|| {
+            RebaseError::UnsupportedState(
+                "the bounded rebase archive has no free evidence slot".into(),
+            )
+        })?;
+        fs::rename(&self.record_path, &destination).map_err(io("archive rebase record"))?;
+        File::open(&archive_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(io("sync rebase archive directory"))?;
+        File::open(&self.partition_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(io("sync rebase partition directory"))?;
+        Ok(ArchivedOperation {
+            operation_id: record.operation_id.clone(),
+            state: record.state,
+            stash: record.stash.clone(),
+            stash_restore: record.stash_restore,
+            archive_file_name,
+        })
+    }
+
     fn helper_paths(&self, operation_id: &str) -> HelperPaths {
         let root = self.partition_dir.join(format!("operation-{operation_id}"));
         HelperPaths {
@@ -1809,18 +2210,18 @@ impl RebaseStore {
             todo.extend_from_slice(step.commit_oid.as_bytes());
             todo.push(b'\n');
             if let PlanAction::Reword { ref message } = step.action {
-                write_private_file(
+                replace_private_file(
                     &paths.messages.join(&step.commit_oid),
                     message.as_bytes(),
                     false,
                 )?;
             }
         }
-        write_private_file(&paths.todo, &todo, false)?;
+        replace_private_file(&paths.todo, &todo, false)?;
         let sequence = b"#!/bin/sh\nset -eu\ntest \"$#\" -eq 1\ncp \"$CIBERGIT_TODO_FILE\" \"$1\"\nprintf '%s\\n' \"$CIBERGIT_OPERATION_ID\" > \"$CIBERGIT_DISPATCH_PROOF.tmp\"\nmv \"$CIBERGIT_DISPATCH_PROOF.tmp\" \"$CIBERGIT_DISPATCH_PROOF\"\nprintf '%s\\n' \"$CIBERGIT_OPERATION_ID\" > \"$CIBERGIT_GIT_DIR/rebase-merge/cibergit-operation.tmp\"\nmv \"$CIBERGIT_GIT_DIR/rebase-merge/cibergit-operation.tmp\" \"$CIBERGIT_GIT_DIR/rebase-merge/cibergit-operation\"\n";
         let message = b"#!/bin/sh\nset -eu\ntest \"$#\" -eq 1\ngitdir=$(git rev-parse --git-path rebase-merge)\noid=\nwhile IFS=' ' read -r action candidate rest; do oid=$candidate; done < \"$gitdir/done\"\ncase \"$oid\" in *[!0-9a-fA-F]*|'') exit 0;; esac\nsource=$CIBERGIT_MESSAGES_DIR/$oid\nif test -f \"$source\"; then cp \"$source\" \"$1\"; fi\n";
-        write_private_file(&paths.sequence_editor, sequence, true)?;
-        write_private_file(&paths.message_editor, message, true)?;
+        replace_private_file(&paths.sequence_editor, sequence, true)?;
+        replace_private_file(&paths.message_editor, message, true)?;
         Ok(())
     }
 
@@ -1861,6 +2262,11 @@ impl RebaseStore {
     fn dispatch_proof_matches(&self, operation_id: &str) -> Result<bool> {
         read_small_optional(&self.helper_paths(operation_id).proof, 4096)
             .map(|value| value.is_some_and(|bytes| trim_lf(&bytes) == operation_id.as_bytes()))
+    }
+
+    fn dispatch_proof_exists(&self, operation_id: &str) -> Result<bool> {
+        read_small_optional(&self.helper_paths(operation_id).proof, 4096)
+            .map(|value| value.is_some())
     }
 
     fn active_identity(&self, operation_id: &str) -> Result<Option<ActiveOperationIdentity>> {
@@ -2243,6 +2649,27 @@ impl RebaseStore {
         Ok(text)
     }
 
+    fn capture_edit_stop(&self, active: &ActiveOperationIdentity) -> Result<EditStopRecord> {
+        let stopped_oid = active.stopped_oid.clone().ok_or_else(|| {
+            RebaseError::UnsupportedState("edit stop has no stopped object ID".into())
+        })?;
+        let snapshot = self.git.snapshot()?;
+        let rewritten_head_oid = match snapshot.head {
+            HeadState::Attached { oid, .. } | HeadState::Detached { oid } => oid,
+            HeadState::Unborn { .. } => {
+                return Err(RebaseError::UnsupportedState(
+                    "edit stop has no concrete HEAD".into(),
+                ));
+            }
+        };
+        let tree_oid = self.rev_parse("HEAD^{tree}")?;
+        Ok(EditStopRecord {
+            stopped_oid,
+            rewritten_head_oid,
+            tree_oid,
+        })
+    }
+
     fn first_parent_count(
         &self,
         from: &str,
@@ -2440,6 +2867,13 @@ fn view(record: &StoredRecord, active: Option<ActiveOperationIdentity>) -> Opera
         base_oid: record.inventory.base_oid.clone(), active, resulting_commits: record.resulting_commits.clone(),
         stash: record.stash.clone(), evidence: record.evidence.clone(),
         stash_restore: record.stash_restore,
+        split: record.split.as_ref().map(|split| SplitState {
+            stopped_oid: split.stopped_oid.clone(),
+            rewritten_stopped_oid: split.rewritten_stopped_oid.clone(),
+            parent_oid: split.parent_oid.clone(),
+            required_tree_oid: split.required_tree_oid.clone(),
+            replacement_commit_count: split.replacement_commit_count,
+        }),
         publish_warning: (record.state == OperationState::Completed).then(|| "History was rewritten locally. Publishing is a separate explicit immutable-OID force-with-lease action; descendant branch repair is not included.".into()),
         publish_handoff,
     }
@@ -2569,6 +3003,38 @@ fn validate_record(record: &StoredRecord) -> Result<()> {
         {
             return Err(RebaseError::CorruptRecord(
                 "record contains an invalid identity path".into(),
+            ));
+        }
+    }
+    if let Some(edit_stop) = &record.edit_stop {
+        for oid in [
+            &edit_stop.stopped_oid,
+            &edit_stop.rewritten_head_oid,
+            &edit_stop.tree_oid,
+        ] {
+            validate_full_oid(oid)
+                .map_err(|error| RebaseError::CorruptRecord(error.to_string()))?;
+        }
+    }
+    if let Some(split) = &record.split {
+        for oid in [
+            Some(&split.stopped_oid),
+            split.rewritten_stopped_oid.as_ref(),
+            Some(&split.parent_oid),
+            Some(&split.required_tree_oid),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validate_full_oid(oid)
+                .map_err(|error| RebaseError::CorruptRecord(error.to_string()))?;
+        }
+        if split
+            .replacement_commit_count
+            .is_some_and(|count| count > MAX_COMMITS)
+        {
+            return Err(RebaseError::CorruptRecord(
+                "split replacement count exceeds its bound".into(),
             ));
         }
     }
@@ -2731,7 +3197,34 @@ fn write_private_file(path: &Path, bytes: &[u8], executable: bool) -> Result<()>
     file.sync_all().map_err(io("sync private helper file"))
 }
 
+fn replace_private_file(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            return Err(RebaseError::InvalidInput(
+                "private helper target is not a regular file".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(RebaseError::Io {
+                context: "inspect private helper target",
+                source,
+            });
+        }
+    }
+    atomic_private_write_with_mode(
+        path,
+        bytes,
+        if executable { 0o700 } else { PRIVATE_FILE_MODE },
+    )
+}
+
 fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_private_write_with_mode(path, bytes, PRIVATE_FILE_MODE)
+}
+
+fn atomic_private_write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| RebaseError::InvalidInput("record has no parent".into()))?;
@@ -2744,7 +3237,7 @@ fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(PRIVATE_FILE_MODE)
+        .mode(mode)
         .open(&temporary)
         .map_err(io("create atomic rebase record"))?;
     file.write_all(bytes)

@@ -8,7 +8,7 @@ mod rebase;
 use local_git::{CommandLimits, GitPath, LocalGit};
 use rebase::{
     BlobContent, OperationState, PlanAction, PlanStep, PrepareOutcome, RebaseAssociation,
-    RebasePlan, RebaseStore, StashRestoreState, UnsupportedHistory,
+    RebaseError, RebasePlan, RebaseStore, StashRestoreState, UnsupportedHistory,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -193,6 +193,53 @@ fn all_non_edit_plan_actions_rewrite_exact_tree_without_publishing() {
             .status
             .success()
     );
+}
+
+#[test]
+fn terminal_retirement_archives_evidence_and_allows_a_second_prepare() {
+    let repo = Repo::new();
+    repo.write("base", "base\n");
+    let base = repo.commit("base");
+    repo.write("topic", "topic\n");
+    repo.commit("topic");
+    let store = repo.store();
+    let preparation = ready(&store, &base);
+    let plan = steps(
+        &preparation.inventory,
+        vec![(
+            0,
+            PlanAction::Reword {
+                message: "rewritten for retirement".into(),
+            },
+        )],
+    );
+    let completed = store.start(&preparation, &plan).unwrap();
+    assert_eq!(completed.state, OperationState::Completed);
+    assert!(matches!(
+        store.prepare(&base).unwrap_err(),
+        RebaseError::PendingOperation(_)
+    ));
+
+    let archived = store.retire_operation(&completed.operation_id).unwrap();
+    assert_eq!(archived.operation_id, completed.operation_id);
+    assert_eq!(archived.state, OperationState::Completed);
+    assert!(archived.stash.is_none());
+    let record = walk_record(&repo.state);
+    assert!(!record.exists());
+    let archived_path = record
+        .parent()
+        .unwrap()
+        .join("archive")
+        .join(&archived.archive_file_name);
+    let archived_bytes = fs::read(&archived_path).unwrap();
+    assert!(
+        archived_bytes
+            .windows(completed.operation_id.len())
+            .any(|window| window == completed.operation_id.as_bytes())
+    );
+
+    let second = ready(&store, &base);
+    assert_ne!(second.operation_id, completed.operation_id);
 }
 
 #[test]
@@ -599,8 +646,71 @@ fn edit_amend_and_real_two_commit_split_conserve_trees() {
             &split.snapshot().guard,
         )
         .unwrap();
+    let split_state = view.split.as_ref().unwrap();
+    assert_eq!(
+        split_state.stopped_oid,
+        preparation.inventory.commits[0].oid
+    );
+    assert!(split_state.rewritten_stopped_oid.is_some());
+    assert_eq!(split_state.required_tree_oid, expected_tree);
+    assert_eq!(split_state.replacement_commit_count, Some(0));
+    let record_path = walk_record(&split.state);
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    envelope["payload"]["action"] = "BeginSplit".into();
+    let payload = serde_json::to_vec(&envelope["payload"]).unwrap();
+    envelope["checksum"] = format!("{:x}", Sha256::digest(payload)).into();
+    fs::write(&record_path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+    assert!(
+        store
+            .retire_operation(&view.operation_id)
+            .unwrap_err()
+            .to_string()
+            .contains("active Git operation")
+    );
+    let head_after_reset = split.oid("HEAD");
+    assert!(
+        store
+            .continue_rebase(
+                &view.operation_id,
+                view.active.as_ref().unwrap(),
+                &split.snapshot().guard,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("finish_split")
+    );
+    assert!(
+        store
+            .skip(
+                &view.operation_id,
+                view.active.as_ref().unwrap(),
+                &split.snapshot().guard,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("finish_split")
+    );
+    assert_eq!(split.oid("HEAD"), head_after_reset);
+    assert!(
+        store
+            .finish_split(
+                &view.operation_id,
+                view.active.as_ref().unwrap(),
+                &split.snapshot().guard,
+            )
+            .is_err()
+    );
+    drop(store);
+    let store = split.store();
+    let view = store.observe().unwrap().unwrap();
+    assert_eq!(view.state, OperationState::PausedForEdit);
+    assert_eq!(
+        view.split.as_ref().unwrap().replacement_commit_count,
+        Some(0)
+    );
     run_ok(&split.root, ["add", "a"]);
-    let view = store
+    store
         .commit_split_part(
             &view.operation_id,
             view.active.as_ref().unwrap(),
@@ -608,6 +718,13 @@ fn edit_amend_and_real_two_commit_split_conserve_trees() {
             "part a",
         )
         .unwrap();
+    drop(store);
+    let store = split.store();
+    let view = store.observe().unwrap().unwrap();
+    assert_eq!(
+        view.split.as_ref().unwrap().replacement_commit_count,
+        Some(1)
+    );
     run_ok(&split.root, ["add", "b"]);
     let view = store
         .commit_split_part(
@@ -634,6 +751,59 @@ fn edit_amend_and_real_two_commit_split_conserve_trees() {
         .trim(),
         "2"
     );
+
+    let changed = Repo::new();
+    changed.write("base", "base");
+    let base = changed.commit("base");
+    changed.write("file", "edit");
+    changed.commit("edit");
+    let store = changed.store();
+    let preparation = ready(&store, &base);
+    let plan = steps(&preparation.inventory, vec![(0, PlanAction::Edit)]);
+    let edit = store.start(&preparation, &plan).unwrap();
+    run_ok(
+        &changed.root,
+        ["commit", "--allow-empty", "-m", "external edit-stop commit"],
+    );
+    assert!(
+        store
+            .begin_split(
+                &edit.operation_id,
+                edit.active.as_ref().unwrap(),
+                &changed.snapshot().guard,
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store.observe().unwrap().unwrap().state,
+        OperationState::FailedUncertain
+    );
+
+    let aborted = Repo::new();
+    aborted.write("base", "base");
+    let base = aborted.commit("base");
+    aborted.write("file", "edit");
+    aborted.commit("edit");
+    let store = aborted.store();
+    let preparation = ready(&store, &base);
+    let plan = steps(&preparation.inventory, vec![(0, PlanAction::Edit)]);
+    let edit = store.start(&preparation, &plan).unwrap();
+    let split_view = store
+        .begin_split(
+            &edit.operation_id,
+            edit.active.as_ref().unwrap(),
+            &aborted.snapshot().guard,
+        )
+        .unwrap();
+    let aborted_view = store
+        .abort(
+            &split_view.operation_id,
+            split_view.active.as_ref().unwrap(),
+            &aborted.snapshot().guard,
+        )
+        .unwrap();
+    assert_eq!(aborted_view.state, OperationState::Aborted);
+    assert!(aborted_view.split.is_none());
 }
 
 #[test]
@@ -679,6 +849,13 @@ fn exact_stash_restore_ignores_newer_stash_and_preserves_untracked() {
     run_ok(&repo.root, ["stash", "push", "-m", "newer"]);
     let newer = repo.oid("refs/stash");
     assert_ne!(newer, saved_oid);
+    assert!(
+        store
+            .retire_operation(&completed.operation_id)
+            .unwrap_err()
+            .to_string()
+            .contains("undisposed stash")
+    );
     let restored = store
         .restore_stash(&completed.operation_id, &repo.snapshot().guard)
         .unwrap();
@@ -697,6 +874,19 @@ fn exact_stash_restore_ignores_newer_stash_and_preserves_untracked() {
             .status
             .success()
     );
+    let archived = store.retire_operation(&completed.operation_id).unwrap();
+    assert_eq!(archived.stash.as_ref().unwrap().oid, saved_oid);
+    assert_eq!(archived.stash_restore, StashRestoreState::Completed);
+    let archive = walk_record(&repo.state)
+        .parent()
+        .unwrap()
+        .join("archive")
+        .join(archived.archive_file_name);
+    assert!(fs::read_to_string(archive).unwrap().contains(&saved_oid));
+    assert!(matches!(
+        store.prepare(&base).unwrap(),
+        PrepareOutcome::Dirty(_)
+    ));
 }
 
 #[test]
@@ -732,7 +922,15 @@ fn stash_acknowledgement_selects_own_object_when_competitor_moves_ref() {
         preparation.inventory.head_oid
     );
 
-    let plan = steps(&preparation.inventory, vec![(0, PlanAction::Pick)]);
+    let plan = steps(
+        &preparation.inventory,
+        vec![(
+            0,
+            PlanAction::Reword {
+                message: "competitor stash rebase".into(),
+            },
+        )],
+    );
     let completed = store.start(&preparation, &plan).unwrap();
     store
         .restore_stash(&completed.operation_id, &repo.snapshot().guard)
@@ -801,6 +999,13 @@ fn stash_restore_conflict_is_explicit_and_stash_is_retained() {
         .unwrap();
     assert_eq!(restored.stash_restore, StashRestoreState::Conflicted);
     assert!(!repo.snapshot().conflicts.is_empty());
+    assert!(
+        store
+            .retire_operation(&completed.operation_id)
+            .unwrap_err()
+            .to_string()
+            .contains("active split or stash restoration")
+    );
     let conflicts = store.stash_conflicts(&completed.operation_id).unwrap();
     assert_eq!(conflicts.len(), 1);
     repo.write("file", "dirty based on topic\n");
@@ -817,6 +1022,59 @@ fn stash_restore_conflict_is_explicit_and_stash_is_retained() {
         .unwrap();
     assert_eq!(finished.stash_restore, StashRestoreState::Completed);
     assert!(run(&repo.root, ["cat-file", "-e", &stash]).status.success());
+}
+
+#[test]
+fn interrupted_restore_after_completion_is_uncertain_and_retains_receipt() {
+    let repo = Repo::new();
+    repo.write("file", "base\n");
+    let base = repo.commit("base");
+    repo.write("topic", "topic\n");
+    repo.commit("topic");
+    repo.write("file", "dirty\n");
+    let store = repo.store();
+    let dirty = match store.prepare(&base).unwrap() {
+        PrepareOutcome::Dirty(value) => value,
+        other => panic!("{other:?}"),
+    };
+    let preparation = store.create_stash(&dirty).unwrap();
+    let stash_oid = preparation.stash.as_ref().unwrap().oid.clone();
+    let plan = steps(
+        &preparation.inventory,
+        vec![(
+            0,
+            PlanAction::Reword {
+                message: "completed before interrupted restore".into(),
+            },
+        )],
+    );
+    let completed = store.start(&preparation, &plan).unwrap();
+    store
+        .persist_restore_stash_intent_for_test(&completed.operation_id)
+        .unwrap();
+    drop(store);
+
+    let reopened = repo.store();
+    let observed = reopened.observe().unwrap().unwrap();
+    assert_eq!(observed.state, OperationState::FailedUncertain);
+    assert_eq!(observed.stash_restore, StashRestoreState::FailedUncertain);
+    assert_eq!(observed.stash.as_ref().unwrap().oid, stash_oid);
+    assert!(
+        run(&repo.root, ["cat-file", "-e", &stash_oid])
+            .status
+            .success()
+    );
+    assert!(
+        reopened
+            .retire_operation(&observed.operation_id)
+            .unwrap_err()
+            .to_string()
+            .contains("authoritative concrete outcome proof")
+    );
+    assert_eq!(
+        reopened.observe().unwrap().unwrap().state,
+        OperationState::FailedUncertain
+    );
 }
 
 #[test]
@@ -886,6 +1144,11 @@ fn stale_dirty_content_locks_ref_movement_and_timeout_never_replay() {
             .contains("changed since")
     );
     assert!(repo.root.join("dirty").exists());
+    assert!(store.observe().unwrap().is_none());
+    assert!(matches!(
+        store.prepare(&base).unwrap(),
+        PrepareOutcome::Dirty(_)
+    ));
 
     let locked = Repo::new();
     locked.write("base", "base");
@@ -894,7 +1157,15 @@ fn stale_dirty_content_locks_ref_movement_and_timeout_never_replay() {
     locked.commit("a");
     let store = locked.store();
     let preparation = ready(&store, &base);
-    let plan = steps(&preparation.inventory, vec![(0, PlanAction::Pick)]);
+    let plan = steps(
+        &preparation.inventory,
+        vec![(
+            0,
+            PlanAction::Reword {
+                message: "index lock retry".into(),
+            },
+        )],
+    );
     fs::write(locked.root.join(".git/index.lock"), "lock").unwrap();
     assert!(
         store
@@ -904,11 +1175,12 @@ fn stale_dirty_content_locks_ref_movement_and_timeout_never_replay() {
             .contains("blocked")
     );
     fs::remove_file(locked.root.join(".git/index.lock")).unwrap();
-    assert_eq!(
-        store.observe().unwrap().unwrap().state,
-        OperationState::Prepared
-    );
+    assert!(store.observe().unwrap().is_none());
     assert_eq!(locked.oid("HEAD"), preparation.inventory.head_oid);
+    assert_eq!(
+        store.start(&preparation, &plan).unwrap().state,
+        OperationState::Completed
+    );
 
     let moved = Repo::new();
     moved.write("base", "base");
@@ -926,11 +1198,12 @@ fn stale_dirty_content_locks_ref_movement_and_timeout_never_replay() {
             .to_string()
             .contains("changed since")
     );
-    assert_eq!(
-        store.observe().unwrap().unwrap().state,
-        OperationState::Prepared
-    );
+    assert!(store.observe().unwrap().is_none());
     assert_eq!(moved.oid("HEAD"), moved.oid("refs/heads/topic"));
+    assert!(matches!(
+        store.prepare(&base).unwrap(),
+        PrepareOutcome::Ready(_)
+    ));
 
     let timed = Repo::new();
     timed.write("base", "base");
@@ -968,6 +1241,14 @@ fn stale_dirty_content_locks_ref_movement_and_timeout_never_replay() {
         OperationState::FailedUncertain
     );
     assert_eq!(timed.oid("HEAD"), preparation.inventory.head_oid);
+    let uncertain_id = store.observe().unwrap().unwrap().operation_id;
+    assert!(
+        store
+            .retire_operation(&uncertain_id)
+            .unwrap_err()
+            .to_string()
+            .contains("authoritative concrete outcome proof")
+    );
 }
 
 #[test]
@@ -1084,11 +1365,12 @@ fn journal_authority_serializes_separate_processes() {
     if env::var_os(CHILD).is_some() {
         let state = PathBuf::from(env::var_os("CIBERGIT_REBASE_TEST_STATE").unwrap());
         let root = PathBuf::from(env::var_os("CIBERGIT_REBASE_TEST_ROOT").unwrap());
-        let base = env::var("CIBERGIT_REBASE_TEST_BASE").unwrap();
         let acquired = PathBuf::from(env::var_os("CIBERGIT_REBASE_TEST_ACQUIRED").unwrap());
-        let store = RebaseStore::open(state, association(), root).unwrap();
-        let _ = store.prepare(&base).unwrap();
-        fs::write(acquired, b"child acquired").unwrap();
+        assert!(matches!(
+            RebaseStore::open(state, association(), root),
+            Err(RebaseError::JournalBusy)
+        ));
+        fs::write(acquired, b"journal busy observed").unwrap();
         return;
     }
 
@@ -1111,6 +1393,7 @@ fn journal_authority_serializes_separate_processes() {
     });
     wait_for_path(&parent_acquired);
 
+    let started = Instant::now();
     let mut child = Command::new(env::current_exe().unwrap())
         .arg("--exact")
         .arg("journal_authority_serializes_separate_processes")
@@ -1118,7 +1401,6 @@ fn journal_authority_serializes_separate_processes() {
         .env(CHILD, "1")
         .env("CIBERGIT_REBASE_TEST_STATE", &repo.state)
         .env("CIBERGIT_REBASE_TEST_ROOT", &repo.root)
-        .env("CIBERGIT_REBASE_TEST_BASE", &base)
         .env("CIBERGIT_REBASE_TEST_ACQUIRED", &child_acquired)
         .spawn()
         .unwrap();
@@ -1126,11 +1408,16 @@ fn journal_authority_serializes_separate_processes() {
     assert!(!child_acquired.exists());
     assert!(child.try_wait().unwrap().is_none());
 
-    fs::write(&release, b"release").unwrap();
-    holder_thread.join().unwrap();
     let status = child.wait().unwrap();
     assert!(status.success());
+    assert!(started.elapsed() >= Duration::from_secs(5));
     wait_for_path(&child_acquired);
+    fs::write(&release, b"release").unwrap();
+    holder_thread.join().unwrap();
+    assert!(matches!(
+        store.prepare(&base).unwrap(),
+        PrepareOutcome::Ready(_)
+    ));
 }
 
 #[test]
