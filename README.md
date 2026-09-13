@@ -2,9 +2,9 @@
 
 cibergit is a local Git client for developers reviewing pull requests, including work produced by coding agents. It brings PR diffs, discussions, checks, local changes, source editing, and interactive rebase into one desktop application.
 
-The initial target is macOS on Apple Silicon, with GitHub.com integration through the GitHub CLI. The application uses Rust, GPUI, and GPUI Kit. Cibergit's own code will use the MIT license.
+The target is macOS on Apple Silicon, with GitHub.com integration through the GitHub CLI. The application uses Rust, GPUI, and GPUI Kit. Cibergit's own code uses the MIT license.
 
-This repository currently contains the design documentation. Application implementation has not started.
+Implementation is underway. The native application can open real PRs, display pinned diffs and collaboration details, and restore review tabs and file progress. The complete V1 scope remains in progress; see the [implementation ledger](docs/implementation-ledger.md) for acceptance status.
 
 ## Documentation
 
@@ -30,4 +30,4 @@ The documentation distinguishes agreed requirements, verified upstream constrain
 
 ## Development
 
-Implementation has started under [the coordinator brief](docs/implementation-coordinator.md). See [build/run instructions](docs/build.md) for the current native editor foundation. The V1 scope below remains pending until its acceptance evidence is recorded.
+See [build/run instructions](docs/build.md) for the native review workspace and reproducible smoke checks. Work follows [the coordinator brief](docs/implementation-coordinator.md); the initial scope above describes the intended V1, including features that are still being implemented.
