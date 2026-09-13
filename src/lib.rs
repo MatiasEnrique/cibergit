@@ -5,3 +5,4 @@ pub mod participation;
 pub mod providers;
 pub mod review;
 pub mod workspace;
+pub mod worktrees;
