@@ -9,7 +9,7 @@ mod local_workspace;
 
 use cibergit::{
     document::DocumentStatus,
-    domain::{Account, Repository},
+    domain::{Account, PullRequestCheckoutSource, Repository, Revision},
     local_git::{GitPath, HeadState, LocalGit, OperationState},
     rebase::{OperationState as RebaseState, PlanAction},
     worktrees::{
@@ -22,7 +22,7 @@ use gpui::{
 };
 use local_workspace::{
     LocalAction, LocalFind, LocalRefresh, LocalReplace, LocalSave, LocalWorkspace,
-    LocalWorkspaceAppearance, LocalWorkspaceContext,
+    LocalWorkspaceAppearance, LocalWorkspaceContext, PrPublishContext,
 };
 use std::{
     borrow::Cow,
@@ -36,12 +36,16 @@ struct SmokeFixture {
     checkout: PathBuf,
     data_root: PathBuf,
     rebase_base_oid: String,
+    publish_bare: PathBuf,
 }
 
 fn run_git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .current_dir(root)
         .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .expect("run temporary Git command");
     assert!(
@@ -50,6 +54,27 @@ fn run_git(root: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn read_git(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("run temporary Git read");
+    assert!(
+        output.status.success(),
+        "git {:?}: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("UTF-8 Git read")
+        .trim()
+        .to_owned()
 }
 
 fn identity(path: &Path) -> FilesystemIdentity {
@@ -77,7 +102,15 @@ fn retained_started_action(data_root: &Path) -> String {
     format!("none under {}", actions.display())
 }
 
-fn fixture(base: &Path) -> (Repository, CheckoutView, PathBuf, String) {
+fn fixture(
+    base: &Path,
+) -> (
+    Repository,
+    CheckoutView,
+    PathBuf,
+    String,
+    PullRequestCheckoutSource,
+) {
     let checkout = base.join("checkout");
     let data = base.join("data");
     fs::create_dir_all(checkout.join("src")).expect("fixture directories");
@@ -94,16 +127,7 @@ fn fixture(base: &Path) -> (Repository, CheckoutView, PathBuf, String) {
     run_git(&checkout, &["config", "user.email", "demo@invalid"]);
     run_git(&checkout, &["add", "."]);
     run_git(&checkout, &["commit", "-m", "base fixture"]);
-    let base_oid = Command::new("git")
-        .current_dir(&checkout)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .expect("read base")
-        .stdout;
-    let base_oid = String::from_utf8(base_oid)
-        .expect("base UTF-8")
-        .trim()
-        .to_owned();
+    let base_oid = read_git(&checkout, &["rev-parse", "HEAD"]);
     fs::write(
         checkout.join("workflow.txt"),
         conflict_source_fixture("first"),
@@ -140,6 +164,43 @@ fn fixture(base: &Path) -> (Repository, CheckoutView, PathBuf, String) {
         },
         local_path: Some(checkout_root.clone()),
     };
+    let publish_bare = base.join("pr-source.git");
+    fs::create_dir_all(&publish_bare).expect("publish bare directory");
+    run_git(&publish_bare, &["init", "--bare"]);
+    run_git(
+        &checkout,
+        &[
+            "remote",
+            "add",
+            "fork-source",
+            publish_bare.to_str().expect("UTF-8 temporary path"),
+        ],
+    );
+    run_git(
+        &checkout,
+        &[
+            "push",
+            "fork-source",
+            &format!("{base_oid}:refs/heads/feature/published"),
+        ],
+    );
+    let publish_source = PullRequestCheckoutSource {
+        number: 42,
+        base_repository: repository.clone(),
+        source_repository: Some(Repository {
+            host: "github.com".into(),
+            owner: "fixture-fork".into(),
+            name: "local-workspace-source".into(),
+            account: repository.account.clone(),
+            local_path: Some(publish_bare.clone()),
+        }),
+        source_branch: "feature/published".into(),
+        target_branch: "main".into(),
+        observed_revision: Revision {
+            base_sha: base_oid.clone(),
+            head_sha: base_oid.clone(),
+        },
+    };
     let checkout_view = CheckoutView {
         association: CheckoutAssociation {
             key: AssociationKey {
@@ -163,7 +224,7 @@ fn fixture(base: &Path) -> (Repository, CheckoutView, PathBuf, String) {
         actual_head: snapshot.head,
         operation: OperationState::default(),
     };
-    (repository, checkout_view, data, base_oid)
+    (repository, checkout_view, data, base_oid, publish_source)
 }
 
 fn conflict_source_fixture(prefix: &str) -> String {
@@ -197,7 +258,9 @@ fn main() {
                 .expect("temporary demo root")
                 .keep()
         });
-    let (repository, checkout, data_root, rebase_base_oid) = fixture(&base);
+    let (repository, checkout, data_root, rebase_base_oid, publish_source) = fixture(&base);
+    let publish_context =
+        PrPublishContext::fixed_for_smoke(repository.clone(), 42, publish_source.clone());
     let checkout_root = checkout.association.path.clone();
     let smoke_data_root = data_root.clone();
     println!(
@@ -240,7 +303,7 @@ fn main() {
             },
             move |window, cx| {
                 let workspace = cx.new(|cx| {
-                    LocalWorkspace::new(
+                    let mut workspace = LocalWorkspace::new(
                         LocalWorkspaceContext {
                             repository,
                             checkout,
@@ -249,7 +312,9 @@ fn main() {
                         },
                         window,
                         cx,
-                    )
+                    );
+                    workspace.set_pr_publish_context(Some(publish_context), cx);
+                    workspace
                 });
                 if let Some(output) = std::env::var_os("CIBERGIT_LOCAL_WORKSPACE_SMOKE_DIR") {
                     start_smoke(
@@ -258,6 +323,11 @@ fn main() {
                             checkout: checkout_root.clone(),
                             data_root: smoke_data_root.clone(),
                             rebase_base_oid: rebase_base_oid.clone(),
+                            publish_bare: publish_source
+                                .source_repository
+                                .as_ref()
+                                .and_then(|repository| repository.local_path.clone())
+                                .expect("temporary publish bare"),
                         },
                         PathBuf::from(output),
                         dark,
@@ -285,6 +355,7 @@ fn start_smoke(
         checkout,
         data_root,
         rebase_base_oid,
+        publish_bare,
     } = fixture;
     window
         .spawn(cx, async move |window| {
@@ -308,6 +379,155 @@ fn start_smoke(
                     async move { fs::create_dir_all(output).expect("prepare smoke evidence") }
                 })
                 .await;
+
+            let publish_prepare_requested = window
+                .update(|_, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| workspace.prepare_pr_publish(cx))
+                        .is_ok()
+                })
+                .unwrap_or(false);
+            let publish_prepare_at = std::time::Instant::now();
+            let publish_prepared = loop {
+                window
+                    .background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let prepared = window
+                    .update(|_, cx| {
+                        workspace
+                            .read_with(cx, |workspace, _| {
+                                workspace.pr_publish_preparation().is_some()
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if prepared || publish_prepare_at.elapsed() > std::time::Duration::from_secs(20) {
+                    break prepared;
+                }
+            };
+            let _ = window.update(|window, _| window.resize(size(px(1440.), px(900.))));
+            let publish_ready_wide_capture = window
+                .update(|window, _| {
+                    window
+                        .render_to_image()
+                        .and_then(|image| {
+                            image
+                                .save(output.join(if dark {
+                                    "pr-publish-ready-dark-wide.png"
+                                } else {
+                                    "pr-publish-ready-light-wide.png"
+                                }))
+                                .map_err(Into::into)
+                        })
+                        .is_ok()
+                })
+                .unwrap_or(false);
+            let publish_local_oid = window
+                .update(|_, cx| {
+                    workspace
+                        .read_with(cx, |workspace, _| {
+                            workspace
+                                .pr_publish_preparation()
+                                .map(|preparation| preparation.local_oid.clone())
+                        })
+                        .ok()
+                        .flatten()
+                })
+                .ok()
+                .flatten();
+            let publish_request = window
+                .update(|_, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.request_prepared_pr_publish(cx)
+                        })
+                        .ok()
+                        .flatten()
+                })
+                .ok()
+                .flatten();
+            let publish_confirmation_wide_capture = window
+                .update(|window, _| {
+                    window
+                        .render_to_image()
+                        .and_then(|image| {
+                            image
+                                .save(output.join(if dark {
+                                    "pr-publish-confirm-dark-wide.png"
+                                } else {
+                                    "pr-publish-confirm-light-wide.png"
+                                }))
+                                .map_err(Into::into)
+                        })
+                        .is_ok()
+                })
+                .unwrap_or(false);
+            let _ = window.update(|window, _| window.resize(size(px(1040.), px(820.))));
+            let publish_confirmation_narrow_capture = window
+                .update(|window, _| {
+                    window
+                        .render_to_image()
+                        .and_then(|image| {
+                            image
+                                .save(output.join(if dark {
+                                    "pr-publish-confirm-dark-narrow.png"
+                                } else {
+                                    "pr-publish-confirm-light-narrow.png"
+                                }))
+                                .map_err(Into::into)
+                        })
+                        .is_ok()
+                })
+                .unwrap_or(false);
+            let publish_dispatched = window
+                .update(|_, cx| {
+                    let Some(request_id) = publish_request else {
+                        return false;
+                    };
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.confirm_action(request_id, cx);
+                            workspace.in_flight_action_id() == Some(request_id)
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let publish_at = std::time::Instant::now();
+            let publish_completed = loop {
+                window
+                    .background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let completed = window
+                    .update(|_, cx| {
+                        workspace
+                            .read_with(cx, |workspace, _| {
+                                publish_dispatched
+                                    && workspace.in_flight_action_id().is_none()
+                                    && workspace.status_message().contains("Completed Push")
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if completed || publish_at.elapsed() > std::time::Duration::from_secs(20) {
+                    break completed;
+                }
+            };
+            let published_oid = window
+                .background_executor()
+                .spawn({
+                    let publish_bare = publish_bare.clone();
+                    async move {
+                        read_git(
+                            &publish_bare,
+                            &["rev-parse", "refs/heads/feature/published"],
+                        )
+                    }
+                })
+                .await;
+            let publish_exact_readback = publish_local_oid.as_deref() == Some(&published_oid);
+            let _ = window.update(|window, _| window.resize(size(px(1440.), px(900.))));
 
             let prepare_requested = window
                 .update(|window, cx| {
@@ -1422,8 +1642,17 @@ fn start_smoke(
                 }
             };
             let report = format!(
-                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nrebase prepare requested: {}\npopulated three-commit plan ready: {}\nplan normal capture: {}\npending plan/message inputs disabled: {}\npending Drop handler preserved exact frozen Edit: {}\nfrozen plan/confirmation capture: {}\nCancel restored editing and explicit edit/reprepare: {}\nedit plan Start requested through confirmation: {}\nPausedForEdit observed: {}\nedit wide capture: {}\nexpanded operation details capture: {}\nexplicit Continue requested through confirmation: {}\nCompleted observed: {}\nresult normal capture: {}\nsafe archive requested and second prepare enabled: {}\nreordered single-conflict plan prepared: {}\nconflicting Start requested through confirmation: {}\nConflicted observed from real Git with one exact path: {}\nconflict list narrow capture: {}\nsource/result presentation opened: {}\nDocumentStore result and immutable source proof ready: {}\nlabels, distinct source content, and exact OIDs pinned: {}\nthree source panes wide capture: {}\nexplicit source-selection narrow capture: {}\nactual result edit plus undo/redo: {}\nresult recovery persist reached Dirty before save: {}\nexplicit result save completed: {}\nsaved result exact readback: {}\nsaved result identity explicitly refreshed without replacing buffer: {}\nexact stage command requested through confirmation: {}\nGit proved the presented conflict resolved: {}\nresolved/stale-evidence capture: {}\nexplicit Continue after resolution requested: {}\nconflict rebase completed: {}\ncompleted checkout retained exact result: {}\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nCreateBranch request outcome: {:?}\nCreateBranch dispatched while no-op refresh pending: {}\nCreateBranch completed authoritatively: {}\nCreateBranch terminal status/error: {}\nSwitchBranch request outcome: {:?}\nSwitchBranch dispatched: {}\nSwitchBranch completed authoritatively: {}\nSwitchBranch terminal status/error: {}\nsame-current SwitchBranch request outcome: {:?}\nsame-current SwitchBranch dispatched: {}\nsame-current SwitchBranch completed authoritatively: {}\nsame-current SwitchBranch terminal status/error: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
+                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nPR source prepare requested: {}\nfresh fake-provider target prepared: {}\npublish target wide capture: {}\nimmutable publish confirmation requested: {:?}\npublish confirmation wide capture: {}\npublish confirmation narrow capture: {}\nnon-force publish dispatched: {}\nnon-force publish completed: {}\nlocal-bare exact target readback: {}\nrebase prepare requested: {}\npopulated three-commit plan ready: {}\nplan normal capture: {}\npending plan/message inputs disabled: {}\npending Drop handler preserved exact frozen Edit: {}\nfrozen plan/confirmation capture: {}\nCancel restored editing and explicit edit/reprepare: {}\nedit plan Start requested through confirmation: {}\nPausedForEdit observed: {}\nedit wide capture: {}\nexpanded operation details capture: {}\nexplicit Continue requested through confirmation: {}\nCompleted observed: {}\nresult normal capture: {}\nsafe archive requested and second prepare enabled: {}\nreordered single-conflict plan prepared: {}\nconflicting Start requested through confirmation: {}\nConflicted observed from real Git with one exact path: {}\nconflict list narrow capture: {}\nsource/result presentation opened: {}\nDocumentStore result and immutable source proof ready: {}\nlabels, distinct source content, and exact OIDs pinned: {}\nthree source panes wide capture: {}\nexplicit source-selection narrow capture: {}\nactual result edit plus undo/redo: {}\nresult recovery persist reached Dirty before save: {}\nexplicit result save completed: {}\nsaved result exact readback: {}\nsaved result identity explicitly refreshed without replacing buffer: {}\nexact stage command requested through confirmation: {}\nGit proved the presented conflict resolved: {}\nresolved/stale-evidence capture: {}\nexplicit Continue after resolution requested: {}\nconflict rebase completed: {}\ncompleted checkout retained exact result: {}\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nCreateBranch request outcome: {:?}\nCreateBranch dispatched while no-op refresh pending: {}\nCreateBranch completed authoritatively: {}\nCreateBranch terminal status/error: {}\nSwitchBranch request outcome: {:?}\nSwitchBranch dispatched: {}\nSwitchBranch completed authoritatively: {}\nSwitchBranch terminal status/error: {}\nsame-current SwitchBranch request outcome: {:?}\nsame-current SwitchBranch dispatched: {}\nsame-current SwitchBranch completed authoritatively: {}\nsame-current SwitchBranch terminal status/error: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
                 if dark { "dark" } else { "light" },
+                publish_prepare_requested,
+                publish_prepared,
+                publish_ready_wide_capture,
+                publish_request,
+                publish_confirmation_wide_capture,
+                publish_confirmation_narrow_capture,
+                publish_dispatched,
+                publish_completed,
+                publish_exact_readback,
                 prepare_requested,
                 plan_ready,
                 plan_capture,

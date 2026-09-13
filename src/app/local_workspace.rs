@@ -7,8 +7,13 @@
 
 #[path = "local_workspace/conflict_view.rs"]
 mod conflict_view;
+#[path = "local_workspace/pr_publish.rs"]
+mod pr_publish;
 #[path = "local_workspace/rebase_panel.rs"]
 mod rebase_panel;
+
+use pr_publish::PrPublishAttempt;
+pub use pr_publish::{PrPublishContext, PrPublishMode, PrPublishPreparation};
 
 use cibergit::{
     document::{
@@ -220,6 +225,11 @@ pub enum LocalAction {
         branch: String,
         observed_remote_oid: String,
     },
+    /// Immutable explicit PR-source preparation. This is constructed only by
+    /// the fresh provider/Git identity pipeline, never by branch-name inference.
+    PublishPrSource {
+        preparation: Box<PrPublishPreparation>,
+    },
     CreateBranch {
         branch: String,
         start_oid: Option<String>,
@@ -235,6 +245,10 @@ impl LocalAction {
             self,
             Self::FastForwardPull { .. } | Self::CreateBranch { .. } | Self::SwitchBranch { .. }
         )
+    }
+
+    fn requires_exclusive_checkout_lane(&self) -> bool {
+        self.changes_checkout() || matches!(self, Self::PublishPrSource { .. })
     }
 
     fn summary(&self) -> String {
@@ -254,6 +268,7 @@ impl LocalAction {
                 branch,
                 observed_remote_oid,
             } => format!("Force push {remote}/{branch} with lease at {observed_remote_oid}"),
+            Self::PublishPrSource { preparation } => preparation.summary(),
             Self::CreateBranch { branch, start_oid } => match start_oid {
                 Some(oid) => format!("Create and switch to branch {branch} at {oid}"),
                 None => format!("Create and switch to branch {branch}"),
@@ -271,6 +286,11 @@ impl LocalAction {
             Self::FastForwardPull { .. } => "fast-forward-pull",
             Self::Push { .. } => "push",
             Self::ForcePushWithLease { .. } => "force-push-with-lease",
+            Self::PublishPrSource { preparation } => match preparation.mode {
+                PrPublishMode::UpToDate => "published-pr-source-noop",
+                PrPublishMode::Publish => "publish-pr-source",
+                PrPublishMode::RepublishWithLease => "republish-pr-source-with-lease",
+            },
             Self::CreateBranch { .. } => "create-branch",
             Self::SwitchBranch { .. } => "switch-branch",
         }
@@ -294,6 +314,8 @@ struct StartedAction {
     checkout_identity: String,
     displayed_head: String,
     expected_remote_oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pr_publish: Option<PrPublishAttempt>,
 }
 
 #[derive(Clone, Debug)]
@@ -527,6 +549,7 @@ pub struct LocalWorkspace {
     active_document: Option<PathBuf>,
     revealed_path: Option<PathBuf>,
     open_generation: u64,
+    open_in_flight: usize,
     git_generation: u64,
     snapshot: Option<LocalSnapshot>,
     selected_diff: Option<SelectedDiff>,
@@ -536,7 +559,13 @@ pub struct LocalWorkspace {
     next_action_id: u64,
     unresolved_started_action: Option<StartedAction>,
     unresolved_refresh_required: bool,
+    unresolved_publish_refresh_required: bool,
     remote_observation: Option<RemoteBranchObservation>,
+    pr_publish_context: Option<PrPublishContext>,
+    pr_publish_preparation: Option<PrPublishPreparation>,
+    pr_publish_generation: u64,
+    pr_publish_loading: bool,
+    pr_publish_notice: String,
     quick_open: Entity<InputState>,
     commit_message: Entity<InputState>,
     branch_name: Entity<InputState>,
@@ -573,6 +602,7 @@ impl LocalWorkspace {
             active_document: None,
             revealed_path: None,
             open_generation: 0,
+            open_in_flight: 0,
             git_generation: 0,
             snapshot: None,
             selected_diff: None,
@@ -582,7 +612,13 @@ impl LocalWorkspace {
             next_action_id: 1,
             unresolved_started_action: None,
             unresolved_refresh_required: false,
+            unresolved_publish_refresh_required: false,
             remote_observation: None,
+            pr_publish_context: None,
+            pr_publish_preparation: None,
+            pr_publish_generation: 0,
+            pr_publish_loading: false,
+            pr_publish_notice: String::new(),
             quick_open,
             commit_message,
             branch_name,
@@ -639,6 +675,185 @@ impl LocalWorkspace {
 
     pub fn in_flight_action_id(&self) -> Option<u64> {
         self.in_flight_action
+    }
+
+    /// Attach or clear explicit PR publication identity without changing the
+    /// stable LocalWorkspace constructor used by non-PR callsites.
+    pub fn set_pr_publish_context(
+        &mut self,
+        context: Option<PrPublishContext>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.in_flight_action.is_some()
+            || self.pending_action.is_some()
+            || self.unresolved_started_action.is_some()
+            || self.reconciliation_clear_in_flight.is_some()
+        {
+            self.report_error(
+                "PR publication identity cannot change while confirmation, dispatch, or durable reconciliation is active"
+                    .into(),
+                cx,
+            );
+            return;
+        }
+        self.pr_publish_generation = self.pr_publish_generation.wrapping_add(1);
+        self.pr_publish_context = context;
+        self.pr_publish_preparation = None;
+        self.pr_publish_loading = false;
+        self.pr_publish_notice = if self.pr_publish_context.is_some() {
+            "Prepare reads the fresh provider source and installed Git push destination; it never changes Review."
+                .into()
+        } else {
+            String::new()
+        };
+        cx.notify();
+    }
+
+    pub fn pr_publish_preparation(&self) -> Option<&PrPublishPreparation> {
+        self.pr_publish_preparation.as_ref()
+    }
+
+    pub fn pr_publish_notice(&self) -> &str {
+        &self.pr_publish_notice
+    }
+
+    /// Explicit read-only preparation. It freezes provider, checkout, local
+    /// branch/OID, effective push endpoint, destination branch/OID, and mode.
+    pub fn prepare_pr_publish(&mut self, cx: &mut Context<Self>) {
+        let Some(context) = self.pr_publish_context.clone() else {
+            self.report_error(
+                "This workspace has no selected PR publication identity".into(),
+                cx,
+            );
+            return;
+        };
+        let BackendState::Ready(backend) = &self.backend else {
+            self.report_error("Local workspace is not ready".into(), cx);
+            return;
+        };
+        if self.pr_publish_loading
+            || self.in_flight_action.is_some()
+            || self.reconciliation_clear_in_flight.is_some()
+            || self.pending_action.is_some()
+            || self.unresolved_started_action.is_some()
+            || self.rebase.has_pending_or_running()
+        {
+            self.report_error(
+                "PR publication preparation is paused by an active confirmation, action, reconciliation, or rebase transition"
+                    .into(),
+                cx,
+            );
+            return;
+        }
+        if let Some(reason) = self.checkout_action_blocker(cx) {
+            self.report_error(reason, cx);
+            return;
+        }
+        self.pr_publish_generation = self.pr_publish_generation.wrapping_add(1);
+        let generation = self.pr_publish_generation;
+        self.pr_publish_loading = true;
+        self.pr_publish_preparation = None;
+        self.pr_publish_notice =
+            "Reading fresh PR source and effective installed-Git push destination…".into();
+        let checkout = self.context.checkout.clone();
+        let git = backend.git.clone();
+        let task =
+            cx.background_spawn(async move { pr_publish::prepare(&context, &checkout, &git) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.pr_publish_generation != generation {
+                    return;
+                }
+                this.pr_publish_loading = false;
+                match result {
+                    Ok(preparation) => {
+                        this.pr_publish_notice = format!(
+                            "{} preparation ready; target and OIDs are frozen until confirmation or refresh.",
+                            preparation.mode.label()
+                        );
+                        this.pr_publish_preparation = Some(preparation);
+                    }
+                    Err(error) => {
+                        this.pr_publish_preparation = None;
+                        this.pr_publish_notice = format!(
+                            "PR publication unavailable: {error}. No Git mutation was started."
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn request_prepared_pr_publish(&mut self, cx: &mut Context<Self>) -> Option<u64> {
+        let Some(preparation) = self.pr_publish_preparation.clone() else {
+            self.report_error(
+                "Prepare and inspect the fresh PR source target first".into(),
+                cx,
+            );
+            return None;
+        };
+        if preparation.mode == PrPublishMode::UpToDate {
+            self.report_error(
+                "The configured PR source branch already has the attached local OID; no push is needed"
+                    .into(),
+                cx,
+            );
+            return None;
+        }
+        self.request_action(
+            LocalAction::PublishPrSource {
+                preparation: Box::new(preparation),
+            },
+            cx,
+        )
+    }
+
+    fn refresh_pr_publish_after_attempt(&mut self, cx: &mut Context<Self>) {
+        let (Some(context), BackendState::Ready(backend)) =
+            (self.pr_publish_context.clone(), &self.backend)
+        else {
+            return;
+        };
+        self.pr_publish_generation = self.pr_publish_generation.wrapping_add(1);
+        let generation = self.pr_publish_generation;
+        self.pr_publish_loading = true;
+        self.pr_publish_preparation = None;
+        self.pr_publish_notice =
+            "Reconciling fresh provider source and effective push endpoint read-only…".into();
+        let checkout = self.context.checkout.clone();
+        let git = backend.git.clone();
+        let task =
+            cx.background_spawn(async move { pr_publish::prepare(&context, &checkout, &git) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.pr_publish_generation != generation {
+                    return;
+                }
+                this.pr_publish_loading = false;
+                match result {
+                    Ok(preparation) => {
+                        this.unresolved_publish_refresh_required = false;
+                        this.pr_publish_notice = format!(
+                            "Read-only reconciliation: {}. No action was replayed.",
+                            preparation.summary()
+                        );
+                        this.pr_publish_preparation = Some(preparation);
+                    }
+                    Err(error) => {
+                        this.pr_publish_notice = format!(
+                            "Read-only PR publication reconciliation is incomplete: {error}. No action was replayed."
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Reads the remote ref through installed Git authentication. The returned
@@ -790,6 +1005,7 @@ impl LocalWorkspace {
             return;
         };
         self.open_generation = self.open_generation.wrapping_add(1);
+        self.open_in_flight = self.open_in_flight.saturating_add(1);
         let generation = self.open_generation;
         let store = backend.documents.clone();
         self.status = format!("Opening {}…", display_path(&path));
@@ -803,6 +1019,7 @@ impl LocalWorkspace {
                 let result = task.await;
                 let _ = window.update(|window, cx| {
                     let _ = weak.update(cx, |this, cx| {
+                        this.open_in_flight = this.open_in_flight.saturating_sub(1);
                         if generation != this.open_generation {
                             return;
                         }
@@ -835,6 +1052,13 @@ impl LocalWorkspace {
             );
             return None;
         }
+        if self.pr_publish_loading {
+            self.report_error(
+                "Wait for the fresh PR publication read to finish".into(),
+                cx,
+            );
+            return None;
+        }
         if self.rebase.has_pending_or_running() {
             self.report_error(
                 "A rebase transition or confirmation is active; finish or cancel it first".into(),
@@ -849,7 +1073,7 @@ impl LocalWorkspace {
             );
             return None;
         }
-        if action.changes_checkout()
+        if action.requires_exclusive_checkout_lane()
             && let Some(reason) = self.checkout_action_blocker(cx)
         {
             self.report_error(reason, cx);
@@ -878,7 +1102,7 @@ impl LocalWorkspace {
             self.report_error("Refresh Local Changes before acting".into(), cx);
             return None;
         };
-        if action.changes_checkout() && operation_is_active(&snapshot.operation) {
+        if action.requires_exclusive_checkout_lane() && operation_is_active(&snapshot.operation) {
             self.report_error(
                 "Branch/pull action paused while a merge, rebase, cherry-pick, or revert is active"
                     .into(),
@@ -886,13 +1110,35 @@ impl LocalWorkspace {
             );
             return None;
         }
+        let guard = match &action {
+            LocalAction::PublishPrSource { preparation } => {
+                if self.pr_publish_context.is_none() {
+                    self.report_error(
+                        "The selected PR publication identity is no longer attached".into(),
+                        cx,
+                    );
+                    return None;
+                }
+                if &snapshot.guard != preparation.snapshot_guard() {
+                    self.pr_publish_preparation = None;
+                    self.report_error(
+                        "Local Git state changed after publication preparation; prepare again"
+                            .into(),
+                        cx,
+                    );
+                    return None;
+                }
+                preparation.snapshot_guard().clone()
+            }
+            _ => snapshot.guard.clone(),
+        };
         let id = self.next_action_id;
         self.next_action_id = self.next_action_id.wrapping_add(1);
         let summary = action.summary();
         self.pending_action = Some(PendingAction {
             id,
             action,
-            guard: snapshot.guard.clone(),
+            guard,
             checkout_generation: backend.checkout_generation,
         });
         self.status = format!("Confirmation required: {summary}");
@@ -930,13 +1176,13 @@ impl LocalWorkspace {
             );
             return;
         }
-        if pending.action.changes_checkout()
+        if pending.action.requires_exclusive_checkout_lane()
             && let Some(reason) = self.checkout_action_blocker(cx)
         {
             self.report_error(format!("Confirmation paused: {reason}"), cx);
             return;
         }
-        if pending.action.changes_checkout()
+        if pending.action.requires_exclusive_checkout_lane()
             && self
                 .snapshot
                 .as_ref()
@@ -968,12 +1214,22 @@ impl LocalWorkspace {
                     observed_remote_oid,
                     ..
                 } => Some(observed_remote_oid.clone()),
+                LocalAction::PublishPrSource { preparation } => {
+                    Some(preparation.expected_remote_oid.clone())
+                }
+                _ => None,
+            },
+            pr_publish: match &pending.action {
+                LocalAction::PublishPrSource { preparation } => {
+                    Some(preparation.attempt(request_id))
+                }
                 _ => None,
             },
         };
         self.pending_action = None;
         self.in_flight_action = Some(request_id);
         self.unresolved_refresh_required = false;
+        self.unresolved_publish_refresh_required = false;
         self.status = format!("Checking and recording {}…", started.summary);
         let retry = pending.clone();
         let action = pending.action;
@@ -995,6 +1251,7 @@ impl LocalWorkspace {
                         this.snapshot = Some(snapshot);
                         this.unresolved_started_action = None;
                         this.unresolved_refresh_required = false;
+                        this.unresolved_publish_refresh_required = false;
                         this.status = format!(
                             "Completed {:?}; refreshed authoritative Git state",
                             receipt.action
@@ -1005,6 +1262,9 @@ impl LocalWorkspace {
                         });
                         cx.emit(LocalWorkspaceEvent::LocalSnapshotChanged);
                         cx.notify();
+                        if started.pr_publish.is_some() {
+                            this.refresh_pr_publish_after_attempt(cx);
+                        }
                     }
                     Err(LocalActionRunError::NotDispatched {
                         error,
@@ -1012,6 +1272,7 @@ impl LocalWorkspace {
                     }) => {
                         this.unresolved_started_action = None;
                         this.unresolved_refresh_required = false;
+                        this.unresolved_publish_refresh_required = false;
                         if this.pending_action.is_none() {
                             this.pending_action = Some(retry);
                         }
@@ -1027,6 +1288,7 @@ impl LocalWorkspace {
                     }) => {
                         this.unresolved_started_action = Some(started);
                         this.unresolved_refresh_required = false;
+                        this.unresolved_publish_refresh_required = false;
                         this.status = format!(
                             "Git was not started, but its durable intent record was preserved: {error}. Reconcile that exact record before retrying."
                         );
@@ -1034,13 +1296,18 @@ impl LocalWorkspace {
                         cx.notify();
                     }
                     Err(LocalActionRunError::StartedOrUncertain(error)) => {
+                        let is_pr_publish = started.pr_publish.is_some();
                         this.unresolved_started_action = Some(started);
                         this.unresolved_refresh_required = true;
+                        this.unresolved_publish_refresh_required = is_pr_publish;
                         this.status = format!(
                             "Action may have started: {error}. Authoritative refresh and explicit reconciliation are required before retry."
                         );
                         cx.emit(LocalWorkspaceEvent::Error(this.status.clone()));
                         this.refresh_git(cx);
+                        if is_pr_publish {
+                            this.refresh_pr_publish_after_attempt(cx);
+                        }
                     }
                 }
             });
@@ -1079,6 +1346,14 @@ impl LocalWorkspace {
         if self.unresolved_refresh_required {
             self.report_error(
                 "Wait for a successful authoritative Git refresh before acknowledging".into(),
+                cx,
+            );
+            return;
+        }
+        if self.unresolved_publish_refresh_required {
+            self.report_error(
+                "Wait for a successful fresh provider and effective push-endpoint reconciliation before acknowledging"
+                    .into(),
                 cx,
             );
             return;
@@ -1123,6 +1398,7 @@ impl LocalWorkspace {
                         return;
                     }
                     this.unresolved_started_action = None;
+                    this.unresolved_publish_refresh_required = false;
                     this.status = "Local action reconciled; no action was retried".into();
                     cx.notify();
                 }
@@ -1255,6 +1531,9 @@ impl LocalWorkspace {
                     let _ = weak.update(cx, |this, cx| match result {
                         Ok((backend, snapshot, started, rebase_operation)) => {
                             this.snapshot = Some(snapshot);
+                            this.unresolved_publish_refresh_required = started
+                                .as_ref()
+                                .is_some_and(|started| started.pr_publish.is_some());
                             this.unresolved_started_action = started;
                             this.unresolved_refresh_required = false;
                             this.status = if this.unresolved_started_action.is_some() {
@@ -1267,6 +1546,9 @@ impl LocalWorkspace {
                             this.rebase.install_observed(rebase_operation);
                             cx.emit(LocalWorkspaceEvent::LocalSnapshotChanged);
                             cx.notify();
+                            if this.unresolved_publish_refresh_required {
+                                this.refresh_pr_publish_after_attempt(cx);
+                            }
                         }
                         Err(error) => {
                             this.backend = BackendState::Failed(error.clone());
@@ -1549,6 +1831,15 @@ impl LocalWorkspace {
                             .as_ref()
                             .is_some_and(|previous| previous.head != snapshot.head);
                         let dirty_buffers = this.checkout_action_blocker(cx).is_some();
+                        let publish_stale = this.pending_action.is_none()
+                            && this.pr_publish_preparation.as_ref().is_some_and(|preparation| {
+                                preparation.snapshot_guard() != &snapshot.guard
+                            });
+                        if publish_stale {
+                            this.pr_publish_preparation = None;
+                            this.pr_publish_notice = "Local Git state changed; prepare the PR source target again before publishing."
+                                .into();
+                        }
                         this.snapshot = Some(snapshot);
                         if this.in_flight_action.is_none() {
                             this.unresolved_refresh_required = false;
@@ -1575,6 +1866,11 @@ impl LocalWorkspace {
     }
 
     fn checkout_action_blocker(&self, cx: &App) -> Option<String> {
+        if self.open_in_flight != 0 {
+            return Some(
+                "Branch/publish action paused while an exact document open is still running".into(),
+            );
+        }
         self.documents.values().find_map(|tab| {
             let editor_value = tab.editor.read(cx).value();
             let buffer_differs_from_accepted_base = editor_value.as_ref() != tab.view.base;
@@ -2094,6 +2390,14 @@ fn validate_local_action_input(action: &LocalAction) -> Result<(), String> {
         {
             Err("Branch name must not be empty".into())
         }
+        LocalAction::PublishPrSource { preparation }
+            if preparation.local_branch.trim().is_empty()
+                || preparation.remote_branch.trim().is_empty()
+                || preparation.local_oid.trim().is_empty()
+                || preparation.expected_remote_oid.trim().is_empty() =>
+        {
+            Err("Prepared PR publication identity is incomplete".into())
+        }
         _ => Ok(()),
     }
 }
@@ -2172,6 +2476,7 @@ fn run_local_action_with_journal(
             branch,
             observed_remote_oid,
         } => git.force_push_with_lease(&remote, &branch, &observed_remote_oid, guard),
+        LocalAction::PublishPrSource { preparation } => preparation.dispatch(&git, guard),
         LocalAction::CreateBranch { branch, start_oid } => {
             git.create_branch(&branch, start_oid.as_deref(), guard)
         }
@@ -3734,6 +4039,130 @@ impl LocalWorkspace {
                             )),
                     ),
             );
+        if self.pr_publish_context.is_some() {
+            let preparation = self.pr_publish_preparation.clone();
+            let controls_locked = self.pr_publish_loading
+                || self.pending_action.is_some()
+                || self.in_flight_action.is_some()
+                || self.unresolved_started_action.is_some()
+                || self.rebase.has_pending_or_running();
+            let mut publish = div()
+                .id("pr-source-publish")
+                .p_3()
+                .border_t_1()
+                .border_color(colors.border)
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("PR SOURCE PUBLISH"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .whitespace_normal()
+                        .child(self.pr_publish_notice.clone()),
+                );
+            if let Some(preparation) = preparation.clone() {
+                publish = publish
+                    .child(
+                        div()
+                            .mt_1()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(preparation.mode.label()),
+                    )
+                    .child(div().text_xs().whitespace_normal().child(format!(
+                        "selected {} · account {} · PR #{}",
+                        preparation.selected_repository,
+                        preparation.selected_account,
+                        preparation.pull_request_number
+                    )))
+                    .child(div().text_xs().whitespace_normal().child(format!(
+                        "target {}/{}/{}",
+                        preparation.source_host,
+                        preparation.source_repository,
+                        preparation.remote_branch
+                    )))
+                    .child(
+                        div()
+                            .font_family(CODE_FONT)
+                            .text_xs()
+                            .whitespace_normal()
+                            .child(format!(
+                                "local {} @ {}",
+                                preparation.local_branch, preparation.local_oid
+                            )),
+                    )
+                    .child(
+                        div()
+                            .font_family(CODE_FONT)
+                            .text_xs()
+                            .whitespace_normal()
+                            .child(format!(
+                                "push {}/{} · observed {}",
+                                preparation.destination.remote,
+                                preparation.remote_branch,
+                                preparation.expected_remote_oid
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if preparation.mode
+                                == PrPublishMode::RepublishWithLease
+                            {
+                                colors.amber
+                            } else {
+                                colors.muted
+                            })
+                            .whitespace_normal()
+                            .child(match preparation.mode {
+                                PrPublishMode::UpToDate => {
+                                    "Installed Git and the fresh provider source agree: already published."
+                                }
+                                PrPublishMode::Publish => {
+                                    "Non-force publish. Git server fast-forward rules remain authoritative."
+                                }
+                                PrPublishMode::RepublishWithLease => {
+                                    "Rewritten history: force only with the exact displayed remote-ref lease."
+                                }
+                            }),
+                    );
+            }
+            let mut buttons = div().mt_2().flex().flex_wrap().gap_2();
+            if !controls_locked {
+                buttons = buttons.child(action_button(
+                    if preparation.is_some() {
+                        "Refresh target"
+                    } else {
+                        "Prepare publish"
+                    },
+                    colors,
+                    cx.listener(|this, _, _, cx| this.prepare_pr_publish(cx)),
+                ));
+                if preparation
+                    .as_ref()
+                    .is_some_and(|preparation| preparation.mode != PrPublishMode::UpToDate)
+                {
+                    let label = preparation
+                        .as_ref()
+                        .map(|preparation| preparation.mode.label())
+                        .unwrap_or("Publish");
+                    buttons = buttons.child(action_button(
+                        label,
+                        colors,
+                        cx.listener(|this, _, _, cx| {
+                            this.request_prepared_pr_publish(cx);
+                        }),
+                    ));
+                }
+            }
+            publish = publish.child(buttons);
+            panel = panel.child(publish);
+        }
         if let Some(pending) = pending {
             let id = pending.id;
             panel = panel.child(
@@ -3771,19 +4200,49 @@ impl LocalWorkspace {
             );
         }
         if let Some(started) = unresolved {
-            panel = panel.child(
-                div()
+            let publish_attempt = started.pr_publish.clone();
+            let mut reconciliation = div()
                     .p_3()
                     .bg(if colors.dark { rgba(0x411f21ff) } else { rgba(0xf9e2e0ff) })
                     .border_t_1()
                     .border_color(colors.red)
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("Started action needs reconciliation"))
                     .child(div().mt_1().text_xs().child(started.summary))
-                    .child(div().mt_1().text_xs().child("Refresh and inspect actual state. This control only acknowledges; it never retries."))
-                    .child(action_button("Acknowledge refreshed state", colors, cx.listener(|this, _, _, cx| {
-                        this.acknowledge_action_reconciliation(cx)
-                    }))),
-            );
+                    .child(div().mt_1().text_xs().child("Refresh and inspect actual state. This control only acknowledges; it never retries."));
+            if let Some(attempt) = publish_attempt {
+                reconciliation = reconciliation
+                    .child(
+                        div()
+                            .mt_1()
+                            .font_family(CODE_FONT)
+                            .text_xs()
+                            .whitespace_normal()
+                            .child(format!(
+                                "request {} · {} {} @ {} -> {}/{} expected {} · config {}",
+                                attempt.request_id,
+                                attempt.mode.label(),
+                                attempt.local_branch,
+                                attempt.local_oid,
+                                attempt.destination_remote,
+                                attempt.remote_branch,
+                                attempt.expected_remote_oid,
+                                attempt.destination_configuration_fingerprint,
+                            )),
+                    )
+                    .child(div().mt_1().text_xs().whitespace_normal().child(format!(
+                        "target {} · selected {}/{} #{}",
+                        attempt.destination_repository,
+                        attempt.selected_host,
+                        attempt.selected_repository,
+                        attempt.pull_request_number,
+                    )));
+            }
+            reconciliation = reconciliation.child(action_button(
+                "Acknowledge refreshed state",
+                colors,
+                cx.listener(|this, _, _, cx| this.acknowledge_action_reconciliation(cx)),
+            ));
+            panel = panel.child(reconciliation);
         }
         panel.into_any_element()
     }
@@ -3916,7 +4375,10 @@ fn local_change_rows(snapshot: &LocalSnapshot) -> Vec<(&'static str, GitPath, Di
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cibergit::document::{ReconcileOutcome, TargetIssue};
+    use cibergit::{
+        document::{ReconcileOutcome, TargetIssue},
+        domain::{PullRequestCheckoutSource, Revision},
+    };
     use std::{os::unix::fs::symlink, process::Command, time::Instant};
     use tempfile::TempDir;
 
@@ -3924,6 +4386,9 @@ mod tests {
         let output = Command::new("git")
             .current_dir(root)
             .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .expect("run git");
         assert!(
@@ -3932,6 +4397,27 @@ mod tests {
             args,
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn git_text(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("UTF-8 Git output")
+            .trim()
+            .to_owned()
     }
 
     fn checkout_fixture() -> (TempDir, LocalWorkspaceContext) {
@@ -4277,6 +4763,7 @@ mod tests {
             checkout_identity: checkout_identity_label(&context.checkout),
             displayed_head: "test".into(),
             expected_remote_oid: None,
+            pr_publish: None,
         };
         let result = run_local_action(
             &context,
@@ -4319,6 +4806,7 @@ mod tests {
             checkout_identity: checkout_identity_label(&context.checkout),
             displayed_head: "test".into(),
             expected_remote_oid: None,
+            pr_publish: None,
         };
         let different = StartedAction {
             request_id: 99,
@@ -4378,6 +4866,7 @@ mod tests {
             checkout_identity: checkout_identity_label(&context.checkout),
             displayed_head: "test".into(),
             expected_remote_oid: None,
+            pr_publish: None,
         };
         let blocked_parent = context.data_root.join("not-a-directory");
         fs::write(&blocked_parent, "block journal directory").expect("blocking file");
@@ -4480,6 +4969,7 @@ mod tests {
             checkout_identity: checkout_identity_label(&context.checkout),
             displayed_head: "test".into(),
             expected_remote_oid: None,
+            pr_publish: None,
         };
         let result = run_local_action_with_journal(
             &context,
@@ -4563,6 +5053,7 @@ mod tests {
             checkout_identity: "checkout".into(),
             displayed_head: "head".into(),
             expected_remote_oid: None,
+            pr_publish: None,
         };
         let second = StartedAction {
             request_id: 42,
@@ -4613,6 +5104,7 @@ mod tests {
             checkout_identity: "checkout".into(),
             displayed_head: "head".into(),
             expected_remote_oid: None,
+            pr_publish: None,
         };
         write_started_action(&journal, &started).expect("durable journal before helper");
         let mut helper = Command::new(std::env::current_exe().expect("test executable"))
@@ -4768,6 +5260,7 @@ mod tests {
             checkout_identity: "checkout".into(),
             displayed_head: "head".into(),
             expected_remote_oid: None,
+            pr_publish: None,
         };
         let write_raw = |bytes: &[u8]| {
             let mut file = fs::OpenOptions::new()
@@ -4815,6 +5308,176 @@ mod tests {
         assert!(!remote_observation_matches(
             None, "origin", "feature", "abc123"
         ));
+    }
+
+    #[test]
+    fn confirmed_pr_publish_uses_durable_admission_and_actual_local_bare_push() {
+        let (_temporary, context) = checkout_fixture();
+        let root = &context.checkout.association.path;
+        let source_bare = tempfile::tempdir().expect("source bare");
+        git(source_bare.path(), &["init", "--bare", "-q"]);
+        git(
+            root,
+            &[
+                "remote",
+                "add",
+                "fork-source",
+                source_bare.path().to_str().expect("path"),
+            ],
+        );
+        let published = git_text(root, &["rev-parse", "HEAD"]);
+        git(
+            root,
+            &[
+                "push",
+                "-q",
+                "fork-source",
+                "feature:refs/heads/feature/published",
+            ],
+        );
+        fs::write(root.join("same.txt"), "publish next\n").expect("local change");
+        git(root, &["add", "same.txt"]);
+        git(root, &["commit", "-m", "publish next"]);
+        let backend = LocalGit::open(root).expect("local git");
+        let local_oid = match backend.snapshot().expect("snapshot").head {
+            HeadState::Attached { oid, .. } => oid,
+            other => panic!("attached head required: {other:?}"),
+        };
+        let source_repository = Repository {
+            host: context.repository.host.clone(),
+            owner: "fork-owner".into(),
+            name: "source-repo".into(),
+            account: context.repository.account.clone(),
+            local_path: Some(source_bare.path().to_owned()),
+        };
+        let source = PullRequestCheckoutSource {
+            number: 7,
+            base_repository: context.repository.clone(),
+            source_repository: Some(source_repository),
+            source_branch: "feature/published".into(),
+            target_branch: "main".into(),
+            observed_revision: Revision {
+                base_sha: published.clone(),
+                head_sha: published.clone(),
+            },
+        };
+        let preparation = pr_publish::prepare_test_source(
+            context.repository.clone(),
+            7,
+            &context.checkout,
+            &backend,
+            source,
+        )
+        .expect("prepare explicit publish");
+        assert_eq!(preparation.mode, PrPublishMode::Publish);
+        let publish_guard = preparation.snapshot_guard().clone();
+        let started = StartedAction {
+            schema_version: 1,
+            request_id: 500,
+            kind: "publish-pr-source".into(),
+            summary: preparation.summary(),
+            checkout_identity: checkout_identity_label(&context.checkout),
+            displayed_head: local_oid.clone(),
+            expected_remote_oid: Some(published.clone()),
+            pr_publish: Some(preparation.attempt(500)),
+        };
+        let blocked_parent = context.data_root.join("blocked-publish-journal");
+        fs::write(&blocked_parent, "not a directory").expect("block journal");
+        let blocked = run_local_action(
+            &context,
+            &blocked_parent.join("started.json"),
+            &started,
+            LocalAction::PublishPrSource {
+                preparation: Box::new(preparation.clone()),
+            },
+            &publish_guard,
+        );
+        assert!(matches!(
+            blocked,
+            Err(LocalActionRunError::NotDispatched {
+                journal_preserved: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            git_text(
+                source_bare.path(),
+                &["rev-parse", "refs/heads/feature/published"]
+            ),
+            published,
+            "durable admission failure must dispatch zero pushes"
+        );
+
+        let uncertain_journal = context.data_root.join("publish-uncertain/started.json");
+        let preserved = run_local_action_with_journal(
+            &context,
+            &uncertain_journal,
+            &started,
+            LocalAction::PublishPrSource {
+                preparation: Box::new(preparation.clone()),
+            },
+            &publish_guard,
+            |path, attempted| {
+                write_started_action(path, attempted)?;
+                Err(JournalWriteError::InstalledOrUncertain(
+                    "injected loss after durable PR publish admission".into(),
+                ))
+            },
+        );
+        assert!(matches!(
+            preserved,
+            Err(LocalActionRunError::NotDispatched {
+                journal_preserved: true,
+                ..
+            })
+        ));
+        let readback = read_started_action(&uncertain_journal)
+            .expect("read durable PR publish attempt")
+            .expect("preserved PR publish attempt");
+        assert_eq!(readback, started);
+        assert_eq!(
+            readback
+                .pr_publish
+                .as_ref()
+                .expect("full PR publish context")
+                .destination_configuration_fingerprint
+                .len(),
+            64
+        );
+        assert_eq!(
+            git_text(
+                source_bare.path(),
+                &["rev-parse", "refs/heads/feature/published"]
+            ),
+            published,
+            "preserved admission uncertainty must not guess or replay"
+        );
+        assert!(
+            clear_started_action(&uncertain_journal, &started)
+                .expect("exact read-only acknowledgement")
+        );
+
+        let journal = context.data_root.join("publish/started.json");
+        let (receipt, snapshot) = run_local_action(
+            &context,
+            &journal,
+            &started,
+            LocalAction::PublishPrSource {
+                preparation: Box::new(preparation),
+            },
+            &publish_guard,
+        )
+        .expect("confirmed publish");
+        assert_eq!(receipt.action, cibergit::local_git::MutationAction::Push);
+        assert!(matches!(snapshot.head, HeadState::Attached { .. }));
+        assert_eq!(
+            git_text(
+                source_bare.path(),
+                &["rev-parse", "refs/heads/feature/published"]
+            ),
+            local_oid
+        );
+        assert!(!journal.exists(), "exact successful attempt clears journal");
     }
 
     #[test]

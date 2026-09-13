@@ -1,5 +1,7 @@
 //! Explicit PR checkout setup. Published review state is never owned here.
-use super::local_workspace::{LocalWorkspace, LocalWorkspaceAppearance, LocalWorkspaceContext};
+use super::local_workspace::{
+    LocalWorkspace, LocalWorkspaceAppearance, LocalWorkspaceContext, PrPublishContext,
+};
 use cibergit::{
     domain::{PullRequest, PullRequestCheckoutSource, Repository, Revision},
     local_git::LocalGit,
@@ -420,7 +422,12 @@ impl Render for LocalCheckout {
                     ),
                 },
             };
-            let workspace = cx.new(|cx| LocalWorkspace::new(context, window, cx));
+            let publish = PrPublishContext::github(self.repository.clone(), self.pull.number);
+            let workspace = cx.new(|cx| {
+                let mut workspace = LocalWorkspace::new(context, window, cx);
+                workspace.set_pr_publish_context(Some(publish), cx);
+                workspace
+            });
             self._subscription =
                 Some(
                     cx.subscribe_in(&workspace, window, |this, workspace, _, window, cx| {

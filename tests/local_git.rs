@@ -79,6 +79,17 @@ fn path(raw: &[u8]) -> GitPath {
     GitPath::from_raw(raw.to_vec()).unwrap()
 }
 
+fn local_repository(path: &Path) -> GitRepositoryTarget {
+    GitRepositoryTarget {
+        repository: GitRepositoryIdentity {
+            host: "github.test".into(),
+            owner: "fork-owner".into(),
+            name: "source-repo".into(),
+        },
+        local_path: Some(path.to_owned()),
+    }
+}
+
 #[test]
 fn discovers_unborn_checkout_and_reports_raw_status_and_selected_diffs() {
     let directory = init();
@@ -706,6 +717,276 @@ fn mapped_branch_publish_uses_only_the_guarded_oid_and_exact_destination_lease()
     assert_eq!(
         git(bare.path(), &["rev-parse", "refs/heads/feature/published"]),
         selected_oid
+    );
+}
+
+#[test]
+fn observes_distinct_effective_fetch_and_push_destinations_after_git_rewriting() {
+    let directory = init();
+    let root = directory.path();
+    fs::write(root.join("file"), "base\n").unwrap();
+    let base = commit_all(root, "base");
+    let source_bare = TempDir::new().unwrap();
+    git(source_bare.path(), &["init", "--bare", "-q"]);
+    git(
+        root,
+        &[
+            "remote",
+            "add",
+            "pr-source",
+            "https://github.test/base-owner/base-repo.git",
+        ],
+    );
+    git(
+        root,
+        &[
+            "remote",
+            "set-url",
+            "--push",
+            "pr-source",
+            source_bare.path().to_str().unwrap(),
+        ],
+    );
+    git(
+        root,
+        &[
+            "push",
+            "-q",
+            "pr-source",
+            "main:refs/heads/feature/published",
+        ],
+    );
+
+    let backend = LocalGit::open(root).unwrap();
+    let destination = backend
+        .observe_push_destination(&local_repository(source_bare.path()))
+        .unwrap();
+    assert_eq!(destination.remote, "pr-source");
+    assert_eq!(destination.repository.owner, "fork-owner");
+    assert_eq!(destination.repository.name, "source-repo");
+    assert_eq!(
+        destination.fetch_repositories,
+        vec![GitRepositoryIdentity {
+            host: "github.test".into(),
+            owner: "base-owner".into(),
+            name: "base-repo".into(),
+        }]
+    );
+    assert_eq!(destination.configuration_fingerprint().len(), 64);
+    let branch = backend
+        .observe_destination_branch(&destination, "feature/published")
+        .unwrap();
+    assert_eq!(branch.oid.as_deref(), Some(base.as_str()));
+}
+
+#[test]
+fn observes_git_push_instead_of_effective_endpoint() {
+    let directory = init();
+    let root = directory.path();
+    fs::write(root.join("file"), "base\n").unwrap();
+    let base = commit_all(root, "base");
+    let source_bare = TempDir::new().unwrap();
+    git(source_bare.path(), &["init", "--bare", "-q"]);
+    git(
+        root,
+        &[
+            "remote",
+            "add",
+            "rewritten",
+            "https://github.test/fork-owner/source-repo.git",
+        ],
+    );
+    let rewrite_key = format!("url.file://{}/.pushInsteadOf", source_bare.path().display());
+    git(
+        root,
+        &[
+            "config",
+            "--local",
+            &rewrite_key,
+            "https://github.test/fork-owner/source-repo.git",
+        ],
+    );
+    git(
+        root,
+        &[
+            "push",
+            "-q",
+            "rewritten",
+            "main:refs/heads/feature/published",
+        ],
+    );
+    let backend = LocalGit::open(root).unwrap();
+    let destination = backend
+        .observe_push_destination(&local_repository(source_bare.path()))
+        .unwrap();
+    assert_eq!(destination.remote, "rewritten");
+    assert_eq!(
+        backend
+            .observe_destination_branch(&destination, "feature/published")
+            .unwrap()
+            .oid
+            .as_deref(),
+        Some(base.as_str())
+    );
+}
+
+#[test]
+fn rejects_multiple_matching_push_urls_and_embedded_credentials_without_disclosure() {
+    let directory = init();
+    let root = directory.path();
+    let first = TempDir::new().unwrap();
+    let second = TempDir::new().unwrap();
+    git(first.path(), &["init", "--bare", "-q"]);
+    git(second.path(), &["init", "--bare", "-q"]);
+    git(
+        root,
+        &["remote", "add", "source", first.path().to_str().unwrap()],
+    );
+    git(
+        root,
+        &[
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "source",
+            second.path().to_str().unwrap(),
+        ],
+    );
+    git(
+        root,
+        &[
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "source",
+            first.path().to_str().unwrap(),
+        ],
+    );
+    let backend = LocalGit::open(root).unwrap();
+    assert!(matches!(
+        backend.observe_push_destination(&local_repository(first.path())),
+        Err(LocalGitError::PushDestinationAmbiguous)
+    ));
+
+    git(root, &["remote", "remove", "source"]);
+    git(
+        root,
+        &[
+            "remote",
+            "add",
+            "credentialed",
+            "https://secret-token@github.test/fork-owner/source-repo.git",
+        ],
+    );
+    let network = GitRepositoryTarget {
+        local_path: None,
+        ..local_repository(first.path())
+    };
+    let error = backend.observe_push_destination(&network).unwrap_err();
+    assert!(matches!(error, LocalGitError::UnsafePushDestination));
+    assert!(!error.to_string().contains("secret-token"));
+}
+
+#[test]
+fn standard_ssh_push_url_matches_network_source_without_exposing_transport() {
+    let directory = init();
+    let root = directory.path();
+    git(
+        root,
+        &[
+            "remote",
+            "add",
+            "fork",
+            "https://github.test/base-owner/base-repo.git",
+        ],
+    );
+    git(
+        root,
+        &[
+            "remote",
+            "set-url",
+            "--push",
+            "fork",
+            "git@github.test:fork-owner/source-repo.git",
+        ],
+    );
+    let target = GitRepositoryTarget {
+        local_path: None,
+        ..local_repository(root)
+    };
+    let destination = LocalGit::open(root)
+        .unwrap()
+        .observe_push_destination(&target)
+        .unwrap();
+    assert_eq!(destination.remote, "fork");
+    let debug = format!("{destination:?}");
+    assert!(debug.contains("fork-owner"));
+    assert!(!debug.contains("git@"));
+    assert!(!debug.contains("https://"));
+}
+
+#[test]
+fn destination_change_after_confirmation_is_a_certain_pre_dispatch_refusal() {
+    let directory = init();
+    let root = directory.path();
+    fs::write(root.join("file"), "base\n").unwrap();
+    let base = commit_all(root, "base");
+    let source = TempDir::new().unwrap();
+    let other = TempDir::new().unwrap();
+    git(source.path(), &["init", "--bare", "-q"]);
+    git(other.path(), &["init", "--bare", "-q"]);
+    git(
+        root,
+        &["remote", "add", "source", source.path().to_str().unwrap()],
+    );
+    git(
+        root,
+        &["push", "-q", "source", "main:refs/heads/feature/published"],
+    );
+    git(root, &["branch", "cibergit/private", &base]);
+    let backend = LocalGit::open(root).unwrap();
+    let destination = backend
+        .observe_push_destination(&local_repository(source.path()))
+        .unwrap();
+    let selected = backend.snapshot().unwrap();
+    git(
+        root,
+        &[
+            "remote",
+            "set-url",
+            "--push",
+            "source",
+            other.path().to_str().unwrap(),
+        ],
+    );
+    let error = backend
+        .force_push_branch_with_lease_to_destination(
+            &destination,
+            "cibergit/private",
+            &base,
+            "feature/published",
+            &base,
+            &selected.guard,
+        )
+        .unwrap_err();
+    assert!(matches!(error, LocalGitError::StalePushDestination));
+    assert_eq!(
+        git(
+            source.path(),
+            &["rev-parse", "refs/heads/feature/published"]
+        ),
+        base
+    );
+    assert!(
+        git_output(
+            other.path(),
+            &["show-ref", "--verify", "refs/heads/feature/published"]
+        )
+        .status
+        .code()
+        .is_some_and(|code| code != 0)
     );
 }
 

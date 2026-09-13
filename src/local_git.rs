@@ -99,6 +99,11 @@ pub enum LocalGitError {
     },
     UnsupportedSnapshotEntry,
     MalformedOutput(&'static str),
+    PushDestinationUnavailable,
+    PushDestinationAmbiguous,
+    UnsafePushDestination,
+    StalePushDestination,
+    StaleRemoteBranch,
     PoisonedLock,
 }
 
@@ -149,6 +154,21 @@ impl fmt::Display for LocalGitError {
                 "snapshot contains a local entry whose content cannot be guarded safely",
             ),
             Self::MalformedOutput(reason) => write!(formatter, "malformed Git output: {reason}"),
+            Self::PushDestinationUnavailable => formatter.write_str(
+                "no configured Git push destination provably matches the PR source repository; configure one outside cibergit and refresh",
+            ),
+            Self::PushDestinationAmbiguous => formatter.write_str(
+                "multiple configured Git push destinations could target the PR source repository; keep one unambiguous destination and refresh",
+            ),
+            Self::UnsafePushDestination => formatter.write_str(
+                "the configured Git destination cannot be used safely because it is unparseable or embeds credentials; replace it outside cibergit and refresh",
+            ),
+            Self::StalePushDestination => formatter.write_str(
+                "the configured Git push destination changed since confirmation; refresh before retrying",
+            ),
+            Self::StaleRemoteBranch => formatter.write_str(
+                "the PR source branch changed since confirmation; refresh before retrying",
+            ),
             Self::PoisonedLock => formatter.write_str("local Git operation lock is unavailable"),
         }
     }
@@ -298,6 +318,74 @@ pub struct SelectedDiff {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteBranchObservation {
     pub remote: String,
+    pub branch: String,
+    pub oid: Option<String>,
+}
+
+/// Credential-free repository coordinates parsed from installed Git's effective
+/// fetch or push URL. Raw URLs are deliberately never exposed by this API.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRepositoryIdentity {
+    pub host: String,
+    pub owner: String,
+    pub name: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PushConfigurationGuard([u8; 32]);
+
+impl fmt::Debug for PushConfigurationGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PushConfigurationGuard(<opaque>)")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitRepositoryTarget {
+    pub repository: GitRepositoryIdentity,
+    pub local_path: Option<PathBuf>,
+}
+
+/// One unambiguous installed-Git destination for a provider repository.
+/// `configuration_guard` covers the exact effective fetch and push URL bytes,
+/// but is opaque so a credential-bearing URL can never be disclosed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PushDestinationObservation {
+    pub remote: String,
+    pub repository: GitRepositoryIdentity,
+    pub fetch_repositories: Vec<GitRepositoryIdentity>,
+    configuration_guard: PushConfigurationGuard,
+    target: GitRepositoryTarget,
+    effective_push_url: String,
+}
+
+impl fmt::Debug for PushDestinationObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PushDestinationObservation")
+            .field("remote", &self.remote)
+            .field("repository", &self.repository)
+            .field("fetch_repositories", &self.fetch_repositories)
+            .field("configuration_guard", &self.configuration_guard)
+            .finish()
+    }
+}
+
+impl PushDestinationObservation {
+    /// Safe stable fingerprint for a durable attempt record. It cannot be used
+    /// to recover the effective URL or credentials that an unsafe URL held.
+    pub fn configuration_fingerprint(&self) -> String {
+        self.configuration_guard
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DestinationBranchObservation {
+    pub destination: PushDestinationObservation,
     pub branch: String,
     pub oid: Option<String>,
 }
@@ -771,12 +859,180 @@ impl LocalGit {
             ))
     }
 
+    /// Test ancestry between two immutable full commit OIDs without consulting
+    /// or moving any branch. Missing ancestry is returned as `false`.
+    pub fn commit_is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        validate_oid(ancestor)?;
+        validate_oid(descendant)?;
+        let output = self.run(
+            "inspect commit ancestry",
+            vec![
+                "--no-replace-objects".into(),
+                "merge-base".into(),
+                ancestor.into(),
+                descendant.into(),
+            ],
+            None,
+            false,
+            &[0, 1],
+        )?;
+        Ok(output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .any(|line| line.eq_ignore_ascii_case(ancestor.as_bytes())))
+    }
+
+    /// Resolve installed Git's effective fetch and push URLs for every remote.
+    /// Exactly one credential-free push destination must match `repository`.
+    /// This reads configuration only; it never adds or changes a remote.
+    pub fn observe_push_destination(
+        &self,
+        repository: &GitRepositoryTarget,
+    ) -> Result<PushDestinationObservation> {
+        let target = GitRepositoryTarget {
+            repository: repository.repository.clone(),
+            local_path: repository
+                .local_path
+                .as_ref()
+                .map(|path| canonical_git_path(path.clone(), "canonicalize push target"))
+                .transpose()?,
+        };
+        self.observe_push_destination_for_target(&target)
+    }
+
+    fn observe_push_destination_for_target(
+        &self,
+        target: &GitRepositoryTarget,
+    ) -> Result<PushDestinationObservation> {
+        let raw_remotes = self.run("list remotes", os_args(&["remote"]), None, false, &[0])?;
+        let remote_names = bounded_lines(&raw_remotes, "invalid remote list")?;
+        let mut candidates = Vec::new();
+        let mut unsafe_destination = false;
+        for remote in remote_names {
+            self.validate_remote_syntax(remote)?;
+            let fetch = self.run(
+                "read effective fetch destinations",
+                vec![
+                    "remote".into(),
+                    "get-url".into(),
+                    "--all".into(),
+                    remote.into(),
+                ],
+                None,
+                false,
+                &[0],
+            )?;
+            let push = self.run(
+                "read effective push destinations",
+                vec![
+                    "remote".into(),
+                    "get-url".into(),
+                    "--push".into(),
+                    "--all".into(),
+                    remote.into(),
+                ],
+                None,
+                false,
+                &[0],
+            )?;
+            let push_urls = bounded_lines(&push, "invalid effective push destination")?;
+            let mut matching = 0;
+            for url in &push_urls {
+                match parse_git_destination(url, &self.root) {
+                    Ok(parsed) if destination_matches(&parsed, target) => matching += 1,
+                    Ok(_) => {}
+                    Err(()) => unsafe_destination = true,
+                }
+            }
+            if matching == 0 {
+                continue;
+            }
+            if matching != 1 || push_urls.len() != 1 {
+                return Err(LocalGitError::PushDestinationAmbiguous);
+            }
+            let fetch_urls = bounded_lines(&fetch, "invalid effective fetch destination")?;
+            let mut fetch_repositories = Vec::new();
+            for url in fetch_urls {
+                match parse_git_destination(url, &self.root) {
+                    Ok(ParsedGitDestination::Network(identity)) => {
+                        fetch_repositories.push(identity)
+                    }
+                    Ok(ParsedGitDestination::Local(path)) => {
+                        if target.local_path.as_ref() == Some(&path) {
+                            fetch_repositories.push(target.repository.clone());
+                        }
+                    }
+                    Err(()) => unsafe_destination = true,
+                }
+            }
+            let mut hash = Sha256::new();
+            hash.update(remote.as_bytes());
+            hash.update([0]);
+            hash.update(&fetch);
+            hash.update([0]);
+            hash.update(&push);
+            candidates.push(PushDestinationObservation {
+                remote: remote.to_owned(),
+                repository: target.repository.clone(),
+                fetch_repositories,
+                configuration_guard: PushConfigurationGuard(hash.finalize().into()),
+                target: target.clone(),
+                effective_push_url: push_urls[0].to_owned(),
+            });
+        }
+        if unsafe_destination {
+            return Err(LocalGitError::UnsafePushDestination);
+        }
+        match candidates.len() {
+            0 => Err(LocalGitError::PushDestinationUnavailable),
+            1 => Ok(candidates.pop().expect("one checked candidate")),
+            _ => Err(LocalGitError::PushDestinationAmbiguous),
+        }
+    }
+
+    /// Observe one exact destination branch after proving that the effective
+    /// configuration still matches the supplied destination snapshot.
+    pub fn observe_destination_branch(
+        &self,
+        destination: &PushDestinationObservation,
+        branch: &str,
+    ) -> Result<DestinationBranchObservation> {
+        let current = self
+            .observe_push_destination_for_target(&destination.target)
+            .map_err(|_| LocalGitError::StalePushDestination)?;
+        if current.remote != destination.remote
+            || current.configuration_guard != destination.configuration_guard
+        {
+            return Err(LocalGitError::StalePushDestination);
+        }
+        let oid = self.observe_branch_at_repository(&destination.effective_push_url, branch)?;
+        Ok(DestinationBranchObservation {
+            destination: destination.clone(),
+            branch: branch.to_owned(),
+            oid,
+        })
+    }
+
     pub fn observe_remote_branch(
         &self,
         remote: &str,
         branch: &str,
     ) -> Result<RemoteBranchObservation> {
         self.validate_remote(remote)?;
+        self.validate_branch(branch)?;
+        let oid = self.observe_branch_at_repository(remote, branch)?;
+        Ok(RemoteBranchObservation {
+            remote: remote.into(),
+            branch: branch.into(),
+            oid,
+        })
+    }
+
+    fn observe_branch_at_repository(
+        &self,
+        repository: &str,
+        branch: &str,
+    ) -> Result<Option<String>> {
         self.validate_branch(branch)?;
         let remote_ref = format!("refs/heads/{branch}");
         let output = self.run(
@@ -785,7 +1041,7 @@ impl LocalGit {
                 "ls-remote".into(),
                 "--refs".into(),
                 "--".into(),
-                remote.into(),
+                repository.into(),
                 remote_ref.clone().into(),
             ],
             None,
@@ -813,11 +1069,7 @@ impl LocalGit {
             validate_oid(oid)?;
             Some(oid.to_owned())
         };
-        Ok(RemoteBranchObservation {
-            remote: remote.into(),
-            branch: branch.into(),
-            oid,
-        })
+        Ok(oid)
     }
 
     pub fn stage(&self, paths: &[GitPath], guard: &SnapshotGuard) -> Result<MutationReceipt> {
@@ -1060,6 +1312,133 @@ impl LocalGit {
         )
     }
 
+    /// Publish a fast-forward update to a previously observed PR source
+    /// destination without force. The expected remote OID is re-read from the
+    /// effective push endpoint immediately before Git starts; ordinary push
+    /// fast-forward checks remain authoritative at the server.
+    pub fn push_branch_to_destination(
+        &self,
+        destination: &PushDestinationObservation,
+        local_branch: &str,
+        expected_local_oid: &str,
+        remote_branch: &str,
+        expected_remote_oid: &str,
+        guard: &SnapshotGuard,
+    ) -> Result<MutationReceipt> {
+        self.validate_remote(&destination.remote)?;
+        self.validate_branch(local_branch)?;
+        self.validate_branch(remote_branch)?;
+        validate_oid(expected_local_oid)?;
+        validate_oid(expected_remote_oid)?;
+        let remote_ref = format!("refs/heads/{remote_branch}");
+        self.guarded(
+            guard,
+            MutationAction::Push,
+            Some(expected_remote_oid.to_owned()),
+            |snapshot| {
+                self.revalidate_push_destination(destination, remote_branch, expected_remote_oid)?;
+                let local_oid = snapshot.local_branch_oids.get(local_branch).ok_or(
+                    LocalGitError::InvalidInput(
+                        "local branch does not exist in the guarded snapshot",
+                    ),
+                )?;
+                if local_oid != expected_local_oid {
+                    return Err(LocalGitError::StaleSnapshot);
+                }
+                let refspec = format!("{expected_local_oid}:{remote_ref}");
+                self.run(
+                    "push PR source",
+                    vec![
+                        "push".into(),
+                        "--porcelain".into(),
+                        "--".into(),
+                        destination.remote.clone().into(),
+                        refspec.into(),
+                    ],
+                    None,
+                    true,
+                    &[0],
+                )?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Publish to a previously observed PR source destination. The exact
+    /// effective Git destination is re-read under the common-directory lock
+    /// immediately before dispatch, and both the local OID and remote lease are
+    /// explicit immutable inputs.
+    pub fn force_push_branch_with_lease_to_destination(
+        &self,
+        destination: &PushDestinationObservation,
+        local_branch: &str,
+        expected_local_oid: &str,
+        remote_branch: &str,
+        expected_remote_oid: &str,
+        guard: &SnapshotGuard,
+    ) -> Result<MutationReceipt> {
+        self.validate_remote(&destination.remote)?;
+        self.validate_branch(local_branch)?;
+        self.validate_branch(remote_branch)?;
+        validate_oid(expected_local_oid)?;
+        validate_oid(expected_remote_oid)?;
+        let remote_ref = format!("refs/heads/{remote_branch}");
+        let lease = format!("--force-with-lease={remote_ref}:{expected_remote_oid}");
+        self.guarded(
+            guard,
+            MutationAction::ForcePushWithLease,
+            Some(expected_remote_oid.to_owned()),
+            |snapshot| {
+                self.revalidate_push_destination(destination, remote_branch, expected_remote_oid)?;
+                let local_oid = snapshot.local_branch_oids.get(local_branch).ok_or(
+                    LocalGitError::InvalidInput(
+                        "local branch does not exist in the guarded snapshot",
+                    ),
+                )?;
+                if local_oid != expected_local_oid {
+                    return Err(LocalGitError::StaleSnapshot);
+                }
+                let refspec = format!("{expected_local_oid}:{remote_ref}");
+                self.run(
+                    "force push with lease",
+                    vec![
+                        "push".into(),
+                        "--porcelain".into(),
+                        lease.into(),
+                        "--".into(),
+                        destination.remote.clone().into(),
+                        refspec.into(),
+                    ],
+                    None,
+                    true,
+                    &[0],
+                )?;
+                Ok(())
+            },
+        )
+    }
+
+    fn revalidate_push_destination(
+        &self,
+        destination: &PushDestinationObservation,
+        branch: &str,
+        expected_remote_oid: &str,
+    ) -> Result<()> {
+        let current = self
+            .observe_push_destination_for_target(&destination.target)
+            .map_err(|_| LocalGitError::StalePushDestination)?;
+        if current.remote != destination.remote
+            || current.configuration_guard != destination.configuration_guard
+        {
+            return Err(LocalGitError::StalePushDestination);
+        }
+        let current_oid = self.observe_branch_at_repository(&current.effective_push_url, branch)?;
+        if current_oid.as_deref() != Some(expected_remote_oid) {
+            return Err(LocalGitError::StaleRemoteBranch);
+        }
+        Ok(())
+    }
+
     fn guarded(
         &self,
         expected: &SnapshotGuard,
@@ -1252,6 +1631,18 @@ impl LocalGit {
     }
 
     fn validate_remote(&self, remote: &str) -> Result<()> {
+        self.validate_remote_syntax(remote)?;
+        let remotes = self.run("list remotes", os_args(&["remote"]), None, false, &[0])?;
+        let found = remotes
+            .split(|byte| *byte == b'\n')
+            .any(|name| name == remote.as_bytes());
+        if !found {
+            return Err(LocalGitError::InvalidInput("unknown remote name"));
+        }
+        Ok(())
+    }
+
+    fn validate_remote_syntax(&self, remote: &str) -> Result<()> {
         if remote.is_empty()
             || remote.len() > 1024
             || remote.starts_with('-')
@@ -1260,13 +1651,6 @@ impl LocalGit {
                 .any(|byte| byte == 0 || byte.is_ascii_control())
         {
             return Err(LocalGitError::InvalidInput("invalid remote name"));
-        }
-        let remotes = self.run("list remotes", os_args(&["remote"]), None, false, &[0])?;
-        let found = remotes
-            .split(|byte| *byte == b'\n')
-            .any(|name| name == remote.as_bytes());
-        if !found {
-            return Err(LocalGitError::InvalidInput("unknown remote name"));
         }
         Ok(())
     }
@@ -1828,6 +2212,155 @@ fn is_media_path(path: &[u8]) -> bool {
 
 fn canonical_git_path(path: PathBuf, context: &'static str) -> Result<PathBuf> {
     fs::canonicalize(path).map_err(|source| LocalGitError::Io { context, source })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ParsedGitDestination {
+    Network(GitRepositoryIdentity),
+    Local(PathBuf),
+}
+
+fn bounded_lines<'a>(bytes: &'a [u8], reason: &'static str) -> Result<Vec<&'a str>> {
+    let value = text(bytes, reason)?;
+    let mut lines = Vec::new();
+    for line in value.lines() {
+        if line.is_empty() || line.len() > 16 * 1024 || line.chars().any(char::is_control) {
+            return Err(LocalGitError::MalformedOutput(reason));
+        }
+        lines.push(line);
+    }
+    Ok(lines)
+}
+
+fn parse_git_destination(
+    value: &str,
+    root: &Path,
+) -> std::result::Result<ParsedGitDestination, ()> {
+    if value.is_empty()
+        || value.len() > 16 * 1024
+        || value.chars().any(char::is_control)
+        || value.contains(['?', '#', '%'])
+    {
+        return Err(());
+    }
+    if let Some(rest) = value.strip_prefix("file://") {
+        if !rest.starts_with('/') {
+            return Err(());
+        }
+        return fs::canonicalize(rest)
+            .map(ParsedGitDestination::Local)
+            .map_err(|_| ());
+    }
+    if value.starts_with('/') || value.starts_with("./") || value.starts_with("../") {
+        let path = Path::new(value);
+        let path = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            root.join(path)
+        };
+        return fs::canonicalize(path)
+            .map(ParsedGitDestination::Local)
+            .map_err(|_| ());
+    }
+    if let Some((scheme, rest)) = value.split_once("://") {
+        if !matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "http" | "https" | "ssh" | "git"
+        ) {
+            return Err(());
+        }
+        let (authority, path) = rest.split_once('/').ok_or(())?;
+        let host = if let Some((userinfo, host)) = authority.rsplit_once('@') {
+            if !scheme.eq_ignore_ascii_case("ssh")
+                || userinfo.is_empty()
+                || userinfo.contains(':')
+                || !userinfo
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+            {
+                return Err(());
+            }
+            host
+        } else {
+            authority
+        };
+        let host = safe_host(host)?;
+        let (owner, name) = repository_path(path)?;
+        return Ok(ParsedGitDestination::Network(GitRepositoryIdentity {
+            host,
+            owner,
+            name,
+        }));
+    }
+    let (authority, path) = value.split_once(':').ok_or(())?;
+    if authority.contains('/') || path.starts_with('/') {
+        return Err(());
+    }
+    let host = if let Some((username, host)) = authority.rsplit_once('@') {
+        if username.is_empty()
+            || username.contains(':')
+            || !username
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        {
+            return Err(());
+        }
+        host
+    } else {
+        authority
+    };
+    let host = safe_host(host)?;
+    let (owner, name) = repository_path(path)?;
+    Ok(ParsedGitDestination::Network(GitRepositoryIdentity {
+        host,
+        owner,
+        name,
+    }))
+}
+
+fn safe_host(host: &str) -> std::result::Result<String, ()> {
+    if host.is_empty()
+        || host.starts_with('[')
+        || host.contains(':')
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+    {
+        return Err(());
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
+fn repository_path(path: &str) -> std::result::Result<(String, String), ()> {
+    let path = path.trim_matches('/');
+    let (owner, name) = path.split_once('/').ok_or(())?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(());
+    }
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    if name.is_empty()
+        || ![owner, name].into_iter().all(|component| {
+            component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+    {
+        return Err(());
+    }
+    Ok((owner.to_owned(), name.to_owned()))
+}
+
+fn destination_matches(destination: &ParsedGitDestination, target: &GitRepositoryTarget) -> bool {
+    match destination {
+        ParsedGitDestination::Network(identity) => {
+            identity.host.eq_ignore_ascii_case(&target.repository.host)
+                && identity
+                    .owner
+                    .eq_ignore_ascii_case(&target.repository.owner)
+                && identity.name.eq_ignore_ascii_case(&target.repository.name)
+        }
+        ParsedGitDestination::Local(path) => target.local_path.as_ref() == Some(path),
+    }
 }
 
 fn strip_one_lf(mut bytes: Vec<u8>) -> Vec<u8> {
