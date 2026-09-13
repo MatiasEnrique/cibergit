@@ -10,6 +10,7 @@ use crate::{
     SelectSinceLastReview, SidebarNarrower, SidebarWider, SubmitReview, ToggleComparisonPicker,
     ToggleFileTree, ToggleInspector, TogglePalette, ToggleSidebar, ToggleStackRelationships,
 };
+mod collaboration_cache;
 mod comparison_picker;
 mod file_tree;
 mod local_checkout;
@@ -47,6 +48,7 @@ use cibergit::{
         PollSchedule, Store, TabState, WorkspaceState,
     },
 };
+use collaboration_cache::{CachedObservation, CollaborationCache, PreparedWrite, now_unix_ms};
 use comparison_picker::{
     ComparisonPicker, PickerMode, RequestToken, remember_request_progress, saved_request_progress,
 };
@@ -66,6 +68,8 @@ use review_interactions::{
 use stack_view::{
     StackLoadState, StackViewController, boundary_label, load_stack, provenance_label,
 };
+#[cfg(feature = "ui-smoke")]
+use std::fs;
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -102,6 +106,7 @@ const SPLIT_GUTTER_WIDTH: f32 = 66.;
 #[cfg(feature = "ui-smoke")]
 const UNIFIED_GUTTER_WIDTH: f32 = 114.;
 const EXCEPTIONAL_LINE_CHUNK_BYTES: usize = 2_048;
+static WORKSPACE_INSTANCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "ui-smoke")]
 const SMOKE_LONG_LINE_TOKEN: &str = "CIBERGIT_LONG_LINE_END_7F3A";
 #[cfg(feature = "ui-smoke")]
@@ -112,6 +117,9 @@ const SMOKE_OLD_LINE_END: &str = "CIBERGIT_OLD_END_9C41";
 const SMOKE_NEW_LINE_START: &str = "CIBERGIT_NEW_START_51B8";
 #[cfg(feature = "ui-smoke")]
 const SMOKE_NEW_LINE_END: &str = "CIBERGIT_NEW_END_E73F";
+#[cfg(feature = "ui-smoke")]
+const SMOKE_OFFLINE_DRAFT: &str =
+    "Offline collaboration smoke draft saved only in the accepted local DraftStore.";
 
 #[derive(Clone, Debug, Default)]
 pub enum LaunchMode {
@@ -610,6 +618,51 @@ impl TabReadEpoch {
     }
 }
 
+#[derive(Clone)]
+struct CollaborationReadToken {
+    workspace_instance: u64,
+    tab_instance: u64,
+    generation: u64,
+    repository_key: String,
+    pull_request: u64,
+}
+
+impl CollaborationReadToken {
+    fn matches(&self, workspace: &ReviewWorkspace, tab: &ReviewTab) -> bool {
+        self.matches_values(
+            workspace.workspace_instance,
+            tab.instance_generation,
+            tab.collaboration_cache_generation,
+            &tab.repository.cache_key(),
+            tab.pull_request.number,
+        )
+    }
+
+    fn matches_values(
+        &self,
+        workspace_instance: u64,
+        tab_instance: u64,
+        generation: u64,
+        repository_key: &str,
+        pull_request: u64,
+    ) -> bool {
+        workspace_instance == self.workspace_instance
+            && tab_instance == self.tab_instance
+            && generation == self.generation
+            && repository_key == self.repository_key
+            && pull_request == self.pull_request
+    }
+}
+
+fn collaboration_completion_matches(
+    expected_workspace: u64,
+    current_workspace: u64,
+    expected_tab: u64,
+    current_tab: u64,
+) -> bool {
+    expected_workspace == current_workspace && expected_tab == current_tab
+}
+
 struct ReviewTab {
     instance_generation: u64,
     repository: Repository,
@@ -635,6 +688,9 @@ struct ReviewTab {
     local_inventory: bool,
     session_persistence_error: Option<String>,
     details: Option<PullRequestDetails>,
+    cached_collaboration: Option<CachedObservation>,
+    collaboration_cache_notice: Option<String>,
+    collaboration_cache_generation: u64,
     pending_snapshot: Option<PendingReviewSnapshot>,
     journal_operations: Vec<JournalOperation>,
     journal_error: Option<String>,
@@ -727,6 +783,8 @@ enum InspectorSection {
 
 pub struct ReviewWorkspace {
     store: Option<Store>,
+    collaboration_cache: CollaborationCache,
+    workspace_instance: u64,
     interaction_root: PathBuf,
     stack_data_root: PathBuf,
     notifications: notifications_view::NotificationController,
@@ -772,6 +830,11 @@ pub struct ReviewWorkspace {
     session_save_locks: HashMap<String, Arc<Mutex<()>>>,
     review_state_latest: HashMap<String, Arc<AtomicU64>>,
     review_state_locks: HashMap<String, Arc<Mutex<()>>>,
+    collaboration_write_latest: HashMap<String, Arc<AtomicU64>>,
+    #[cfg(feature = "ui-smoke")]
+    collaboration_read_disabled: bool,
+    #[cfg(feature = "ui-smoke")]
+    collaboration_read_attempts: Arc<AtomicU64>,
     composer_edit_generation: u64,
     next_request_generation: u64,
     _subscriptions: Vec<Subscription>,
@@ -885,6 +948,8 @@ impl ReviewWorkspace {
                 .join("Library/Application Support/cibergit")
         });
         let interaction_root = data_root.join("review-interactions");
+        let collaboration_cache = CollaborationCache::new(data_root.clone());
+        let workspace_instance = WORKSPACE_INSTANCE.fetch_add(1, Ordering::Relaxed) + 1;
         let notifications = notifications_view::NotificationController::new(data_root.clone());
         cx.bind_keys([
             KeyBinding::new("cmd-shift-e", local_checkout::EditLocally, None),
@@ -978,6 +1043,8 @@ impl ReviewWorkspace {
             .collect();
         let mut this = Self {
             store,
+            collaboration_cache,
+            workspace_instance,
             interaction_root,
             stack_data_root: data_root,
             notifications,
@@ -1023,6 +1090,14 @@ impl ReviewWorkspace {
             session_save_locks: HashMap::new(),
             review_state_latest: HashMap::new(),
             review_state_locks: HashMap::new(),
+            collaboration_write_latest: HashMap::new(),
+            #[cfg(feature = "ui-smoke")]
+            collaboration_read_disabled: std::env::var_os(
+                "CIBERGIT_SMOKE_COLLABORATION_READ_DISABLED",
+            )
+            .is_some(),
+            #[cfg(feature = "ui-smoke")]
+            collaboration_read_attempts: Arc::new(AtomicU64::new(0)),
             composer_edit_generation: 0,
             next_request_generation: 0,
             _subscriptions: Vec::new(),
@@ -1569,6 +1644,10 @@ impl ReviewWorkspace {
         }
         if std::env::var_os("CIBERGIT_SMOKE_STACK").is_some() {
             self.start_stack_smoke(window, cx, output);
+            return;
+        }
+        if let Ok(phase) = std::env::var("CIBERGIT_SMOKE_OFFLINE_COLLABORATION") {
+            self.start_offline_collaboration_smoke(window, cx, output, phase);
             return;
         }
         let second_pr = std::env::var("CIBERGIT_SMOKE_SECOND_PR")
@@ -2572,6 +2651,347 @@ impl ReviewWorkspace {
                     }
                     cx.quit();
                 });
+            })
+            .detach();
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn start_offline_collaboration_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+        output: PathBuf,
+        phase: String,
+    ) {
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                let appearance = std::env::var("CIBERGIT_SMOKE_APPEARANCE")
+                    .unwrap_or_else(|_| "system".into());
+                let started = std::time::Instant::now();
+                let ready = loop {
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                let Root::Review(this) = root else { return false };
+                                let Some(index) = this.active_tab else { return false };
+                                let tab = &this.tabs[index];
+                                if phase == "populate" {
+                                    tab.session.is_some()
+                                        && tab.details.is_some()
+                                        && matches!(tab.interactions, InteractionState::Ready(_))
+                                        && !tab.details_refresh.active
+                                } else {
+                                    tab.session.is_some()
+                                        && tab.details.is_none()
+                                        && tab.cached_collaboration.is_some()
+                                        && matches!(tab.interactions, InteractionState::Ready(_))
+                                        && !tab.details_refresh.active
+                                        && matches!(tab.details_state, LoadState::Cached(_))
+                                }
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready || started.elapsed() > Duration::from_secs(90) {
+                        break ready;
+                    }
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                };
+                if !ready {
+                    panic!("offline collaboration {phase} smoke did not become ready");
+                }
+
+                if phase == "populate" {
+                    let setup = window
+                        .update(|window, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("smoke left review workspace".to_owned());
+                                };
+                                let index = this
+                                    .active_tab
+                                    .ok_or_else(|| "smoke has no active tab".to_owned())?;
+                                let repository = this.tabs[index].repository.clone();
+                                let number = this.tabs[index].pull_request.number;
+                                let revision = this.tabs[index].canonical_full_revision.clone();
+                                this.compose_first_selectable(window, cx);
+                                this.composer_input.update(cx, |input, cx| {
+                                    input.set_value(SMOKE_OFFLINE_DRAFT, window, cx)
+                                });
+                                this.persist_composer(cx);
+                                Ok((
+                                    this.collaboration_cache.clone(),
+                                    repository,
+                                    number,
+                                    revision,
+                                ))
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")));
+                    let (cache, repository, number, revision) =
+                        setup.unwrap_or_else(|error| panic!("offline cache setup failed: {error}"));
+
+                    let settled = std::time::Instant::now();
+                    let (cached, draft_saved) = loop {
+                        let cache_task = window.background_executor().spawn({
+                            let cache = cache.clone();
+                            let repository = repository.clone();
+                            async move { cache.load(&repository, number) }
+                        });
+                        let cached = cache_task.await.ok().flatten();
+                        let draft_saved = window
+                            .update(|_, cx| {
+                                weak.read_with(cx, |root, _| {
+                                    let Root::Review(this) = root else { return false };
+                                    let Some(index) = this.active_tab else { return false };
+                                    matches!(&this.tabs[index].interactions, InteractionState::Ready(controller)
+                                        if controller.durable_composition.as_ref().is_some_and(|composition| {
+                                            composition.drafts.iter().any(|draft| draft.body == SMOKE_OFFLINE_DRAFT)
+                                        }))
+                                })
+                                .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if (cached.is_some() && draft_saved)
+                            || settled.elapsed() > Duration::from_secs(20)
+                        {
+                            break (cached, draft_saved);
+                        }
+                        window
+                            .background_executor()
+                            .timer(Duration::from_millis(150))
+                            .await;
+                    };
+                    let cached = cached.unwrap_or_else(|| {
+                        panic!("fresh provider details were not persisted through the cache path")
+                    });
+                    assert!(draft_saved, "local draft did not become durable");
+                    assert_eq!(cached.details.number, number);
+                    let baseline = serde_json::to_vec(&revision).expect("serialize smoke revision");
+                    let report = format!(
+                        "Offline collaboration populate phase\nReal provider details admitted: true\nCached observed_at_unix_ms: {}\nCached payload: body={} bytes, issue comments={}, reviews={}, threads={}, checks={}\nActivity complete: {}\nChecks complete: {}\nLocal DraftStore draft durable: {}\nPinned revision: {}..{}\nRemote mutations: 0\n",
+                        cached.observed_at_unix_ms,
+                        cached.details.body.len(),
+                        cached.details.issue_comments.len(),
+                        cached.details.reviews.len(),
+                        cached.details.review_threads.len(),
+                        cached.details.checks.len(),
+                        cached.details.activity_complete,
+                        cached.details.checks_complete,
+                        draft_saved,
+                        revision.base_sha,
+                        revision.head_sha,
+                    );
+                    let write = window.background_executor().spawn({
+                        let output = output.clone();
+                        async move {
+                            fs::create_dir_all(&output)?;
+                            fs::write(output.join("offline-collaboration-baseline.json"), baseline)?;
+                            fs::write(output.join("offline-collaboration-populate.txt"), report)
+                        }
+                    });
+                    write.await.expect("write offline collaboration populate evidence");
+                    let _ = window.update(|_, cx| cx.quit());
+                    return;
+                }
+
+                assert_eq!(phase, "offline", "unknown offline collaboration smoke phase");
+                let baseline_task = window.background_executor().spawn({
+                    let path = output.join("offline-collaboration-baseline.json");
+                    async move { fs::read(path) }
+                });
+                let baseline: Revision = serde_json::from_slice(
+                    &baseline_task
+                        .await
+                        .expect("read offline collaboration baseline"),
+                )
+                .expect("parse offline collaboration baseline");
+                let state = window
+                    .update(|window, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err("smoke left review workspace".to_owned());
+                            };
+                            let index = this
+                                .active_tab
+                                .ok_or_else(|| "smoke has no active tab".to_owned())?;
+                            let tab = &this.tabs[index];
+                            let cached = tab.cached_collaboration.as_ref().ok_or_else(|| {
+                                "offline restart did not install cached presentation".to_owned()
+                            })?;
+                            if tab.details.is_some() {
+                                return Err("offline fixture installed fresh details".into());
+                            }
+                            if tab.canonical_full_revision != baseline {
+                                return Err("offline cache changed the pinned comparison".into());
+                            }
+                            let draft_saved = matches!(&tab.interactions, InteractionState::Ready(controller)
+                                if controller.composition.drafts.iter().any(|draft| draft.body == SMOKE_OFFLINE_DRAFT));
+                            if !draft_saved {
+                                return Err("local draft did not survive restart".into());
+                            }
+                            if cached.details.body.is_empty()
+                                || cached.details.issue_comments.is_empty()
+                                || cached.details.review_threads.is_empty()
+                                || cached.details.checks.is_empty()
+                            {
+                                return Err("cached Overview/Activity/Checks evidence is empty".into());
+                            }
+                            let state = (
+                                cached.observed_at_unix_ms,
+                                cached.details.activity_complete,
+                                cached.details.checks_complete,
+                                cached.details.issue_comments.len(),
+                                cached.details.reviews.len(),
+                                cached.details.review_threads.len(),
+                                cached.details.checks.len(),
+                                this.collaboration_read_attempts.load(Ordering::Acquire),
+                            );
+                            this.inspector_open = true;
+                            this.tabs[index].inspector_section = InspectorSection::Overview;
+                            this.refresh_auto_layout(window);
+                            cx.notify();
+                            Ok(state)
+                        })
+                        .unwrap_or_else(|error| {
+                            Err(format!("smoke entity unavailable: {error:#}"))
+                        })
+                    })
+                    .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")))
+                    .unwrap_or_else(|error| panic!("offline cache validation failed: {error}"));
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
+                let overview_name = format!("native-offline-overview-{appearance}.png");
+                let overview = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image.save(output.join(&overview_name)).map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root
+                            && let Some(index) = this.active_tab
+                        {
+                            this.tabs[index].inspector_section = InspectorSection::Activity;
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
+                let activity_name = format!("native-offline-activity-{appearance}.png");
+                let activity = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image.save(output.join(&activity_name)).map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root
+                            && let Some(index) = this.active_tab
+                        {
+                            this.tabs[index].inspector_section = InspectorSection::Checks;
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
+                let checks_name = format!("native-offline-checks-{appearance}.png");
+                let checks = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image.save(output.join(&checks_name)).map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root
+                            && let Some(index) = this.active_tab
+                        {
+                            this.refresh_details(index, cx);
+                        }
+                    });
+                });
+                let reconnect_started = std::time::Instant::now();
+                let reconnect_read_only = loop {
+                    let result = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                let Root::Review(this) = root else { return false };
+                                let Some(index) = this.active_tab else { return false };
+                                this.collaboration_read_attempts.load(Ordering::Acquire) > state.7
+                                    && !this.tabs[index].details_refresh.active
+                                    && this.tabs[index].details.is_none()
+                                    && this.tabs[index].cached_collaboration.is_some()
+                                    && this.tabs[index].canonical_full_revision == baseline
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if result || reconnect_started.elapsed() > Duration::from_secs(10) {
+                        break result;
+                    }
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                };
+                let report = format!(
+                    "Offline collaboration restart phase ({appearance})\nScoped provider-details transport disabled: true\nFresh details installed: false\nCached observed_at_unix_ms: {}\nCached Activity complete: {}\nCached Checks complete: {}\nCached counts: issue comments={}, reviews={}, threads={}, checks={}\nOverview capture: {}\nActivity capture: {}\nChecks capture: {}\nPinned comparison unchanged: true\nLocal DraftStore draft survived restart: true\nExplicit reconnect/refresh triggered another read only: {}\nRemote mutation dispatches from smoke path: 0\nOS notifications: not invoked\nFocus requested by smoke: false\nPhysical input, AX, acrylic identity, and network-wide offline state: not established by in-process capture.\n",
+                    state.0,
+                    state.1,
+                    state.2,
+                    state.3,
+                    state.4,
+                    state.5,
+                    state.6,
+                    if overview { &overview_name } else { "failed" },
+                    if activity { &activity_name } else { "failed" },
+                    if checks { &checks_name } else { "failed" },
+                    reconnect_read_only,
+                );
+                let report_name = format!("offline-collaboration-{appearance}.txt");
+                let write = window.background_executor().spawn({
+                    let output = output.clone();
+                    async move {
+                        fs::create_dir_all(&output)?;
+                        fs::write(output.join(report_name), report)
+                    }
+                });
+                write.await.expect("write offline collaboration evidence");
+                if !overview || !activity || !checks || !reconnect_read_only {
+                    panic!("offline collaboration native smoke assertions failed");
+                }
+                let _ = window.update(|_, cx| cx.quit());
             })
             .detach();
     }
@@ -5881,6 +6301,9 @@ impl ReviewWorkspace {
             local_inventory,
             session_persistence_error,
             details: None,
+            cached_collaboration: None,
+            collaboration_cache_notice: None,
+            collaboration_cache_generation: 0,
             pending_snapshot: None,
             journal_operations: Vec::new(),
             journal_error: None,
@@ -5908,6 +6331,7 @@ impl ReviewWorkspace {
         let index = self.tabs.len() - 1;
         self.active_tab = Some(index);
         self.setup_open = false;
+        self.load_cached_collaboration(index, cx);
         #[cfg(feature = "ui-smoke")]
         if std::env::var_os("CIBERGIT_SMOKE_STACK").is_some() {
             return;
@@ -7703,6 +8127,139 @@ impl ReviewWorkspace {
         self.refresh_details_with_intent(index, true, cx);
     }
 
+    fn load_cached_collaboration(&mut self, index: usize, cx: &mut Context<Root>) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        tab.collaboration_cache_generation = tab.collaboration_cache_generation.saturating_add(1);
+        let repository = tab.repository.clone();
+        let token = CollaborationReadToken {
+            workspace_instance: self.workspace_instance,
+            tab_instance: tab.instance_generation,
+            generation: tab.collaboration_cache_generation,
+            repository_key: repository.cache_key(),
+            pull_request: tab.pull_request.number,
+        };
+        let cache = self.collaboration_cache.clone();
+        let number = tab.pull_request.number;
+        let task = cx.background_spawn(async move { cache.load(&repository, number) });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(tab_index) = this.tabs.iter().position(|tab| token.matches(this, tab))
+                else {
+                    return;
+                };
+                let tab = &mut this.tabs[tab_index];
+                match result {
+                    Ok(Some(observation)) if tab.details.is_none() => {
+                        let observed_at = observation.observed_at_unix_ms;
+                        let age = collaboration_age_label(observed_at);
+                        let prior_failure = match &tab.details_state {
+                            LoadState::Error(error) => Some(error.clone()),
+                            _ => None,
+                        };
+                        tab.cached_collaboration = Some(observation);
+                        tab.details_state = LoadState::Cached(match prior_failure {
+                            Some(error) => format!(
+                                "Cached collaboration observed {age} · current read failed: {error}"
+                            ),
+                            None if tab.details_refresh.active => format!(
+                                "Cached collaboration observed {age} · refreshing current data"
+                            ),
+                            None => format!("Cached collaboration observed {age}"),
+                        });
+                        tab.collaboration_cache_notice = None;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tab.collaboration_cache_notice = Some(format!(
+                            "Offline collaboration cache was refused and preserved: {error:#}"
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn queue_collaboration_save(
+        &mut self,
+        index: usize,
+        details: PullRequestDetails,
+        prepared: Result<(PreparedWrite, u64), String>,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let key = tab.repository.cache_key();
+        let number = tab.pull_request.number;
+        let instance = tab.instance_generation;
+        let workspace_instance = self.workspace_instance;
+        let latest = self
+            .collaboration_write_latest
+            .entry(format!("{key}\u{1f}{number}"))
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        let sequence = latest.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        let cache = self.collaboration_cache.clone();
+        let completion_latest = latest.clone();
+        let task = cx.background_spawn(async move {
+            if latest.load(Ordering::Acquire) != sequence {
+                return Ok::<bool, String>(false);
+            }
+            let (prepared, observed_at) = prepared?;
+            if latest.load(Ordering::Acquire) != sequence {
+                return Ok(false);
+            }
+            cache
+                .save(prepared, details, observed_at)
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(true)
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                if this.workspace_instance != workspace_instance {
+                    return;
+                }
+                let Some(tab) = this.tabs.iter_mut().find(|tab| {
+                    tab.repository.cache_key() == key
+                        && tab.pull_request.number == number
+                        && tab.instance_generation == instance
+                }) else {
+                    return;
+                };
+                if !collaboration_completion_matches(
+                    workspace_instance,
+                    this.workspace_instance,
+                    instance,
+                    tab.instance_generation,
+                ) {
+                    return;
+                }
+                if completion_latest.load(Ordering::Acquire) != sequence {
+                    return;
+                }
+                match result {
+                    Ok(true) => tab.collaboration_cache_notice = None,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tab.collaboration_cache_notice = Some(format!(
+                            "Fresh collaboration data remains usable, but its disposable offline cache was not updated: {error}"
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn refresh_details_with_intent(
         &mut self,
         index: usize,
@@ -7720,27 +8277,53 @@ impl ReviewWorkspace {
             instance: tab.instance_generation,
             generation: tab.details_generation,
         };
+        let read_workspace_instance = self.workspace_instance;
         let repository = tab.repository.clone();
         let number = tab.pull_request.number;
         let key = repository.cache_key();
         let journal_root = self.interaction_root.clone();
+        let collaboration_cache = self.collaboration_cache.clone();
+        #[cfg(feature = "ui-smoke")]
+        let collaboration_read_disabled = self.collaboration_read_disabled;
+        #[cfg(feature = "ui-smoke")]
+        let collaboration_read_attempts = self.collaboration_read_attempts.clone();
         if tab.details.is_none() {
             tab.details_state = LoadState::Loading("Loading PR details…".into());
         }
         let task = cx.background_spawn(async move {
+            #[cfg(feature = "ui-smoke")]
+            collaboration_read_attempts.fetch_add(1, Ordering::AcqRel);
+            let prepared = collaboration_cache
+                .prepare_write(&repository, number)
+                .map_err(|error| format!("prepare disposable collaboration cache: {error:#}"));
+            #[cfg(feature = "ui-smoke")]
+            if collaboration_read_disabled {
+                return Err(anyhow::anyhow!(
+                    "scoped collaboration transport fixture refused the provider read"
+                ));
+            }
             let provider = GithubProvider::new(repository.account.clone());
             let details = provider.details(&repository, number)?;
+            let observed_at = now_unix_ms()
+                .map_err(|error| format!("capture collaboration observation time: {error:#}"));
+            let cache_write = match (prepared, observed_at) {
+                (Ok(prepared), Ok(observed_at)) => Ok((prepared, observed_at)),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            };
             let pending = provider.pending_review(&repository, number);
             let journal = ReviewKey::for_repository("github", &repository, number)
                 .map_err(|error| error.to_string())
                 .and_then(|key| ActionJournal::open(&journal_root, key))
                 .and_then(|journal| journal.operations());
-            Ok::<_, anyhow::Error>((details, pending, journal))
+            Ok::<_, anyhow::Error>((details, pending, journal, cache_write))
         });
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
+                if this.workspace_instance != read_workspace_instance {
+                    return;
+                }
                 let Some(tab_index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == key
                         && tab.pull_request.number == number
@@ -7759,10 +8342,16 @@ impl ReviewWorkspace {
                     return;
                 }
                 match result {
-                    Ok((details, pending, journal)) => {
+                    Ok((details, pending, journal, cache_write)) => {
                         let pending = match pending {
                             Ok(pending) => pending,
                             Err(error) => {
+                                this.queue_collaboration_save(
+                                    tab_index,
+                                    details.clone(),
+                                    cache_write,
+                                    cx,
+                                );
                                 let tab = &mut this.tabs[tab_index];
                                 tab.details = Some(details);
                                 let notice = format!(
@@ -7785,6 +8374,12 @@ impl ReviewWorkspace {
                                 return;
                             }
                         };
+                        this.queue_collaboration_save(
+                            tab_index,
+                            details.clone(),
+                            cache_write,
+                            cx,
+                        );
                         let save = {
                             let tab = &mut this.tabs[tab_index];
                             tab.details = Some(details);
@@ -7889,7 +8484,9 @@ impl ReviewWorkspace {
                     }
                     Err(error) => {
                         let tab = &mut this.tabs[tab_index];
-                        tab.details_state = if tab.details.is_some() {
+                        tab.details_state = if tab.details.is_some()
+                            || tab.cached_collaboration.is_some()
+                        {
                             LoadState::Cached(format!("Details refresh failed · {error:#}"))
                         } else {
                             LoadState::Error(format!("PR details unavailable · {error:#}"))
@@ -12355,6 +12952,16 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) -> impl IntoElement {
         let tab = &self.tabs[index];
+        let cached_observation = if tab.details.is_none() {
+            tab.cached_collaboration.as_ref()
+        } else {
+            None
+        };
+        let displayed_details = tab
+            .details
+            .as_ref()
+            .or_else(|| cached_observation.map(|observation| &observation.details));
+        let fresh_details = tab.details.is_some();
         let confirmation_open = tab.confirmation.is_some();
         let current = tab.inspector_section;
         let root = cx.entity();
@@ -12393,7 +13000,7 @@ impl ReviewWorkspace {
                         colors,
                     ),
                 ];
-                if let Some(details) = &tab.details {
+                if let Some(details) = displayed_details {
                     fields.push(detail(
                         "Requested reviewers",
                         if details.requested_reviewers.is_empty() {
@@ -12404,7 +13011,11 @@ impl ReviewWorkspace {
                         colors,
                     ));
                     fields.push(detail(
-                        "Merge state",
+                        if cached_observation.is_some() {
+                            "Merge state (cached observation)"
+                        } else {
+                            "Merge state"
+                        },
                         format!(
                             "{} · {}",
                             details.merge_eligibility.mergeable,
@@ -12891,7 +13502,7 @@ impl ReviewWorkspace {
                         activity.push(div().text_color(colors.red).child(reason.clone()))
                     }
                 }
-                if let Some(details) = &tab.details {
+                if let Some(details) = displayed_details {
                     let comment_count = details.issue_comments.len();
                     let comment_pages = comment_count.div_ceil(20).max(1);
                     let comment_page = tab.issue_comment_page.min(comment_pages - 1);
@@ -12942,7 +13553,7 @@ impl ReviewWorkspace {
                         .skip(comment_page * 20)
                         .take(20)
                     {
-                        let editable = tab.lifecycle.current_user_comment(comment);
+                        let editable = fresh_details && tab.lifecycle.current_user_comment(comment);
                         let edit_comment = comment.clone();
                         let delete_comment = comment.clone();
                         activity.push(
@@ -13035,6 +13646,12 @@ impl ReviewWorkspace {
                                     )),
                             ),
                         );
+                    }
+                    if cached_observation.is_some() && details.reviews.len() > 20 {
+                        activity.push(div().text_color(colors.amber).child(format!(
+                            "Cached snapshot contains {} reviews; this view displays the first 20.",
+                            details.reviews.len()
+                        )));
                     }
                     let placed = tab
                         .session
@@ -13131,6 +13748,14 @@ impl ReviewWorkspace {
                                 }),
                         );
                     }
+                    if cached_observation.is_some() && placed.len() > 30 {
+                        activity.push(
+                            div().text_color(colors.amber).child(format!(
+                                "Cached snapshot contains {} mapped discussion threads; this view displays the first 30.",
+                                placed.len()
+                            )),
+                        );
+                    }
                     if !details.activity_complete {
                         activity.push(
                             div().text_color(colors.amber).child(
@@ -13154,7 +13779,7 @@ impl ReviewWorkspace {
                     empty_unknown(&tab.pull_request.check_status),
                     colors,
                 )];
-                if let Some(details) = &tab.details {
+                if let Some(details) = displayed_details {
                     for check in details.checks.iter().take(40) {
                         checks.push(div().mb_3().child(check.name.clone()).child(
                             div().text_xs().text_color(colors.muted).child(format!(
@@ -13174,6 +13799,12 @@ impl ReviewWorkspace {
                                 .text_color(colors.amber)
                                 .child("Check results are incomplete."),
                         );
+                    }
+                    if cached_observation.is_some() && details.checks.len() > 40 {
+                        checks.push(div().text_color(colors.amber).child(format!(
+                            "Cached snapshot contains {} checks; this view displays the first 40.",
+                            details.checks.len()
+                        )));
                     }
                 }
                 div().children(checks).into_any_element()
@@ -13202,6 +13833,25 @@ impl ReviewWorkspace {
                     .child(section("Activity", InspectorSection::Activity))
                     .child(section("Checks", InspectorSection::Checks)),
             )
+            .when_some(cached_observation, |panel, observation| {
+                let details = &observation.details;
+                panel.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_xs()
+                        .text_color(colors.amber)
+                        .child(format!(
+                            "Cached · observed {} · read-only collaboration snapshot. Cached data does not supply permissions.{}{}",
+                            collaboration_age_label(observation.observed_at_unix_ms),
+                            if details.activity_complete { "" } else { " Activity was incomplete when observed." },
+                            if details.checks_complete { "" } else { " Checks were incomplete when observed." },
+                        ))
+                        .when_some(details.notice.clone(), |notice, value| {
+                            notice.child(format!(" Original provider notice: {value}"))
+                        }),
+                )
+            })
             .when_some(tab.details_state.notice(), |panel, notice| {
                 panel.child(
                     div()
@@ -13209,6 +13859,16 @@ impl ReviewWorkspace {
                         .py_2()
                         .text_xs()
                         .text_color(colors.muted)
+                        .child(notice),
+                )
+            })
+            .when_some(tab.collaboration_cache_notice.clone(), |panel, notice| {
+                panel.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_xs()
+                        .text_color(colors.amber)
                         .child(notice),
                 )
             })
@@ -14527,6 +15187,29 @@ fn empty_unknown(value: &str) -> String {
     }
 }
 
+fn collaboration_age_label(observed_at_unix_ms: u64) -> String {
+    let now = now_unix_ms().unwrap_or(observed_at_unix_ms);
+    let elapsed_seconds = now.saturating_sub(observed_at_unix_ms) / 1_000;
+    match elapsed_seconds {
+        0..=59 => "just now".into(),
+        60..=3_599 => {
+            let minutes = elapsed_seconds / 60;
+            format!(
+                "{minutes} minute{} ago",
+                if minutes == 1 { "" } else { "s" }
+            )
+        }
+        3_600..=86_399 => {
+            let hours = elapsed_seconds / 3_600;
+            format!("{hours} hour{} ago", if hours == 1 { "" } else { "s" })
+        }
+        _ => {
+            let days = elapsed_seconds / 86_400;
+            format!("{days} day{} ago", if days == 1 { "" } else { "s" })
+        }
+    }
+}
+
 fn group_label(group: Option<&GroupBy>) -> &'static str {
     match group {
         Some(GroupBy::Repository) => "Repository",
@@ -15511,12 +16194,13 @@ impl EditorWorkspace {
 #[cfg(test)]
 mod layout_tests {
     use super::{
-        COLLAPSED_PANEL_WIDTH, DEFAULT_SIDEBAR_WIDTH, DiffLine, DiffLineKind, DiffMode, DiffRow,
-        EXCEPTIONAL_LINE_CHUNK_BYTES, JournalOperation, JournalRequest, JournalStatus,
-        MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH, MIN_SIDEBAR_WIDTH,
-        MIN_SPLIT_DIFF_WIDTH, PanelKind, PanelLayout, available_diff_width_for, diff_content_width,
-        display_columns, journal_operation_description, journal_operation_summary,
-        line_text_chunks, media_free_markdown, resolved_panel_widths_for,
+        COLLAPSED_PANEL_WIDTH, CollaborationReadToken, DEFAULT_SIDEBAR_WIDTH, DiffLine,
+        DiffLineKind, DiffMode, DiffRow, EXCEPTIONAL_LINE_CHUNK_BYTES, JournalOperation,
+        JournalRequest, JournalStatus, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
+        MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, PanelKind, PanelLayout, available_diff_width_for,
+        collaboration_completion_matches, diff_content_width, display_columns,
+        journal_operation_description, journal_operation_summary, line_text_chunks,
+        media_free_markdown, resolved_panel_widths_for,
     };
     use cibergit::domain::{ProviderCoordinates, ReviewAuxiliaryAction, ReviewAuxiliaryRequest};
 
@@ -15549,6 +16233,27 @@ mod layout_tests {
                 "later periodic refresh remains available"
             );
         }
+    }
+
+    #[test]
+    fn cache_load_and_save_callbacks_reject_workspace_and_tab_replacement() {
+        let token = CollaborationReadToken {
+            workspace_instance: 10,
+            tab_instance: 20,
+            generation: 30,
+            repository_key: "selected-account/repository".into(),
+            pull_request: 7,
+        };
+        assert!(token.matches_values(10, 20, 30, "selected-account/repository", 7));
+        assert!(!token.matches_values(11, 20, 30, "selected-account/repository", 7));
+        assert!(!token.matches_values(10, 21, 30, "selected-account/repository", 7));
+        assert!(!token.matches_values(10, 20, 31, "selected-account/repository", 7));
+        assert!(!token.matches_values(10, 20, 30, "other-account/repository", 7));
+        assert!(!token.matches_values(10, 20, 30, "selected-account/repository", 8));
+
+        assert!(collaboration_completion_matches(10, 10, 20, 20));
+        assert!(!collaboration_completion_matches(10, 11, 20, 20));
+        assert!(!collaboration_completion_matches(10, 10, 20, 21));
     }
 
     #[test]
