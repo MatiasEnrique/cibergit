@@ -1,4 +1,5 @@
 use cibergit::domain::{Account, Comparison, PullRequest, Repository, Revision};
+use cibergit::review::{ComparisonMetadata, ComparisonMode, DiffMode, ReviewSession};
 use cibergit::workspace::{Store, WorkspaceState};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
@@ -36,6 +37,87 @@ fn json_files(root: &Path) -> Vec<std::path::PathBuf> {
                 && path.file_name().and_then(|name| name.to_str()) != Some("workspace.json")
         })
         .collect()
+}
+
+#[test]
+fn review_progress_restores_pinned_code_and_independent_file_positions() {
+    let dir = tempfile::tempdir().unwrap();
+    let one = repo("one");
+    let mut snapshot = comparison(&"a".repeat(40), &"b".repeat(40));
+    for path in ["first.rs", "second.rs"] {
+        snapshot.files.push(cibergit::domain::ChangedFile {
+            path: path.into(),
+            previous_path: None,
+            raw_path: None,
+            raw_previous_path: None,
+            status: "modified".into(),
+            additions: 1,
+            deletions: 1,
+            patch_complete: true,
+            patch: Some("@@ -1 +1 @@\n-old\n+new\n".into()),
+        });
+    }
+    let mut session = ReviewSession::new(snapshot.clone());
+    session.select_comparison(
+        snapshot,
+        ComparisonMetadata {
+            mode: ComparisonMode::CommitRange,
+            requested_mode: None,
+            notice: None,
+        },
+    );
+    session.mark_viewed("first.rs", true);
+    session.set_scroll_position(120.0);
+    session.select_file("second.rs");
+    session.set_scroll_position(640.0);
+    session.set_diff_mode(DiffMode::Unified);
+    let newer = Revision {
+        base_sha: "a".repeat(40),
+        head_sha: "c".repeat(40),
+    };
+    session.observe_revision(newer.clone());
+    Store::open(dir.path())
+        .unwrap()
+        .save_review_session(&one, 9, &session)
+        .unwrap();
+    let reopened = Store::open(dir.path()).unwrap();
+    let mut restored = reopened.load_review_session(&one, 9).unwrap();
+    assert_eq!(restored.revision().head_sha, "b".repeat(40));
+    assert_eq!(restored.available_revision(), Some(&newer));
+    assert_eq!(restored.selected_file().unwrap().path, "second.rs");
+    assert_eq!(restored.scroll_position(), 640.0);
+    restored.select_file("first.rs");
+    assert_eq!(restored.scroll_position(), 120.0);
+    assert!(restored.is_viewed("first.rs"));
+    assert_eq!(restored.diff_mode(), DiffMode::Unified);
+    assert_eq!(restored.metadata().mode, ComparisonMode::CommitRange);
+    assert!(reopened.load_review_session(&repo("two"), 9).is_err());
+    assert!(reopened.load_review_session(&one, 10).is_err());
+}
+
+#[test]
+fn review_progress_refuses_corruption_future_schema_and_foreign_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let one = repo("one");
+    let session = ReviewSession::new(comparison("aaa", "bbb"));
+    store.save_review_session(&one, 9, &session).unwrap();
+    let path = json_files(dir.path()).remove(0);
+    let valid: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut future = valid.clone();
+    future["schema_version"] = 99.into();
+    let mut foreign = valid;
+    foreign["repository_key"] = "different account".into();
+    for bytes in [
+        b"broken json".to_vec(),
+        serde_json::to_vec(&future).unwrap(),
+        serde_json::to_vec(&foreign).unwrap(),
+    ] {
+        fs::write(&path, &bytes).unwrap();
+        assert!(store.load_review_session(&one, 9).is_err());
+        assert!(store.save_review_session(&one, 9, &session).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
 }
 
 #[test]

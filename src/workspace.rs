@@ -1,5 +1,6 @@
 //! Personal workspace state and account-partitioned offline data.
 use crate::domain::{Comparison, PullRequest, Repository, Revision};
+use crate::review::ReviewSession;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -166,6 +167,13 @@ impl WorkspaceState {
 pub struct Store {
     root: PathBuf,
 }
+#[derive(Serialize, Deserialize)]
+struct StoredReviewSession {
+    schema_version: u32,
+    repository_key: String,
+    number: u64,
+    session: ReviewSession,
+}
 impl Store {
     pub fn open_default() -> Result<Self> {
         let home = std::env::var_os("HOME").context("Cannot locate application data directory")?;
@@ -249,6 +257,40 @@ impl Store {
     }
     pub fn load_draft(&self, repo: &Repository, number: u64, key: &str) -> Result<String> {
         read_json(&self.cache_path(repo, &format!("draft/{number}/{key}")))
+    }
+    /// Persist the displayed comparison and progress together. A poll response
+    /// must not replace the session that the user has explicitly selected.
+    pub fn save_review_session(
+        &self,
+        repo: &Repository,
+        number: u64,
+        session: &ReviewSession,
+    ) -> Result<()> {
+        let path = self.cache_path(repo, &format!("review-session/{number}"));
+        if path.try_exists()? {
+            self.load_review_session(repo, number)
+                .context("Refusing to overwrite unreadable or unsupported review progress")?;
+        }
+        write_json(
+            &path,
+            &StoredReviewSession {
+                schema_version: 1,
+                repository_key: repo.cache_key(),
+                number,
+                session: session.clone(),
+            },
+        )
+    }
+    pub fn load_review_session(&self, repo: &Repository, number: u64) -> Result<ReviewSession> {
+        let stored: StoredReviewSession =
+            read_json(&self.cache_path(repo, &format!("review-session/{number}")))?;
+        if stored.schema_version != 1 {
+            bail!("Review progress was saved by an unsupported application version");
+        }
+        if stored.repository_key != repo.cache_key() || stored.number != number {
+            bail!("Stored review progress does not match the requested repository, account and PR");
+        }
+        Ok(stored.session)
     }
 }
 fn decode_workspace(bytes: &[u8]) -> Result<WorkspaceState> {
