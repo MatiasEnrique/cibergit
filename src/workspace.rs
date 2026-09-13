@@ -39,9 +39,8 @@ pub enum PersonalFilter {
     All,
     ReviewRequested,
     Own,
-    /// Author, requested reviewer, or assignee. Comment and submitted-review
-    /// participation is not represented on `PullRequest`, so this is not full
-    /// GitHub participating-search parity.
+    /// Known author, requested reviewer, assignee, commenter or review author.
+    /// The UI must disclose incomplete results when participant reads are capped.
     Participating,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +107,8 @@ impl Filter {
                     !login.is_empty()
                         && (pr.author.eq_ignore_ascii_case(login)
                             || includes(&pr.reviewers, login)
-                            || includes(&pr.assignees, login))
+                            || includes(&pr.assignees, login)
+                            || includes(&pr.participants, login))
                 }
             }
     }

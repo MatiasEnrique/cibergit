@@ -34,6 +34,31 @@ fn stack_label(item: &PullRequest, prs: &[PullRequest]) -> String {
 }
 
 #[test]
+fn participating_includes_known_commenters_and_review_authors_from_partial_metadata() {
+    let item = PullRequest {
+        participants: vec!["Commenter".into(), "Reviewer".into()],
+        participants_complete: false,
+        participants_notice: Some("Additional participants may be unavailable".into()),
+        ..pr(1, "feature", "main")
+    };
+    let filter = Filter {
+        personal: PersonalFilter::Participating,
+        ..Default::default()
+    };
+    assert!(filter.matches(&item, "commenter"));
+    assert!(filter.matches(&item, "REVIEWER"));
+    assert!(!filter.matches(&item, "unknown-user"));
+    assert!(!filter.matches(&item, ""));
+    assert!(
+        !Filter {
+            personal: PersonalFilter::ReviewRequested,
+            ..Default::default()
+        }
+        .matches(&item, "Reviewer")
+    );
+}
+
+#[test]
 fn default_filter_is_all_open_and_closed_remain_searchable() {
     let open = PullRequest {
         state: "OPEN".into(),
