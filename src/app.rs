@@ -595,6 +595,7 @@ struct ReviewTab {
     lifecycle_details_expanded: bool,
     lifecycle_choice_pages: [usize; 3],
     lifecycle_confirmation_details: bool,
+    issue_comment_page: usize,
     #[allow(dead_code)] // Reserved opaque presentation slot; this slice does not provision it.
     local_workspace: Option<AnyView>,
     local_visible: bool,
@@ -5174,6 +5175,7 @@ impl ReviewWorkspace {
             lifecycle_details_expanded: false,
             lifecycle_choice_pages: [0; 3],
             lifecycle_confirmation_details: false,
+            issue_comment_page: 0,
             local_workspace: None,
             local_visible: false,
         });
@@ -6630,6 +6632,12 @@ impl ReviewWorkspace {
 
     fn begin_metadata_edit(&mut self, window: &mut Window, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "Wait for the current request to finish before preparing another change.".into();
+            cx.notify();
+            return;
+        }
         match self.tabs[index].lifecycle.begin_metadata_edit() {
             Ok(form) => {
                 self.metadata_title_input
@@ -6650,6 +6658,12 @@ impl ReviewWorkspace {
 
     fn apply_metadata_edit(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "Wait for the current request to finish before preparing another change.".into();
+            cx.notify();
+            return;
+        }
         self.stage_active_metadata_inputs(cx);
         let operation_id = next_attempt_id("pr-lifecycle");
         let attempt_id = next_attempt_id(&operation_id);
@@ -6673,6 +6687,12 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "Wait for the current request to finish before preparing another change.".into();
+            cx.notify();
+            return;
+        }
         let operation_id = next_attempt_id("pr-lifecycle");
         let attempt_id = next_attempt_id(&operation_id);
         match self.tabs[index]
@@ -6690,6 +6710,12 @@ impl ReviewWorkspace {
 
     fn begin_comment_create(&mut self, window: &mut Window, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "Wait for the current request to finish before preparing another change.".into();
+            cx.notify();
+            return;
+        }
         match self.tabs[index].lifecycle.begin_comment_create() {
             Ok(()) => {
                 self.discussion_input.update(cx, |input, cx| {
@@ -6711,6 +6737,12 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "Wait for the current request to finish before preparing another change.".into();
+            cx.notify();
+            return;
+        }
         match self.tabs[index].lifecycle.begin_comment_edit(comment) {
             Ok(body) => {
                 self.discussion_input.update(cx, |input, cx| {
@@ -6726,6 +6758,12 @@ impl ReviewWorkspace {
 
     fn apply_discussion(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "Wait for the current request to finish before preparing another change.".into();
+            cx.notify();
+            return;
+        }
         let body = self.discussion_input.read(cx).value().to_string();
         self.tabs[index].lifecycle.stage_discussion_body(body);
         let operation_id = next_attempt_id("pr-discussion");
@@ -6748,6 +6786,12 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "Wait for the current request to finish before preparing another change.".into();
+            cx.notify();
+            return;
+        }
         let operation_id = next_attempt_id("pr-discussion-delete");
         let attempt_id = next_attempt_id(&operation_id);
         match self.tabs[index]
@@ -10965,7 +11009,56 @@ impl ReviewWorkspace {
                     }
                 }
                 if let Some(details) = &tab.details {
-                    for (position, comment) in details.issue_comments.iter().take(20).enumerate() {
+                    let comment_count = details.issue_comments.len();
+                    let comment_pages = comment_count.div_ceil(20).max(1);
+                    let comment_page = tab.issue_comment_page.min(comment_pages - 1);
+                    if comment_pages > 1 {
+                        activity.push(
+                            div()
+                                .mb_3()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .when(comment_page > 0, |row| {
+                                    row.child(action_link("Previous comments", colors).on_click(
+                                        cx.listener(move |root, _, _, cx| {
+                                            if let Root::Review(this) = root
+                                                && let Some(index) = this.active_tab
+                                            {
+                                                this.tabs[index].issue_comment_page =
+                                                    comment_page - 1;
+                                                cx.notify();
+                                            }
+                                        }),
+                                    ))
+                                })
+                                .child(div().text_xs().text_color(colors.muted).child(format!(
+                                    "Comments {}–{} of {comment_count}",
+                                    comment_page * 20 + 1,
+                                    ((comment_page + 1) * 20).min(comment_count)
+                                )))
+                                .when(comment_page + 1 < comment_pages, |row| {
+                                    row.child(action_link("Next comments", colors).on_click(
+                                        cx.listener(move |root, _, _, cx| {
+                                            if let Root::Review(this) = root
+                                                && let Some(index) = this.active_tab
+                                            {
+                                                this.tabs[index].issue_comment_page =
+                                                    comment_page + 1;
+                                                cx.notify();
+                                            }
+                                        }),
+                                    ))
+                                }),
+                        );
+                    }
+                    for (position, comment) in details
+                        .issue_comments
+                        .iter()
+                        .enumerate()
+                        .skip(comment_page * 20)
+                        .take(20)
+                    {
                         let editable = tab.lifecycle.current_user_comment(comment);
                         let edit_comment = comment.clone();
                         let delete_comment = comment.clone();

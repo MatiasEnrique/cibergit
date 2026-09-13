@@ -121,6 +121,7 @@ impl PrLifecycleController {
     }
 
     pub fn begin_metadata_edit(&mut self) -> Result<MetadataForm, String> {
+        self.require_idle()?;
         let snapshot = self
             .snapshot
             .as_ref()
@@ -149,6 +150,9 @@ impl PrLifecycleController {
     }
 
     pub fn cancel_metadata(&mut self) {
+        if self.active_operation.is_some() {
+            return;
+        }
         self.editing_metadata = false;
         self.confirmation = None;
         self.metadata_form = self.snapshot.as_ref().map(MetadataForm::from_snapshot);
@@ -159,6 +163,7 @@ impl PrLifecycleController {
         operation_id: String,
         attempt_id: String,
     ) -> Result<(), String> {
+        self.require_idle()?;
         let snapshot = self.snapshot()?;
         let form = self
             .metadata_form
@@ -223,6 +228,7 @@ impl PrLifecycleController {
         operation_id: String,
         attempt_id: String,
     ) -> Result<(), String> {
+        self.require_idle()?;
         let snapshot = self.snapshot()?;
         validate_action_capability(snapshot, &action)?;
         let summary = lifecycle_summary(&action);
@@ -240,6 +246,7 @@ impl PrLifecycleController {
     }
 
     pub fn begin_comment_create(&mut self) -> Result<(), String> {
+        self.require_idle()?;
         let snapshot = self.snapshot()?;
         if !snapshot.can_comment.available {
             return Err(capability_reason(
@@ -256,6 +263,7 @@ impl PrLifecycleController {
     }
 
     pub fn begin_comment_edit(&mut self, comment: IssueComment) -> Result<String, String> {
+        self.require_idle()?;
         let snapshot = self.snapshot()?;
         let author = comment
             .author
@@ -283,6 +291,9 @@ impl PrLifecycleController {
     }
 
     pub fn cancel_discussion(&mut self) {
+        if self.active_operation.is_some() {
+            return;
+        }
         self.discussion_form = None;
         self.confirmation = None;
     }
@@ -292,6 +303,7 @@ impl PrLifecycleController {
         operation_id: String,
         attempt_id: String,
     ) -> Result<(), String> {
+        self.require_idle()?;
         let snapshot = self.snapshot()?;
         let form = self
             .discussion_form
@@ -352,6 +364,7 @@ impl PrLifecycleController {
         operation_id: String,
         attempt_id: String,
     ) -> Result<(), String> {
+        self.require_idle()?;
         let snapshot = self.snapshot()?;
         let author = comment
             .author
@@ -421,13 +434,41 @@ impl PrLifecycleController {
         if self.active_operation.as_deref() != Some(operation_id) {
             return;
         }
+        // A successful request only retires the exact form it sent. Text typed
+        // while the provider was working, and forms unrelated to that action,
+        // remain open so the following snapshot cannot overwrite them.
+        if acknowledged {
+            match self.confirmation.as_ref() {
+                Some(FrozenMutation::Lifecycle {
+                    form_witness: Some(witness),
+                    ..
+                }) if self.metadata_form.as_ref() == Some(witness) => {
+                    self.editing_metadata = false;
+                }
+                Some(FrozenMutation::Discussion {
+                    body_witness: Some(witness),
+                    ..
+                }) if self
+                    .discussion_form
+                    .as_ref()
+                    .is_some_and(|form| &form.body == witness) =>
+                {
+                    self.discussion_form = None;
+                }
+                _ => {}
+            }
+        }
         self.active_operation = None;
         self.confirmation = None;
-        if acknowledged {
-            self.editing_metadata = false;
-            self.discussion_form = None;
-        }
         self.notice = Some(notice);
+    }
+
+    fn require_idle(&self) -> Result<(), String> {
+        if self.active_operation.is_some() {
+            Err("Wait for the current request to finish before preparing another change.".into())
+        } else {
+            Ok(())
+        }
     }
 
     pub fn cancel_confirmation(&mut self) {
@@ -780,6 +821,106 @@ mod tests {
             PullRequestDiscussionAction::Edit { ref comment, ref observed_body, ref body, .. }
                 if comment.remote_id == "C1" && observed_body == "old" && body == "new"
         ));
+    }
+
+    #[test]
+    fn successful_reply_preserves_newer_metadata_and_discussion_edits() {
+        for newer in [false, true] {
+            let mut controller = PrLifecycleController::new(repository(), 7);
+            controller.install_snapshot(snapshot()).unwrap();
+            controller.begin_metadata_edit().unwrap();
+            controller.stage_metadata("sent title".into(), "old body".into(), "main".into());
+            controller
+                .prepare_metadata_apply("metadata".into(), "attempt".into())
+                .unwrap();
+            controller.take_confirmed().unwrap();
+            if newer {
+                controller.stage_metadata("newer title".into(), "old body".into(), "main".into());
+            }
+            controller.finish_operation("metadata", true, "acknowledged".into());
+            let mut refreshed = snapshot();
+            refreshed.title = "sent title".into();
+            controller.install_snapshot(refreshed).unwrap();
+            assert_eq!(controller.editing_metadata, newer);
+            assert_eq!(
+                controller.metadata_form.as_ref().unwrap().title,
+                if newer { "newer title" } else { "sent title" }
+            );
+
+            controller
+                .begin_comment_edit(comment("C1", "alice", "old comment"))
+                .unwrap();
+            controller.stage_discussion_body("sent comment".into());
+            controller
+                .prepare_discussion_apply("comment".into(), "attempt".into())
+                .unwrap();
+            controller.take_confirmed().unwrap();
+            if newer {
+                controller.stage_discussion_body("newer comment".into());
+            }
+            controller.finish_operation("comment", true, "acknowledged".into());
+            assert_eq!(controller.discussion_form.is_some(), newer);
+            if newer {
+                assert_eq!(
+                    controller.discussion_form.as_ref().unwrap().body,
+                    "newer comment"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn state_ack_keeps_unrelated_dirty_forms_and_started_request_cannot_be_replaced() {
+        let mut controller = PrLifecycleController::new(repository(), 7);
+        controller.install_snapshot(snapshot()).unwrap();
+        controller.begin_metadata_edit().unwrap();
+        controller.stage_metadata("unsent title".into(), "old body".into(), "main".into());
+        controller.begin_comment_create().unwrap();
+        controller.stage_discussion_body("unsent discussion".into());
+        controller
+            .prepare_lifecycle_action(
+                PullRequestLifecycleAction::Close,
+                "close".into(),
+                "attempt".into(),
+            )
+            .unwrap();
+        let frozen = controller.take_confirmed().unwrap();
+        assert!(
+            controller
+                .prepare_lifecycle_action(
+                    PullRequestLifecycleAction::ConvertToDraft,
+                    "replacement".into(),
+                    "attempt2".into()
+                )
+                .is_err()
+        );
+        assert!(controller.begin_metadata_edit().is_err());
+        assert!(controller.begin_comment_create().is_err());
+        assert!(
+            controller
+                .prepare_comment_delete(
+                    comment("C1", "alice", "old"),
+                    "delete".into(),
+                    "attempt3".into()
+                )
+                .is_err()
+        );
+        controller.cancel_metadata();
+        controller.cancel_discussion();
+        assert_eq!(controller.confirmation.as_ref(), Some(&frozen));
+        controller.finish_operation("wrong", true, "late".into());
+        assert_eq!(controller.active_operation.as_deref(), Some("close"));
+        controller.finish_operation("close", true, "acknowledged".into());
+        controller.install_snapshot(snapshot()).unwrap();
+        assert!(controller.editing_metadata);
+        assert_eq!(
+            controller.metadata_form.as_ref().unwrap().title,
+            "unsent title"
+        );
+        assert_eq!(
+            controller.discussion_form.as_ref().unwrap().body,
+            "unsent discussion"
+        );
     }
 
     #[test]
