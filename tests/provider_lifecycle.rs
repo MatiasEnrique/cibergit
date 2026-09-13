@@ -220,7 +220,9 @@ else:
                 account: lifecycle_account(login),
                 runner: Runner {
                     gh: executable,
-                    timeout: Duration::from_secs(3),
+                    // Ordinary fixture startup must tolerate the full parallel suite.
+                    // Dedicated transport tests retain their short deadline assertions.
+                    timeout: Duration::from_secs(30),
                     ..Runner::default()
                 },
             };
@@ -672,7 +674,7 @@ else:
             let mut admission = FakeAdmission::new();
             admission.terminal_fail = true;
             let result = provider.execute_pr_lifecycle(&lifecycle_repo("alice"), &title_request(), &mut admission);
-            let ProviderMutationOutcome::Uncertain { context, reason } = result else { panic!("expected uncertainty") };
+            let ProviderMutationOutcome::Uncertain { context, reason } = result else { panic!("expected uncertainty, received {result:?}") };
             assert_eq!(context.operation_id, "op-title");
             assert!(reason.contains("durable InFlight retained"));
             assert_eq!(file_count(&dir, "writes"), 1);
