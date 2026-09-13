@@ -98,6 +98,20 @@ files; it opens a compatibility screen directing you to the PR workspace.
   lack an exact local recovery link stay authoritative and are identified instead of guessed into
   local state. Replies, resolve/unresolve, pending-summary updates, comment deletion and review
   cancellation use their visible explicit controls. Partial provider reads are labelled.
+- Overview reads a separate selected-account lifecycle snapshot and bounded branch, reviewer-user,
+  reviewer-team, label, and assignee choices. Title, exact Markdown body, and base-branch editing use
+  Apply/Cancel and freeze one affected old/new value per confirmation. Close/reopen, draft/ready,
+  user/team reviewer deltas, label deltas, and assignee deltas each require the same exact-target
+  confirmation. Incomplete values, permissions, and action-specific capability reasons stay visible.
+  Control-Option-M opens metadata editing, Control-Option-Return applies one metadata change, and
+  Control-Option-Shift-M confirms the frozen action; every visible control has the same controller
+  path as its keyboard action.
+- Activity's top-level composer creates or edits issue comments, never review-thread comments.
+  Edit/Delete appear only for an exact provider comment ID whose author matches the selected viewer.
+  Delete freezes the exact ID, author, body, and update time. Control-Option-C opens a new top-level
+  composer, Control-Option-Shift-Return applies it, and Control-Option-Escape cancels the active
+  lifecycle/discussion edit or confirmation. Dirty text remains per tab through polls and tab
+  switches; late completions require the exact repository, PR, generation, and operation identity.
 - Activity separates unresolved review-composition writes from auxiliary/merge journal actions,
   with independent counts and read-only reconciliation controls. Review reconciliation runs fresh
   selected-account details and pending-review reads under the same per-PR authority and durable CAS
@@ -157,8 +171,13 @@ independent metadata, comments, checks and pending-review polls never advance it
 partitioned by account/repository/PR and saved in private, versioned atomic recovery files. A
 failed initial save sends zero provider writes. Started or uncertain review operations survive
 restart, freeze incompatible preparation, trigger reads only, and are never replayed blindly.
-Auxiliary and merge operations additionally write an exact caller-owned request/attempt journal
-before dispatch under a crash-released per-review lock. Corrupt/future recovery is preserved.
+Review, auxiliary, merge, lifecycle, and top-level-discussion dispatch share one canonical-root,
+account/repository/PR OS authority. The bounded action journal contains auxiliary, merge, lifecycle,
+and discussion attempts, while the durable review store is checked in both directions under that
+same lock. An InFlight/Uncertain record in either family blocks all other target mutations until
+exact read-only reconciliation. The guard spans durable admission, second provider preflight,
+dispatch, and terminal save, then explicitly unlocks before closing its descriptor so duplicated
+or fork-inherited descriptors cannot extend the critical section. Corrupt/future recovery is preserved.
 Authentication, capability, mapping and persistence failures keep local text and are disclosed.
 
 ## Validation
@@ -284,6 +303,44 @@ captures, `native-comparison-newer-head.png`, `native-comparison-two-tabs.png`, 
 the light directory; the restart directory receives `native-comparison-restart.png` and its report.
 These are in-process application-owned scene captures, not claims of physical input, Accessibility,
 or the exact macOS acrylic material behind the window.
+
+### PR lifecycle smoke
+
+The lifecycle harness first captures an actual public PR lifecycle snapshot and repository choice
+read for the selected `gh` account credential. It then installs clearly labelled synthetic metadata and
+exact-comment-ID witnesses and exercises the native editor/confirmation presentation without calling
+any mutation transport. It asserts that canonical Full and selected comparison identities do not
+change. Run light and dark independently with isolated data directories:
+
+```sh
+test ! -e /tmp/cibergit-lifecycle-smoke-light
+mkdir -p /absolute/path/to/evidence/lifecycle-light
+CIBERGIT_DATA_DIR=/tmp/cibergit-lifecycle-smoke-light \
+CIBERGIT_SMOKE_DIR=/absolute/path/to/evidence/lifecycle-light \
+CIBERGIT_SMOKE_BACKGROUND=1 \
+CIBERGIT_SMOKE_LIFECYCLE=1 \
+CIBERGIT_SMOKE_APPEARANCE=light \
+CARGO_TARGET_DIR=/tmp/cibergit-native-target \
+cargo run --locked --features ui-smoke -- \
+  --repo cli/cli --account YOUR_GH_LOGIN --pr 14130
+
+test ! -e /tmp/cibergit-lifecycle-smoke-dark
+mkdir -p /absolute/path/to/evidence/lifecycle-dark
+CIBERGIT_DATA_DIR=/tmp/cibergit-lifecycle-smoke-dark \
+CIBERGIT_SMOKE_DIR=/absolute/path/to/evidence/lifecycle-dark \
+CIBERGIT_SMOKE_BACKGROUND=1 \
+CIBERGIT_SMOKE_LIFECYCLE=1 \
+CIBERGIT_SMOKE_APPEARANCE=dark \
+CARGO_TARGET_DIR=/tmp/cibergit-native-target \
+cargo run --locked --features ui-smoke -- \
+  --repo cli/cli --account YOUR_GH_LOGIN --pr 14130
+```
+
+Each directory receives `native-lifecycle-real-read.png`,
+`native-lifecycle-synthetic-metadata.png`,
+`native-lifecycle-synthetic-activity-narrow.png`, and `native-lifecycle-smoke.txt`. The report names
+the real snapshot/account, completeness flags, unchanged comparison assertion, `focus=false` mode,
+and the explicit zero-live-mutation limit.
 
 ## Native dependency notes
 

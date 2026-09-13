@@ -44,6 +44,12 @@ actions!(
         SelectSinceLastReview,
         SelectPreviousComparisonCommit,
         SelectNextComparisonCommit,
+        EditPrMetadata,
+        ApplyPrMetadata,
+        NewPrDiscussion,
+        ApplyPrDiscussion,
+        ConfirmPrMutation,
+        CancelPrMutation,
     ]
 );
 actions!(
@@ -180,6 +186,12 @@ fn main() {
             KeyBinding::new("cmd-alt-4", SelectSinceLastReview, None),
             KeyBinding::new("cmd-alt-[", SelectPreviousComparisonCommit, None),
             KeyBinding::new("cmd-alt-]", SelectNextComparisonCommit, None),
+            KeyBinding::new("ctrl-alt-m", EditPrMetadata, None),
+            KeyBinding::new("ctrl-alt-enter", ApplyPrMetadata, None),
+            KeyBinding::new("ctrl-alt-c", NewPrDiscussion, None),
+            KeyBinding::new("ctrl-alt-shift-enter", ApplyPrDiscussion, None),
+            KeyBinding::new("ctrl-alt-shift-m", ConfirmPrMutation, None),
+            KeyBinding::new("ctrl-alt-escape", CancelPrMutation, None),
             KeyBinding::new("up", FileTreeUp, Some("FileTree")),
             KeyBinding::new("down", FileTreeDown, Some("FileTree")),
             KeyBinding::new("left", FileTreeLeft, Some("FileTree")),

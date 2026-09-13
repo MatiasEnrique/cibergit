@@ -1,18 +1,20 @@
 use crate::{
-    AddPendingComment, CloseTab, ComposeInlineComment, CycleDiffMode, DetailsNarrower,
-    DetailsWider, DiffScrollEnd, DiffScrollHome, DiffScrollLeft, DiffScrollRight, FileTreeActivate,
-    FileTreeDown, FileTreeLeft, FileTreeNarrower, FileTreeRight, FileTreeUp, FileTreeWider,
-    MergePullRequest, NextFile, OpenRepositorySetup, PostImmediateComment, PreviousFile, Refresh,
-    ResetLayout, Save, SaveReviewDraft, SelectFullComparison, SelectNextComparisonCommit,
-    SelectPreviousComparisonCommit, SelectSinceLastReview, SidebarNarrower, SidebarWider,
-    SubmitReview, ToggleComparisonPicker, ToggleFileTree, ToggleInspector, TogglePalette,
-    ToggleSidebar,
+    AddPendingComment, ApplyPrDiscussion, ApplyPrMetadata, CancelPrMutation, CloseTab,
+    ComposeInlineComment, ConfirmPrMutation, CycleDiffMode, DetailsNarrower, DetailsWider,
+    DiffScrollEnd, DiffScrollHome, DiffScrollLeft, DiffScrollRight, EditPrMetadata,
+    FileTreeActivate, FileTreeDown, FileTreeLeft, FileTreeNarrower, FileTreeRight, FileTreeUp,
+    FileTreeWider, MergePullRequest, NewPrDiscussion, NextFile, OpenRepositorySetup,
+    PostImmediateComment, PreviousFile, Refresh, ResetLayout, Save, SaveReviewDraft,
+    SelectFullComparison, SelectNextComparisonCommit, SelectPreviousComparisonCommit,
+    SelectSinceLastReview, SidebarNarrower, SidebarWider, SubmitReview, ToggleComparisonPicker,
+    ToggleFileTree, ToggleInspector, TogglePalette, ToggleSidebar,
 };
 mod comparison_picker;
 mod file_tree;
 mod local_checkout;
 #[allow(dead_code)] // Public component surface also serves standalone native verification.
 mod local_workspace;
+mod pr_lifecycle;
 mod review_interactions;
 mod view_editor;
 
@@ -26,8 +28,9 @@ use cibergit::{
     },
     domain::{
         MergeAction, MergeExecutionRequest, MergeMethod, MergePreparation, PendingReviewSnapshot,
-        ProviderMutationOutcome, PullRequest, PullRequestDetails, Repository,
-        ReviewAuxiliaryAction, ReviewAuxiliaryRequest, Revision,
+        ProviderMutationOutcome, ProviderReadEvidence, PullRequest, PullRequestDetails,
+        PullRequestDiscussionAction, PullRequestLifecycleAction, Repository, ReviewAuxiliaryAction,
+        ReviewAuxiliaryRequest, Revision,
     },
     participation::{DiffSide, LineSelection, ReviewEvent, ReviewKey},
     providers::GithubProvider,
@@ -49,6 +52,7 @@ use gpui_base::{
     Scrollbar, TextView, TextViewStyle,
     input::{Input, InputEditorStyle, InputEvent, InputState, Textarea, TextareaState},
 };
+use pr_lifecycle::{ChoiceKind, FrozenMutation, PrLifecycleController, reviewer};
 use review_interactions::{
     ActionJournal, ComposerState, ControllerLoad, InlineThread, JournalOperation, JournalRequest,
     JournalStatus, ReviewInteractionController, ReviewReconciliationItem,
@@ -578,6 +582,9 @@ struct ReviewTab {
     journal_error: Option<String>,
     details_state: LoadState,
     details_generation: u64,
+    lifecycle: PrLifecycleController,
+    lifecycle_state: LoadState,
+    lifecycle_generation: u64,
     interactions: InteractionState,
     interaction_generation: u64,
     confirmation: Option<NativeConfirmation>,
@@ -680,6 +687,10 @@ pub struct ReviewWorkspace {
     merge_title_input: Entity<InputState>,
     merge_body_input: Entity<TextareaState>,
     reply_input: Entity<TextareaState>,
+    metadata_title_input: Entity<InputState>,
+    metadata_body_input: Entity<TextareaState>,
+    metadata_base_input: Entity<InputState>,
+    discussion_input: Entity<TextareaState>,
     view_editor: ViewEditorController,
     view_inputs: ViewEditorInputs,
     repository_input: Entity<InputState>,
@@ -849,6 +860,11 @@ impl ReviewWorkspace {
         let merge_title_input = new_input("", "Merge headline", window, cx);
         let merge_body_input = new_textarea("", "Merge message", window, cx);
         let reply_input = new_textarea("", "Reply to this review thread…", window, cx);
+        let metadata_title_input = new_input("", "Pull request title", window, cx);
+        let metadata_body_input = new_textarea("", "Pull request description", window, cx);
+        let metadata_base_input = new_input("", "Base branch", window, cx);
+        let discussion_input =
+            new_textarea("", "Write a top-level pull request comment…", window, cx);
         let view_inputs = ViewEditorInputs::new(&workspace.view(), window, cx);
         let repository_input = new_input(
             startup.repository.clone().unwrap_or_default(),
@@ -916,6 +932,10 @@ impl ReviewWorkspace {
             merge_title_input,
             merge_body_input,
             reply_input,
+            metadata_title_input,
+            metadata_body_input,
+            metadata_base_input,
+            discussion_input,
             view_editor: ViewEditorController::new(),
             view_inputs,
             repository_input,
@@ -950,6 +970,8 @@ impl ReviewWorkspace {
                 &this.repository_input,
                 &this.pr_input,
                 &this.merge_title_input,
+                &this.metadata_title_input,
+                &this.metadata_base_input,
             ]
             .into_iter()
             .chain(this.view_inputs.all())
@@ -961,6 +983,8 @@ impl ReviewWorkspace {
                 &this.review_summary_input,
                 &this.merge_body_input,
                 &this.reply_input,
+                &this.metadata_body_input,
+                &this.discussion_input,
             ] {
                 editor.update(cx, |editor, _| editor.set_editor_style(style.clone()));
             }
@@ -1017,8 +1041,56 @@ impl ReviewWorkspace {
                 })
                 .detach();
             });
-        this._subscriptions
-            .extend([activation, appearance, bounds, composer_changes]);
+        let lifecycle_title_changes = cx.subscribe(
+            &this.metadata_title_input,
+            |root, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Root::Review(this) = root
+                {
+                    this.stage_active_metadata_inputs(cx);
+                }
+            },
+        );
+        let lifecycle_body_changes = cx.subscribe(
+            &this.metadata_body_input,
+            |root, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Root::Review(this) = root
+                {
+                    this.stage_active_metadata_inputs(cx);
+                }
+            },
+        );
+        let lifecycle_base_changes = cx.subscribe(
+            &this.metadata_base_input,
+            |root, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Root::Review(this) = root
+                {
+                    this.stage_active_metadata_inputs(cx);
+                }
+            },
+        );
+        let discussion_changes =
+            cx.subscribe(&this.discussion_input, |root, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Root::Review(this) = root
+                    && let Some(index) = this.active_tab
+                {
+                    let body = this.discussion_input.read(cx).value().to_string();
+                    this.tabs[index].lifecycle.stage_discussion_body(body);
+                }
+            });
+        this._subscriptions.extend([
+            activation,
+            appearance,
+            bounds,
+            composer_changes,
+            lifecycle_title_changes,
+            lifecycle_body_changes,
+            lifecycle_base_changes,
+            discussion_changes,
+        ]);
         this.discover_accounts(startup.account, cx);
         for index in 0..this.repositories.len() {
             this.refresh_repository(index, cx);
@@ -1143,6 +1215,10 @@ impl ReviewWorkspace {
         let expect_restore = std::env::var_os("CIBERGIT_SMOKE_EXPECT_RESTORE").is_some();
         if std::env::var_os("CIBERGIT_SMOKE_COMPARISONS").is_some() {
             self.start_comparison_smoke(window, cx, output, second_pr, expect_restore);
+            return;
+        }
+        if std::env::var_os("CIBERGIT_SMOKE_LIFECYCLE").is_some() {
+            self.start_lifecycle_smoke(window, cx, output);
             return;
         }
         let weak = cx.weak_entity();
@@ -3282,6 +3358,305 @@ impl ReviewWorkspace {
     #[cfg(not(feature = "ui-smoke"))]
     fn start_smoke(&mut self, _: &mut Window, _: &mut Context<Root>) {}
 
+    #[cfg(feature = "ui-smoke")]
+    fn start_lifecycle_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+        output: PathBuf,
+    ) {
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                let started = std::time::Instant::now();
+                loop {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.smoke_ready()
+                                    && this.active_tab.is_some_and(|index| {
+                                        this.tabs[index].lifecycle.snapshot.is_some()
+                                            && this.tabs[index].lifecycle.choices.is_some()
+                                            && !matches!(this.tabs[index].lifecycle_state, LoadState::Loading(_))
+                                    }))
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready || started.elapsed() > Duration::from_secs(90) {
+                        break;
+                    }
+                }
+                let _ = std::fs::create_dir_all(&output);
+                let before = window
+                    .update(|_, cx| {
+                        weak.read_with(cx, |root, _| {
+                            let Root::Review(this) = root else {
+                                return Err("lifecycle smoke left review workspace".to_owned());
+                            };
+                            let index = this
+                                .active_tab
+                                .ok_or_else(|| "lifecycle smoke has no tab".to_owned())?;
+                            let tab = &this.tabs[index];
+                            let snapshot = tab.lifecycle.snapshot.as_ref().ok_or_else(|| {
+                                tab.lifecycle_state.notice().unwrap_or_else(|| {
+                                    "real lifecycle read unavailable".into()
+                                })
+                            })?;
+                            Ok((
+                                tab.canonical_full_revision.clone(),
+                                tab.session.as_ref().map(|session| session.revision().clone()),
+                                snapshot.title.clone(),
+                                snapshot.viewer_login.clone(),
+                                snapshot.values_complete,
+                                snapshot.capabilities_complete,
+                            ))
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke entity unavailable: {error:#}")))
+                    })
+                    .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")));
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let real_read_captured = before.is_ok()
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join("native-lifecycle-real-read.png"))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+
+                let metadata_scene = window
+                    .update(|window, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err("lifecycle smoke left review workspace".to_owned());
+                            };
+                            let index = this.active_tab.ok_or_else(|| "no active tab".to_owned())?;
+                            let mut synthetic_snapshot = this.tabs[index]
+                                .lifecycle
+                                .snapshot
+                                .as_ref()
+                                .ok_or_else(|| "no lifecycle snapshot".to_owned())?
+                                .clone();
+                            synthetic_snapshot.can_update_metadata.available = true;
+                            synthetic_snapshot.can_update_metadata.reason = None;
+                            synthetic_snapshot.can_comment.available = true;
+                            synthetic_snapshot.can_comment.reason = None;
+                            this.tabs[index]
+                                .lifecycle
+                                .install_snapshot(synthetic_snapshot)?;
+                            this.begin_metadata_edit(window, cx);
+                            let snapshot = this.tabs[index]
+                                .lifecycle
+                                .snapshot
+                                .as_ref()
+                                .expect("synthetic snapshot installed")
+                                .clone();
+                            let synthetic = format!("{} [synthetic confirmation only]", snapshot.title);
+                            this.tabs[index].lifecycle.stage_metadata(
+                                synthetic.clone(),
+                                snapshot.body.clone(),
+                                snapshot.base_branch.clone(),
+                            );
+                            this.metadata_title_input.update(cx, |input, cx| {
+                                input.set_value(synthetic.clone(), window, cx)
+                            });
+                            this.tabs[index].lifecycle.stage_metadata(
+                                synthetic,
+                                snapshot.body,
+                                snapshot.base_branch,
+                            );
+                            let operation_id = next_attempt_id("synthetic-lifecycle-smoke");
+                            let attempt_id = next_attempt_id(&operation_id);
+                            this.tabs[index]
+                                .lifecycle
+                                .prepare_metadata_apply(operation_id, attempt_id)?;
+                            if this.tabs[index].lifecycle.confirmation.is_none() {
+                                return Err(this.status.clone());
+                            }
+                            this.tabs[index].inspector_section = InspectorSection::Overview;
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                            Ok(())
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke entity unavailable: {error:#}")))
+                    })
+                    .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")));
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
+                let metadata_captured = metadata_scene.is_ok()
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join("native-lifecycle-synthetic-metadata.png"))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+
+                let activity_scene = window
+                    .update(|window, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err("lifecycle smoke left review workspace".to_owned());
+                            };
+                            let index = this.active_tab.ok_or_else(|| "no active tab".to_owned())?;
+                            this.tabs[index].lifecycle.cancel_metadata();
+                            this.tabs[index].lifecycle.cancel_confirmation();
+                            let repository = this.tabs[index].repository.clone();
+                            let number = this.tabs[index].pull_request.number;
+                            let viewer = this.tabs[index]
+                                .lifecycle
+                                .snapshot
+                                .as_ref()
+                                .ok_or_else(|| "no lifecycle snapshot".to_owned())?
+                                .viewer_login
+                                .clone();
+                            let comment = cibergit::domain::IssueComment {
+                                coordinates: cibergit::domain::ProviderCoordinates {
+                                    provider: "github".into(),
+                                    host: repository.host.clone(),
+                                    owner: repository.owner.clone(),
+                                    repository: repository.name.clone(),
+                                    pull_request: number,
+                                    remote_id: "SYNTHETIC_NO_DISPATCH_COMMENT_ID".into(),
+                                },
+                                author: Some(viewer),
+                                body: "Synthetic exact-ID comment. No provider mutation is dispatched by this scene."
+                                    .into(),
+                                created_at: "2026-09-13T12:00:00Z".into(),
+                                updated_at: "2026-09-13T12:00:00Z".into(),
+                                url: String::new(),
+                            };
+                            let details = this.tabs[index]
+                                .details
+                                .as_mut()
+                                .ok_or_else(|| "real details read unavailable".to_owned())?;
+                            details.issue_comments.insert(0, comment.clone());
+                            this.tabs[index].inspector_section = InspectorSection::Activity;
+                            this.begin_comment_edit(comment, window, cx);
+                            this.tabs[index].lifecycle.stage_discussion_body(
+                                "Synthetic edited body frozen for native confirmation; no remote write."
+                                    .into(),
+                            );
+                            this.discussion_input.update(cx, |input, cx| {
+                                input.set_value(
+                                    "Synthetic edited body frozen for native confirmation; no remote write.",
+                                    window,
+                                    cx,
+                                )
+                            });
+                            let operation_id = next_attempt_id("synthetic-discussion-smoke");
+                            let attempt_id = next_attempt_id(&operation_id);
+                            this.tabs[index]
+                                .lifecycle
+                                .prepare_discussion_apply(operation_id, attempt_id)?;
+                            if this.tabs[index].lifecycle.confirmation.is_none() {
+                                return Err(this.status.clone());
+                            }
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                            Ok(())
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke entity unavailable: {error:#}")))
+                    })
+                    .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")));
+                let _ = window.update(|window, _| window.resize(size(px(1040.), px(760.))));
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
+                let activity_captured = activity_scene.is_ok()
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join(
+                                            "native-lifecycle-synthetic-activity-narrow.png",
+                                        ))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+
+                let unchanged = window
+                    .update(|_, cx| {
+                        weak.read_with(cx, |root, _| {
+                            let Root::Review(this) = root else { return false };
+                            let Some(index) = this.active_tab else { return false };
+                            let Ok((canonical, selected, ..)) = &before else {
+                                return false;
+                            };
+                            this.tabs[index].canonical_full_revision == *canonical
+                                && this.tabs[index]
+                                    .session
+                                    .as_ref()
+                                    .map(|session| session.revision().clone())
+                                    == *selected
+                                && this.tabs[index].lifecycle.active_operation.is_none()
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                let (real_title, viewer, values_complete, capabilities_complete) = before
+                    .as_ref()
+                    .map(|(_, _, title, viewer, values, capabilities)| {
+                        (title.as_str(), viewer.as_str(), *values, *capabilities)
+                    })
+                    .unwrap_or(("unavailable", "unavailable", false, false));
+                let passed = real_read_captured
+                    && metadata_captured
+                    && activity_captured
+                    && unchanged;
+                let report = format!(
+                    "Native PR lifecycle smoke: {}\nReal provider read: cli/cli snapshot title {:?}, selected account {}, values_complete={}, capabilities_complete={}\nSynthetic metadata confirmation capture: {}\nSynthetic exact-ID discussion confirmation capture: {}\nCanonical and selected comparison identities unchanged: {}\nMutation transport: not invoked; zero live metadata/comment/review/merge writes\nWindow focus requested: false when CIBERGIT_SMOKE_BACKGROUND=1\n",
+                    if passed { "passed" } else { "failed" },
+                    real_title,
+                    viewer,
+                    values_complete,
+                    capabilities_complete,
+                    metadata_captured,
+                    activity_captured,
+                    unchanged,
+                );
+                let _ = std::fs::write(output.join("native-lifecycle-smoke.txt"), report);
+                if !passed {
+                    panic!(
+                        "native lifecycle smoke failed: before={before:?}, metadata={metadata_scene:?}, activity={activity_scene:?}"
+                    );
+                }
+                let _ = window.update(|_, cx| cx.quit());
+            })
+            .detach();
+    }
+
     fn add_repository(&mut self, cx: &mut Context<Root>) {
         let input = self.repository_input.read(cx).value().trim().to_owned();
         let Some(account) = self.accounts.get(self.selected_account).cloned() else {
@@ -4594,6 +4969,11 @@ impl ReviewWorkspace {
 
     fn activate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Root>) {
         if index < self.tabs.len() {
+            self.stage_active_metadata_inputs(cx);
+            if let Some(previous) = self.active_tab {
+                let body = self.discussion_input.read(cx).value().to_string();
+                self.tabs[previous].lifecycle.stage_discussion_body(body);
+            }
             if let Some(previous) = self.active_tab {
                 self.capture_scroll(previous);
                 let current = self.composer_input.read(cx).value().to_string();
@@ -4624,6 +5004,24 @@ impl ReviewWorkspace {
                 .update(cx, |input, cx| input.set_disabled(disabled, cx));
             self.review_summary_input
                 .update(cx, |input, cx| input.set_disabled(disabled, cx));
+            if let Some(form) = self.tabs[index]
+                .lifecycle
+                .metadata_form
+                .clone()
+                .filter(|_| self.tabs[index].lifecycle.editing_metadata)
+            {
+                self.metadata_title_input
+                    .update(cx, |input, cx| input.set_value(form.title, window, cx));
+                self.metadata_body_input
+                    .update(cx, |input, cx| input.set_value(form.body, window, cx));
+                self.metadata_base_input.update(cx, |input, cx| {
+                    input.set_value(form.base_branch, window, cx)
+                });
+            }
+            if let Some(form) = self.tabs[index].lifecycle.discussion_form.clone() {
+                self.discussion_input
+                    .update(cx, |input, cx| input.set_value(form.body, window, cx));
+            }
             if let Some(key) = self.tabs[index]
                 .session
                 .as_ref()
@@ -4731,6 +5129,7 @@ impl ReviewWorkspace {
             .map(|session| FileTree::new(&session.comparison().files))
             .unwrap_or_default();
         let request_generation = self.issue_request_generation();
+        let lifecycle = PrLifecycleController::new(repository.clone(), pull_request.number);
         self.tabs.push(ReviewTab {
             repository,
             pull_request,
@@ -4759,6 +5158,9 @@ impl ReviewWorkspace {
             journal_error: None,
             details_state: LoadState::Loading("Loading PR details…".into()),
             details_generation: 0,
+            lifecycle,
+            lifecycle_state: LoadState::Loading("Loading lifecycle metadata…".into()),
+            lifecycle_generation: 0,
             interactions: InteractionState::Loading,
             interaction_generation: 0,
             confirmation: None,
@@ -4784,6 +5186,7 @@ impl ReviewWorkspace {
             self.load_comparison(index, revision, false, cx);
             self.refresh_details(index, cx);
         }
+        self.refresh_lifecycle(index, cx);
     }
 
     fn load_interactions(&mut self, index: usize, cx: &mut Context<Root>) {
@@ -5529,7 +5932,7 @@ impl ReviewWorkspace {
         };
         self.tabs[index].details_generation += 1;
         self.tabs[index].write_in_flight = true;
-        let journal_root = self.interaction_root.join("action-journal");
+        let journal_root = self.interaction_root.clone();
         let preference_root = self.interaction_root.clone();
         let provider = GithubProvider::new(repository.account.clone());
         let task = cx.background_spawn(async move {
@@ -5637,7 +6040,7 @@ impl ReviewWorkspace {
         };
         self.tabs[index].details_generation += 1;
         self.tabs[index].write_in_flight = true;
-        let journal_root = self.interaction_root.join("action-journal");
+        let journal_root = self.interaction_root.clone();
         let provider = GithubProvider::new(repository.account.clone());
         let task = cx.background_spawn(async move {
             let journal =
@@ -5701,7 +6104,7 @@ impl ReviewWorkspace {
                 return;
             }
         };
-        let journal_root = self.interaction_root.join("action-journal");
+        let journal_root = self.interaction_root.clone();
         self.tabs[index].write_in_flight = true;
         self.status = "Reading authoritative state to reconcile started actions…".into();
         let provider = GithubProvider::new(repository.account.clone());
@@ -5730,6 +6133,34 @@ impl ReviewWorkspace {
                         .prepare_merge(&repository, number, &preparation.reviewed_head_sha)
                         .ok()
                         .and_then(|fresh| observe_merge(&request.action, preparation, &fresh)),
+                    JournalRequest::Lifecycle(_) => None,
+                    JournalRequest::Discussion(request) => match &request.action {
+                        PullRequestDiscussionAction::Edit {
+                            comment,
+                            selected_author,
+                            body,
+                            ..
+                        } => match provider.reconcile_pr_comment(&repository, number, comment) {
+                            ProviderReadEvidence::Observed(observed)
+                                if observed.body == *body
+                                    && observed.author.as_deref().is_some_and(|author| {
+                                        author.eq_ignore_ascii_case(selected_author)
+                                    }) => Some((
+                                true,
+                                true,
+                                format!(
+                                    "Exact known comment {} has the frozen edited body.",
+                                    comment.remote_id
+                                ),
+                            )),
+                            ProviderReadEvidence::Observed(_) => None,
+                            ProviderReadEvidence::Inconclusive { .. } => None,
+                        },
+                        // Create has no returned ID in a lost acknowledgement,
+                        // and absence after delete is explicitly inconclusive.
+                        PullRequestDiscussionAction::Create { .. }
+                        | PullRequestDiscussionAction::Delete { .. } => None,
+                    },
                 };
                 match observation {
                     Some((true, completed, evidence)) => {
@@ -6124,6 +6555,312 @@ impl ReviewWorkspace {
         })
         .detach();
         self.refresh_details(index, cx);
+        self.refresh_lifecycle(index, cx);
+    }
+
+    fn refresh_lifecycle(&mut self, index: usize, cx: &mut Context<Root>) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        tab.lifecycle_generation = tab.lifecycle_generation.saturating_add(1);
+        let generation = tab.lifecycle_generation;
+        let repository = tab.repository.clone();
+        let number = tab.pull_request.number;
+        let identity = repository.cache_key();
+        if tab.lifecycle.snapshot.is_none() {
+            tab.lifecycle_state = LoadState::Loading("Loading lifecycle metadata…".into());
+        }
+        let task = cx.background_spawn(async move {
+            let provider = GithubProvider::new(repository.account.clone());
+            let snapshot = provider.pr_lifecycle_snapshot(&repository, number)?;
+            let choices = provider.pr_lifecycle_choices(&repository)?;
+            Ok::<_, anyhow::Error>((snapshot, choices))
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(tab) = this.tabs.iter_mut().find(|tab| {
+                    tab.repository.cache_key() == identity
+                        && tab.pull_request.number == number
+                        && tab.lifecycle_generation == generation
+                }) else {
+                    return;
+                };
+                match result {
+                    Ok((snapshot, choices)) => {
+                        let install = tab
+                            .lifecycle
+                            .install_snapshot(snapshot)
+                            .and_then(|()| tab.lifecycle.install_choices(choices));
+                        match install {
+                            Ok(()) => tab.lifecycle_state = LoadState::Ready,
+                            Err(error) => {
+                                tab.lifecycle_state = LoadState::Error(format!(
+                                    "Lifecycle response rejected without changing comparison state: {error}"
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tab.lifecycle_state = LoadState::Error(format!(
+                            "Lifecycle read failed; dirty forms and comparison state were preserved: {error:#}"
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn stage_active_metadata_inputs(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        let title = self.metadata_title_input.read(cx).value().to_string();
+        let body = self.metadata_body_input.read(cx).value().to_string();
+        let base = self.metadata_base_input.read(cx).value().to_string();
+        self.tabs[index].lifecycle.stage_metadata(title, body, base);
+    }
+
+    fn begin_metadata_edit(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        match self.tabs[index].lifecycle.begin_metadata_edit() {
+            Ok(form) => {
+                self.metadata_title_input
+                    .update(cx, |input, cx| input.set_value(form.title, window, cx));
+                self.metadata_body_input
+                    .update(cx, |input, cx| input.set_value(form.body, window, cx));
+                self.metadata_base_input.update(cx, |input, cx| {
+                    input.set_value(form.base_branch, window, cx)
+                });
+                self.status =
+                    "Editing isolated mutable metadata; Apply freezes one exact changed field."
+                        .into();
+            }
+            Err(error) => self.status = error,
+        }
+        cx.notify();
+    }
+
+    fn apply_metadata_edit(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        self.stage_active_metadata_inputs(cx);
+        let operation_id = next_attempt_id("pr-lifecycle");
+        let attempt_id = next_attempt_id(&operation_id);
+        match self.tabs[index]
+            .lifecycle
+            .prepare_metadata_apply(operation_id, attempt_id)
+        {
+            Ok(()) => {
+                self.status =
+                    "Exact metadata delta frozen; review it before confirming one provider action."
+                        .into()
+            }
+            Err(error) => self.status = format!("Metadata was not prepared: {error}"),
+        }
+        cx.notify();
+    }
+
+    fn prepare_lifecycle_action(
+        &mut self,
+        action: PullRequestLifecycleAction,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.active_tab else { return };
+        let operation_id = next_attempt_id("pr-lifecycle");
+        let attempt_id = next_attempt_id(&operation_id);
+        match self.tabs[index]
+            .lifecycle
+            .prepare_lifecycle_action(action, operation_id, attempt_id)
+        {
+            Ok(()) => {
+                self.status =
+                    "Exact lifecycle target and action frozen; confirmation required.".into()
+            }
+            Err(error) => self.status = format!("Lifecycle action unavailable: {error}"),
+        }
+        cx.notify();
+    }
+
+    fn begin_comment_create(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        match self.tabs[index].lifecycle.begin_comment_create() {
+            Ok(()) => {
+                self.discussion_input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                    input.focus(window, cx);
+                });
+                self.status =
+                    "Composing a top-level PR discussion; no review thread is affected.".into();
+            }
+            Err(error) => self.status = error,
+        }
+        cx.notify();
+    }
+
+    fn begin_comment_edit(
+        &mut self,
+        comment: cibergit::domain::IssueComment,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.active_tab else { return };
+        match self.tabs[index].lifecycle.begin_comment_edit(comment) {
+            Ok(body) => {
+                self.discussion_input.update(cx, |input, cx| {
+                    input.set_value(body, window, cx);
+                    input.focus(window, cx);
+                });
+                self.status = "Editing an exact current-user issue comment by provider ID.".into();
+            }
+            Err(error) => self.status = error,
+        }
+        cx.notify();
+    }
+
+    fn apply_discussion(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        let body = self.discussion_input.read(cx).value().to_string();
+        self.tabs[index].lifecycle.stage_discussion_body(body);
+        let operation_id = next_attempt_id("pr-discussion");
+        let attempt_id = next_attempt_id(&operation_id);
+        match self.tabs[index]
+            .lifecycle
+            .prepare_discussion_apply(operation_id, attempt_id)
+        {
+            Ok(()) => {
+                self.status = "Exact top-level comment action frozen; confirmation required.".into()
+            }
+            Err(error) => self.status = format!("Discussion was not prepared: {error}"),
+        }
+        cx.notify();
+    }
+
+    fn prepare_comment_delete(
+        &mut self,
+        comment: cibergit::domain::IssueComment,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.active_tab else { return };
+        let operation_id = next_attempt_id("pr-discussion-delete");
+        let attempt_id = next_attempt_id(&operation_id);
+        match self.tabs[index]
+            .lifecycle
+            .prepare_comment_delete(comment, operation_id, attempt_id)
+        {
+            Ok(()) => {
+                self.status = "Exact comment ID and body snapshot frozen; confirm deletion.".into()
+            }
+            Err(error) => self.status = error,
+        }
+        cx.notify();
+    }
+
+    fn confirm_lifecycle_mutation(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status = "Another mutation is still in progress.".into();
+            return;
+        }
+        let frozen = match self.tabs[index].lifecycle.take_confirmed() {
+            Ok(frozen) => frozen,
+            Err(error) => {
+                self.status = error;
+                cx.notify();
+                return;
+            }
+        };
+        let operation_id = frozen.operation_id().to_owned();
+        let repository = self.tabs[index].repository.clone();
+        let number = self.tabs[index].pull_request.number;
+        let identity = repository.cache_key();
+        let root_path = self.interaction_root.clone();
+        self.tabs[index].write_in_flight = true;
+        self.status = "Admitting one exact target mutation on the background executor…".into();
+        let task = cx.background_spawn(async move {
+            let key = ReviewKey::for_repository("github", &repository, number)
+                .map_err(|error| error.to_string())?;
+            let mut journal = ActionJournal::open(&root_path, key)?;
+            let provider = GithubProvider::new(repository.account.clone());
+            let (acknowledged, notice) = match frozen {
+                FrozenMutation::Lifecycle { request, .. } => {
+                    let mut admission = journal
+                        .admission(JournalRequest::Lifecycle(Box::new(request.clone())));
+                    match provider.execute_pr_lifecycle(&repository, &request, &mut admission) {
+                        ProviderMutationOutcome::Acknowledged(ack) => (
+                            true,
+                            format!(
+                                "GitHub durably acknowledged {} at {} on head {}.",
+                                ack.operation_id,
+                                ack.updated_at,
+                                short_sha(&ack.head_sha)
+                            ),
+                        ),
+                        ProviderMutationOutcome::PreflightRejected { reason } => {
+                            (false, format!("Lifecycle write was not sent: {reason}"))
+                        }
+                        ProviderMutationOutcome::Uncertain { reason, .. } => (false, format!(
+                            "Lifecycle outcome is uncertain and frozen against replay: {reason}"
+                        )),
+                    }
+                }
+                FrozenMutation::Discussion { request, .. } => {
+                    let mut admission = journal
+                        .admission(JournalRequest::Discussion(Box::new(request.clone())));
+                    match provider.execute_pr_discussion(&repository, &request, &mut admission) {
+                        ProviderMutationOutcome::Acknowledged(ack) => (
+                            true,
+                            format!(
+                                "GitHub durably acknowledged {} for exact comment {}{}.",
+                                ack.operation_id,
+                                ack.comment.remote_id,
+                                if ack.deleted { " (deleted)" } else { "" }
+                            ),
+                        ),
+                        ProviderMutationOutcome::PreflightRejected { reason } => {
+                            (false, format!("Discussion write was not sent: {reason}"))
+                        }
+                        ProviderMutationOutcome::Uncertain { reason, .. } => (false, format!(
+                            "Discussion outcome is uncertain and frozen against replay: {reason}"
+                        )),
+                    }
+                }
+            };
+            Ok::<_, String>((acknowledged, notice))
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(index) = this.tabs.iter().position(|tab| {
+                    tab.repository.cache_key() == identity
+                        && tab.pull_request.number == number
+                        && tab.lifecycle.active_operation.as_deref() == Some(&operation_id)
+                }) else {
+                    // A closed tab cannot receive another tab's late reply. The
+                    // durable journal remains authoritative for the completion.
+                    return;
+                };
+                this.tabs[index].write_in_flight = false;
+                let (acknowledged, notice) = match result {
+                    Ok(value) => value,
+                    Err(error) => (
+                        false,
+                        format!("Mutation admission failed; zero writes sent: {error}"),
+                    ),
+                };
+                this.tabs[index].lifecycle.finish_operation(
+                    &operation_id,
+                    acknowledged,
+                    notice.clone(),
+                );
+                this.status = notice;
+                this.refresh_lifecycle(index, cx);
+                this.refresh_details(index, cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn refresh_details(&mut self, index: usize, cx: &mut Context<Root>) {
@@ -6135,7 +6872,7 @@ impl ReviewWorkspace {
         let repository = tab.repository.clone();
         let number = tab.pull_request.number;
         let key = repository.cache_key();
-        let journal_root = self.interaction_root.join("action-journal");
+        let journal_root = self.interaction_root.clone();
         if tab.details.is_none() {
             tab.details_state = LoadState::Loading("Loading PR details…".into());
         }
@@ -6784,6 +7521,47 @@ impl ReviewWorkspace {
             .on_action(cx.listener(|root, _: &MergePullRequest, _, cx| {
                 if let Root::Review(this) = root {
                     this.prepare_merge_confirmation(cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &EditPrMetadata, window, cx| {
+                if let Root::Review(this) = root {
+                    this.begin_metadata_edit(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &ApplyPrMetadata, _, cx| {
+                if let Root::Review(this) = root {
+                    this.apply_metadata_edit(cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &NewPrDiscussion, window, cx| {
+                if let Root::Review(this) = root {
+                    this.begin_comment_create(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &ApplyPrDiscussion, _, cx| {
+                if let Root::Review(this) = root {
+                    this.apply_discussion(cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &ConfirmPrMutation, _, cx| {
+                if let Root::Review(this) = root {
+                    this.confirm_lifecycle_mutation(cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &CancelPrMutation, _, cx| {
+                if let Root::Review(this) = root
+                    && let Some(index) = this.active_tab
+                    && !this.tabs[index].write_in_flight
+                {
+                    if this.tabs[index].lifecycle.confirmation.is_some() {
+                        this.tabs[index].lifecycle.cancel_confirmation();
+                    } else if this.tabs[index].lifecycle.discussion_form.is_some() {
+                        this.tabs[index].lifecycle.cancel_discussion();
+                    } else {
+                        this.tabs[index].lifecycle.cancel_metadata();
+                    }
+                    this.status = "Lifecycle edit cancelled; zero writes sent.".into();
+                    cx.notify();
                 }
             }))
             .on_action(cx.listener(|root, _: &FileTreeUp, window, cx| {
@@ -9045,6 +9823,490 @@ impl ReviewWorkspace {
             })
     }
 
+    fn render_lifecycle_overview(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> AnyElement {
+        let tab = &self.tabs[index];
+        let lifecycle = &tab.lifecycle;
+        let Some(snapshot) = lifecycle.snapshot.as_ref() else {
+            return div()
+                .mt_3()
+                .text_xs()
+                .text_color(colors.muted)
+                .child(
+                    tab.lifecycle_state
+                        .notice()
+                        .unwrap_or_else(|| "Lifecycle metadata is loading.".into()),
+                )
+                .into_any_element();
+        };
+        let capability = |label: &'static str, value: &cibergit::domain::ProviderCapability| {
+            div()
+                .mt_1()
+                .text_xs()
+                .text_color(if value.available {
+                    colors.muted
+                } else {
+                    colors.amber
+                })
+                .child(format!(
+                    "{label}: {}{}",
+                    if value.available {
+                        "available"
+                    } else {
+                        "unavailable"
+                    },
+                    value
+                        .reason
+                        .as_ref()
+                        .map(|reason| format!(" · {reason}"))
+                        .unwrap_or_default()
+                ))
+        };
+        let mut panel = div()
+            .mt_4()
+            .pt_3()
+            .border_t_1()
+            .border_color(colors.border)
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Mutable PR metadata"),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(colors.muted)
+                    .child(format!(
+                        "Selected account {} · permission {} · observed {}",
+                        snapshot.viewer_login,
+                        snapshot.viewer_permission.as_deref().unwrap_or("unknown"),
+                        snapshot.updated_at
+                    )),
+            )
+            .when(!snapshot.values_complete || !snapshot.capabilities_complete, |panel| {
+                panel.child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(colors.amber)
+                        .child(
+                            snapshot
+                                .notice
+                                .clone()
+                                .unwrap_or_else(|| "GitHub returned incomplete mutable values or capabilities; unavailable actions remain disabled.".into()),
+                        ),
+                )
+            });
+        if lifecycle.editing_metadata {
+            panel = panel
+                .child(
+                    div()
+                        .mt_3()
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .child("Title"),
+                )
+                .child(
+                    div()
+                        .mt_1()
+                        .h(px(36.))
+                        .border_1()
+                        .border_color(colors.border)
+                        .rounded_md()
+                        .child(Input::new(&self.metadata_title_input)),
+                )
+                .child(
+                    div()
+                        .mt_2()
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .child("Body · exact Markdown retained; media is not rendered"),
+                )
+                .child(
+                    div()
+                        .mt_1()
+                        .h(px(112.))
+                        .border_1()
+                        .border_color(colors.border)
+                        .rounded_md()
+                        .overflow_hidden()
+                        .child(Textarea::new(&self.metadata_body_input)),
+                )
+                .child(
+                    div()
+                        .mt_2()
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .child("Base branch"),
+                )
+                .child(
+                    div()
+                        .mt_1()
+                        .h(px(36.))
+                        .border_1()
+                        .border_color(colors.border)
+                        .rounded_md()
+                        .child(Input::new(&self.metadata_base_input)),
+                );
+            if let Some((branches, complete, notice)) = lifecycle.choices_for(ChoiceKind::Branch) {
+                panel = panel.child(
+                    div()
+                        .mt_2()
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .children(branches.iter().take(10).map(|choice| {
+                            let value = choice.name.clone();
+                            action_link_with_id(
+                                format!("lifecycle-base-{value}"),
+                                "Use branch",
+                                colors,
+                            )
+                            .child(format!(" {value}"))
+                            .on_click(cx.listener(
+                                move |root, _, window, cx| {
+                                    if let Root::Review(this) = root {
+                                        this.metadata_base_input.update(cx, |input, cx| {
+                                            input.set_value(value.clone(), window, cx)
+                                        });
+                                    }
+                                },
+                            ))
+                        }))
+                        .when(!complete, |row| {
+                            row.child(
+                                div().text_xs().text_color(colors.amber).child(
+                                    notice
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| "Branch choices are incomplete.".into()),
+                                ),
+                            )
+                        }),
+                );
+            }
+            panel = panel.child(
+                div()
+                    .mt_3()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        action_link("Apply one change", colors).on_click(cx.listener(
+                            |root, _, _, cx| {
+                                if let Root::Review(this) = root {
+                                    this.apply_metadata_edit(cx);
+                                }
+                            },
+                        )),
+                    )
+                    .child(action_link("Cancel metadata", colors).on_click(cx.listener(
+                        |root, _, _, cx| {
+                            if let Root::Review(this) = root
+                                && let Some(index) = this.active_tab
+                            {
+                                this.tabs[index].lifecycle.cancel_metadata();
+                                this.status = "Metadata edits cancelled; zero writes sent.".into();
+                                cx.notify();
+                            }
+                        },
+                    ))),
+            );
+        } else {
+            panel = panel
+                .child(compact_detail("Title", &snapshot.title, colors))
+                .child(compact_detail("Base", &snapshot.base_branch, colors))
+                .when(!snapshot.body.is_empty(), |panel| {
+                    panel.child(markdown_detail(
+                        format!("lifecycle-body-{}", tab.pull_request.number),
+                        "Body",
+                        &snapshot.body,
+                        colors,
+                    ))
+                })
+                .child(
+                    div()
+                        .mt_2()
+                        .child(action_link("Edit metadata", colors).on_click(cx.listener(
+                            |root, _, window, cx| {
+                                if let Root::Review(this) = root {
+                                    this.begin_metadata_edit(window, cx);
+                                }
+                            },
+                        ))),
+                );
+        }
+        let state_action = if snapshot.state == "CLOSED" {
+            PullRequestLifecycleAction::Reopen
+        } else {
+            PullRequestLifecycleAction::Close
+        };
+        let state_label = if snapshot.state == "CLOSED" {
+            "Reopen PR"
+        } else {
+            "Close PR"
+        };
+        let draft_action = if snapshot.draft {
+            PullRequestLifecycleAction::MarkReadyForReview
+        } else {
+            PullRequestLifecycleAction::ConvertToDraft
+        };
+        let draft_label = if snapshot.draft {
+            "Mark ready"
+        } else {
+            "Convert to draft"
+        };
+        panel = panel.child(
+            div()
+                .mt_3()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(action_link(state_label, colors).on_click(cx.listener(
+                    move |root, _, _, cx| {
+                        if let Root::Review(this) = root {
+                            this.prepare_lifecycle_action(state_action.clone(), cx);
+                        }
+                    },
+                )))
+                .child(action_link(draft_label, colors).on_click(cx.listener(
+                    move |root, _, _, cx| {
+                        if let Root::Review(this) = root {
+                            this.prepare_lifecycle_action(draft_action.clone(), cx);
+                        }
+                    },
+                ))),
+        );
+        panel = panel
+            .child(capability("Metadata", &snapshot.can_update_metadata))
+            .child(capability("State", &snapshot.can_change_state))
+            .child(capability("Draft", &snapshot.can_change_draft))
+            .child(capability("Reviewers", &snapshot.can_request_reviewers))
+            .child(capability("Labels", &snapshot.can_change_labels))
+            .child(capability("Assignees", &snapshot.can_change_assignees))
+            .child(capability("Top-level comments", &snapshot.can_comment));
+
+        let delta_group =
+            |title: &'static str,
+             selected: Vec<(String, PullRequestLifecycleAction)>,
+             available: Vec<(String, PullRequestLifecycleAction)>,
+             complete: bool,
+             notice: Option<String>| {
+                let mut group = div().mt_3().child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                );
+                for (label, action) in selected.into_iter().chain(available).take(18) {
+                    group = group.child(
+                        action_link_with_id(
+                            format!("lifecycle-delta-{title}-{label}"),
+                            "Change",
+                            colors,
+                        )
+                        .mt_1()
+                        .child(format!(" {label}"))
+                        .on_click(cx.listener(move |root, _, _, cx| {
+                            if let Root::Review(this) = root {
+                                this.prepare_lifecycle_action(action.clone(), cx);
+                            }
+                        })),
+                    );
+                }
+                group.when(!complete, |group| {
+                    group.child(div().mt_1().text_xs().text_color(colors.amber).child(
+                        notice.unwrap_or_else(|| format!("{title} choices are incomplete.")),
+                    ))
+                })
+            };
+        let reviewer_selected = snapshot
+            .reviewers
+            .iter()
+            .cloned()
+            .map(|value| {
+                (
+                    format!("Remove {} {}", value.kind, value.name),
+                    PullRequestLifecycleAction::RemoveReviewer(value),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut reviewer_available = Vec::new();
+        let mut reviewer_complete = true;
+        let mut reviewer_notice = None;
+        for (kind, choice_kind) in [
+            ("USER", ChoiceKind::ReviewerUser),
+            ("TEAM", ChoiceKind::ReviewerTeam),
+        ] {
+            if let Some((choices, complete, notice)) = lifecycle.choices_for(choice_kind) {
+                reviewer_complete &= complete;
+                reviewer_notice = reviewer_notice.or_else(|| notice.map(str::to_owned));
+                reviewer_available.extend(
+                    choices
+                        .iter()
+                        .filter(|choice| {
+                            !snapshot.reviewers.iter().any(|selected| {
+                                selected.kind == kind
+                                    && selected.name.eq_ignore_ascii_case(&choice.name)
+                            })
+                        })
+                        .map(|choice| {
+                            let value = reviewer(kind, choice.name.clone());
+                            (
+                                format!("Add {kind} {}", choice.name),
+                                PullRequestLifecycleAction::AddReviewer(value),
+                            )
+                        }),
+                );
+            }
+        }
+        panel = panel.child(delta_group(
+            "Reviewers",
+            reviewer_selected,
+            reviewer_available,
+            reviewer_complete,
+            reviewer_notice,
+        ));
+        let choice_delta =
+            |kind: ChoiceKind,
+             selected: &[String],
+             add: fn(String) -> PullRequestLifecycleAction,
+             remove: fn(String) -> PullRequestLifecycleAction| {
+                let removed = selected
+                    .iter()
+                    .cloned()
+                    .map(|value| (format!("Remove {value}"), remove(value)))
+                    .collect::<Vec<_>>();
+                let (available, complete, notice) = lifecycle
+                    .choices_for(kind)
+                    .map(|(choices, complete, notice)| {
+                        (
+                            choices
+                                .iter()
+                                .filter(|choice| {
+                                    !selected
+                                        .iter()
+                                        .any(|value| value.eq_ignore_ascii_case(&choice.name))
+                                })
+                                .map(|choice| {
+                                    (format!("Add {}", choice.name), add(choice.name.clone()))
+                                })
+                                .collect(),
+                            complete,
+                            notice.map(str::to_owned),
+                        )
+                    })
+                    .unwrap_or_default();
+                (removed, available, complete, notice)
+            };
+        let (selected, available, complete, notice) = choice_delta(
+            ChoiceKind::Label,
+            &snapshot.labels,
+            PullRequestLifecycleAction::AddLabel,
+            PullRequestLifecycleAction::RemoveLabel,
+        );
+        panel = panel.child(delta_group("Labels", selected, available, complete, notice));
+        let (selected, available, complete, notice) = choice_delta(
+            ChoiceKind::Assignee,
+            &snapshot.assignees,
+            PullRequestLifecycleAction::AddAssignee,
+            PullRequestLifecycleAction::RemoveAssignee,
+        );
+        panel = panel.child(delta_group(
+            "Assignees",
+            selected,
+            available,
+            complete,
+            notice,
+        ));
+        if let Some(notice) = &lifecycle.notice {
+            panel = panel.child(
+                div()
+                    .mt_3()
+                    .text_xs()
+                    .text_color(colors.muted)
+                    .child(notice.clone()),
+            );
+        }
+        panel.into_any_element()
+    }
+
+    fn render_lifecycle_confirmation(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> Option<AnyElement> {
+        let tab = &self.tabs[index];
+        let frozen = tab.lifecycle.confirmation.as_ref()?;
+        let target = match frozen {
+            FrozenMutation::Lifecycle { request, .. } => &request.target,
+            FrozenMutation::Discussion { request, .. } => &request.target,
+        };
+        Some(
+            div()
+                .mb_4()
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.accent)
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Confirm exact PR mutation"),
+                )
+                .child(div().mt_1().text_xs().child(frozen.summary().to_owned()))
+                .child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .child(format!(
+                            "{} · #{} · account {} · state {} · head {} · observed {}",
+                            target.repository.full_name(),
+                            target.pull_request.pull_request,
+                            target.repository.account.login,
+                            target.observed_state,
+                            short_sha(&target.observed_head_sha),
+                            target.observed_updated_at
+                        )),
+                )
+                .child(
+                    div()
+                        .mt_3()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            action_link("Confirm exact action", colors).on_click(cx.listener(
+                                |root, _, _, cx| {
+                                    if let Root::Review(this) = root {
+                                        this.confirm_lifecycle_mutation(cx);
+                                    }
+                                },
+                            )),
+                        )
+                        .child(action_link("Cancel action", colors).on_click(cx.listener(
+                            |root, _, _, cx| {
+                                if let Root::Review(this) = root
+                                    && let Some(index) = this.active_tab
+                                {
+                                    this.tabs[index].lifecycle.cancel_confirmation();
+                                    this.status =
+                                        "Lifecycle confirmation cancelled; zero writes sent."
+                                            .into();
+                                    cx.notify();
+                                }
+                            },
+                        ))),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_inspector(
         &self,
         index: usize,
@@ -9055,17 +10317,21 @@ impl ReviewWorkspace {
         let tab = &self.tabs[index];
         let confirmation_open = tab.confirmation.is_some();
         let current = tab.inspector_section;
-        let section = |name: &'static str, value: InspectorSection| {
+        let root = cx.entity();
+        let section = move |name: &'static str, value: InspectorSection| {
+            let root = root.clone();
             side_control(name, current == value, colors)
                 .id(SharedString::from(format!("inspector-{name}")))
-                .on_click(cx.listener(move |root, _, _, cx| {
-                    if let Root::Review(this) = root
-                        && let Some(index) = this.active_tab
-                    {
-                        this.tabs[index].inspector_section = value;
-                        cx.notify();
-                    }
-                }))
+                .on_click(move |_, _, cx| {
+                    root.update(cx, |root, cx| {
+                        if let Root::Review(this) = root
+                            && let Some(index) = this.active_tab
+                        {
+                            this.tabs[index].inspector_section = value;
+                            cx.notify();
+                        }
+                    });
+                })
         };
         let content = match current {
             InspectorSection::Overview => {
@@ -9115,10 +10381,85 @@ impl ReviewWorkspace {
                         ));
                     }
                 }
-                div().children(fields).into_any_element()
+                div()
+                    .child(self.render_lifecycle_overview(index, colors, cx))
+                    .children(fields)
+                    .into_any_element()
             }
             InspectorSection::Activity => {
                 let mut activity = Vec::new();
+                if let Some(snapshot) = tab.lifecycle.snapshot.as_ref() {
+                    let mut composer = div()
+                        .mb_4()
+                        .p_3()
+                        .rounded_md()
+                        .bg(colors.elevated)
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Top-level discussion"),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child(format!(
+                                    "Issue comments for account {} · separate from review threads",
+                                    snapshot.viewer_login
+                                )),
+                        );
+                    if tab.lifecycle.discussion_form.is_some() {
+                        composer = composer
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .h(px(110.))
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .rounded_md()
+                                    .overflow_hidden()
+                                    .child(Textarea::new(&self.discussion_input)),
+                            )
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .flex()
+                                    .gap_2()
+                                    .child(action_link("Apply comment", colors).on_click(
+                                        cx.listener(|root, _, _, cx| {
+                                            if let Root::Review(this) = root {
+                                                this.apply_discussion(cx);
+                                            }
+                                        }),
+                                    ))
+                                    .child(action_link("Cancel comment", colors).on_click(
+                                        cx.listener(|root, _, _, cx| {
+                                            if let Root::Review(this) = root
+                                                && let Some(index) = this.active_tab
+                                            {
+                                                this.tabs[index].lifecycle.cancel_discussion();
+                                                this.status =
+                                                    "Discussion edit cancelled; zero writes sent."
+                                                        .into();
+                                                cx.notify();
+                                            }
+                                        }),
+                                    )),
+                            );
+                    } else {
+                        composer = composer.child(div().mt_2().child(
+                            action_link("New top-level comment", colors).on_click(cx.listener(
+                                |root, _, window, cx| {
+                                    if let Root::Review(this) = root {
+                                        this.begin_comment_create(window, cx);
+                                    }
+                                },
+                            )),
+                        ));
+                    }
+                    activity.push(composer);
+                }
                 match &tab.interactions {
                     InteractionState::Ready(controller) => {
                         let journal_unresolved = tab
@@ -9512,6 +10853,9 @@ impl ReviewWorkspace {
                 }
                 if let Some(details) = &tab.details {
                     for (position, comment) in details.issue_comments.iter().take(20).enumerate() {
+                        let editable = tab.lifecycle.current_user_comment(comment);
+                        let edit_comment = comment.clone();
+                        let delete_comment = comment.clone();
                         activity.push(
                             activity_item(
                                 format!("issue-comment-{position}"),
@@ -9526,7 +10870,56 @@ impl ReviewWorkspace {
                                     .text_xs()
                                     .text_color(colors.faint)
                                     .child(format!("Remote ID {}", comment.coordinates.remote_id)),
-                            ),
+                            )
+                            .when(editable, |card| {
+                                card.child(
+                                    div()
+                                        .mt_2()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            action_link_with_id(
+                                                format!(
+                                                    "edit-issue-comment-{}",
+                                                    edit_comment.coordinates.remote_id
+                                                ),
+                                                "Edit exact comment",
+                                                colors,
+                                            )
+                                            .on_click(
+                                                cx.listener(move |root, _, window, cx| {
+                                                    if let Root::Review(this) = root {
+                                                        this.begin_comment_edit(
+                                                            edit_comment.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            action_link_with_id(
+                                                format!(
+                                                    "delete-issue-comment-{}",
+                                                    delete_comment.coordinates.remote_id
+                                                ),
+                                                "Delete exact comment",
+                                                colors,
+                                            )
+                                            .on_click(
+                                                cx.listener(move |root, _, _, cx| {
+                                                    if let Root::Review(this) = root {
+                                                        this.prepare_comment_delete(
+                                                            delete_comment.clone(),
+                                                            cx,
+                                                        );
+                                                    }
+                                                }),
+                                            ),
+                                        ),
+                                )
+                            }),
                         );
                     }
                     for (position, review) in details.reviews.iter().take(20).enumerate() {
@@ -9737,6 +11130,10 @@ impl ReviewWorkspace {
                     .overflow_y_scroll()
                     .when_some(
                         self.render_confirmation(index, colors, cx),
+                        |panel, confirmation| panel.child(confirmation),
+                    )
+                    .when_some(
+                        self.render_lifecycle_confirmation(index, colors, cx),
                         |panel, confirmation| panel.child(confirmation),
                     )
                     .when(!confirmation_open, |panel| panel.child(content))
@@ -10488,6 +11885,8 @@ fn journal_identity(request: &JournalRequest) -> (&str, &str) {
     match request {
         JournalRequest::Auxiliary(request) => (&request.operation_id, &request.attempt_id),
         JournalRequest::Merge { request, .. } => (&request.operation_id, &request.attempt_id),
+        JournalRequest::Lifecycle(request) => (&request.operation_id, &request.attempt_id),
+        JournalRequest::Discussion(request) => (&request.operation_id, &request.attempt_id),
     }
 }
 
@@ -10560,12 +11959,42 @@ fn journal_operation_summary(operation: &JournalOperation) -> String {
             MergeAction::Enqueue => "Add pull request to merge queue",
             MergeAction::Dequeue => "Remove pull request from merge queue",
         },
+        JournalRequest::Lifecycle(request) => match &request.action {
+            PullRequestLifecycleAction::UpdateTitle { .. } => "Update PR title",
+            PullRequestLifecycleAction::UpdateBody { .. } => "Update PR body",
+            PullRequestLifecycleAction::UpdateBaseBranch { .. } => "Update PR base branch",
+            PullRequestLifecycleAction::Close => "Close pull request",
+            PullRequestLifecycleAction::Reopen => "Reopen pull request",
+            PullRequestLifecycleAction::ConvertToDraft => "Convert pull request to draft",
+            PullRequestLifecycleAction::MarkReadyForReview => "Mark pull request ready",
+            PullRequestLifecycleAction::AddReviewer(_) => "Add reviewer",
+            PullRequestLifecycleAction::RemoveReviewer(_) => "Remove reviewer",
+            PullRequestLifecycleAction::AddLabel(_) => "Add label",
+            PullRequestLifecycleAction::RemoveLabel(_) => "Remove label",
+            PullRequestLifecycleAction::AddAssignee(_) => "Add assignee",
+            PullRequestLifecycleAction::RemoveAssignee(_) => "Remove assignee",
+        },
+        JournalRequest::Discussion(request) => match request.action {
+            PullRequestDiscussionAction::Create { .. } => "Create top-level comment",
+            PullRequestDiscussionAction::Edit { .. } => "Edit top-level comment",
+            PullRequestDiscussionAction::Delete { .. } => "Delete top-level comment",
+        },
     };
     let reason = match &operation.request {
         JournalRequest::Auxiliary(request)
             if matches!(request.action, ReviewAuxiliaryAction::Reply { .. }) =>
         {
             "Outcome unknown; no exact reply identity is available."
+        }
+        JournalRequest::Discussion(request)
+            if matches!(request.action, PullRequestDiscussionAction::Create { .. }) =>
+        {
+            "Outcome unknown; the lost create acknowledgement has no exact new comment ID."
+        }
+        JournalRequest::Discussion(request)
+            if matches!(request.action, PullRequestDiscussionAction::Delete { .. }) =>
+        {
+            "Outcome unknown; absence of the exact comment is not proof this delete applied."
         }
         _ => "Outcome unknown; use read-only reconciliation before retry.",
     };
@@ -10615,6 +12044,22 @@ fn journal_operation_description(operation: &JournalOperation) -> String {
             preparation.pull_request.remote_id,
             preparation.reviewed_head_sha,
             preparation.current_head_sha
+        ),
+        JournalRequest::Lifecycle(request) => format!(
+            "lifecycle {:?} · PR {} · observed updated {} · state {} · head {}",
+            request.action,
+            request.target.pull_request.remote_id,
+            request.target.observed_updated_at,
+            request.target.observed_state,
+            request.target.observed_head_sha
+        ),
+        JournalRequest::Discussion(request) => format!(
+            "top-level discussion {:?} · PR {} · observed updated {} · state {} · head {}",
+            request.action,
+            request.target.pull_request.remote_id,
+            request.target.observed_updated_at,
+            request.target.observed_state,
+            request.target.observed_head_sha
         ),
     };
     let status = match &operation.status {

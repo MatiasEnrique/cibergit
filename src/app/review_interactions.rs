@@ -1,9 +1,10 @@
 use cibergit::{
     domain::{
         MergeAcknowledgement, MergeExecutionRequest, MergeMethod, MergePreparation,
-        MutationContext, PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome,
-        PullRequestDetails, Repository, ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryRequest,
-        ReviewComment, ReviewThread,
+        MutationAdmissionReceipt, MutationContext, MutationTerminalRecord, PendingReviewSnapshot,
+        ProviderCoordinates, ProviderMutationOutcome, PullRequestDetails,
+        PullRequestDiscussionRequest, PullRequestLifecycleRequest, Repository,
+        ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryRequest, ReviewComment, ReviewThread,
     },
     participation::{
         CanonicalPublishedPatch, DraftCoordinate, DraftStore, LineSelection, LoadOutcome,
@@ -11,14 +12,17 @@ use cibergit::{
         ReviewOperationPayload, ReviewOperationStatus, ReviewOperationTarget,
         map_to_canonical_published, validate_coordinate,
     },
+    providers::{AdmittedMutationAttempt, MutationAdmission},
     review::{ReviewSession, file_key},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
+    ffi::c_int,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
+    os::fd::AsRawFd,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -28,8 +32,13 @@ const JOURNAL_VERSION: u64 = 1;
 const MAX_JOURNAL_BYTES: usize = 512 * 1024;
 const MAX_JOURNAL_OPERATIONS: usize = 96;
 const MAX_JOURNAL_TEXT_BYTES: usize = 64 * 1024;
+const LOCK_UN: c_int = 0x08;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+unsafe extern "C" {
+    fn flock(fd: c_int, operation: c_int) -> c_int;
+}
 
 #[derive(Clone, Debug)]
 pub struct ComposerState {
@@ -142,7 +151,7 @@ impl ReviewInteractionController {
                 )));
             }
         };
-        let authority = ReviewStateAuthority::open(root.join("state-authority"), key)?;
+        let authority = ReviewStateAuthority::open(root.to_owned(), key)?;
         Ok(ControllerLoad::Ready(Box::new(Self {
             composition,
             store,
@@ -540,16 +549,81 @@ impl ReviewInteractionController {
     }
 }
 
+/// The one cross-process authority lane for every provider mutation targeting
+/// an account/repository/pull-request tuple. Durable journals decide whether a
+/// later operation is admissible; this OS lock prevents their critical
+/// sections and provider dispatches from racing across app processes.
 #[derive(Clone, Debug)]
-pub struct ReviewStateAuthority {
+struct TargetMutationAuthority {
     root: PathBuf,
     key: ReviewKey,
 }
 
-impl ReviewStateAuthority {
-    pub fn open(root: PathBuf, key: ReviewKey) -> Result<Self, String> {
+impl TargetMutationAuthority {
+    fn new(root: PathBuf, key: ReviewKey) -> Result<Self, String> {
         ensure_private_directory(&root)?;
         Ok(Self { root, key })
+    }
+
+    fn acquire(&self) -> Result<TargetMutationGuard, String> {
+        let file = open_private_lock(&self.lock_path()?)?;
+        file.lock()
+            .map_err(|error| format!("Cannot lock target mutation authority: {error}"))?;
+        Ok(TargetMutationGuard { file: Some(file) })
+    }
+
+    fn lock_path(&self) -> Result<PathBuf, String> {
+        let account = stable_component(&(
+            self.key.account.host.as_str(),
+            self.key.account.login.as_str(),
+        ))?;
+        let repository = stable_component(&(
+            self.key.provider.as_str(),
+            self.key.host.as_str(),
+            self.key.owner.as_str(),
+            self.key.repository.as_str(),
+        ))?;
+        Ok(self
+            .root
+            .join("target-authority")
+            .join("v1")
+            .join(account)
+            .join(repository)
+            .join(format!("pr-{}.lock", self.key.pull_request)))
+    }
+}
+
+#[derive(Debug)]
+struct TargetMutationGuard {
+    file: Option<File>,
+}
+
+impl Drop for TargetMutationGuard {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            // BSD flock belongs to the open-file description. Closing this
+            // descriptor alone would not release it if a fork/dup still held
+            // the description, so explicitly unlock before close on every
+            // normal and error exit.
+            let _ = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ReviewStateAuthority {
+    root: PathBuf,
+    key: ReviewKey,
+    target: TargetMutationAuthority,
+}
+
+impl ReviewStateAuthority {
+    pub fn open(root: PathBuf, key: ReviewKey) -> Result<Self, String> {
+        Ok(Self {
+            target: TargetMutationAuthority::new(root.clone(), key.clone())?,
+            root,
+            key,
+        })
     }
 
     pub fn save_if_current(
@@ -584,10 +658,27 @@ impl ReviewStateAuthority {
                         .into(),
                 );
             }
+            self.refuse_unresolved_action_journal()?;
             let result = execute();
             let durable = load_composition(store, &self.key)?;
             Ok((result, durable))
         })
+    }
+
+    fn refuse_unresolved_action_journal(&self) -> Result<(), String> {
+        let journal = ActionJournal::open(&self.root, self.key.clone())?;
+        if journal.operations_unlocked()?.iter().any(|operation| {
+            matches!(
+                operation.status,
+                JournalStatus::InFlight | JournalStatus::Uncertain { .. }
+            )
+        }) {
+            return Err(
+                "Another target mutation has an unresolved durable outcome; zero review writes sent. Reconcile that exact attempt first."
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     /// Reconcile started review-composition operations with fresh read-only
@@ -640,29 +731,8 @@ impl ReviewStateAuthority {
     }
 
     fn with_lock<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-        let lock = open_private_lock(&self.lock_path()?)?;
-        lock.lock()
-            .map_err(|error| format!("Cannot lock review state authority: {error}"))?;
+        let _lock = self.target.acquire()?;
         action()
-    }
-
-    fn lock_path(&self) -> Result<PathBuf, String> {
-        let account = stable_component(&(
-            self.key.account.host.as_str(),
-            self.key.account.login.as_str(),
-        ))?;
-        let repository = stable_component(&(
-            self.key.provider.as_str(),
-            self.key.host.as_str(),
-            self.key.owner.as_str(),
-            self.key.repository.as_str(),
-        ))?;
-        Ok(self
-            .root
-            .join("v1")
-            .join(account)
-            .join(repository)
-            .join(format!("pr-{}.lock", self.key.pull_request)))
     }
 }
 
@@ -1440,6 +1510,8 @@ pub enum JournalRequest {
         preparation: Box<MergePreparation>,
         request: MergeExecutionRequest,
     },
+    Lifecycle(Box<PullRequestLifecycleRequest>),
+    Discussion(Box<PullRequestDiscussionRequest>),
 }
 
 impl JournalRequest {
@@ -1447,6 +1519,8 @@ impl JournalRequest {
         match self {
             Self::Auxiliary(request) => (&request.operation_id, &request.attempt_id),
             Self::Merge { request, .. } => (&request.operation_id, &request.attempt_id),
+            Self::Lifecycle(request) => (&request.operation_id, &request.attempt_id),
+            Self::Discussion(request) => (&request.operation_id, &request.attempt_id),
         }
     }
 
@@ -1480,14 +1554,83 @@ impl JournalRequest {
                 cibergit::domain::MergeAction::Enqueue => "enqueue pull request",
                 cibergit::domain::MergeAction::Dequeue => "dequeue pull request",
             },
+            Self::Lifecycle(request) => match &request.action {
+                cibergit::domain::PullRequestLifecycleAction::UpdateTitle { .. } => {
+                    "update-pr-title"
+                }
+                cibergit::domain::PullRequestLifecycleAction::UpdateBody { .. } => "update-pr-body",
+                cibergit::domain::PullRequestLifecycleAction::UpdateBaseBranch { .. } => {
+                    "update-pr-base"
+                }
+                cibergit::domain::PullRequestLifecycleAction::Close => "close-pr",
+                cibergit::domain::PullRequestLifecycleAction::Reopen => "reopen-pr",
+                cibergit::domain::PullRequestLifecycleAction::ConvertToDraft => {
+                    "convert-pr-to-draft"
+                }
+                cibergit::domain::PullRequestLifecycleAction::MarkReadyForReview => "mark-pr-ready",
+                cibergit::domain::PullRequestLifecycleAction::AddReviewer(_) => "add-pr-reviewer",
+                cibergit::domain::PullRequestLifecycleAction::RemoveReviewer(_) => {
+                    "remove-pr-reviewer"
+                }
+                cibergit::domain::PullRequestLifecycleAction::AddLabel(_) => "add-pr-label",
+                cibergit::domain::PullRequestLifecycleAction::RemoveLabel(_) => "remove-pr-label",
+                cibergit::domain::PullRequestLifecycleAction::AddAssignee(_) => "add-pr-assignee",
+                cibergit::domain::PullRequestLifecycleAction::RemoveAssignee(_) => {
+                    "remove-pr-assignee"
+                }
+            },
+            Self::Discussion(request) => match request.action {
+                cibergit::domain::PullRequestDiscussionAction::Create { .. } => {
+                    "create-pr-discussion-comment"
+                }
+                cibergit::domain::PullRequestDiscussionAction::Edit { .. } => {
+                    "edit-pr-discussion-comment"
+                }
+                cibergit::domain::PullRequestDiscussionAction::Delete { .. } => {
+                    "delete-pr-discussion-comment"
+                }
+            },
+        };
+        let payload = match self {
+            Self::Lifecycle(request) => serde_json::json!({
+                "request": request,
+                "dispatch": {"transport": "journal-context"},
+            }),
+            Self::Discussion(request) => serde_json::json!({
+                "request": request,
+                "dispatch": {"transport": "journal-context"},
+            }),
+            _ => serde_json::to_value(self)
+                .unwrap_or_else(|_| serde_json::json!({"serialization": "failed"})),
         };
         MutationContext {
             operation_id: operation_id.to_owned(),
             attempt_id: attempt_id.to_owned(),
             action: action.into(),
-            payload: serde_json::to_value(self)
-                .unwrap_or_else(|_| serde_json::json!({"serialization": "failed"})),
+            payload,
         }
+    }
+
+    fn validate_provider_context(&self, context: &MutationContext) -> Result<(), String> {
+        let expected = self.mutation_context();
+        if context.operation_id != expected.operation_id
+            || context.attempt_id != expected.attempt_id
+            || context.action != expected.action
+        {
+            return Err(
+                "provider mutation identity differs from the frozen journal request".into(),
+            );
+        }
+        let expected_request = expected.payload.get("request").ok_or_else(|| {
+            "journal request is not supported by held provider admission".to_owned()
+        })?;
+        if context.payload.get("request") != Some(expected_request) {
+            return Err("provider mutation payload differs from the frozen journal request".into());
+        }
+        if context.payload.get("dispatch").is_none() {
+            return Err("provider mutation context omitted its exact dispatch payload".into());
+        }
+        Ok(())
     }
 }
 
@@ -1530,6 +1673,7 @@ enum JournalLoad {
 pub struct ActionJournal {
     root: PathBuf,
     key: ReviewKey,
+    target: TargetMutationAuthority,
 }
 
 impl ActionJournal {
@@ -1537,6 +1681,7 @@ impl ActionJournal {
         ensure_private_directory(root)?;
         Ok(Self {
             root: root.to_owned(),
+            target: TargetMutationAuthority::new(root.to_owned(), key.clone())?,
             key,
         })
     }
@@ -1595,21 +1740,7 @@ impl ActionJournal {
         execute: impl FnOnce() -> ProviderMutationOutcome<T>,
         acknowledged: impl FnOnce(&T) -> (bool, bool, String),
     ) -> ProviderMutationOutcome<T> {
-        let lock = match open_private_lock(&match self.lock_path() {
-            Ok(path) => path,
-            Err(reason) => {
-                return ProviderMutationOutcome::PreflightRejected {
-                    reason: format!(
-                        "Could not resolve the caller journal lock; zero writes sent: {reason}"
-                    ),
-                };
-            }
-        })
-        .and_then(|file| {
-            file.lock()
-                .map_err(|error| format!("Cannot lock action journal: {error}"))?;
-            Ok(file)
-        }) {
+        let lock = match self.target.acquire() {
             Ok(lock) => lock,
             Err(reason) => {
                 return ProviderMutationOutcome::PreflightRejected {
@@ -1677,9 +1808,7 @@ impl ActionJournal {
         attempt_id: &str,
         evidence: String,
     ) -> Result<(), String> {
-        let lock = open_private_lock(&self.lock_path()?)?;
-        lock.lock()
-            .map_err(|error| format!("Cannot lock action journal: {error}"))?;
+        let _lock = self.target.acquire()?;
         let operation = self
             .operations_unlocked()?
             .into_iter()
@@ -1703,9 +1832,7 @@ impl ActionJournal {
         completed: bool,
         summary: String,
     ) -> Result<(), String> {
-        let lock = open_private_lock(&self.lock_path()?)?;
-        lock.lock()
-            .map_err(|error| format!("Cannot lock action journal: {error}"))?;
+        let _lock = self.target.acquire()?;
         let operation = self
             .operations_unlocked()?
             .into_iter()
@@ -1730,9 +1857,7 @@ impl ActionJournal {
     }
 
     pub fn operations(&self) -> Result<Vec<JournalOperation>, String> {
-        let lock = open_private_lock(&self.lock_path()?)?;
-        lock.lock()
-            .map_err(|error| format!("Cannot lock action journal: {error}"))?;
+        let _lock = self.target.acquire()?;
         self.operations_unlocked()
     }
 
@@ -1753,6 +1878,12 @@ impl ActionJournal {
         }) {
             return Err(
                 "Another auxiliary or merge attempt still needs outcome reconciliation.".into(),
+            );
+        }
+        if self.review_operations_unresolved()? {
+            return Err(
+                "A review mutation still needs exact outcome reconciliation; no target mutation was admitted."
+                    .into(),
             );
         }
         let identity = request.operation_and_attempt();
@@ -1844,14 +1975,114 @@ impl ActionJournal {
         ))?;
         Ok(self
             .root
+            .join("action-journal")
             .join("v1")
             .join(account)
             .join(repository)
             .join(format!("pr-{}.json", self.key.pull_request)))
     }
 
-    fn lock_path(&self) -> Result<PathBuf, String> {
-        Ok(self.path()?.with_extension("lock"))
+    fn review_operations_unresolved(&self) -> Result<bool, String> {
+        let store =
+            DraftStore::open(self.root.join("drafts")).map_err(|error| error.to_string())?;
+        Ok(
+            load_composition(&store, &self.key)?.is_some_and(|composition| {
+                composition
+                    .operations_requiring_reconciliation()
+                    .next()
+                    .is_some()
+            }),
+        )
+    }
+
+    pub fn admission(&mut self, request: JournalRequest) -> JournalAdmission<'_> {
+        JournalAdmission {
+            journal: self,
+            request,
+        }
+    }
+}
+
+/// Adapter between the provider's held `MutationAdmission` contract and the
+/// app's one shared per-target action journal.
+pub struct JournalAdmission<'a> {
+    journal: &'a mut ActionJournal,
+    request: JournalRequest,
+}
+
+impl MutationAdmission for JournalAdmission<'_> {
+    fn admit<'a>(
+        &'a mut self,
+        context: &MutationContext,
+    ) -> anyhow::Result<Box<dyn AdmittedMutationAttempt + 'a>> {
+        self.request
+            .validate_provider_context(context)
+            .map_err(anyhow::Error::msg)?;
+        let guard = self.journal.target.acquire().map_err(anyhow::Error::msg)?;
+        self.journal
+            .record_in_flight_unlocked(self.request.clone())
+            .map_err(anyhow::Error::msg)?;
+        let (operation_id, attempt_id) = self.request.operation_and_attempt();
+        let operation_id = operation_id.to_owned();
+        let attempt_id = attempt_id.to_owned();
+        let durable_record_id = stable_component(&(
+            self.journal.key.provider.as_str(),
+            self.journal.key.host.as_str(),
+            self.journal.key.owner.as_str(),
+            self.journal.key.repository.as_str(),
+            self.journal.key.pull_request,
+            self.journal.key.account.host.as_str(),
+            self.journal.key.account.login.as_str(),
+            operation_id.as_str(),
+            attempt_id.as_str(),
+            context,
+        ))
+        .map_err(anyhow::Error::msg)?;
+        Ok(Box::new(HeldJournalAttempt {
+            journal: self.journal.clone(),
+            request: self.request.clone(),
+            receipt: MutationAdmissionReceipt {
+                operation_id,
+                attempt_id,
+                durable_record_id,
+            },
+            _guard: guard,
+        }))
+    }
+}
+
+struct HeldJournalAttempt {
+    journal: ActionJournal,
+    request: JournalRequest,
+    receipt: MutationAdmissionReceipt,
+    _guard: TargetMutationGuard,
+}
+
+impl AdmittedMutationAttempt for HeldJournalAttempt {
+    fn receipt(&self) -> &MutationAdmissionReceipt {
+        &self.receipt
+    }
+
+    fn record_terminal(&mut self, record: &MutationTerminalRecord) -> anyhow::Result<()> {
+        let status = match record {
+            MutationTerminalRecord::NotStarted { reason } => JournalStatus::NotApplied {
+                evidence: format!("Provider second preflight dispatched zero writes: {reason}"),
+            },
+            MutationTerminalRecord::Acknowledged { acknowledgement } => {
+                let encoded = serde_json::to_string(acknowledgement)?;
+                JournalStatus::Acknowledged {
+                    accepted: true,
+                    completed: true,
+                    summary: format!("Durable provider acknowledgement: {encoded}"),
+                }
+            }
+            MutationTerminalRecord::Uncertain { reason } => JournalStatus::Uncertain {
+                reason: reason.clone(),
+            },
+        };
+        self.journal
+            .update_status_unlocked(&self.request, status)
+            .map_err(anyhow::Error::msg)
     }
 }
 
@@ -2087,16 +2318,18 @@ mod tests {
     use super::*;
     use cibergit::domain::{
         Account, ChangedFile, Comparison, LinkedReviewComment, MergeEligibility,
-        ProviderCoordinates, PullRequestReview, ReviewComment, Revision,
+        ProviderCoordinates, PullRequestLifecycleAction, PullRequestMutationTarget,
+        PullRequestReview, ReviewComment, Revision,
     };
     use cibergit::participation::{DiffSide, RemoteDraftIds, ReviewOperationStatus};
     use std::{
+        process::Command,
         sync::{
             Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tempfile::tempdir;
 
@@ -2219,6 +2452,21 @@ mod tests {
                 },
                 resolved: true,
             },
+        }
+    }
+
+    fn lifecycle_request() -> PullRequestLifecycleRequest {
+        PullRequestLifecycleRequest {
+            operation_id: "lifecycle-1".into(),
+            attempt_id: "lifecycle-attempt-1".into(),
+            target: PullRequestMutationTarget {
+                repository: repository(),
+                pull_request: coordinates("PR_7"),
+                observed_updated_at: "2026-09-13T00:00:00Z".into(),
+                observed_state: "OPEN".into(),
+                observed_head_sha: "2222222".into(),
+            },
+            action: PullRequestLifecycleAction::Close,
         }
     }
 
@@ -2625,9 +2873,11 @@ mod tests {
         let directory = tempdir().unwrap();
         let blocked = directory.path().join("blocked");
         fs::write(&blocked, b"not a directory").unwrap();
+        let key = review_key();
         let journal = ActionJournal {
-            root: blocked,
-            key: review_key(),
+            root: blocked.clone(),
+            key: key.clone(),
+            target: TargetMutationAuthority { root: blocked, key },
         };
         let calls = AtomicUsize::new(0);
         let outcome: ProviderMutationOutcome<()> = journal.dispatch(
@@ -2763,6 +3013,240 @@ mod tests {
             1
         );
         assert_eq!(journal.operations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn explicit_target_guard_unlocks_while_duplicate_descriptor_remains_open() {
+        let directory = tempdir().unwrap();
+        let authority =
+            TargetMutationAuthority::new(directory.path().to_owned(), review_key()).unwrap();
+        let guard = authority.acquire().unwrap();
+        let duplicate = guard.file.as_ref().unwrap().try_clone().unwrap();
+        drop(guard);
+        drop(authority.acquire().expect(
+            "Drop must explicitly unlock even while a duplicate open-file description remains",
+        ));
+        drop(duplicate);
+    }
+
+    #[test]
+    fn unresolved_review_blocks_lifecycle_admission_before_dispatch() {
+        let directory = tempdir().unwrap();
+        let (_controller, _) = uncertain_comment_controller(directory.path(), None);
+        let request = lifecycle_request();
+        let journal = ActionJournal::open(directory.path(), review_key()).unwrap();
+        let mut owned = journal.clone();
+        let mut admission = owned.admission(JournalRequest::Lifecycle(Box::new(request.clone())));
+        let error = admission
+            .admit(&JournalRequest::Lifecycle(Box::new(request)).mutation_context())
+            .err()
+            .expect("unresolved review must refuse lifecycle admission");
+        assert!(error.to_string().contains("review mutation"));
+        assert!(journal.operations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unresolved_lifecycle_blocks_review_and_merge_families() {
+        let directory = tempdir().unwrap();
+        let request = lifecycle_request();
+        let mut journal = ActionJournal::open(directory.path(), review_key()).unwrap();
+        let frozen = JournalRequest::Lifecycle(Box::new(request.clone()));
+        {
+            let mut admission = journal.admission(frozen.clone());
+            let mut held = admission.admit(&frozen.mutation_context()).unwrap();
+            held.record_terminal(&MutationTerminalRecord::Uncertain {
+                reason: "provider reply lost".into(),
+            })
+            .unwrap();
+        }
+
+        let controller =
+            match ReviewInteractionController::load(directory.path(), &repository(), 7, &session())
+                .unwrap()
+            {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+        let review_error = controller
+            .authority
+            .execute_if_current(
+                &controller.store,
+                controller.durable_composition.as_ref(),
+                || panic!("unresolved lifecycle must reject before review dispatch"),
+            )
+            .unwrap_err();
+        assert!(review_error.contains("unresolved durable outcome"));
+
+        let calls = AtomicUsize::new(0);
+        let merge_family = journal.dispatch(
+            JournalRequest::Auxiliary(Box::new(auxiliary_request())),
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ProviderMutationOutcome::Acknowledged(())
+            },
+            |_| (true, true, "unexpected".into()),
+        );
+        assert!(matches!(
+            merge_family,
+            ProviderMutationOutcome::PreflightRejected { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn duplicate_lifecycle_window_attempt_is_admitted_exactly_once() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let barrier = Arc::new(Barrier::new(3));
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            let admitted = admitted.clone();
+            workers.push(thread::spawn(move || {
+                let request = lifecycle_request();
+                let frozen = JournalRequest::Lifecycle(Box::new(request));
+                let mut journal = ActionJournal::open(&root, review_key()).unwrap();
+                let mut admission = journal.admission(frozen.clone());
+                barrier.wait();
+                match admission.admit(&frozen.mutation_context()) {
+                    Ok(mut held) => {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(30));
+                        held.record_terminal(&MutationTerminalRecord::Acknowledged {
+                            acknowledgement: serde_json::json!({"exact": true}),
+                        })
+                        .unwrap();
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }));
+        }
+        barrier.wait();
+        let accepted = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|accepted| *accepted)
+            .count();
+        assert_eq!(accepted, 1);
+        assert_eq!(admitted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn duplicate_lifecycle_process_is_refused_after_first_terminal_tombstone() {
+        let directory = tempdir().unwrap();
+        let ready = directory.path().join("helper-ready");
+        let request = lifecycle_request();
+        let frozen = JournalRequest::Lifecycle(Box::new(request));
+        let mut journal = ActionJournal::open(directory.path(), review_key()).unwrap();
+        let mut admission = journal.admission(frozen.clone());
+        let mut held = admission.admit(&frozen.mutation_context()).unwrap();
+        let mut helper = Command::new(std::env::current_exe().unwrap())
+            .arg("app::review_interactions::tests::lifecycle_admission_helper_process")
+            .arg("--ignored")
+            .arg("--exact")
+            .env("CIBERGIT_TEST_LIFECYCLE_ROOT", directory.path())
+            .env("CIBERGIT_TEST_LIFECYCLE_READY", &ready)
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        while !ready.exists() && started.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "helper reached cross-process admission");
+        held.record_terminal(&MutationTerminalRecord::Acknowledged {
+            acknowledgement: serde_json::json!({"first_process": true}),
+        })
+        .unwrap();
+        drop(held);
+        assert!(helper.wait().unwrap().success());
+        assert_eq!(journal.operations().unwrap().len(), 1);
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for exact cross-process lifecycle admission"]
+    fn lifecycle_admission_helper_process() {
+        let Some(root) = std::env::var_os("CIBERGIT_TEST_LIFECYCLE_ROOT") else {
+            return;
+        };
+        let ready = std::env::var_os("CIBERGIT_TEST_LIFECYCLE_READY").unwrap();
+        let request = lifecycle_request();
+        let frozen = JournalRequest::Lifecycle(Box::new(request));
+        let mut journal = ActionJournal::open(Path::new(&root), review_key()).unwrap();
+        fs::write(ready, b"ready").unwrap();
+        let mut admission = journal.admission(frozen.clone());
+        let error = admission
+            .admit(&frozen.mutation_context())
+            .err()
+            .expect("first process terminal tombstone must refuse duplicate");
+        assert!(error.to_string().contains("already journaled"));
+    }
+
+    #[test]
+    fn lifecycle_initial_save_failure_has_no_admitted_dispatch() {
+        let directory = tempdir().unwrap();
+        let mut journal = ActionJournal::open(directory.path(), review_key()).unwrap();
+        fs::write(
+            directory.path().join("action-journal"),
+            b"blocks journal tree",
+        )
+        .unwrap();
+        let request = lifecycle_request();
+        let frozen = JournalRequest::Lifecycle(Box::new(request));
+        let calls = AtomicUsize::new(0);
+        let mut admission = journal.admission(frozen.clone());
+        if admission.admit(&frozen.mutation_context()).is_ok() {
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn lifecycle_terminal_save_failure_retains_inflight_and_refuses_restart_replay() {
+        let directory = tempdir().unwrap();
+        let request = lifecycle_request();
+        let frozen = JournalRequest::Lifecycle(Box::new(request));
+        let mut journal = ActionJournal::open(directory.path(), review_key()).unwrap();
+        let path = journal.path().unwrap();
+        {
+            let mut admission = journal.admission(frozen.clone());
+            let mut held = admission.admit(&frozen.mutation_context()).unwrap();
+            let partition = path.parent().unwrap().to_owned();
+            let displaced = partition.with_extension("terminal-save-backup");
+            fs::rename(&partition, &displaced).unwrap();
+            fs::write(&partition, b"blocks terminal record").unwrap();
+            assert!(
+                held.record_terminal(&MutationTerminalRecord::Acknowledged {
+                    acknowledgement: serde_json::json!({"provider": "accepted"}),
+                })
+                .is_err()
+            );
+            fs::remove_file(&partition).unwrap();
+            fs::rename(&displaced, &partition).unwrap();
+        }
+        assert!(matches!(
+            journal.operations().unwrap()[0].status,
+            JournalStatus::InFlight
+        ));
+        let mut restarted = ActionJournal::open(directory.path(), review_key()).unwrap();
+        let mut admission = restarted.admission(frozen.clone());
+        assert!(admission.admit(&frozen.mutation_context()).is_err());
+    }
+
+    #[test]
+    fn corrupt_and_future_action_journals_are_preserved() {
+        for bytes in [b"{".as_slice(), br#"{"version":99}"#.as_slice()] {
+            let directory = tempdir().unwrap();
+            let journal = ActionJournal::open(directory.path(), review_key()).unwrap();
+            let path = journal.path().unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, bytes).unwrap();
+            let error = journal.operations().unwrap_err();
+            assert!(error.contains("preserved"));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]
