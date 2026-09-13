@@ -2,6 +2,8 @@ use crate::{
     CloseTab, CycleDiffMode, NextFile, OpenRepositorySetup, PreviousFile, Refresh, Save,
     ToggleInspector, TogglePalette,
 };
+mod view_editor;
+
 use cibergit::{
     domain::{PullRequest, PullRequestDetails, Repository, Revision},
     providers::GithubProvider,
@@ -9,9 +11,7 @@ use cibergit::{
         AlignedRow, DiffLine, DiffLineKind, DiffMode, ParsedDiff, PatchStatus, ReviewSession,
         file_key, load_local_file, local_pr_inventory, parse_file,
     },
-    workspace::{
-        GroupBy, PersonalFilter, PollSchedule, Store, TabState, WorkspaceState, group_path,
-    },
+    workspace::{Filter, GroupBy, PersonalFilter, PollSchedule, Store, TabState, WorkspaceState},
 };
 use gpui::{prelude::*, *};
 use gpui_base::{
@@ -19,7 +19,6 @@ use gpui_base::{
     input::{Editor, EditorState, Input, InputEditorStyle, InputState},
 };
 use std::{
-    cmp::Reverse,
     collections::HashMap,
     ops::Range,
     path::PathBuf,
@@ -29,6 +28,7 @@ use std::{
     },
     time::Duration,
 };
+use view_editor::{RepositoryPulls, SidebarRow, ViewEditorController, compose_sidebar_rows};
 
 const UI_FONT: &str = "IBM Plex Sans";
 const CODE_FONT: &str = "Menlo";
@@ -163,6 +163,123 @@ fn new_input(
     })
 }
 
+struct ViewEditorInputs {
+    name: Entity<InputState>,
+    search: Entity<InputState>,
+    author: Entity<InputState>,
+    reviewer: Entity<InputState>,
+    assignee: Entity<InputState>,
+    label: Entity<InputState>,
+    review_status: Entity<InputState>,
+    check_status: Entity<InputState>,
+    target_branch: Entity<InputState>,
+    source_branch: Entity<InputState>,
+    source_prefix: Entity<InputState>,
+}
+
+impl ViewEditorInputs {
+    fn new(
+        view: &cibergit::workspace::SavedView,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) -> Self {
+        let prefix = view
+            .groups
+            .iter()
+            .find_map(|group| match group {
+                GroupBy::SourcePrefix(prefix) => Some(prefix.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        Self {
+            name: new_input(&view.name, "View name", window, cx),
+            search: new_input(&view.filter.search, "Title, number, or branch", window, cx),
+            author: new_input(&view.filter.author, "Author login", window, cx),
+            reviewer: new_input(&view.filter.reviewer, "Requested reviewer", window, cx),
+            assignee: new_input(&view.filter.assignee, "Assignee", window, cx),
+            label: new_input(&view.filter.label, "Label", window, cx),
+            review_status: new_input(&view.filter.review_status, "e.g. approved", window, cx),
+            check_status: new_input(&view.filter.check_status, "e.g. passing", window, cx),
+            target_branch: new_input(&view.filter.target_branch, "Target branch", window, cx),
+            source_branch: new_input(
+                &view.filter.source_branch,
+                "Exact source branch",
+                window,
+                cx,
+            ),
+            source_prefix: new_input(prefix, "e.g. feature/", window, cx),
+        }
+    }
+
+    fn all(&self) -> [&Entity<InputState>; 11] {
+        [
+            &self.name,
+            &self.search,
+            &self.author,
+            &self.reviewer,
+            &self.assignee,
+            &self.label,
+            &self.review_status,
+            &self.check_status,
+            &self.target_branch,
+            &self.source_branch,
+            &self.source_prefix,
+        ]
+    }
+
+    fn set_view(
+        &self,
+        view: &cibergit::workspace::SavedView,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) {
+        let prefix = view
+            .groups
+            .iter()
+            .find_map(|group| match group {
+                GroupBy::SourcePrefix(prefix) => Some(prefix.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        for (editor, value) in [
+            (&self.name, view.name.as_str()),
+            (&self.search, view.filter.search.as_str()),
+            (&self.author, view.filter.author.as_str()),
+            (&self.reviewer, view.filter.reviewer.as_str()),
+            (&self.assignee, view.filter.assignee.as_str()),
+            (&self.label, view.filter.label.as_str()),
+            (&self.review_status, view.filter.review_status.as_str()),
+            (&self.check_status, view.filter.check_status.as_str()),
+            (&self.target_branch, view.filter.target_branch.as_str()),
+            (&self.source_branch, view.filter.source_branch.as_str()),
+            (&self.source_prefix, prefix),
+        ] {
+            editor.update(cx, |editor, cx| editor.set_value(value, window, cx));
+        }
+    }
+
+    fn value(editor: &Entity<InputState>, cx: &Context<Root>) -> String {
+        editor.read(cx).value().trim().to_owned()
+    }
+
+    fn filter(&self, base: &Filter, cx: &Context<Root>) -> Filter {
+        Filter {
+            search: Self::value(&self.search, cx),
+            author: Self::value(&self.author, cx),
+            reviewer: Self::value(&self.reviewer, cx),
+            assignee: Self::value(&self.assignee, cx),
+            label: Self::value(&self.label, cx),
+            draft: base.draft,
+            review_status: Self::value(&self.review_status, cx),
+            check_status: Self::value(&self.check_status, cx),
+            target_branch: Self::value(&self.target_branch, cx),
+            source_branch: Self::value(&self.source_branch, cx),
+            personal: base.personal.clone(),
+            state: base.state.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 enum LoadState {
     Loading(String),
@@ -248,7 +365,10 @@ pub struct ReviewWorkspace {
     focused: bool,
     wide: bool,
     focus: FocusHandle,
+    view_editor_scroll: ScrollHandle,
     query: Entity<InputState>,
+    view_editor: ViewEditorController,
+    view_inputs: ViewEditorInputs,
     repository_input: Entity<InputState>,
     pr_input: Entity<InputState>,
     selected_account: usize,
@@ -289,6 +409,7 @@ impl ReviewWorkspace {
             window,
             cx,
         );
+        let view_inputs = ViewEditorInputs::new(&workspace.view(), window, cx);
         let repository_input = new_input(
             startup.repository.clone().unwrap_or_default(),
             "owner/name, URL, or local folder",
@@ -341,7 +462,10 @@ impl ReviewWorkspace {
             focused: window.is_window_active(),
             wide: window.bounds().size.width > px(1180.),
             focus,
+            view_editor_scroll: ScrollHandle::new(),
             query,
+            view_editor: ViewEditorController::new(),
+            view_inputs,
             repository_input,
             pr_input,
             selected_account: 0,
@@ -364,7 +488,10 @@ impl ReviewWorkspace {
         let appearance = cx.observe_window_appearance(window, |root, window, cx| {
             let Root::Review(this) = root else { return };
             let style = input_style(palette(is_dark(window)));
-            for editor in [&this.query, &this.repository_input, &this.pr_input] {
+            for editor in [&this.query, &this.repository_input, &this.pr_input]
+                .into_iter()
+                .chain(this.view_inputs.all())
+            {
                 editor.update(cx, |editor, _| editor.set_editor_style(style.clone()));
             }
             cx.notify();
@@ -591,6 +718,64 @@ impl ReviewWorkspace {
                     .background_executor()
                     .timer(Duration::from_millis(750))
                     .await;
+                let review_captured = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join("native-pr-review.png"))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let editor_opened = window
+                    .update(|window, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return false;
+                            };
+                            this.open_view_editor(window, cx);
+                            true
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let filter_editor_captured = editor_opened
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join("native-view-editor-filters.png"))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let editor_scrolled = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return false;
+                            };
+                            this.view_editor_scroll.scroll_to_bottom();
+                            cx.notify();
+                            true
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
                 let _ = window.update(|window, cx| {
                     let validation = actions.and_then(|mut actions| {
                         weak.update(cx, |root, _| {
@@ -607,23 +792,37 @@ impl ReviewWorkspace {
                             Err(format!("smoke entity unavailable: {error:#}"))
                         })
                     });
-                    let captured = window
-                        .render_to_image()
-                        .and_then(|image| {
-                            image
-                                .save(output.join("native-pr-review.png"))
-                                .map_err(Into::into)
-                        })
-                        .is_ok();
-                    let passed = validation.is_ok() && captured;
+                    let group_editor_captured = editor_scrolled
+                        && window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join("native-view-editor-groups.png"))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok();
+                    let passed = validation.is_ok()
+                        && review_captured
+                        && filter_editor_captured
+                        && group_editor_captured;
                     let details = validation
                         .map(|actions| actions.report)
                         .unwrap_or_else(|error| format!("Smoke failed: {error}\n"));
                     let report = format!(
-                        "{details}Programmatic native actions: {}\nScene capture: {}\nNative backdrop blending and physical input: not established by in-process capture\nRemote writes: none\n",
+                        "{details}Programmatic native actions: {}\nReview scene capture: {}\nFilter editor scene capture: {}\nGrouping editor scene capture: {}\nNative backdrop blending and physical input: not established by in-process capture\nRemote writes: none\n",
                         if passed { "passed" } else { "failed" },
-                        if captured {
+                        if review_captured {
                             "native-pr-review.png"
+                        } else {
+                            "failed"
+                        },
+                        if filter_editor_captured {
+                            "native-view-editor-filters.png"
+                        } else {
+                            "failed"
+                        },
+                        if group_editor_captured {
+                            "native-view-editor-groups.png"
                         } else {
                             "failed"
                         }
@@ -684,11 +883,12 @@ impl ReviewWorkspace {
         let repository = tab.repository.clone();
         let number = tab.pull_request.number;
         let title = tab.pull_request.title.clone();
-        let branches = format!(
-            "{} -> {}",
-            tab.pull_request.source_branch, tab.pull_request.target_branch
-        );
+        let source_branch = tab.pull_request.source_branch.clone();
+        let target_branch = tab.pull_request.target_branch.clone();
+        let branches = format!("{} -> {}", source_branch, target_branch);
         let revision = session.revision().head_sha.clone();
+        let saved_view_report =
+            self.exercise_saved_view_smoke(&source_branch, &target_branch, expect_restore)?;
 
         self.next_file(&NextFile, window, cx);
         let next_key = self.tabs[index]
@@ -741,7 +941,7 @@ impl ReviewWorkspace {
         Ok(SmokeActions {
             primary_number: number,
             report: format!(
-                "Real read complete\nRepository: {}\nPR: #{number} {title}\nBranches: {branches}\nRevision: {revision}\nFiles: {file_count}\nSelected: {}\nSidebar and details reads: settled\nRestart restore observed: {restored}\nNext/previous handlers: {original_key} -> {next_key} -> {returned_key}\nExplicit diff mode survived narrow resize\n",
+                "Real read complete\nRepository: {}\nPR: #{number} {title}\nBranches: {branches}\nRevision: {revision}\nFiles: {file_count}\nSelected: {}\nSidebar and details reads: settled\n{saved_view_report}\nRestart restore observed: {restored}\nNext/previous handlers: {original_key} -> {next_key} -> {returned_key}\nExplicit diff mode survived narrow resize\n",
                 repository.full_name(),
                 self.tabs[index]
                     .session
@@ -752,6 +952,64 @@ impl ReviewWorkspace {
             ),
             expectations: Vec::new(),
         })
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn exercise_saved_view_smoke(
+        &mut self,
+        source_branch: &str,
+        target_branch: &str,
+        expect_restore: bool,
+    ) -> Result<String, String> {
+        const NAME: &str = "Smoke · target → repository → source prefix";
+        let prefix = source_branch
+            .split_once('/')
+            .map(|(first, _)| format!("{first}/"))
+            .unwrap_or_else(|| source_branch.to_owned());
+        if !expect_restore {
+            self.view_editor.begin(&self.workspace);
+            self.view_editor.replace_filter(Filter {
+                source_branch: source_branch.to_owned(),
+                state: "open".into(),
+                ..Default::default()
+            });
+            self.view_editor.replace_groups(vec![
+                GroupBy::TargetBranch,
+                GroupBy::Repository,
+                GroupBy::SourcePrefix(prefix.clone()),
+            ]);
+            self.view_editor.save_as(&mut self.workspace, NAME)?;
+            self.save_workspace();
+        }
+        let view = self.workspace.view();
+        if view.name != NAME
+            || view.filter.source_branch != source_branch
+            || view.filter.state != "open"
+            || view.groups
+                != vec![
+                    GroupBy::TargetBranch,
+                    GroupBy::Repository,
+                    GroupBy::SourcePrefix(prefix.clone()),
+                ]
+        {
+            return Err("saved composed view did not restore exactly".into());
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| "saved-view smoke requires an isolated persistent store".to_owned())?;
+        let restored = store
+            .load_workspace()
+            .map_err(|error| format!("cannot read saved view back: {error:#}"))?;
+        if restored.view().name != NAME
+            || restored.view().filter.source_branch != source_branch
+            || restored.view().groups != view.groups
+        {
+            return Err("saved composed view read-back differs from active view".into());
+        }
+        Ok(format!(
+            "Saved view: {NAME}\nExact source filter: {source_branch}\nGlobal grouping: {target_branch} → repository → prefix {prefix}\nSaved-view restart/read-back: passed"
+        ))
     }
 
     #[cfg(feature = "ui-smoke")]
@@ -1641,51 +1899,97 @@ impl ReviewWorkspace {
         cx.notify();
     }
 
-    fn cycle_group(&mut self, cx: &mut Context<Root>) {
-        let mut view = self.workspace.view();
-        view.groups = match view.groups.first() {
-            Some(GroupBy::Repository) => vec![GroupBy::TargetBranch],
-            Some(GroupBy::TargetBranch) => vec![GroupBy::SourceBranch],
-            Some(GroupBy::SourceBranch) => vec![GroupBy::Stack],
-            _ => vec![GroupBy::Repository],
-        };
-        self.workspace.views[self.workspace.selected_view] = view;
-        self.save_workspace();
+    fn open_view_editor(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        let view = self.workspace.view();
+        self.view_editor.begin(&self.workspace);
+        self.view_editor_scroll.set_offset(point(px(0.), px(0.)));
+        self.view_inputs.set_view(&view, window, cx);
+        self.command_palette = false;
+        self.view_inputs
+            .name
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
         cx.notify();
     }
 
-    fn cycle_state(&mut self, cx: &mut Context<Root>) {
-        let mut view = self.workspace.view();
-        view.filter.state = match view.filter.state.as_str() {
-            "" | "open" => "closed",
-            "closed" => "merged",
-            "merged" => "all",
-            _ => "open",
+    fn sync_view_editor_inputs(&mut self, cx: &Context<Root>) {
+        let Some(draft) = self.view_editor.draft() else {
+            return;
+        };
+        let filter = self.view_inputs.filter(&draft.filter, cx);
+        let prefix = ViewEditorInputs::value(&self.view_inputs.source_prefix, cx);
+        let source_index = draft
+            .groups
+            .iter()
+            .position(|group| matches!(group, GroupBy::SourceBranch | GroupBy::SourcePrefix(_)));
+        self.view_editor.replace_filter(filter);
+        if let Some(index) = source_index {
+            let uses_prefix = self
+                .view_editor
+                .draft()
+                .and_then(|view| view.groups.get(index))
+                .is_some_and(|group| matches!(group, GroupBy::SourcePrefix(_)));
+            if uses_prefix {
+                self.view_editor
+                    .set_source_group_prefix(index, Some(&prefix));
+            }
         }
-        .into();
-        self.workspace.views[self.workspace.selected_view] = view;
-        self.save_workspace();
-        self.refresh_all(cx);
+    }
+
+    fn commit_view_editor(&mut self, save_as: bool, window: &mut Window, cx: &mut Context<Root>) {
+        let old_state = self.workspace.view().filter.state;
+        self.sync_view_editor_inputs(cx);
+        let name = ViewEditorInputs::value(&self.view_inputs.name, cx);
+        let result = if save_as {
+            self.view_editor.save_as(&mut self.workspace, &name)
+        } else {
+            self.view_editor.apply(&mut self.workspace, &name)
+        };
+        match result {
+            Ok(()) => {
+                let view = self.workspace.view();
+                self.query.update(cx, |query, cx| {
+                    query.set_value(view.filter.search.clone(), window, cx)
+                });
+                self.save_workspace();
+                if old_state != view.filter.state {
+                    self.refresh_all(cx);
+                }
+                self.status = if save_as {
+                    format!("Saved view “{}”", view.name)
+                } else {
+                    format!("Applied view “{}”", view.name)
+                };
+                self.focus.focus(window, cx);
+            }
+            Err(error) => {
+                self.status = error;
+            }
+        }
         cx.notify();
     }
 
-    fn save_current_view(&mut self, cx: &mut Context<Root>) {
-        let mut view = self.workspace.view();
-        let state = if view.filter.state.is_empty() {
-            "Open"
-        } else {
-            &view.filter.state
-        };
-        view.name = format!(
-            "{} · {} · {}",
-            state,
-            group_label(view.groups.first()),
-            self.workspace.views.len()
-        );
-        self.workspace.views.push(view);
-        self.workspace.selected_view = self.workspace.views.len() - 1;
+    fn cancel_view_editor(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        self.view_editor.cancel();
+        self.status = "View changes cancelled".into();
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn delete_current_view(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        let old_state = self.workspace.view().filter.state;
+        self.view_editor.delete_selected(&mut self.workspace);
+        let view = self.workspace.view();
+        self.query.update(cx, |query, cx| {
+            query.set_value(view.filter.search.clone(), window, cx)
+        });
         self.save_workspace();
-        self.status = "Saved current filter and grouping".into();
+        if old_state != view.filter.state {
+            self.refresh_all(cx);
+        }
+        self.status = "Deleted saved view; a usable view remains selected".into();
+        self.focus.focus(window, cx);
         cx.notify();
     }
 
@@ -1694,6 +1998,7 @@ impl ReviewWorkspace {
             return;
         }
         self.workspace.selected_view = index;
+        self.view_editor.cancel();
         let search = self.workspace.view().filter.search;
         self.query
             .update(cx, |query, cx| query.set_value(search, window, cx));
@@ -1738,6 +2043,13 @@ impl ReviewWorkspace {
                     this.close_tab(action, window, cx)
                 }
             }))
+            .on_action(cx.listener(|root, _: &Save, window, cx| {
+                if let Root::Review(this) = root
+                    && this.view_editor.is_open()
+                {
+                    this.commit_view_editor(false, window, cx);
+                }
+            }))
             .on_action(cx.listener(|root, _: &TogglePalette, _, cx| {
                 if let Root::Review(this) = root {
                     this.command_palette = !this.command_palette;
@@ -1762,6 +2074,15 @@ impl ReviewWorkspace {
                     cx.notify();
                 }
             }))
+            .on_key_down(cx.listener(|root, event: &KeyDownEvent, window, cx| {
+                if let Root::Review(this) = root
+                    && this.view_editor.is_open()
+                    && event.keystroke.key == "escape"
+                {
+                    this.cancel_view_editor(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .size_full()
             .flex()
             .font_family(UI_FONT)
@@ -1773,16 +2094,13 @@ impl ReviewWorkspace {
             .when(self.command_palette, |root| {
                 root.child(self.render_palette(colors, cx))
             })
+            .when(self.view_editor.is_open(), |root| {
+                root.child(self.render_view_editor(colors, cx))
+            })
     }
 
     fn render_sidebar(&self, colors: Palette, cx: &mut Context<Root>) -> impl IntoElement {
         let view = self.workspace.view();
-        let group = group_label(view.groups.first());
-        let state = if view.filter.state.is_empty() {
-            "open"
-        } else {
-            &view.filter.state
-        };
         let saved_views = self
             .workspace
             .views
@@ -1804,107 +2122,117 @@ impl ReviewWorkspace {
                     .iter()
                     .any(|pull_request| !pull_request.participants_complete)
             });
+        let inventories = self
+            .repositories
+            .iter()
+            .enumerate()
+            .map(|(index, runtime)| RepositoryPulls {
+                index,
+                repository: &runtime.repository,
+                pull_requests: &runtime.pull_requests,
+            })
+            .collect::<Vec<_>>();
         let mut rows = Vec::new();
-        for (repo_index, runtime) in self.repositories.iter().enumerate() {
-            let active_number = self
-                .active_tab
-                .and_then(|index| self.tabs.get(index))
-                .filter(|tab| tab.repository.cache_key() == runtime.repository.cache_key())
-                .map(|tab| tab.pull_request.number);
-            let mut filtered: Vec<_> = runtime
-                .pull_requests
-                .iter()
-                .filter(|pull_request| {
-                    view.filter
-                        .matches(pull_request, &runtime.repository.account.login)
-                })
-                .cloned()
-                .collect();
-            filtered.sort_by_key(|pull_request| {
-                (
-                    pull_request.number != active_number.unwrap_or_default(),
-                    Reverse(pull_request.number),
-                )
-            });
-            let label = filtered
-                .first()
-                .map(|pull_request| {
-                    group_path(
-                        &runtime.repository,
-                        pull_request,
-                        &view.groups,
-                        &runtime.pull_requests,
-                    )
-                    .join(" / ")
-                })
-                .unwrap_or_else(|| {
-                    format!(
-                        "{} · {}",
-                        runtime.repository.full_name(),
-                        runtime.repository.account.login
-                    )
-                });
+        for row in compose_sidebar_rows(&inventories, &view) {
+            match row {
+                SidebarRow::Group { depth, label } => rows.push(
+                    div()
+                        .pl(px(12. + depth as f32 * 14.))
+                        .pr_3()
+                        .pt(if depth == 0 { px(10.) } else { px(4.) })
+                        .pb_1()
+                        .text_xs()
+                        .font_weight(if depth == 0 {
+                            FontWeight::MEDIUM
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .text_color(if depth == 0 {
+                            colors.muted
+                        } else {
+                            colors.faint
+                        })
+                        .child(if depth == 0 {
+                            label
+                        } else {
+                            format!("↳ {label}")
+                        })
+                        .into_any_element(),
+                ),
+                SidebarRow::Pull {
+                    repository_index,
+                    repository_key,
+                    pull_request,
+                } => {
+                    let pull_request = *pull_request;
+                    let selected = self
+                        .active_tab
+                        .and_then(|index| self.tabs.get(index))
+                        .is_some_and(|tab| {
+                            tab.repository.cache_key() == repository_key
+                                && tab.pull_request.number == pull_request.number
+                        });
+                    let number = pull_request.number;
+                    rows.push(
+                        div()
+                            .id(SharedString::from(format!(
+                                "pr-{repository_index}-{number}"
+                            )))
+                            .mx_2()
+                            .my_px()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(selected, |row| row.bg(colors.selected))
+                            .hover(|row| row.bg(colors.selected))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div().text_color(colors.faint).child(format!("#{number}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .child(pull_request.title),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(colors.muted)
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(pull_request.source_branch),
+                            )
+                            .on_click(cx.listener(move |root, _, _, cx| {
+                                if let Root::Review(this) = root {
+                                    this.open_pr(repository_index, number, cx)
+                                }
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        if rows.is_empty() {
             rows.push(
                 div()
-                    .px_3()
-                    .pt_3()
-                    .pb_1()
+                    .px_5()
+                    .py_4()
                     .text_xs()
-                    .text_color(colors.muted)
-                    .child(label)
+                    .text_color(colors.faint)
+                    .child("No pull requests match this view.")
                     .into_any_element(),
             );
-            for pull_request in filtered {
-                let selected = self
-                    .active_tab
-                    .and_then(|index| self.tabs.get(index))
-                    .is_some_and(|tab| {
-                        tab.repository.cache_key() == runtime.repository.cache_key()
-                            && tab.pull_request.number == pull_request.number
-                    });
-                let number = pull_request.number;
-                rows.push(
-                    div()
-                        .id(SharedString::from(format!("pr-{repo_index}-{number}")))
-                        .mx_2()
-                        .my_px()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .when(selected, |row| row.bg(colors.selected))
-                        .hover(|row| row.bg(colors.selected))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(div().text_color(colors.faint).child(format!("#{number}")))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .child(pull_request.title),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(colors.muted)
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .child(pull_request.source_branch),
-                        )
-                        .on_click(cx.listener(move |root, _, _, cx| {
-                            if let Root::Review(this) = root {
-                                this.open_pr(repo_index, number, cx)
-                            }
-                        }))
-                        .into_any_element(),
-                );
-            }
+        }
+        for runtime in &self.repositories {
             if let Some(notice) = runtime.state.notice() {
                 rows.push(
                     div()
@@ -1937,17 +2265,35 @@ impl ReviewWorkspace {
                     .child(div().text_xs().text_color(colors.faint).child("READ ONLY")),
             )
             .child(
-                div().px_3().pb_2().child(
-                    div()
-                        .h(px(32.))
-                        .px_2()
-                        .rounded_md()
-                        .bg(colors.elevated)
-                        .border_1()
-                        .border_color(colors.border)
-                        .font_family(UI_FONT)
-                        .child(Input::new(&self.query)),
-                ),
+                div()
+                    .px_3()
+                    .pb_2()
+                    .child(
+                        div()
+                            .h(px(32.))
+                            .px_2()
+                            .rounded_md()
+                            .bg(colors.elevated)
+                            .border_1()
+                            .border_color(colors.border)
+                            .font_family(UI_FONT)
+                            .child(Input::new(&self.query)),
+                    )
+                    .child(
+                        div()
+                            .id("apply-sidebar-search")
+                            .pt_1()
+                            .text_xs()
+                            .text_color(colors.accent)
+                            .cursor_pointer()
+                            .child("Apply search")
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                if let Root::Review(this) = root {
+                                    let personal = this.workspace.view().filter.personal;
+                                    this.apply_filter(personal, cx);
+                                }
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -1959,22 +2305,22 @@ impl ReviewWorkspace {
                     .text_xs()
                     .child(
                         div()
-                            .id("cycle-state")
-                            .cursor_pointer()
-                            .text_color(colors.accent)
-                            .child(format!("State: {state}"))
-                            .on_click(cx.listener(|root, _, _, cx| {
-                                if let Root::Review(this) = root { this.cycle_state(cx) }
-                            })),
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(view.name.clone()),
                     )
                     .child(
                         div()
-                            .id("save-view")
+                            .id("edit-view")
                             .cursor_pointer()
                             .text_color(colors.accent)
-                            .child("Save view")
-                            .on_click(cx.listener(|root, _, _, cx| {
-                                if let Root::Review(this) = root { this.save_current_view(cx) }
+                            .child("Edit view…")
+                            .on_click(cx.listener(|root, _, window, cx| {
+                                if let Root::Review(this) = root {
+                                    this.open_view_editor(window, cx)
+                                }
                             })),
                     ),
             )
@@ -2056,24 +2402,10 @@ impl ReviewWorkspace {
                 div()
                     .px_3()
                     .pt_2()
-                    .flex()
-                    .items_center()
-                    .justify_between()
+                    .pb_1()
                     .text_xs()
-                    .text_color(colors.muted)
-                    .child(format!("Group by {group}"))
-                    .child(
-                        div()
-                            .id("cycle-group")
-                            .cursor_pointer()
-                            .text_color(colors.accent)
-                            .child("Change")
-                            .on_click(cx.listener(|root, _, _, cx| {
-                                if let Root::Review(this) = root {
-                                    this.cycle_group(cx)
-                                }
-                            })),
-                    ),
+                    .text_color(colors.faint)
+                    .child(view_summary(&view)),
             )
             .child(
                 div()
@@ -2108,6 +2440,386 @@ impl ReviewWorkspace {
                                     cx.notify();
                                 }
                             })),
+                    ),
+            )
+    }
+
+    fn render_view_editor(&self, colors: Palette, cx: &mut Context<Root>) -> impl IntoElement {
+        let draft = self.view_editor.draft().cloned().unwrap_or_default();
+        let prefix = ViewEditorInputs::value(&self.view_inputs.source_prefix, cx);
+        let groups = draft
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                let is_source = matches!(group, GroupBy::SourceBranch | GroupBy::SourcePrefix(_));
+                let uses_prefix = matches!(group, GroupBy::SourcePrefix(_));
+                div()
+                    .id(SharedString::from(format!("view-group-{index}")))
+                    .py_2()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(22.))
+                                    .text_xs()
+                                    .text_color(colors.faint)
+                                    .child(format!("{}", index + 1)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(group_label(Some(group))),
+                            )
+                            .child(
+                                small_action("Change", colors)
+                                    .id(SharedString::from(format!("change-view-group-{index}")))
+                                    .on_click(cx.listener(move |root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            let prefix = ViewEditorInputs::value(
+                                                &this.view_inputs.source_prefix,
+                                                cx,
+                                            );
+                                            this.view_editor.cycle_group(index, &prefix);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                small_action("↑", colors)
+                                    .id(SharedString::from(format!("move-up-view-group-{index}")))
+                                    .on_click(cx.listener(move |root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.view_editor.move_group(index, -1);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                small_action("↓", colors)
+                                    .id(SharedString::from(format!("move-down-view-group-{index}")))
+                                    .on_click(cx.listener(move |root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.view_editor.move_group(index, 1);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                small_action("Remove", colors)
+                                    .id(SharedString::from(format!("remove-view-group-{index}")))
+                                    .on_click(cx.listener(move |root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.view_editor.remove_group(index);
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    )
+                    .when(is_source, |row| {
+                        row.child(
+                            div()
+                                .ml(px(30.))
+                                .mt_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    side_control("Exact", !uses_prefix, colors)
+                                        .id(SharedString::from(format!(
+                                            "source-group-exact-{index}"
+                                        )))
+                                        .on_click(cx.listener(move |root, _, _, cx| {
+                                            if let Root::Review(this) = root {
+                                                this.view_editor
+                                                    .set_source_group_prefix(index, None);
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    side_control("Prefix", uses_prefix, colors)
+                                        .id(SharedString::from(format!(
+                                            "source-group-prefix-{index}"
+                                        )))
+                                        .on_click(cx.listener(move |root, _, _, cx| {
+                                            if let Root::Review(this) = root {
+                                                let prefix = ViewEditorInputs::value(
+                                                    &this.view_inputs.source_prefix,
+                                                    cx,
+                                                );
+                                                this.view_editor
+                                                    .set_source_group_prefix(index, Some(&prefix));
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .h(px(32.))
+                                        .px_2()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(colors.border)
+                                        .bg(colors.elevated)
+                                        .child(Input::new(&self.view_inputs.source_prefix)),
+                                ),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        let state = if draft.filter.state.is_empty() {
+            "open"
+        } else {
+            draft.filter.state.as_str()
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_8()
+            .bg(rgba(0x00000066))
+            .child(
+                div()
+                    .id("view-editor")
+                    .w(px(760.))
+                    .max_h_full()
+                    .flex()
+                    .flex_col()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.surface)
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .px_5()
+                            .py_4()
+                            .border_b_1()
+                            .border_color(colors.border)
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Edit sidebar view"),
+                            )
+                            .child(div().mt_1().text_xs().text_color(colors.muted).child(
+                                "Changes stay in this editor until you apply or save them.",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("view-editor-scroll")
+                            .track_scroll(&self.view_editor_scroll)
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .px_5()
+                            .py_4()
+                            .child(editor_field("View name", &self.view_inputs.name, colors))
+                            .child(section_label("FILTERS", colors))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_3()
+                                    .child(editor_field("Search", &self.view_inputs.search, colors))
+                                    .child(editor_field(
+                                        "Author",
+                                        &self.view_inputs.author,
+                                        colors,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_3()
+                                    .child(editor_field(
+                                        "Requested reviewer",
+                                        &self.view_inputs.reviewer,
+                                        colors,
+                                    ))
+                                    .child(editor_field(
+                                        "Assignee",
+                                        &self.view_inputs.assignee,
+                                        colors,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_3()
+                                    .child(editor_field("Label", &self.view_inputs.label, colors))
+                                    .child(editor_field(
+                                        "Review status",
+                                        &self.view_inputs.review_status,
+                                        colors,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_3()
+                                    .child(editor_field(
+                                        "Checks",
+                                        &self.view_inputs.check_status,
+                                        colors,
+                                    ))
+                                    .child(editor_field(
+                                        "Target branch",
+                                        &self.view_inputs.target_branch,
+                                        colors,
+                                    )),
+                            )
+                            .child(editor_field(
+                                "Exact source branch",
+                                &self.view_inputs.source_branch,
+                                colors,
+                            ))
+                            .child(choice_row(
+                                "Pull request state",
+                                &[
+                                    ("Open", state.eq_ignore_ascii_case("open")),
+                                    ("Closed", state.eq_ignore_ascii_case("closed")),
+                                    ("Merged", state.eq_ignore_ascii_case("merged")),
+                                    ("All", state.eq_ignore_ascii_case("all")),
+                                ],
+                                colors,
+                                cx,
+                                |this, index| {
+                                    this.view_editor
+                                        .set_pr_state(["open", "closed", "merged", "all"][index]);
+                                },
+                            ))
+                            .child(choice_row(
+                                "Draft status",
+                                &[
+                                    ("All", draft.filter.draft.is_none()),
+                                    ("Draft", draft.filter.draft == Some(true)),
+                                    ("Ready", draft.filter.draft == Some(false)),
+                                ],
+                                colors,
+                                cx,
+                                |this, index| {
+                                    this.view_editor
+                                        .set_draft_state([None, Some(true), Some(false)][index]);
+                                },
+                            ))
+                            .child(choice_row(
+                                "Relationship",
+                                &[
+                                    ("All", draft.filter.personal == PersonalFilter::All),
+                                    (
+                                        "Needs review",
+                                        draft.filter.personal == PersonalFilter::ReviewRequested,
+                                    ),
+                                    ("Mine", draft.filter.personal == PersonalFilter::Own),
+                                    (
+                                        "Participating",
+                                        draft.filter.personal == PersonalFilter::Participating,
+                                    ),
+                                ],
+                                colors,
+                                cx,
+                                |this, index| {
+                                    this.view_editor.set_personal(
+                                        [
+                                            PersonalFilter::All,
+                                            PersonalFilter::ReviewRequested,
+                                            PersonalFilter::Own,
+                                            PersonalFilter::Participating,
+                                        ][index]
+                                            .clone(),
+                                    );
+                                },
+                            ))
+                            .child(section_label("GROUPING ORDER", colors))
+                            .children(groups)
+                            .child(
+                                small_action("＋ Add grouping level", colors)
+                                    .id("add-view-group")
+                                    .mt_2()
+                                    .on_click(cx.listener(|root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.view_editor.add_group();
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .mt_3()
+                                    .text_xs()
+                                    .text_color(colors.muted)
+                                    .child(format!(
+                                        "Source prefix preview: {}",
+                                        if prefix.is_empty() {
+                                            "not set"
+                                        } else {
+                                            &prefix
+                                        }
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px_5()
+                            .py_3()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .border_t_1()
+                            .border_color(colors.border)
+                            .child(
+                                modal_button("Delete view", false, colors)
+                                    .id("delete-view")
+                                    .on_click(cx.listener(|root, _, window, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.delete_current_view(window, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        modal_button("Cancel", false, colors)
+                                            .id("cancel-view-editor")
+                                            .on_click(cx.listener(|root, _, window, cx| {
+                                                if let Root::Review(this) = root {
+                                                    this.cancel_view_editor(window, cx);
+                                                }
+                                            })),
+                                    )
+                                    .child(
+                                        modal_button("Save as new", false, colors)
+                                            .id("save-new-view")
+                                            .on_click(cx.listener(|root, _, window, cx| {
+                                                if let Root::Review(this) = root {
+                                                    this.commit_view_editor(true, window, cx);
+                                                }
+                                            })),
+                                    )
+                                    .child(
+                                        modal_button("Apply  ⌘S", true, colors)
+                                            .id("apply-view-editor")
+                                            .on_click(cx.listener(|root, _, window, cx| {
+                                                if let Root::Review(this) = root {
+                                                    this.commit_view_editor(false, window, cx);
+                                                }
+                                            })),
+                                    ),
+                            ),
                     ),
             )
     }
@@ -3007,6 +3719,17 @@ impl ReviewWorkspace {
                             })),
                     )
                     .child(
+                        command_row("Edit sidebar filters and grouping", "⌘S to apply", colors)
+                            .id("command-edit-view")
+                            .cursor_pointer()
+                            .hover(|row| row.bg(colors.selected))
+                            .on_click(cx.listener(|root, _, window, cx| {
+                                if let Root::Review(this) = root {
+                                    this.open_view_editor(window, cx);
+                                }
+                            })),
+                    )
+                    .child(
                         command_row("Add repository", "⌘O", colors)
                             .id("command-add")
                             .cursor_pointer()
@@ -3057,6 +3780,108 @@ fn input_box(editor: &Entity<InputState>, colors: Palette) -> Div {
         .border_color(colors.border)
         .font_family(UI_FONT)
         .child(Input::new(editor))
+}
+
+fn editor_field(label: &str, editor: &Entity<InputState>, colors: Palette) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .mb_3()
+        .child(field_label(label, colors))
+        .child(input_box(editor, colors))
+}
+
+fn section_label(label: &str, colors: Palette) -> Div {
+    div()
+        .mt_3()
+        .mb_2()
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(colors.faint)
+        .child(label.to_owned())
+}
+
+fn small_action(label: &str, colors: Palette) -> Div {
+    div()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_xs()
+        .text_color(colors.accent)
+        .cursor_pointer()
+        .hover(|button| button.bg(colors.selected))
+        .child(label.to_owned())
+}
+
+fn modal_button(label: &str, primary: bool, colors: Palette) -> Div {
+    div()
+        .h(px(32.))
+        .px_3()
+        .flex()
+        .items_center()
+        .rounded_md()
+        .border_1()
+        .border_color(if primary {
+            colors.accent
+        } else {
+            colors.border
+        })
+        .bg(if primary {
+            colors.selected
+        } else {
+            colors.elevated
+        })
+        .text_color(if primary { colors.accent } else { colors.text })
+        .cursor_pointer()
+        .hover(|button| button.bg(colors.selected))
+        .child(label.to_owned())
+}
+
+fn choice_row(
+    label: &str,
+    choices: &[(&'static str, bool)],
+    colors: Palette,
+    cx: &mut Context<Root>,
+    select: fn(&mut ReviewWorkspace, usize),
+) -> Div {
+    let controls = choices
+        .iter()
+        .enumerate()
+        .map(|(index, (label, selected))| {
+            side_control(label, *selected, colors)
+                .id(SharedString::from(format!(
+                    "view-choice-{}-{index}",
+                    label.to_ascii_lowercase().replace(' ', "-")
+                )))
+                .on_click(cx.listener(move |root, _, _, cx| {
+                    if let Root::Review(this) = root {
+                        select(this, index);
+                        cx.notify();
+                    }
+                }))
+        });
+    div()
+        .mb_3()
+        .child(field_label(label, colors))
+        .child(div().mt_2().flex().flex_wrap().gap_1().children(controls))
+}
+
+fn view_summary(view: &cibergit::workspace::SavedView) -> String {
+    let state = if view.filter.state.is_empty() {
+        "open"
+    } else {
+        view.filter.state.as_str()
+    };
+    let groups = if view.groups.is_empty() {
+        "no grouping".to_owned()
+    } else {
+        view.groups
+            .iter()
+            .map(|group| group_label(Some(group)))
+            .collect::<Vec<_>>()
+            .join(" → ")
+    };
+    format!("{state} · {groups}")
 }
 
 fn file_status_badge(status: &str) -> &'static str {

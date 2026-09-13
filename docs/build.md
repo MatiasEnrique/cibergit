@@ -53,6 +53,12 @@ cargo run --locked -- --edit /absolute/path/to/file.rs
 - Command-Shift-D cycles Auto, Unified, and Side-by-side diff modes. Auto responds to window width; explicit modes do not.
 - Command-Shift-I toggles pull-request details.
 - Command-Shift-P opens the command palette.
+- Open **Edit view…** in the sidebar (or choose **Edit sidebar filters and grouping** in the
+  command palette) to compose filters and ordered grouping levels. Text fields accept exact
+  GitHub values; source grouping can use an exact branch or a configurable prefix. Apply with
+  Command-S, cancel with Escape, or use the visible buttons. **Save as new** requires a name;
+  applying a changed name renames the selected view, and **Delete view** always leaves a valid
+  default or another saved view selected.
 - Command-W closes the active review tab. Command-O opens repository setup.
 - File progress, per-file scroll, comparison mode, pinned revision, and tab state persist in the selected data directory.
 
@@ -96,7 +102,16 @@ cargo run --locked --features ui-smoke -- \
   --repo cli/cli --account YOUR_GH_LOGIN --pr 9847
 ```
 
-Each evidence directory receives `native-pr-review.png` and `native-pr-smoke.txt`. The harness labels these as programmatic native actions: the in-process capture does not prove physical keyboard/mouse input, Accessibility behavior, or the composited macOS blur behind the transparent sidebar. It performs no remote writes or destructive local editing.
+Each evidence directory receives `native-pr-review.png`, `native-view-editor-filters.png`,
+`native-view-editor-groups.png`, and `native-pr-smoke.txt`. The harness labels these as
+programmatic native actions: the in-process captures do not prove physical keyboard/mouse input,
+Accessibility behavior, or the composited macOS blur behind the transparent sidebar. It performs
+no remote writes or destructive local editing.
+
+The first smoke run also saves a named view with an exact source-branch filter and global
+target → repository → source-prefix grouping. The restart run requires that exact view and the
+review session to restore, then reads the persisted view back before reporting success. Use the
+same isolated data directory for the two runs and remove it before starting a new smoke pair.
 
 ## Native dependency notes
 
