@@ -10054,6 +10054,13 @@ impl ReviewWorkspace {
                             if let Root::Review(this) = root
                                 && let Some(index) = this.active_tab
                             {
+                                if this.tabs[index].write_in_flight
+                                    || this.tabs[index].lifecycle.active_operation.is_some()
+                                {
+                                    this.status = "Wait for the current action to finish; your edits are retained.".into();
+                                    cx.notify();
+                                    return;
+                                }
                                 this.tabs[index].lifecycle.cancel_metadata();
                                 this.status = "Metadata edits cancelled; zero writes sent.".into();
                                 cx.notify();
@@ -10595,6 +10602,13 @@ impl ReviewWorkspace {
                                             if let Root::Review(this) = root
                                                 && let Some(index) = this.active_tab
                                             {
+                                                if this.tabs[index].write_in_flight
+                                                    || this.tabs[index].lifecycle.active_operation.is_some()
+                                                {
+                                                    this.status = "Wait for the current action to finish; your edits are retained.".into();
+                                                    cx.notify();
+                                                    return;
+                                                }
                                                 this.tabs[index].lifecycle.cancel_discussion();
                                                 this.status =
                                                     "Discussion edit cancelled; zero writes sent."
