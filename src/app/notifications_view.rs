@@ -118,21 +118,45 @@ impl PollCompletion {
 
 impl PollWork {
     pub(super) fn run(self) -> PollCompletion {
+        self.run_with(|account, chunk, cache| {
+            GithubProvider::new(account.clone()).notification_observations_conditional(
+                chunk,
+                None,
+                NotificationReadLimits::default(),
+                cache,
+            )
+        })
+    }
+
+    fn run_with(
+        self,
+        mut read: impl FnMut(
+            &Account,
+            &[Repository],
+            NotificationConditionalCache,
+        )
+            -> Result<cibergit::providers::notifications::NotificationObservationRead>,
+    ) -> PollCompletion {
         let mut batches = Vec::with_capacity(self.chunks.len());
         let mut failures = Vec::new();
         let mut cache = self.cache;
         let mut poll = NotificationPollDirective::default();
         for (index, chunk) in self.chunks.iter().enumerate() {
-            match GithubProvider::new(self.account.clone()).notification_observations_conditional(
-                chunk,
-                None,
-                NotificationReadLimits::default(),
-                cache.clone(),
-            ) {
+            match read(&self.account, chunk, cache.clone()) {
                 Ok(read) => {
+                    let rate_limited = read.poll.rate_limit.is_some();
                     cache = read.cache;
                     poll.merge(&read.poll);
                     batches.push((index, read.batch));
+                    if rate_limited {
+                        failures.extend(((index + 1)..self.chunks.len()).map(|deferred| {
+                            (
+                                deferred,
+                                "notification chunk deferred by server rate limit".into(),
+                            )
+                        }));
+                        break;
+                    }
                 }
                 Err(error) => failures.push((index, format!("{error:#}"))),
             }
@@ -374,13 +398,19 @@ impl NotificationServerGate {
         !self.suspended && self.not_before.is_none_or(|deadline| now >= deadline)
     }
 
-    fn apply(&mut self, delay: &NotificationDelay, reason: ServerGateReason, now: Instant) {
+    fn apply(
+        &mut self,
+        delay: &NotificationDelay,
+        reason: ServerGateReason,
+        now: Instant,
+        wall_now: SystemTime,
+    ) {
         let deadline = match delay {
             NotificationDelay::Seconds(seconds) => now.checked_add(Duration::from_secs(*seconds)),
-            NotificationDelay::UntilUnixSeconds(unix) => SystemTime::now()
+            NotificationDelay::UntilUnixSeconds(unix) => wall_now
                 .duration_since(UNIX_EPOCH)
                 .ok()
-                .and_then(|wall| unix.checked_sub(wall.as_secs()))
+                .map(|wall| unix.saturating_sub(wall.as_secs()))
                 .and_then(|seconds| now.checked_add(Duration::from_secs(seconds))),
             NotificationDelay::Suspend => None,
         };
@@ -392,6 +422,28 @@ impl NotificationServerGate {
         if self.not_before.is_none_or(|current| deadline > current) {
             self.not_before = Some(deadline);
             self.reason = Some(reason);
+        }
+    }
+
+    fn notice(&self, now: Instant) -> Option<&'static str> {
+        let active = self.suspended || self.not_before.is_some_and(|deadline| deadline > now);
+        if !active {
+            return None;
+        }
+        match (self.suspended, self.reason) {
+            (true, Some(ServerGateReason::PollInterval)) => Some(
+                "Notification polling is paused because GitHub returned an unrepresentable polling interval.",
+            ),
+            (true, Some(ServerGateReason::RateLimit)) => Some(
+                "Notification polling is paused because GitHub returned an unrepresentable rate-limit delay.",
+            ),
+            (false, Some(ServerGateReason::PollInterval)) => {
+                Some("Notification refresh is deferred by GitHub's polling interval.")
+            }
+            (false, Some(ServerGateReason::RateLimit)) => {
+                Some("Notification refresh is deferred by GitHub rate limiting.")
+            }
+            _ => None,
         }
     }
 }
@@ -627,6 +679,15 @@ impl NotificationController {
     }
 
     pub(super) fn release_poll_at(&mut self, completion: &PollCompletion, now: Instant) -> bool {
+        self.release_poll_at_with_wall(completion, now, SystemTime::now())
+    }
+
+    fn release_poll_at_with_wall(
+        &mut self,
+        completion: &PollCompletion,
+        now: Instant,
+        wall_now: SystemTime,
+    ) -> bool {
         let key = account_key(&completion.account);
         let Some(state) = self.accounts.get_mut(&key) else {
             return false;
@@ -642,13 +703,13 @@ impl NotificationController {
                 if let Some(delay) = &completion.poll.x_poll_interval {
                     state
                         .server_gate
-                        .apply(delay, ServerGateReason::PollInterval, now);
+                        .apply(delay, ServerGateReason::PollInterval, now, wall_now);
                 }
             }
             if let Some(delay) = &completion.poll.rate_limit {
                 state
                     .server_gate
-                    .apply(delay, ServerGateReason::RateLimit, now);
+                    .apply(delay, ServerGateReason::RateLimit, now, wall_now);
             }
         }
         state.active_poll_generation = None;
@@ -1036,6 +1097,9 @@ impl NotificationController {
                     .when_some(state.stale_notice.clone(), |section, notice| {
                         section.child(div().mt_2().text_xs().text_color(colors.amber).child(notice))
                     })
+                    .when_some(state.server_gate.notice(Instant::now()), |section, notice| {
+                        section.child(div().mt_2().text_xs().text_color(colors.amber).child(notice))
+                    })
                     .child(div().mt_3().children(event_rows))
                     .when(event_count == 0, |section| {
                         section.child(div().mt_3().text_color(colors.muted).child("No proven unread events."))
@@ -1175,27 +1239,40 @@ impl NotificationController {
                 requested_reviewer: account.login.clone(),
             },
         };
-        let key = account_key(&account);
         let partial_repository = Repository {
             name: "partial-repository".into(),
             ..repository.clone()
         };
-        let selected = [repository.clone(), partial_repository];
-        let selection = selection_key(&selected);
-        let state = self.accounts.entry(key.clone()).or_default();
-        state.account = Some(account.clone());
-        state.selection = selection.clone();
-        state.selected_repositories = selected.iter().map(repository_scope).collect();
-        state.selection_generation = state.selection_generation.saturating_add(1);
-        state.generation = state.generation.saturating_add(1);
-        state.in_flight = true;
-        let token = ControllerToken {
-            consent_generation: state.consent_generation,
-            lifetime: self.lifetime,
-            account_key: key,
-            selection,
-            generation: state.generation,
+        let interval_account = Account {
+            host: "github.com".into(),
+            login: "smoke-poll-reader".into(),
         };
+        let interval_repository = Repository {
+            host: "github.com".into(),
+            owner: "octo".into(),
+            name: "poll-interval".into(),
+            account: interval_account.clone(),
+            local_path: None,
+        };
+        let selected = [
+            repository.clone(),
+            partial_repository,
+            interval_repository.clone(),
+        ];
+        let mut work = self.begin_polls_when_at(&selected, Instant::now(), |_| true);
+        let interval_token = work
+            .iter()
+            .find(|work| work.account == interval_account)
+            .ok_or("smoke controller did not begin its polling-interval account")?
+            .token
+            .clone();
+        let token = work
+            .iter()
+            .find(|work| work.account == account)
+            .ok_or("smoke controller did not begin its rate-limit account")?
+            .token
+            .clone();
+        work.clear();
         let snapshot = NotificationSnapshot {
             state_version: 2,
             unread_by_pull_request: vec![PullRequestUnreadSummary {
@@ -1233,9 +1310,39 @@ impl NotificationController {
             snapshot,
             newly_admitted: vec![event],
             error: None,
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective {
+                x_poll_interval: None,
+                rate_limit: Some(NotificationDelay::Seconds(300)),
+            },
         });
         if admission.is_some() {
             return Err("default-off smoke unexpectedly admitted an OS alert".into());
+        }
+        let interval_admission = self.complete_poll(PollCompletion {
+            token: interval_token,
+            account: interval_account,
+            snapshot: NotificationSnapshot {
+                state_version: 1,
+                unread_by_pull_request: Vec::new(),
+                repository_completeness: vec![RepositoryNotificationCompleteness {
+                    target: repository_scope(&interval_repository),
+                    complete: true,
+                    reasons: Vec::new(),
+                }],
+                incomplete_candidates: Vec::new(),
+                notices: Vec::new(),
+            },
+            newly_admitted: Vec::new(),
+            error: None,
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective {
+                x_poll_interval: Some(NotificationDelay::Seconds(300)),
+                rate_limit: None,
+            },
+        });
+        if interval_admission.is_some() {
+            return Err("polling-interval smoke unexpectedly admitted an OS alert".into());
         }
         let mut calls = Vec::new();
         let dispatched = self.dispatch_to(&mut |notification| calls.push(notification));
@@ -1259,7 +1366,7 @@ impl NotificationController {
         if !self.open {
             self.toggle_open();
         }
-        Ok("Synthetic exact event installed through the real completion handler; one incomplete mention candidate remains separate; test sink calls=0; platform calls=0; preference=off."
+        Ok("Synthetic exact event installed through the real begin/release/complete controller path; separate visible rate-limit and polling-interval notices are active; one incomplete mention candidate remains separate; test sink calls=0; platform calls=0; preference=off."
             .into())
     }
 }
@@ -2185,6 +2292,58 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_stops_later_chunks_and_reaches_poll_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = NotificationController::new(dir.path().into());
+        assert!(controller.complete_bootstrap(controller.begin_bootstrap().run()));
+        let repositories = (0..6).map(|index| repo("alice", index)).collect::<Vec<_>>();
+        let work = controller.begin_polls(&repositories).pop().unwrap();
+        assert_eq!(work.chunks.len(), 2);
+        let mut calls = 0;
+        let completion = work.run_with(|_, chunk, cache| {
+            calls += 1;
+            assert_eq!(chunk.len(), 5);
+            let mut response = batch("alice", Vec::new(), true);
+            response.repositories = chunk
+                .iter()
+                .map(|repository| RepositoryNotificationCompleteness {
+                    target: repository_scope(repository),
+                    complete: false,
+                    reasons: vec!["server rate limit".into()],
+                })
+                .collect();
+            response.complete = false;
+            Ok(
+                cibergit::providers::notifications::NotificationObservationRead {
+                    batch: response,
+                    cache,
+                    poll: NotificationPollDirective {
+                        x_poll_interval: None,
+                        rate_limit: Some(NotificationDelay::Seconds(90)),
+                    },
+                },
+            )
+        });
+        assert_eq!(
+            calls, 1,
+            "later chunks must not dispatch after rate limiting"
+        );
+        assert_eq!(
+            completion.poll.rate_limit,
+            Some(NotificationDelay::Seconds(90))
+        );
+        assert!(completion.failed());
+        assert_eq!(completion.snapshot.repository_completeness.len(), 6);
+        assert!(
+            completion
+                .snapshot
+                .repository_completeness
+                .iter()
+                .all(|repository| !repository.complete)
+        );
+    }
+
+    #[test]
     fn polling_respects_each_accounts_due_time_and_invalidates_removed_selection() {
         let dir = tempfile::tempdir().unwrap();
         let mut controller = NotificationController::new(dir.path().into());
@@ -2252,6 +2411,12 @@ mod tests {
             },
         };
         assert!(controller.release_poll_at(&completion, now));
+        assert_eq!(
+            controller.accounts[&account_key(&account("alice"))]
+                .server_gate
+                .notice(now),
+            Some("Notification refresh is deferred by GitHub's polling interval.")
+        );
         for label in ["timer", "focus", "manual"] {
             assert!(
                 controller
@@ -2283,6 +2448,12 @@ mod tests {
             },
         };
         assert!(controller.release_poll_at(&overflow, now + Duration::from_secs(120)));
+        assert!(
+            controller.accounts[&account_key(&account("alice"))]
+                .server_gate
+                .notice(now + Duration::from_secs(120))
+                .is_some_and(|notice| notice.contains("paused"))
+        );
         assert!(
             controller
                 .begin_polls_when_at(
@@ -2325,6 +2496,12 @@ mod tests {
         };
         assert!(controller.release_poll_at(&stale, now));
         assert!(!controller.accepts_poll(&stale));
+        assert_eq!(
+            controller.accounts[&account_key(&account("alice"))]
+                .server_gate
+                .notice(now),
+            Some("Notification refresh is deferred by GitHub rate limiting.")
+        );
         assert!(
             controller
                 .begin_polls_when_at(&[repo("alice", 1)], now + Duration::from_secs(89), |_| true)
@@ -2336,6 +2513,118 @@ mod tests {
                 .len(),
             1,
             "stale X-Poll-Interval must not install, but matching rate delay must"
+        );
+    }
+
+    #[test]
+    fn successful_completion_does_not_reset_server_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = NotificationController::new(dir.path().into());
+        assert!(controller.complete_bootstrap(controller.begin_bootstrap().run()));
+        let now = Instant::now();
+        let work = controller
+            .begin_polls_when_at(&[repo("alice", 0)], now, |_| true)
+            .pop()
+            .unwrap();
+        let completion = PollCompletion {
+            token: work.token,
+            account: account("alice"),
+            snapshot: empty_snapshot(String::new()),
+            newly_admitted: vec![],
+            error: None,
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective {
+                x_poll_interval: Some(NotificationDelay::Seconds(120)),
+                rate_limit: None,
+            },
+        };
+        assert!(controller.complete_poll(completion).is_none());
+        assert!(
+            controller
+                .begin_polls_when_at(&[repo("alice", 0)], now + Duration::from_secs(119), |_| {
+                    true
+                })
+                .is_empty(),
+            "a successful completion may clear local backoff but not the server deadline"
+        );
+    }
+
+    #[test]
+    fn expired_absolute_reset_is_zero_and_never_shortens_a_later_floor() {
+        let wall_epoch = UNIX_EPOCH + Duration::from_secs(10_000);
+        let now = Instant::now();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = NotificationController::new(dir.path().into());
+        assert!(controller.complete_bootstrap(controller.begin_bootstrap().run()));
+        let work = controller.begin_polls(&[repo("alice", 0)]).pop().unwrap();
+        let expired = PollCompletion {
+            token: work.token,
+            account: account("alice"),
+            snapshot: empty_snapshot(String::new()),
+            newly_admitted: vec![],
+            error: Some("rate limited".into()),
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective {
+                x_poll_interval: None,
+                rate_limit: Some(NotificationDelay::UntilUnixSeconds(10_001)),
+            },
+        };
+        assert!(controller.release_poll_at_with_wall(
+            &expired,
+            now,
+            wall_epoch + Duration::from_secs(2)
+        ));
+        assert!(
+            controller.accounts[&account_key(&account("alice"))]
+                .server_gate
+                .notice(now)
+                .is_none()
+        );
+        assert_eq!(
+            controller
+                .begin_polls_when_at(&[repo("alice", 0)], now, |_| true)
+                .len(),
+            1,
+            "a reset that expired during response processing must not suspend polling"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = NotificationController::new(dir.path().into());
+        assert!(controller.complete_bootstrap(controller.begin_bootstrap().run()));
+        let work = controller.begin_polls(&[repo("alice", 0)]).pop().unwrap();
+        let mixed = PollCompletion {
+            token: work.token,
+            account: account("alice"),
+            snapshot: empty_snapshot(String::new()),
+            newly_admitted: vec![],
+            error: Some("rate limited".into()),
+            cache: NotificationConditionalCache::default(),
+            poll: NotificationPollDirective {
+                x_poll_interval: Some(NotificationDelay::Seconds(120)),
+                rate_limit: Some(NotificationDelay::UntilUnixSeconds(10_001)),
+            },
+        };
+        assert!(controller.release_poll_at_with_wall(
+            &mixed,
+            now,
+            wall_epoch + Duration::from_secs(2)
+        ));
+        assert!(
+            controller
+                .begin_polls_when_at(&[repo("alice", 0)], now + Duration::from_secs(119), |_| {
+                    true
+                })
+                .is_empty()
+        );
+        assert_eq!(
+            controller
+                .begin_polls_when_at(&[repo("alice", 0)], now + Duration::from_secs(120), |_| {
+                    true
+                })
+                .len(),
+            1,
+            "an expired reset must not shorten another server floor"
         );
     }
 

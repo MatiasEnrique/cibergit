@@ -15,7 +15,7 @@ use super::{
     validate_sha,
 };
 use crate::domain::{Account, Repository};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -273,6 +273,7 @@ impl GithubProvider {
         let conditional = conditional_cache.is_some();
         let mut cache = conditional_cache.unwrap_or_default();
         let mut poll = RestPollDirective::default();
+        let mut rate_limited = false;
         limits.validate()?;
         ensure!(
             !repositories.is_empty() && repositories.len() <= MAX_NOTIFICATION_REPOSITORIES,
@@ -290,6 +291,12 @@ impl GithubProvider {
                 "Duplicate selected notification repository"
             );
         }
+        let observed_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("System clock is before Unix epoch")?
+            .as_millis()
+            .try_into()
+            .context("System timestamp is outside supported range")?;
 
         let mut repository_completeness: HashMap<String, RepositoryNotificationCompleteness> =
             selected
@@ -426,6 +433,19 @@ impl GithubProvider {
                                 repository.full_name()
                             ),
                         });
+                        if conditional && poll.rate_limit.is_some() {
+                            rate_limited = true;
+                            mark_selected_incomplete(
+                                &mut repository_completeness,
+                                &repositories[repository_index..],
+                                "notification work deferred by server rate limit",
+                            );
+                            notice(
+                                &mut notices,
+                                "Further notification reads were deferred by a server rate limit.",
+                            );
+                            break 'repositories;
+                        }
                         continue 'repositories;
                     }
                 };
@@ -465,10 +485,31 @@ impl GithubProvider {
                 });
                 let mut omitted_from_page = false;
                 for item in page_items {
-                    ensure!(
-                        seen_notifications.insert(item.id.clone()),
-                        "Notifications changed during pagination; refresh to retry"
-                    );
+                    if !seen_notifications.insert(item.id.clone()) {
+                        if !conditional {
+                            bail!("Notifications changed during pagination; refresh to retry");
+                        }
+                        complete = false;
+                        mark_repo_incomplete(
+                            &mut repository_completeness,
+                            &key,
+                            "notifications changed during pagination",
+                        );
+                        notice(
+                            &mut notices,
+                            "Notifications changed during pagination; refresh to retry.",
+                        );
+                        incomplete.push(IncompleteNotificationCandidate {
+                            target: None,
+                            provider_notification_id: None,
+                            kind: IncompleteCandidateKind::PullRequestNotification,
+                            reason: format!(
+                                "notifications changed during pagination for {}",
+                                repository.full_name()
+                            ),
+                        });
+                        continue 'repositories;
+                    }
                     if raw.len() == limits.max_notifications {
                         omitted_from_page = true;
                         break;
@@ -522,6 +563,22 @@ impl GithubProvider {
                     staged_pages.push((page_key, cached_page));
                 }
                 repository_page = next_page.expect("nonterminal notification page has a next page");
+            }
+        }
+
+        if rate_limited {
+            complete = false;
+            mark_selected_incomplete(
+                &mut repository_completeness,
+                repositories,
+                "candidate hydration deferred by server rate limit",
+            );
+            if !raw.is_empty() {
+                raw.clear();
+                notice(
+                    &mut notices,
+                    "Candidate hydration was deferred by the server rate limit; no cached discovery became event evidence.",
+                );
             }
         }
 
@@ -651,12 +708,6 @@ impl GithubProvider {
             left.provider_notification_id
                 .cmp(&right.provider_notification_id)
         });
-        let observed_at_unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("System clock is before Unix epoch")?
-            .as_millis()
-            .try_into()
-            .context("System timestamp is outside supported range")?;
         let mut repositories: Vec<_> = repository_completeness.into_values().collect();
         repositories.sort_by_key(|value| scope_key(&value.target));
         Ok(NotificationObservationRead {

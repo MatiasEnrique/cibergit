@@ -251,20 +251,30 @@ pub(crate) fn parse_included_response(
         }
         fields.push((name.to_ascii_lowercase(), value.trim().to_owned()));
     }
-    let x_poll_interval = delay_header(&fields, "x-poll-interval")?;
-    let retry_after = parsed_decimal_header(&fields, "retry-after")?;
-    let remaining = single_bounded(&fields, "x-ratelimit-remaining")?;
-    let reset = parsed_decimal_header(&fields, "x-ratelimit-reset")?;
+    let (retry_after, retry_error) = capture_decimal(&fields, "retry-after");
+    let (remaining, remaining_error) = capture_single(&fields, "x-ratelimit-remaining");
+    let (reset, reset_error) = capture_decimal(&fields, "x-ratelimit-reset");
     let rate_limit = match status {
+        429 if retry_error.is_some() => Some(BoundedDelay::Suspend),
         429 => Some(rate_delay(&retry_after, remaining, &reset)),
         403 if retry_after.is_present() || remaining == Some("0") => {
             Some(rate_delay(&retry_after, remaining, &reset))
         }
         _ => None,
     };
-    let poll = RestPollDirective {
-        x_poll_interval,
+    let mut poll = RestPollDirective {
+        x_poll_interval: None,
         rate_limit,
+    };
+    if let Some(error) = retry_error.or(remaining_error).or(reset_error) {
+        return Err(error.with_poll(poll));
+    }
+    poll.x_poll_interval = match delay_header(&fields, "x-poll-interval") {
+        Ok(delay) => delay,
+        Err(error) => {
+            poll.x_poll_interval = Some(BoundedDelay::Suspend);
+            return Err(error.with_poll(poll));
+        }
     };
     let validators = parse_validators(&fields).map_err(|error| error.with_poll(poll.clone()))?;
     let link = single(&fields, "link")
@@ -379,6 +389,26 @@ enum ParsedDecimal {
     Malformed,
     Value(u64),
     Overflow,
+}
+
+fn capture_decimal(
+    fields: &[(String, String)],
+    name: &str,
+) -> (ParsedDecimal, Option<RestReadError>) {
+    match parsed_decimal_header(fields, name) {
+        Ok(value) => (value, None),
+        Err(error) => (ParsedDecimal::Malformed, Some(error)),
+    }
+}
+
+fn capture_single<'a>(
+    fields: &'a [(String, String)],
+    name: &str,
+) -> (Option<&'a str>, Option<RestReadError>) {
+    match single_bounded(fields, name) {
+        Ok(value) => (value, None),
+        Err(error) => (None, Some(error)),
+    }
 }
 
 impl ParsedDecimal {
@@ -581,5 +611,25 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Seconds(90)));
+
+        let error = parse_included_response(
+            b"HTTP/2 429 Too Many Requests\r\nRetry-After: 90\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Remaining: 1\r\n\r\nprivate",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Seconds(90)));
+        let error = parse_included_response(
+            b"HTTP/2 429 Too Many Requests\r\nRetry-After: 90\r\nX-Poll-Interval: 10\r\nX-Poll-Interval: 20\r\n\r\nprivate",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Seconds(90)));
+        assert_eq!(error.poll().x_poll_interval, Some(BoundedDelay::Suspend));
+        let error = parse_included_response(
+            b"HTTP/2 429 Too Many Requests\r\nRetry-After: 90\r\nRetry-After: 91\r\n\r\nprivate",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Suspend));
     }
 }

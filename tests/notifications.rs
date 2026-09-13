@@ -454,10 +454,37 @@ print(json.dumps(responses[endpoint]))
                 &[provider_repo("alice")], None, NotificationReadLimits::default(), NotificationConditionalCache::default(),
             ).unwrap();
             assert!(first.batch.complete);
-            let error = provider.notification_observations_conditional(
+            let moved = provider.notification_observations_conditional(
                 &[provider_repo("alice")], None, NotificationReadLimits::default(), first.cache,
-            ).unwrap_err();
-            assert!(error.to_string().contains("changed during pagination"));
+            ).unwrap();
+            assert!(!moved.batch.complete);
+            assert!(!moved.batch.repositories[0].complete);
+            assert!(moved.batch.notices.iter().any(|notice| notice.contains("changed during pagination")));
+        }
+
+        #[test]
+        fn rate_limit_stops_later_repository_and_hydration_requests() {
+            let (dir, provider) = conditional_provider_fixture(
+                "alice",
+                complete_responses("review_requested", "failure"),
+                vec![json!({
+                    "endpoint": notifications_endpoint("one", 1), "status": 429, "exit": 1,
+                    "headers": [["Retry-After", "90"]],
+                    "body": {"message": "fixture-private"},
+                })],
+            );
+            let read = provider.notification_observations_conditional(
+                &[provider_repo_named("alice", "one"), provider_repo_named("alice", "two")],
+                None,
+                NotificationReadLimits::default(),
+                NotificationConditionalCache::default(),
+            ).unwrap();
+            assert_eq!(read.poll.rate_limit, Some(NotificationDelay::Seconds(90)));
+            assert!(!read.batch.complete);
+            assert!(read.batch.repositories.iter().all(|repository| !repository.complete));
+            assert_eq!(fs::read_to_string(dir.path().join("conditional-count")).unwrap(), "1");
+            assert!(!dir.path().join("calls").exists(), "no hydration or later repository request may run before applying the server floor");
+            assert!(!format!("{:?}", read.batch).contains("fixture-private"));
         }
 
         #[test]
