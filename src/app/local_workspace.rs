@@ -5,6 +5,8 @@
 //! gesture here. All checkout and Git I/O is started on GPUI's background executor;
 //! editor changes are serialized by one FIFO worker per open document.
 
+#[path = "local_workspace/conflict_view.rs"]
+mod conflict_view;
 #[path = "local_workspace/rebase_panel.rs"]
 mod rebase_panel;
 

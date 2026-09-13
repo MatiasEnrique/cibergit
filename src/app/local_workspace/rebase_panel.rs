@@ -3,6 +3,10 @@
 //! The controller never invents Git state. Every mutation is confirmed against
 //! an immutable backend snapshot plus the exact state of every open document.
 
+use super::conflict_view::{
+    ConflictContextState, ConflictPresentation, ConflictSource, WIDE_CONFLICT_PANE_MIN,
+    source_panel,
+};
 use super::*;
 use cibergit::rebase::{
     ActiveOperationIdentity, BlobContent, ConflictFile, DirtyPreparation,
@@ -217,6 +221,7 @@ pub(super) struct RebasePanel {
     steps: Vec<PlanStep>,
     selected_step: Option<usize>,
     conflicts: Vec<ConflictFile>,
+    conflict_view: Option<ConflictPresentation>,
     pending: Option<PendingRebaseCommand>,
     in_flight: Option<u64>,
     read_generation: u64,
@@ -250,6 +255,7 @@ impl RebasePanel {
             steps: Vec::new(),
             selected_step: None,
             conflicts: Vec::new(),
+            conflict_view: None,
             pending: None,
             in_flight: None,
             read_generation: 0,
@@ -308,6 +314,9 @@ impl RebasePanel {
         {
             self.show_operation_details = false;
         }
+        if let Some(view) = &mut self.conflict_view {
+            view.observe(operation.as_ref(), &conflicts);
+        }
         self.operation = operation;
         self.conflicts = conflicts;
     }
@@ -345,6 +354,58 @@ impl LocalWorkspace {
 
     pub fn rebase_plan_action(&self, index: usize) -> Option<PlanAction> {
         self.rebase.steps.get(index).map(|step| step.action.clone())
+    }
+
+    pub fn rebase_conflict_count(&self) -> usize {
+        self.rebase.conflicts.len()
+    }
+
+    pub fn rebase_conflict_source_proof(&self) -> Option<Vec<(String, Option<String>, String)>> {
+        let view = self.rebase.conflict_view.as_ref()?;
+        Some(
+            ConflictSource::ALL
+                .into_iter()
+                .map(|source| {
+                    let (label, stage) = view.source(source);
+                    (
+                        label.into(),
+                        stage.oid.clone(),
+                        super::conflict_view::source_text(stage),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub fn rebase_conflict_context_status(&self) -> Option<&'static str> {
+        match self.rebase.conflict_view.as_ref()?.state() {
+            ConflictContextState::Current => Some("current"),
+            ConflictContextState::StagesChanged => Some("stages-changed"),
+            ConflictContextState::ConflictResolved => Some("resolved-by-git"),
+            ConflictContextState::OperationChanged => Some("operation-changed"),
+            ConflictContextState::OperationUnavailable => Some("operation-unavailable"),
+        }
+    }
+
+    pub fn open_rebase_conflict_sources(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_rebase_conflict(index, window, cx);
+    }
+
+    pub fn request_stage_open_rebase_conflict(&mut self, cx: &mut Context<Self>) {
+        self.request_stage_presented_conflict(cx);
+    }
+
+    pub fn refresh_open_rebase_conflict_sources(&mut self, cx: &mut Context<Self>) {
+        self.refresh_conflict_sources(cx);
+    }
+
+    pub fn close_rebase_conflict_sources(&mut self, cx: &mut Context<Self>) {
+        self.close_conflict_view(cx);
     }
 
     pub fn rebase_confirmation_inputs_locked(&self, cx: &App) -> bool {
@@ -1160,12 +1221,26 @@ impl LocalWorkspace {
     }
 
     fn open_rebase_conflict(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(conflict) = self.rebase.conflicts.get(index) else {
+        if self.refuse_conflict_control(cx) {
+            return;
+        }
+        let Some(conflict) = self.rebase.conflicts.get(index).cloned() else {
             return;
         };
-        if !conflict_is_editor_candidate(conflict) {
+        let Some(operation) = self.rebase.operation.as_ref() else {
+            return;
+        };
+        let Some(presentation) = ConflictPresentation::new(operation, conflict.clone()) else {
+            self.rebase.status =
+                "Conflict sources are unavailable because the exact operation identity is missing"
+                    .into();
+            cx.notify();
+            return;
+        };
+        self.rebase.conflict_view = Some(presentation);
+        if !conflict_is_editor_candidate(&conflict) {
             self.rebase.status = format!(
-                "{} cannot be opened in the safe text editor; resolve it externally, refresh, then stage explicitly",
+                "Showing immutable sources for {}. Its result cannot be opened in the safe text editor; resolve it externally, refresh, then stage explicitly",
                 conflict.path.display
             );
             cx.notify();
@@ -1173,6 +1248,160 @@ impl LocalWorkspace {
         }
         let path = PathBuf::from(OsString::from_vec(conflict.path.raw.clone()));
         self.open_relative_path(path, window, cx);
+    }
+
+    fn refuse_conflict_control(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.rebase.pending.is_none() && self.rebase.in_flight.is_none() {
+            return false;
+        }
+        self.rebase.status = if self.rebase.pending.is_some() {
+            "Conflict controls are frozen while the exact confirmation is visible; confirm or cancel it first"
+        } else {
+            "Conflict controls are frozen while the rebase/local effect is running"
+        }
+        .into();
+        cx.notify();
+        true
+    }
+
+    fn close_conflict_view(&mut self, cx: &mut Context<Self>) {
+        if self.refuse_conflict_control(cx) {
+            return;
+        }
+        self.rebase.conflict_view = None;
+        self.rebase.status =
+            "Closed the source presentation; the result document and unsaved buffer were preserved"
+                .into();
+        cx.notify();
+    }
+
+    fn select_conflict_source(&mut self, source: ConflictSource, cx: &mut Context<Self>) {
+        if self.refuse_conflict_control(cx) {
+            return;
+        }
+        if let Some(view) = &mut self.rebase.conflict_view {
+            view.select(source);
+            cx.notify();
+        }
+    }
+
+    fn move_conflict_source(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.refuse_conflict_control(cx) {
+            return;
+        }
+        if let Some(view) = &mut self.rebase.conflict_view {
+            view.move_selection(delta);
+            cx.notify();
+        }
+    }
+
+    fn toggle_conflict_details(&mut self, cx: &mut Context<Self>) {
+        if self.refuse_conflict_control(cx) {
+            return;
+        }
+        if let Some(view) = &mut self.rebase.conflict_view {
+            view.toggle_details();
+            cx.notify();
+        }
+    }
+
+    fn refresh_conflict_sources(&mut self, cx: &mut Context<Self>) {
+        if self.refuse_conflict_control(cx) {
+            return;
+        }
+        let Some(view) = self.rebase.conflict_view.as_ref() else {
+            return;
+        };
+        let Some(operation) = self.rebase.operation.as_ref() else {
+            self.rebase.status =
+                "The original operation is no longer available; source context was not changed"
+                    .into();
+            cx.notify();
+            return;
+        };
+        let Some(conflict) = self
+            .rebase
+            .conflicts
+            .iter()
+            .find(|conflict| conflict.path.raw == view.path_raw())
+            .cloned()
+        else {
+            self.rebase.status =
+                "Git no longer reports this path as unmerged; source context was not changed"
+                    .into();
+            cx.notify();
+            return;
+        };
+        let refreshed = self
+            .rebase
+            .conflict_view
+            .as_mut()
+            .is_some_and(|view| view.refresh_from(operation, conflict));
+        self.rebase.status = if refreshed {
+            "Refreshed immutable source stages; the editable result buffer was not changed"
+        } else {
+            "The operation identity changed; this presentation cannot attach to the new operation"
+        }
+        .into();
+        cx.notify();
+    }
+
+    fn request_stage_presented_conflict(&mut self, cx: &mut Context<Self>) {
+        if self.refuse_conflict_control(cx) {
+            return;
+        }
+        let Some(view) = self.rebase.conflict_view.as_ref() else {
+            return;
+        };
+        if !view.can_stage() {
+            self.rebase.status = view
+                .state()
+                .explanation()
+                .unwrap_or("The source context is stale and cannot be staged")
+                .into();
+            cx.notify();
+            return;
+        }
+        let expected = view.conflict().clone();
+        let Some(index) = self
+            .rebase
+            .conflicts
+            .iter()
+            .position(|conflict| conflict == &expected)
+        else {
+            self.rebase.status =
+                "The exact source stages are no longer current; refresh before staging".into();
+            cx.notify();
+            return;
+        };
+        self.request_stage_rebase_conflict(index, cx);
+    }
+
+    fn save_presented_conflict(&mut self, cx: &mut Context<Self>) {
+        if self.refuse_conflict_control(cx) {
+            return;
+        }
+        let Some(view) = self.rebase.conflict_view.as_ref() else {
+            return;
+        };
+        let path = PathBuf::from(OsString::from_vec(view.path_raw().to_vec()));
+        if self.active_document.as_ref() != Some(&path) {
+            self.rebase.status =
+                "The presented result is not the active document; reopen it before saving".into();
+            cx.notify();
+            return;
+        }
+        if self.documents.get(&path).is_none_or(|tab| {
+            !matches!(
+                tab.view.status,
+                DocumentStatus::Clean | DocumentStatus::Dirty
+            )
+        }) {
+            self.rebase.status = "Save is blocked by the separate disk/base/buffer conflict; reconcile or reload it in Local Changes first".into();
+            cx.notify();
+            return;
+        }
+        self.save_active(cx);
     }
 
     fn request_stage_rebase_conflict(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1218,6 +1447,15 @@ impl LocalWorkspace {
         if !self.rebase.open || !event.keystroke.modifiers.platform {
             return false;
         }
+        if self.rebase.conflict_view.is_some() {
+            let delta = match event.keystroke.key.as_str() {
+                "left" => -1,
+                "right" => 1,
+                _ => return false,
+            };
+            self.move_conflict_source(delta, cx);
+            return true;
+        }
         let delta = match event.keystroke.key.as_str() {
             "up" => -1,
             "down" => 1,
@@ -1233,7 +1471,7 @@ impl LocalWorkspace {
     pub(super) fn render_rebase_panel(
         &mut self,
         colors: LocalPalette,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let operation = self.rebase.operation.clone();
@@ -1308,7 +1546,9 @@ impl LocalWorkspace {
             .flex()
             .flex_col()
             .gap_3();
-        if let Some(operation) = operation {
+        if self.rebase.conflict_view.is_some() {
+            content = content.child(self.render_conflict_view(colors, window, cx));
+        } else if let Some(operation) = operation {
             content = content.child(self.render_operation(operation, colors, cx));
         } else if let Some(preparation) = preparation {
             content = content.child(render_preparation_summary(&preparation, colors));
@@ -1559,6 +1799,338 @@ impl LocalWorkspace {
             .into_any_element()
     }
 
+    fn render_conflict_view(
+        &mut self,
+        colors: LocalPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(view) = self.rebase.conflict_view.clone() else {
+            return div().into_any_element();
+        };
+        let pane_width = (window.bounds().size.width.as_f32() - 300.).max(0.);
+        let wide = pane_width >= WIDE_CONFLICT_PANE_MIN;
+        let controls_frozen = self.rebase.has_pending_or_running();
+        let path = PathBuf::from(OsString::from_vec(view.path_raw().to_vec()));
+        let editor_candidate = conflict_is_editor_candidate(view.conflict());
+        let tab = self.documents.get(&path);
+        let tab_state = tab.map(|tab| (tab.editor.clone(), tab.view.status, tab.message.clone()));
+
+        let mut selectors = div().flex().flex_wrap().gap_2();
+        for source in ConflictSource::ALL {
+            let label = view.source(source).0;
+            selectors = selectors.child(
+                action_button(
+                    label,
+                    colors,
+                    cx.listener(move |this, _, _, cx| this.select_conflict_source(source, cx)),
+                )
+                .when(view.selected() == source, |button| {
+                    button.border_color(colors.accent).bg(colors.selected)
+                })
+                .when(controls_frozen, |button| {
+                    button.opacity(0.52).cursor_default()
+                }),
+            );
+        }
+
+        let mut sources = if wide {
+            div().flex().gap_2()
+        } else {
+            div().flex().flex_col()
+        };
+        for source in ConflictSource::ALL {
+            if wide || source == view.selected() {
+                let (label, stage) = view.source(source);
+                sources = sources.child(
+                    source_panel(
+                        source,
+                        label,
+                        stage,
+                        source == view.selected(),
+                        view.show_details(),
+                        colors,
+                    )
+                    .when(wide, |panel| panel.flex_1())
+                    .when(!wide, |panel| panel.w_full()),
+                );
+            }
+        }
+
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("THREE-WAY CONFLICT"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(CODE_FONT)
+                                    .text_xs()
+                                    .child(view.conflict().path.display.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors.muted)
+                                    .child(format!(
+                                        "operation {} · {}px pane · {} layout",
+                                        view.operation_id(),
+                                        pane_width.round(),
+                                        if wide { "wide" } else { "narrow" }
+                                    )),
+                            ),
+                    )
+                    .child(
+                        action_button(
+                            "Back to conflict list",
+                            colors,
+                            cx.listener(|this, _, _, cx| this.close_conflict_view(cx)),
+                        )
+                        .when(controls_frozen, |button| {
+                            button.opacity(0.52).cursor_default()
+                        }),
+                    ),
+            )
+            .children(view.state().explanation().map(|explanation| {
+                notice_box(
+                    "Frozen source context",
+                    explanation,
+                    colors.red,
+                    colors,
+                )
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(selectors)
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                action_button(
+                                    if view.show_details() {
+                                        "Hide full source details"
+                                    } else {
+                                        "Show full source details"
+                                    },
+                                    colors,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.toggle_conflict_details(cx)
+                                    }),
+                                )
+                                .when(controls_frozen, |button| {
+                                    button.opacity(0.52).cursor_default()
+                                }),
+                            )
+                            .when(
+                                view.state() == &ConflictContextState::StagesChanged,
+                                |actions| {
+                                    actions.child(
+                                        action_button(
+                                            "Refresh changed stages",
+                                            colors,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.refresh_conflict_sources(cx)
+                                            }),
+                                        )
+                                        .when(controls_frozen, |button| {
+                                            button.opacity(0.52).cursor_default()
+                                        }),
+                                    )
+                                },
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(colors.muted)
+                    .child(if wide {
+                        "Immutable sources are side by side. Select with the mouse or ⌘← / ⌘→; each pane scrolls to the actual end of long lines."
+                    } else {
+                        "Narrow layout shows one immutable source at a time. Select with the mouse or ⌘← / ⌘→; the editable result remains labelled below."
+                    }),
+            )
+            .child(sources);
+
+        let result_header = div()
+            .min_h(px(42.))
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                div()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("EDITABLE RESULT"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors.muted)
+                            .child("Same Local Changes document · save is explicit"),
+                    ),
+            );
+        if !editor_candidate {
+            body = body.child(
+                div()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.red)
+                    .bg(colors.surface)
+                    .child(result_header)
+                    .child(
+                        div()
+                            .p_3()
+                            .text_color(colors.red)
+                            .child("This result cannot be represented safely by the accepted text editor. Use an external Git tool, then return and refresh. cibergit will not launch an application, create, remove, rename, or stage the path implicitly."),
+                    ),
+            );
+        } else if let Some((editor, status, message)) = tab_state {
+            let disk_conflict = matches!(
+                status,
+                DocumentStatus::Conflict
+                    | DocumentStatus::Missing
+                    | DocumentStatus::Unsafe
+                    | DocumentStatus::RecoveryCorrupt
+            );
+            let result_actions = div()
+                .flex()
+                .gap_2()
+                .child(
+                    action_button(
+                        "Save result ⌘S",
+                        colors,
+                        cx.listener(|this, _, _, cx| this.save_presented_conflict(cx)),
+                    )
+                    .when(controls_frozen || disk_conflict, |button| {
+                        button.opacity(0.52).cursor_default()
+                    }),
+                )
+                .when(view.can_stage(), |actions| {
+                    actions.child(
+                        action_button(
+                            "Stage saved result",
+                            colors,
+                            cx.listener(|this, _, _, cx| this.request_stage_presented_conflict(cx)),
+                        )
+                        .when(controls_frozen || disk_conflict, |button| {
+                            button.opacity(0.52).cursor_default()
+                        }),
+                    )
+                });
+            let result_header = result_header.child(result_actions);
+            let mut result = div()
+                .h(px(300.))
+                .min_h(px(220.))
+                .flex()
+                .flex_col()
+                .rounded_md()
+                .border_1()
+                .border_color(if disk_conflict {
+                    colors.red
+                } else {
+                    colors.border
+                })
+                .bg(colors.surface)
+                .child(result_header);
+            if disk_conflict {
+                result = result.child(
+                    div()
+                        .flex_1()
+                        .p_3()
+                        .bg(if colors.dark {
+                            rgba(0x411f21ff)
+                        } else {
+                            rgba(0xf9e2e0ff)
+                        })
+                        .text_color(colors.red)
+                        .child("A separate external disk/base/buffer conflict is active. That DocumentStore reconciliation takes precedence; the Git stage sources above remain immutable and staging is blocked.")
+                        .child(
+                            action_button(
+                                "Open disk reconciliation in Local Changes",
+                                colors,
+                                cx.listener(|this, _, _, cx| {
+                                    this.route_rebase_to_local_changes(
+                                        "Reconcile the external disk change without discarding the preserved result buffer, then reopen Rebase",
+                                        cx,
+                                    )
+                                }),
+                            )
+                            .when(controls_frozen, |button| {
+                                button.opacity(0.52).cursor_default()
+                            }),
+                        ),
+                );
+            } else {
+                result = result.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .font_family(CODE_FONT)
+                        .child(Editor::new(&editor)),
+                );
+            }
+            body = body.child(
+                result.child(
+                    div()
+                        .min_h(px(30.))
+                        .px_3()
+                        .py_1()
+                        .border_t_1()
+                        .border_color(colors.border)
+                        .text_xs()
+                        .text_color(if status == DocumentStatus::Clean {
+                            colors.green
+                        } else if status == DocumentStatus::Dirty {
+                            colors.amber
+                        } else {
+                            colors.red
+                        })
+                        .child(format!("{message} · {status:?}")),
+                ),
+            );
+        } else {
+            body = body.child(
+                div()
+                    .h(px(220.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.surface)
+                    .child(result_header)
+                    .child(
+                        div()
+                            .p_3()
+                            .text_color(colors.muted)
+                            .child("Opening the same DocumentStore-backed result…"),
+                    ),
+            );
+        }
+        body.into_any_element()
+    }
+
     fn render_operation(
         &mut self,
         operation: RebaseOperationView,
@@ -1632,6 +2204,7 @@ impl LocalWorkspace {
             body = body.child(render_split(split, colors));
         }
         if !self.rebase.conflicts.is_empty() {
+            let conflict_controls_frozen = self.rebase.has_pending_or_running();
             body = body.child(div().font_weight(FontWeight::SEMIBOLD).child("CONFLICTS"));
             for (index, conflict) in self.rebase.conflicts.clone().into_iter().enumerate() {
                 let detail = conflict_reason(&conflict, self.rebase.show_operation_details);
@@ -1640,8 +2213,10 @@ impl LocalWorkspace {
                     .child(div().mt_1().text_xs().text_color(colors.muted).child(detail))
                     .child(div().mt_1().text_xs().child("Rebase orientation: ours = already rebased series; theirs = replayed original commit."))
                     .child(div().mt_2().flex().gap_2()
-                        .child(action_button("Open result", colors, cx.listener(move |this, _, window, cx| this.open_rebase_conflict(index, window, cx))))
-                        .child(action_button("Stage saved result", colors, cx.listener(move |this, _, _, cx| this.request_stage_rebase_conflict(index, cx))))));
+                        .child(action_button("Open sources and result", colors, cx.listener(move |this, _, window, cx| this.open_rebase_conflict(index, window, cx)))
+                            .when(conflict_controls_frozen, |button| button.opacity(0.52).cursor_default()))
+                        .child(action_button("Stage saved result", colors, cx.listener(move |this, _, _, cx| this.request_stage_rebase_conflict(index, cx)))
+                            .when(conflict_controls_frozen, |button| button.opacity(0.52).cursor_default()))));
             }
         }
         if let Some(stash) = &operation.stash {

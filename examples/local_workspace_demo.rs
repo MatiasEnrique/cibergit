@@ -104,10 +104,18 @@ fn fixture(base: &Path) -> (Repository, CheckoutView, PathBuf, String) {
         .expect("base UTF-8")
         .trim()
         .to_owned();
-    fs::write(checkout.join("workflow.txt"), "first replay\n").expect("first replay");
+    fs::write(
+        checkout.join("workflow.txt"),
+        "first-source-token\nfirst-end-of-long-line-END\n",
+    )
+    .expect("first replay");
     run_git(&checkout, &["add", "."]);
     run_git(&checkout, &["commit", "-m", "first replay"]);
-    fs::write(checkout.join("workflow.txt"), "second replay\n").expect("second replay");
+    fs::write(
+        checkout.join("workflow.txt"),
+        "second-source-token\nsecond-end-of-long-line-END\n",
+    )
+    .expect("second replay");
     run_git(&checkout, &["add", "."]);
     run_git(&checkout, &["commit", "-m", "second replay"]);
     fs::write(
@@ -499,6 +507,7 @@ fn start_smoke(
             }
             let conflict_started = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
                 workspace.move_rebase_plan_step(1, -1, cx);
+                workspace.set_rebase_step_action(1, PlanAction::Drop, cx);
                 workspace.request_start_rebase(cx);
                 let Some(id) = workspace.rebase_pending_action_id() else { return false; };
                 workspace.confirm_rebase_action(id, cx);
@@ -509,6 +518,7 @@ fn start_smoke(
                 window.background_executor().timer(std::time::Duration::from_millis(50)).await;
                 let ready = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
                     workspace.rebase_operation().is_some_and(|operation| operation.state == RebaseState::Conflicted)
+                        && workspace.rebase_conflict_count() == 1
                 }).unwrap_or(false)).unwrap_or(false);
                 if ready || conflict_at.elapsed() > std::time::Duration::from_secs(20) { break ready; }
             };
@@ -517,28 +527,134 @@ fn start_smoke(
                 .background_executor()
                 .timer(std::time::Duration::from_millis(250))
                 .await;
-            let conflict_capture = window.update(|window, _| {
+            let conflict_list_capture = window.update(|window, _| {
                 window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-conflict-dark-narrow.png" } else { "rebase-conflict-light-narrow.png" })).map_err(Into::into)).is_ok()
             }).unwrap_or(false);
-            let abort_requested = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
-                workspace.request_abort_rebase(cx);
+
+            let conflict_opened = window.update(|window, cx| workspace.update(cx, |workspace, cx| {
+                workspace.open_rebase_conflict_sources(0, window, cx);
+                true
+            }).unwrap_or(false)).unwrap_or(false);
+            let conflict_open_at = std::time::Instant::now();
+            let conflict_sources_ready = loop {
+                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                let ready = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
+                    workspace.active_path() == Some(Path::new("workflow.txt"))
+                        && workspace.rebase_conflict_source_proof().is_some()
+                }).unwrap_or(false)).unwrap_or(false);
+                if ready || conflict_open_at.elapsed() > std::time::Duration::from_secs(20) { break ready; }
+            };
+            let source_identity_proof = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
+                let Some(proof) = workspace.rebase_conflict_source_proof() else { return false; };
+                let labels = proof.iter().map(|(label, _, _)| label.as_str()).collect::<Vec<_>>();
+                let oids = proof.iter().filter_map(|(_, oid, _)| oid.as_ref()).collect::<std::collections::BTreeSet<_>>();
+                let contents = proof.iter().map(|(_, _, text)| text.as_str()).collect::<std::collections::BTreeSet<_>>();
+                labels == ["Base", "Already rebased (ours)", "Replayed commit (theirs)"]
+                    && oids.len() >= 2
+                    && contents.len() == 3
+                    && contents.iter().any(|text| text.contains("first-end-of-long-line-END"))
+                    && contents.iter().any(|text| text.contains("second-end-of-long-line-END"))
+            }).unwrap_or(false)).unwrap_or(false);
+            let _ = window.update(|window, _| window.resize(size(px(1680.), px(940.))));
+            window.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            let conflict_sources_wide_capture = window.update(|window, _| {
+                window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-conflict-sources-dark-wide.png" } else { "rebase-conflict-sources-light-wide.png" })).map_err(Into::into)).is_ok()
+            }).unwrap_or(false);
+            let _ = window.update(|window, _| window.resize(size(px(1040.), px(820.))));
+            window.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            let conflict_sources_narrow_capture = window.update(|window, _| {
+                window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-conflict-sources-dark-narrow.png" } else { "rebase-conflict-sources-light-narrow.png" })).map_err(Into::into)).is_ok()
+            }).unwrap_or(false);
+
+            let result_edit_undo_redo = window.update(|window, cx| workspace.update(cx, |workspace, cx| {
+                let Some(editor) = workspace.active_editor() else { return false; };
+                editor.update(cx, |editor, cx| {
+                    editor.focus(window, cx);
+                    editor.select_all(window, cx);
+                    editor.replace("resolved-result-token\nresult-long-line-END\n", window, cx);
+                });
+                let edited = editor.read(cx).value().to_string();
+                let focus = editor.read(cx).focus_handle(cx).clone();
+                focus.dispatch_action(&gpui_base::input::Undo, window, cx);
+                let undone = editor.read(cx).value().to_string();
+                focus.dispatch_action(&gpui_base::input::Redo, window, cx);
+                let redone = editor.read(cx).value().to_string();
+                edited.contains("resolved-result-token") && undone != edited && redone == edited
+            }).unwrap_or(false)).unwrap_or(false);
+            let result_persist_at = std::time::Instant::now();
+            let result_persisted_dirty = loop {
+                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                let dirty = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
+                    workspace.active_document_status() == Some(DocumentStatus::Dirty)
+                }).unwrap_or(false)).unwrap_or(false);
+                if dirty || result_persist_at.elapsed() > std::time::Duration::from_secs(20) { break dirty; }
+            };
+            let _ = window.update(|_, cx| { let _ = workspace.update(cx, |workspace, cx| workspace.save_active(cx)); });
+            let result_save_at = std::time::Instant::now();
+            let result_saved = loop {
+                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                let clean = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
+                    workspace.active_document_status() == Some(DocumentStatus::Clean)
+                }).unwrap_or(false)).unwrap_or(false);
+                if clean || result_save_at.elapsed() > std::time::Duration::from_secs(20) { break clean; }
+            };
+            let result_readback = window.background_executor().spawn({
+                let path = checkout.join("workflow.txt");
+                async move { fs::read_to_string(path).unwrap_or_default() }
+            }).await;
+            let result_save_readback = result_readback == "resolved-result-token\nresult-long-line-END\n";
+            let _ = window.update(|_, cx| { let _ = workspace.update(cx, |workspace, cx| workspace.refresh_all(cx)); });
+            let saved_context_at = std::time::Instant::now();
+            loop {
+                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                let changed = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
+                    workspace.rebase_conflict_context_status() == Some("stages-changed")
+                }).unwrap_or(false)).unwrap_or(false);
+                if changed || saved_context_at.elapsed() > std::time::Duration::from_secs(20) { break; }
+            }
+            let result_identity_refreshed = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
+                workspace.refresh_open_rebase_conflict_sources(cx);
+                workspace.rebase_conflict_context_status() == Some("current")
+            }).unwrap_or(false)).unwrap_or(false);
+            let stage_requested = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
+                workspace.request_stage_open_rebase_conflict(cx);
                 let Some(id) = workspace.rebase_pending_action_id() else { return false; };
                 workspace.confirm_rebase_action(id, cx);
                 true
             }).unwrap_or(false)).unwrap_or(false);
-            let abort_at = std::time::Instant::now();
-            loop {
+            let stage_at = std::time::Instant::now();
+            let staged_and_proven_resolved = loop {
+                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                let resolved = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
+                    workspace.rebase_conflict_count() == 0
+                        && workspace.rebase_conflict_context_status() == Some("resolved-by-git")
+                }).unwrap_or(false)).unwrap_or(false);
+                if resolved || stage_at.elapsed() > std::time::Duration::from_secs(20) { break resolved; }
+            };
+            let _ = window.update(|window, _| window.resize(size(px(1440.), px(900.))));
+            window.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            let resolved_capture = window.update(|window, _| {
+                window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-conflict-resolved-dark.png" } else { "rebase-conflict-resolved-light.png" })).map_err(Into::into)).is_ok()
+            }).unwrap_or(false);
+            let continue_after_resolution = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
+                workspace.close_rebase_conflict_sources(cx);
+                workspace.request_continue_rebase(cx);
+                let Some(id) = workspace.rebase_pending_action_id() else { return false; };
+                workspace.confirm_rebase_action(id, cx);
+                true
+            }).unwrap_or(false)).unwrap_or(false);
+            let conflict_continue_at = std::time::Instant::now();
+            let conflict_rebase_completed = loop {
                 window.background_executor().timer(std::time::Duration::from_millis(50)).await;
                 let done = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
-                    workspace.rebase_operation().is_some_and(|operation| operation.state == RebaseState::Aborted)
+                    workspace.rebase_operation().is_some_and(|operation| operation.state == RebaseState::Completed)
                 }).unwrap_or(false)).unwrap_or(false);
-                if done || abort_at.elapsed() > std::time::Duration::from_secs(20) { break; }
-            }
-            let _ = window.update(|window, _| window.resize(size(px(1440.), px(900.))));
-            window
-                .background_executor()
-                .timer(std::time::Duration::from_millis(250))
-                .await;
+                if done || conflict_continue_at.elapsed() > std::time::Duration::from_secs(20) { break done; }
+            };
+            let completed_result_persisted = window.background_executor().spawn({
+                let path = checkout.join("workflow.txt");
+                async move { fs::read_to_string(path).unwrap_or_default() }
+            }).await == "resolved-result-token\nresult-long-line-END\n";
             let post_rebase_guard = window.background_executor().spawn({
                 let checkout = checkout.clone();
                 async move {
@@ -1280,7 +1396,7 @@ fn start_smoke(
                 }
             };
             let report = format!(
-                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nrebase prepare requested: {}\npopulated three-commit plan ready: {}\nplan normal capture: {}\npending plan/message inputs disabled: {}\npending Drop handler preserved exact frozen Edit: {}\nfrozen plan/confirmation capture: {}\nCancel restored editing and explicit edit/reprepare: {}\nedit plan Start requested through confirmation: {}\nPausedForEdit observed: {}\nedit wide capture: {}\nexpanded operation details capture: {}\nexplicit Continue requested through confirmation: {}\nCompleted observed: {}\nresult normal capture: {}\nsafe archive requested and second prepare enabled: {}\nreordered conflict plan prepared: {}\nconflicting Start requested through confirmation: {}\nConflicted observed from real Git: {}\nconflict narrow capture: {}\nexplicit Abort requested through confirmation: {}\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nCreateBranch request outcome: {:?}\nCreateBranch dispatched while no-op refresh pending: {}\nCreateBranch completed authoritatively: {}\nCreateBranch terminal status/error: {}\nSwitchBranch request outcome: {:?}\nSwitchBranch dispatched: {}\nSwitchBranch completed authoritatively: {}\nSwitchBranch terminal status/error: {}\nsame-current SwitchBranch request outcome: {:?}\nsame-current SwitchBranch dispatched: {}\nsame-current SwitchBranch completed authoritatively: {}\nsame-current SwitchBranch terminal status/error: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
+                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nrebase prepare requested: {}\npopulated three-commit plan ready: {}\nplan normal capture: {}\npending plan/message inputs disabled: {}\npending Drop handler preserved exact frozen Edit: {}\nfrozen plan/confirmation capture: {}\nCancel restored editing and explicit edit/reprepare: {}\nedit plan Start requested through confirmation: {}\nPausedForEdit observed: {}\nedit wide capture: {}\nexpanded operation details capture: {}\nexplicit Continue requested through confirmation: {}\nCompleted observed: {}\nresult normal capture: {}\nsafe archive requested and second prepare enabled: {}\nreordered single-conflict plan prepared: {}\nconflicting Start requested through confirmation: {}\nConflicted observed from real Git with one exact path: {}\nconflict list narrow capture: {}\nsource/result presentation opened: {}\nDocumentStore result and immutable source proof ready: {}\nlabels, distinct source content, and exact OIDs pinned: {}\nthree source panes wide capture: {}\nexplicit source-selection narrow capture: {}\nactual result edit plus undo/redo: {}\nresult recovery persist reached Dirty before save: {}\nexplicit result save completed: {}\nsaved result exact readback: {}\nsaved result identity explicitly refreshed without replacing buffer: {}\nexact stage command requested through confirmation: {}\nGit proved the presented conflict resolved: {}\nresolved/stale-evidence capture: {}\nexplicit Continue after resolution requested: {}\nconflict rebase completed: {}\ncompleted checkout retained exact result: {}\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nCreateBranch request outcome: {:?}\nCreateBranch dispatched while no-op refresh pending: {}\nCreateBranch completed authoritatively: {}\nCreateBranch terminal status/error: {}\nSwitchBranch request outcome: {:?}\nSwitchBranch dispatched: {}\nSwitchBranch completed authoritatively: {}\nSwitchBranch terminal status/error: {}\nsame-current SwitchBranch request outcome: {:?}\nsame-current SwitchBranch dispatched: {}\nsame-current SwitchBranch completed authoritatively: {}\nsame-current SwitchBranch terminal status/error: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
                 if dark { "dark" } else { "light" },
                 prepare_requested,
                 plan_ready,
@@ -1300,8 +1416,23 @@ fn start_smoke(
                 conflict_requested,
                 conflict_started,
                 rebase_conflict,
-                conflict_capture,
-                abort_requested,
+                conflict_list_capture,
+                conflict_opened,
+                conflict_sources_ready,
+                source_identity_proof,
+                conflict_sources_wide_capture,
+                conflict_sources_narrow_capture,
+                result_edit_undo_redo,
+                result_persisted_dirty,
+                result_saved,
+                result_save_readback,
+                result_identity_refreshed,
+                stage_requested,
+                staged_and_proven_resolved,
+                resolved_capture,
+                continue_after_resolution,
+                conflict_rebase_completed,
+                completed_result_persisted,
                 opened,
                 edited,
                 readback.contains("highlighted local edit") && readback.contains("verified"),
