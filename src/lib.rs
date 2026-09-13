@@ -1,3 +1,4 @@
+pub mod comparisons;
 pub mod document;
 pub mod domain;
 pub mod local_git;
