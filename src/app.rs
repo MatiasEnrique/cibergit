@@ -592,6 +592,9 @@ struct ReviewTab {
     reply_thread: Option<cibergit::domain::ProviderCoordinates>,
     editing_pending_summary: bool,
     recovery_details_expanded: bool,
+    lifecycle_details_expanded: bool,
+    lifecycle_choice_pages: [usize; 3],
+    lifecycle_confirmation_details: bool,
     #[allow(dead_code)] // Reserved opaque presentation slot; this slice does not provision it.
     local_workspace: Option<AnyView>,
     local_visible: bool,
@@ -5168,6 +5171,9 @@ impl ReviewWorkspace {
             reply_thread: None,
             editing_pending_summary: false,
             recovery_details_expanded: false,
+            lifecycle_details_expanded: false,
+            lifecycle_choice_pages: [0; 3],
+            lifecycle_confirmation_details: false,
             local_workspace: None,
             local_visible: false,
         });
@@ -9839,7 +9845,7 @@ impl ReviewWorkspace {
                 .child(
                     tab.lifecycle_state
                         .notice()
-                        .unwrap_or_else(|| "Lifecycle metadata is loading.".into()),
+                        .unwrap_or_else(|| "Loading pull request details.".into()),
                 )
                 .into_any_element();
         };
@@ -9874,7 +9880,7 @@ impl ReviewWorkspace {
             .child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Mutable PR metadata"),
+                    .child("Pull request"),
             )
             .child(
                 div()
@@ -9882,10 +9888,8 @@ impl ReviewWorkspace {
                     .text_xs()
                     .text_color(colors.muted)
                     .child(format!(
-                        "Selected account {} · permission {} · observed {}",
-                        snapshot.viewer_login,
-                        snapshot.viewer_permission.as_deref().unwrap_or("unknown"),
-                        snapshot.updated_at
+                        "Signed in as {}",
+                        snapshot.viewer_login
                     )),
             )
             .when(!snapshot.values_complete || !snapshot.capabilities_complete, |panel| {
@@ -9925,7 +9929,7 @@ impl ReviewWorkspace {
                         .mt_2()
                         .text_xs()
                         .text_color(colors.muted)
-                        .child("Body · exact Markdown retained; media is not rendered"),
+                        .child("Description · Markdown"),
                 )
                 .child(
                     div()
@@ -9994,16 +9998,14 @@ impl ReviewWorkspace {
                     .mt_3()
                     .flex()
                     .gap_2()
-                    .child(
-                        action_link("Apply one change", colors).on_click(cx.listener(
-                            |root, _, _, cx| {
-                                if let Root::Review(this) = root {
-                                    this.apply_metadata_edit(cx);
-                                }
-                            },
-                        )),
-                    )
-                    .child(action_link("Cancel metadata", colors).on_click(cx.listener(
+                    .child(action_link("Review change…", colors).on_click(cx.listener(
+                        |root, _, _, cx| {
+                            if let Root::Review(this) = root {
+                                this.apply_metadata_edit(cx);
+                            }
+                        },
+                    )))
+                    .child(action_link("Cancel edit", colors).on_click(cx.listener(
                         |root, _, _, cx| {
                             if let Root::Review(this) = root
                                 && let Some(index) = this.active_tab
@@ -10030,7 +10032,7 @@ impl ReviewWorkspace {
                 .child(
                     div()
                         .mt_2()
-                        .child(action_link("Edit metadata", colors).on_click(cx.listener(
+                        .child(action_link("Edit details…", colors).on_click(cx.listener(
                             |root, _, window, cx| {
                                 if let Root::Review(this) = root {
                                     this.begin_metadata_edit(window, cx);
@@ -10080,14 +10082,37 @@ impl ReviewWorkspace {
                     },
                 ))),
         );
-        panel = panel
-            .child(capability("Metadata", &snapshot.can_update_metadata))
-            .child(capability("State", &snapshot.can_change_state))
-            .child(capability("Draft", &snapshot.can_change_draft))
-            .child(capability("Reviewers", &snapshot.can_request_reviewers))
-            .child(capability("Labels", &snapshot.can_change_labels))
-            .child(capability("Assignees", &snapshot.can_change_assignees))
-            .child(capability("Top-level comments", &snapshot.can_comment));
+        panel = panel.child(
+            action_link(
+                if tab.lifecycle_details_expanded {
+                    "Hide permissions"
+                } else {
+                    "Show permissions"
+                },
+                colors,
+            )
+            .mt_2()
+            .on_click(cx.listener(|root, _, _, cx| {
+                if let Root::Review(this) = root
+                    && let Some(index) = this.active_tab
+                {
+                    this.tabs[index].lifecycle_details_expanded =
+                        !this.tabs[index].lifecycle_details_expanded;
+                    cx.notify();
+                }
+            })),
+        );
+        if tab.lifecycle_details_expanded {
+            panel = panel
+                .child(compact_detail("Last updated", &snapshot.updated_at, colors))
+                .child(capability("Metadata", &snapshot.can_update_metadata))
+                .child(capability("State", &snapshot.can_change_state))
+                .child(capability("Draft", &snapshot.can_change_draft))
+                .child(capability("Reviewers", &snapshot.can_request_reviewers))
+                .child(capability("Labels", &snapshot.can_change_labels))
+                .child(capability("Assignees", &snapshot.can_change_assignees))
+                .child(capability("Comments", &snapshot.can_comment));
+        }
 
         let delta_group =
             |title: &'static str,
@@ -10101,21 +10126,80 @@ impl ReviewWorkspace {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(title),
                 );
-                for (label, action) in selected.into_iter().chain(available).take(18) {
+                let group_index = match title {
+                    "Reviewers" => 0,
+                    "Labels" => 1,
+                    _ => 2,
+                };
+                let choices = selected.into_iter().chain(available).collect::<Vec<_>>();
+                let total = choices.len();
+                let page_count = total.div_ceil(18).max(1);
+                let page = tab.lifecycle_choice_pages[group_index].min(page_count - 1);
+                for (label, action) in choices.into_iter().skip(page * 18).take(18) {
                     group = group.child(
-                        action_link_with_id(
-                            format!("lifecycle-delta-{title}-{label}"),
-                            "Change",
-                            colors,
-                        )
-                        .mt_1()
-                        .child(format!(" {label}"))
-                        .on_click(cx.listener(move |root, _, _, cx| {
-                            if let Root::Review(this) = root {
-                                this.prepare_lifecycle_action(action.clone(), cx);
-                            }
-                        })),
+                        action_link_with_id(format!("lifecycle-delta-{title}-{label}"), "", colors)
+                            .mt_1()
+                            .child(label)
+                            .on_click(cx.listener(move |root, _, _, cx| {
+                                if let Root::Review(this) = root {
+                                    this.prepare_lifecycle_action(action.clone(), cx);
+                                }
+                            })),
                     );
+                }
+                if page_count > 1 {
+                    group = group.child(
+                        div()
+                            .mt_2()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .when(page > 0, |row| {
+                                row.child(
+                                    action_link_with_id(
+                                        format!("lifecycle-{title}-previous"),
+                                        "Previous",
+                                        colors,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |root, _, _, cx| {
+                                            if let Root::Review(this) = root
+                                                && let Some(index) = this.active_tab
+                                            {
+                                                this.tabs[index].lifecycle_choice_pages
+                                                    [group_index] = page - 1;
+                                                cx.notify();
+                                            }
+                                        },
+                                    )),
+                                )
+                            })
+                            .child(div().text_xs().text_color(colors.muted).child(format!(
+                                "{}–{} of {total}",
+                                page * 18 + 1,
+                                ((page + 1) * 18).min(total)
+                            )))
+                            .when(page + 1 < page_count, |row| {
+                                row.child(
+                                    action_link_with_id(
+                                        format!("lifecycle-{title}-next"),
+                                        "Next",
+                                        colors,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |root, _, _, cx| {
+                                            if let Root::Review(this) = root
+                                                && let Some(index) = this.active_tab
+                                            {
+                                                this.tabs[index].lifecycle_choice_pages
+                                                    [group_index] = page + 1;
+                                                cx.notify();
+                                            }
+                                        },
+                                    )),
+                                )
+                            }),
+                    )
                 }
                 group.when(!complete, |group| {
                     group.child(div().mt_1().text_xs().text_color(colors.amber).child(
@@ -10256,40 +10340,76 @@ impl ReviewWorkspace {
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("Confirm exact PR mutation"),
+                        .child("Confirm change"),
                 )
-                .child(div().mt_1().text_xs().child(frozen.summary().to_owned()))
+                .child(render_lifecycle_change(frozen, colors))
                 .child(
                     div()
                         .mt_1()
                         .text_xs()
                         .text_color(colors.muted)
                         .child(format!(
-                            "{} · #{} · account {} · state {} · head {} · observed {}",
+                            "{} #{} · {} · {}",
                             target.repository.full_name(),
                             target.pull_request.pull_request,
                             target.repository.account.login,
-                            target.observed_state,
-                            short_sha(&target.observed_head_sha),
-                            target.observed_updated_at
+                            short_sha(&target.observed_head_sha)
                         )),
                 )
+                .child(
+                    action_link(
+                        if tab.lifecycle_confirmation_details {
+                            "Hide action details"
+                        } else {
+                            "Show action details"
+                        },
+                        colors,
+                    )
+                    .mt_2()
+                    .on_click(cx.listener(|root, _, _, cx| {
+                        if let Root::Review(this) = root
+                            && let Some(index) = this.active_tab
+                        {
+                            this.tabs[index].lifecycle_confirmation_details =
+                                !this.tabs[index].lifecycle_confirmation_details;
+                            cx.notify();
+                        }
+                    })),
+                )
+                .when(tab.lifecycle_confirmation_details, |card| {
+                    card.child(
+                        div()
+                            .mt_2()
+                            .text_xs()
+                            .text_color(colors.muted)
+                            .child(frozen.summary().to_owned()),
+                    )
+                    .child(compact_detail("State", &target.observed_state, colors))
+                    .child(compact_detail(
+                        "Observed",
+                        &target.observed_updated_at,
+                        colors,
+                    ))
+                    .child(compact_detail(
+                        "Head",
+                        &target.observed_head_sha,
+                        colors,
+                    ))
+                })
                 .child(
                     div()
                         .mt_3()
                         .flex()
                         .flex_wrap()
                         .gap_2()
-                        .child(
-                            action_link("Confirm exact action", colors).on_click(cx.listener(
-                                |root, _, _, cx| {
-                                    if let Root::Review(this) = root {
-                                        this.confirm_lifecycle_mutation(cx);
-                                    }
-                                },
-                            )),
-                        )
-                        .child(action_link("Cancel action", colors).on_click(cx.listener(
+                        .child(action_link("Confirm", colors).on_click(cx.listener(
+                            |root, _, _, cx| {
+                                if let Root::Review(this) = root {
+                                    this.confirm_lifecycle_mutation(cx);
+                                }
+                            },
+                        )))
+                        .child(action_link("Cancel", colors).on_click(cx.listener(
                             |root, _, _, cx| {
                                 if let Root::Review(this) = root
                                     && let Some(index) = this.active_tab
@@ -10372,7 +10492,7 @@ impl ReviewWorkspace {
                         ),
                         colors,
                     ));
-                    if !details.body.trim().is_empty() {
+                    if tab.lifecycle.snapshot.is_none() && !details.body.trim().is_empty() {
                         fields.push(markdown_detail(
                             format!("pr-description-{}", tab.pull_request.number),
                             "Description",
@@ -10394,20 +10514,13 @@ impl ReviewWorkspace {
                         .p_3()
                         .rounded_md()
                         .bg(colors.elevated)
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("Top-level discussion"),
-                        )
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Discussion"))
                         .child(
                             div()
                                 .mt_1()
                                 .text_xs()
                                 .text_color(colors.muted)
-                                .child(format!(
-                                    "Issue comments for account {} · separate from review threads",
-                                    snapshot.viewer_login
-                                )),
+                                .child(format!("Comment as {}", snapshot.viewer_login)),
                         );
                     if tab.lifecycle.discussion_form.is_some() {
                         composer = composer
@@ -10426,7 +10539,7 @@ impl ReviewWorkspace {
                                     .mt_2()
                                     .flex()
                                     .gap_2()
-                                    .child(action_link("Apply comment", colors).on_click(
+                                    .child(action_link("Review comment…", colors).on_click(
                                         cx.listener(|root, _, _, cx| {
                                             if let Root::Review(this) = root {
                                                 this.apply_discussion(cx);
@@ -10449,7 +10562,7 @@ impl ReviewWorkspace {
                             );
                     } else {
                         composer = composer.child(div().mt_2().child(
-                            action_link("New top-level comment", colors).on_click(cx.listener(
+                            action_link("Write a comment…", colors).on_click(cx.listener(
                                 |root, _, window, cx| {
                                     if let Root::Review(this) = root {
                                         this.begin_comment_create(window, cx);
@@ -10883,7 +10996,7 @@ impl ReviewWorkspace {
                                                     "edit-issue-comment-{}",
                                                     edit_comment.coordinates.remote_id
                                                 ),
-                                                "Edit exact comment",
+                                                "Edit comment…",
                                                 colors,
                                             )
                                             .on_click(
@@ -12171,6 +12284,54 @@ fn detail(label: &str, value: impl Into<String>, colors: Palette) -> Div {
                 .child(label.to_owned()),
         )
         .child(div().mt_1().child(value.into()))
+}
+
+fn render_lifecycle_change(frozen: &FrozenMutation, colors: Palette) -> Div {
+    let text = |label: &str, value: &str| {
+        div()
+            .mt_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(colors.muted)
+                    .child(label.to_owned()),
+            )
+            .child(div().mt_1().text_xs().child(if value.is_empty() {
+                "(empty)".to_owned()
+            } else {
+                value.to_owned()
+            }))
+    };
+    match frozen {
+        FrozenMutation::Lifecycle { request, .. } => match &request.action {
+            PullRequestLifecycleAction::UpdateTitle { observed, value }
+            | PullRequestLifecycleAction::UpdateBody { observed, value }
+            | PullRequestLifecycleAction::UpdateBaseBranch { observed, value } => div()
+                .child(div().mt_2().font_weight(FontWeight::SEMIBOLD).child(
+                    match &request.action {
+                        PullRequestLifecycleAction::UpdateTitle { .. } => "Title",
+                        PullRequestLifecycleAction::UpdateBody { .. } => "Description",
+                        _ => "Base branch",
+                    },
+                ))
+                .child(text("Current", observed))
+                .child(text("Replace with", value)),
+            _ => div().mt_2().text_xs().child(frozen.summary().to_owned()),
+        },
+        FrozenMutation::Discussion { request, .. } => match &request.action {
+            PullRequestDiscussionAction::Create { body } => div().child(text("Post comment", body)),
+            PullRequestDiscussionAction::Edit {
+                observed_body,
+                body,
+                ..
+            } => div()
+                .child(text("Current comment", observed_body))
+                .child(text("Replace with", body)),
+            PullRequestDiscussionAction::Delete { observed_body, .. } => {
+                div().child(text("Delete comment", observed_body))
+            }
+        },
+    }
 }
 
 fn compact_detail(label: &str, value: impl Into<String>, colors: Palette) -> Div {
