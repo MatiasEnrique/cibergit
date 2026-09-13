@@ -202,3 +202,22 @@ same isolated data directory for the two runs and remove it before starting a ne
 ## Native dependency notes
 
 `gpui-base = 0.6.1` supplies inputs and safe Markdown text views. `gpui-pre = 0.3.1` and `gpui-pre-platform = 0.3.1` select one compatible GPUI family, with transitive resolutions retained in `Cargo.lock`. The `font-kit` feature renders glyphs, and `runtime_shaders` compiles Metal source through the system runtime. The full Xcode application and standalone Metal compiler are not required for this development path; a precompiled-shader distribution build does require them.
+
+## Local app bundle
+
+Create an Apple Silicon `.app` with a local ad-hoc signature:
+
+```sh
+./scripts/package-app.sh --output target/package/cibergit-dev.app
+```
+
+The command builds the default development profile, honors `CARGO_TARGET_DIR`,
+includes license notices and build provenance, verifies the arm64 executable and
+bundle signature, and writes a file-hash manifest beside the bundle. The output
+path must be new; an existing app is never replaced. Use `--release` for an
+optimized build or `--ui-smoke` to include the opt-in background native capture
+harness. Normal bundles omit that harness.
+
+This ad-hoc signature uses no signing identity or credentials. It does not provide
+Developer ID distribution signing, notarization, or validation on macOS 15. Those
+remain separate release gates.
