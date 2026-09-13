@@ -40,15 +40,17 @@ Parent read/save callbacks at `052cd39` require the current tab lifetime and lat
 
 Notification enumeration remains under correction for valid non-PR subjects and endpoint page size (`art_57a400a6-7bbb-40c0-9bb9-01d065c02515` / `av_6c84e85f-5f56-4909-8f77-a10be238df76`). A diagnostic rerun of its ordinary fixture proved the three-second fake credential subprocess timed out before repository API dispatch. Only that fixture budget may increase to ten seconds; production and dedicated deadline tests are unchanged. Original failed and diagnostic output are retained.
 
-Active native BB assignments:
+All three bounded reviews have completed. Publish recovery ACCEPT is `art_9f077aef-da03-4f2b-bc40-31a00f8bde6a` / `av_5f881dd8-32d7-4aa5-b258-f7c50b9476f7` at worker `1fda5b1` / parent `ea28933`. Notification enumeration ACCEPT is `art_5c65907c-381d-4cde-8b34-8dbce7877ab1` / `av_b4578d44-e00c-492e-8779-dbda7ec728d8` at worker `d1276a60` / parent `ed6aabc`. Stack and separately scoped parent callback ACCEPT are `art_2e41f233-6641-4b2e-ac75-e1183367a13c` / `av_2fc1369b-a472-4d1a-a617-c6c0dc287e7c` at `f7c689c` / `e63b4a8`. Parent verified every report manifest and full readback hash. The integrated `ed6aabc` full suite passed 454/0/12; both strict Clippy configurations passed. Integrated light/dark Stack runs exited successfully and the full END marker was visually inspected. Report and logs: `art_07911a39-efc7-4c85-8c01-e5dda80cea2f` / `av_fb8a229d-7b66-4aa3-aeca-ef7de3c6bda3` revision2, 22 files / 2,714,337 bytes, full download hashes verified.
 
-| Worker | Deliverable | Source / workspace |
+Active native BB assignments, all isolated from exact `ed6aabc70cc81b9963cfb0c4034c80db7d9ea46a`:
+
+| Worker | Deliverable | Workspace / verified brief |
 | --- | --- | --- |
-| Grok `thr_n8enh59y37` | Frozen publish recovery independent recheck | `1fda5b1`; `/Users/matias/Development/cibergit-publish-recovery` |
-| Sol `thr_qiv5cnjysy` | Complete PR notification enumeration | `f634dda`; `/Users/matias/Development/cibergit-notification-enumeration` |
-| Grok `thr_bnxkhi5fz3` | Native Stack and separately scoped parent read/save callback review | `f7c689c` / `e63b4a8`; `/Users/matias/Development/cibergit-native-stack-view` |
+| Sol `thr_rtfg32b8ce` | Native PR creation, frozen form and durable admission | `/Users/matias/Development/cibergit-native-pr-creation`; `art_8aef5166-d8b6-4b89-81b0-d0d24648be80` / `av_6c0b50a1-fcf3-4626-a252-0ba2ac895d81` |
+| Sol `thr_k57rh8p6my` | In-app unread, exact mark-read and explicit macOS opt-in | `/Users/matias/Development/cibergit-native-notifications`; `art_6d2a4d76-2f06-49f4-b3a3-5706504b4313` / `av_1a003a15-39aa-4414-bc70-4cd7d08e95a2` |
+| Sol `thr_hs8k2a8rgv` | Attachment verification and conservative managed cleanup | `/Users/matias/Development/cibergit-native-checkout-cleanup`; `art_be9f7d23-a611-42b9-88de-112673d40312` / `av_1f34b305-c1ee-49da-aad5-cc06798b7b1a` |
 
-Consumed workers are archived/stopped. Preserve original preview PID43840 and its state. No live remote writes or auth/global changes. Native creation, notification delivery/sync, cleanup and full PR inventory remain required. The prepared creation brief is `art_63b16921-bbd2-4ed4-bd34-f7ee2a283594` / `av_452460b1-3de3-4d70-9750-5f3c957b2471`; it is not yet dispatched. Q60–Q66/Q68 and signing, physical-input and live-write gates remain explicit. Historical unclassified worktree-hook and same-current-branch incidents remain disclosed. G1–G5 and full V1 remain open.
+Consumed workers are archived/stopped. Preserve original preview PID43840 and its state. No live remote writes or auth/global changes. Native creation, notification delivery/sync, cleanup and full PR inventory remain required. Q60–Q66/Q68 and signing, physical-input and live-write gates remain explicit. Historical unclassified worktree-hook and same-current-branch incidents remain disclosed. G1–G5 and full V1 remain open.
 
 ## Reading and maintaining the ledger
 
@@ -86,14 +88,14 @@ Dependencies name tasks or `G0` through `G5`, the runnable milestone gates below
 | M2-PROGRESS | Full/commit/range/since-review selection and viewed progress; V08, R06 | M2 | G1, M2-REVIEW | C0 | running | Native4dee335 independently accepted; horizontal3d51bb3; local completion pending | art_94e5138f-e6a3-47b0-88b9-a3be5c6d346d |
 | M2-PR | PR lifecycle, metadata, reviewers and checks; F07, R07 | M2 | Accepted provider; G1 for final gate | C0 | running | Native lifecycle ce36e23 material review findings closed; broader PR/CI inventory pending | Integrated lifecycle evidence above |
 | M2-MERGE | Current-head requirement and explicit merge controls; R08, R09, E10 | M2 | M2-REVIEW, M2-PR | C0 | running | Backend56662a3; native confirmation22a4d15; reconciliationc3bb8bd accepted; final gate pending | art_25a4a81b-bb27-4e01-83ea-423c7ddc5ab5 |
-| M2-NOTIFY | Personal unread state and opt-in system notifications; S05 | M2 | M2-DISCUSS, M2-PR | Sol thr_qiv5cnjysy | running | Store integrated104cc9b; enumeration HOLD corrections; native delivery pending | Brief above |
+| M2-NOTIFY | Personal unread state and opt-in system notifications; S05 | M2 | M2-DISCUSS, M2-PR | Sol thr_k57rh8p6my | running | Store/enumeration ed6aabc accepted; native delivery underway | Reports and brief above |
 | M3-WORKTREE | Create/attach/reuse persistent PR checkouts; L01, L02 | M3 | G2 | C0 | running | Backend85af97c accepted; nativea69cc54 create/restart passed; attach/recovery/cleanup pending | Reports above |
 | M3-EDITOR | Focused editor, Edit locally, file browser and quick-open; L03-L05, F08 | M3 | M3-WORKTREE | C0 | running | Componente193ccc accepted; PR embeddinga69cc54 real-read native passed; full integration acceptance pending | art_dba381fa-731c-42c1-ba6d-86da28dd4fab |
 | M3-EXTERNAL | Disk/Git observation, safe saves and reconciliation; L06-L08, E11, E12 | M3 | M3-EDITOR | C0 | running | Document11a3a8e and componente193ccc accepted; full PR flow evidence pending | art_dba381fa-731c-42c1-ba6d-86da28dd4fab |
 | M3-GIT | Stage/unstage, commit, fetch/pull/push and branches; L09, S04, E06, E12 | M3 | M3-EXTERNAL | C0 | running | Gitd138c7c/componente193ccc accepted; temp native stage passed; PR-target publish mapping pending | Reports above |
-| M3-CREATE | Secondary normal/draft PR creation; L10 | M3 | M3-GIT, M2-PR | U | dependent | pending | pending |
-| M3-CLEAN | Safe persistent-worktree cleanup; L11 | M3 | M3-GIT | U | dependent | pending | pending |
-| M4-STACK | Native/inferred relationships, corrections and aggregate diff; K01-K03, E13 | M4 | G3, M1-SIDEBAR, M2-PROGRESS | Sol thr_uv2pauvq4f | running | Backend 3aa339b independently accepted; native linear view underway | Stack reports and brief above |
+| M3-CREATE | Secondary normal/draft PR creation; L10 | M3 | M3-GIT, M2-PR | Sol thr_rtfg32b8ce | running | Accepted provider; native form/admission underway | Brief above |
+| M3-CLEAN | Safe persistent-worktree cleanup; L11 | M3 | M3-GIT | Sol thr_hs8k2a8rgv | running | Accepted backend; native caller and buffer guards underway | Brief above |
+| M4-STACK | Native/inferred relationships, corrections and aggregate diff; K01-K03, E13 | M4 | G3, M1-SIDEBAR, M2-PROGRESS | C0 | running | Backend 3aa339b and native e63b4a8 independently accepted; sidebar grouping and G4 policy gates open | Stack reports above |
 | M4-REBASE | Linear graphical plan, edit/split and dirty preparation; B01-B03, E14 | M4 | Accepted M3 backend; G3 for final native gate | C0 | running | Lifecycle651037f and native N1 correction565b61f independently accepted | art_63cc3dbd-330a-43ae-a827-c4c6fe20b43e |
 | M4-CONFLICT | Editable three-way result, external resolution and recovery; B04, B05, E14 | M4 | M4-REBASE, accepted Document backend; native M3-EXTERNAL | Coordinator | running | Native three-way 4b5c43e independently accepted; final G4 input validation pending | Three-way reports above |
 | M4-PUBLISH | Inspect rewritten commits, explicit lease-protected push; B06, E15 | M4 | M4-CONFLICT, M3-GIT | Sol thr_2v3kfhzsmw | running | Destination/confirmation integrated6e6d5a9; exact recovery HOLD correction running | Brief above |
