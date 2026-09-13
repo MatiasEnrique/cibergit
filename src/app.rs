@@ -3,11 +3,12 @@ use crate::{
     ComposeInlineComment, ConfirmPrMutation, CycleDiffMode, DetailsNarrower, DetailsWider,
     DiffScrollEnd, DiffScrollHome, DiffScrollLeft, DiffScrollRight, EditPrMetadata,
     FileTreeActivate, FileTreeDown, FileTreeLeft, FileTreeNarrower, FileTreeRight, FileTreeUp,
-    FileTreeWider, MergePullRequest, NewPrDiscussion, NextFile, OpenRepositorySetup,
-    PostImmediateComment, PreviousFile, Refresh, ResetLayout, Save, SaveReviewDraft,
-    SelectFullComparison, SelectNextComparisonCommit, SelectPreviousComparisonCommit,
-    SelectSinceLastReview, SidebarNarrower, SidebarWider, SubmitReview, ToggleComparisonPicker,
-    ToggleFileTree, ToggleInspector, TogglePalette, ToggleSidebar,
+    FileTreeWider, MergePullRequest, NewPrDiscussion, NextFile, OpenRepositorySetup, OpenStackView,
+    PostImmediateComment, PreviousFile, Refresh, RefreshStackView, ResetLayout,
+    ReturnToPullRequest, Save, SaveReviewDraft, SelectFullComparison, SelectNextComparisonCommit,
+    SelectPreviousComparisonCommit, SelectSinceLastReview, SidebarNarrower, SidebarWider,
+    SubmitReview, ToggleComparisonPicker, ToggleFileTree, ToggleInspector, TogglePalette,
+    ToggleSidebar, ToggleStackRelationships,
 };
 mod comparison_picker;
 mod file_tree;
@@ -16,6 +17,7 @@ mod local_checkout;
 mod local_workspace;
 mod pr_lifecycle;
 mod review_interactions;
+mod stack_view;
 mod view_editor;
 
 #[cfg(feature = "ui-smoke")]
@@ -58,6 +60,9 @@ use review_interactions::{
     JournalStatus, ReviewInteractionController, ReviewReconciliationItem,
     ReviewReconciliationOutcome, dispatch_auxiliary, dispatch_merge, load_merge_preference,
     next_attempt_id, place_threads_with_canonical, save_merge_preference,
+};
+use stack_view::{
+    StackLoadState, StackViewController, boundary_label, load_stack, provenance_label,
 };
 use std::{
     cell::Cell,
@@ -614,6 +619,7 @@ struct ReviewTab {
     #[allow(dead_code)] // Reserved opaque presentation slot; this slice does not provision it.
     local_workspace: Option<AnyView>,
     local_visible: bool,
+    stack: StackViewController,
 }
 
 enum InteractionState {
@@ -682,6 +688,7 @@ enum InspectorSection {
 pub struct ReviewWorkspace {
     store: Option<Store>,
     interaction_root: PathBuf,
+    stack_data_root: PathBuf,
     workspace: WorkspaceState,
     persistence_error: Option<String>,
     accounts: Vec<cibergit::domain::Account>,
@@ -927,6 +934,7 @@ impl ReviewWorkspace {
         let mut this = Self {
             store,
             interaction_root,
+            stack_data_root: data_root,
             workspace,
             persistence_error,
             accounts: Vec::new(),
@@ -1226,6 +1234,10 @@ impl ReviewWorkspace {
         };
         if std::env::var_os("CIBERGIT_SMOKE_LOCAL_CHECKOUT").is_some() {
             local_checkout::start_smoke(cx.weak_entity(), output, window, cx);
+            return;
+        }
+        if std::env::var_os("CIBERGIT_SMOKE_STACK").is_some() {
+            self.start_stack_smoke(window, cx, output);
             return;
         }
         let second_pr = std::env::var("CIBERGIT_SMOKE_SECOND_PR")
@@ -2225,6 +2237,266 @@ impl ReviewWorkspace {
                     }
                     cx.quit();
                 });
+            })
+            .detach();
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn start_stack_smoke(&mut self, window: &mut Window, cx: &mut Context<Root>, output: PathBuf) {
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                let started = std::time::Instant::now();
+                let account = loop {
+                    let account = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| match root {
+                                Root::Review(this) => this.accounts.first().cloned(),
+                                Root::Editor(_) => None,
+                            })
+                            .ok()
+                            .flatten()
+                        })
+                        .ok()
+                        .flatten();
+                    if account.is_some() || started.elapsed() > Duration::from_secs(10) {
+                        break account;
+                    }
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                };
+                let public_read = if let Some(account) = account {
+                    let task = window.background_executor().spawn(async move {
+                        let provider = GithubProvider::new(account);
+                        let repo = provider.repository("cli/cli")?;
+                        provider.pull_request(&repo, 1).map(|pull| {
+                            format!(
+                                "Real public provider read: cli/cli #1 at {} with head {}",
+                                pull.state,
+                                short_sha(&pull.head_sha)
+                            )
+                        })
+                    });
+                    task.await.unwrap_or_else(|error| {
+                        format!("Real public provider read unavailable without changing auth: {error:#}")
+                    })
+                } else {
+                    "Real public provider read unavailable: no stored account was usable; auth was not changed."
+                        .into()
+                };
+                let data_root = output.join("stack-smoke-state");
+                let fixture = window
+                    .update(|_, _| stack_view::synthetic_stack_smoke(data_root))
+                    .unwrap_or_else(|error| Err(error.to_string()));
+                let (repository, pull_request, controller, fixture_report) = match fixture {
+                    Ok(fixture) => fixture,
+                    Err(error) => {
+                        let _ = std::fs::create_dir_all(&output);
+                        let _ = std::fs::write(
+                            output.join("native-stack-smoke.txt"),
+                            format!("Smoke failed: {error}\n{public_read}\n"),
+                        );
+                        panic!("native Stack smoke fixture failed: {error}");
+                    }
+                };
+                let installed = window
+                    .update(|window, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err("Stack smoke left review workspace".to_owned());
+                            };
+                            this.install_tab(repository, pull_request, cx);
+                            let index = this.active_tab.expect("installed Stack smoke tab");
+                            this.tabs[index].stack = controller;
+                            this.tabs[index].stack.visible = true;
+                            if let Some(key) = this.tabs[index]
+                                .stack
+                                .session
+                                .as_ref()
+                                .and_then(|session| {
+                                    session
+                                        .comparison()
+                                        .files
+                                        .iter()
+                                        .find(|file| file.path == "stack.rs")
+                                        .map(file_key)
+                                })
+                            {
+                                this.tabs[index].stack.select_file(&key, true);
+                            }
+                            this.tabs[index].stack.cycle_diff(true);
+                            this.tabs[index].stack.cycle_diff(true);
+                            this.status = "Synthetic linear Stack · read-only evidence".into();
+                            window.resize(size(px(1440.), px(900.)));
+                            cx.notify();
+                            Ok(())
+                        })
+                        .map_err(|error| error.to_string())?
+                    })
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                if let Err(error) = installed {
+                    panic!("native Stack smoke install failed: {error}");
+                }
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(700))
+                    .await;
+                let _ = std::fs::create_dir_all(&output);
+                let wide = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join("native-stack-wide.png"))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let _ = window.update(|window, cx| {
+                    window.resize(size(px(1040.), px(720.)));
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root
+                            && let Some(index) = this.active_tab
+                        {
+                            if let Some(session) = this.tabs[index].stack.session.as_mut() {
+                                session.set_diff_mode(DiffMode::Auto);
+                            }
+                            this.tabs[index].stack.rebuild(false);
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let narrow = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join("native-stack-narrow.png"))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let narrow_layers_opened = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return false };
+                            this.toggle_stack_relationships(cx);
+                            this.active_tab.is_some_and(|index| {
+                                this.tabs[index].stack.narrow_relationships_open
+                            })
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let narrow_layers = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join("native-stack-narrow-layers.png"))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let narrow_returned = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return false };
+                            this.toggle_stack_relationships(cx);
+                            this.active_tab.is_some_and(|index| {
+                                !this.tabs[index].stack.narrow_relationships_open
+                                    && this.tabs[index]
+                                        .stack
+                                        .session
+                                        .as_ref()
+                                        .and_then(ReviewSession::selected_file)
+                                        .is_some()
+                            })
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let maximum = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return 0. };
+                            let Some(index) = this.active_tab else { return 0. };
+                            let maximum = this.tabs[index]
+                                .stack
+                                .horizontal
+                                .max_offset()
+                                .x
+                                .as_f32();
+                            this.tabs[index]
+                                .stack
+                                .horizontal
+                                .set_offset(point(px(-maximum), px(0.)));
+                            cx.notify();
+                            maximum
+                        })
+                        .unwrap_or(0.)
+                    })
+                    .unwrap_or(0.);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let long_end = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join("native-stack-long-line-end.png"))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let report = format!(
+                    "Native Stack runnable smoke\n{public_read}\n{fixture_report}Wide split capture: {}\nNarrow unified capture: {}\nNarrow layers disclosure capture: {}\nNarrow disclosure opened through controller handler: {narrow_layers_opened}\nNarrow disclosure closed through the same handler and selected diff restored: {narrow_returned}\nLong-line end capture: {}\nHorizontal maximum: {maximum}px\nWindow focus requested: false\nRemote mutation transport: not invoked\nAggregate review/comment/merge/repair actions: absent\nOwn-scene capture does not establish physical input, AX, or acrylic behavior.\n",
+                    if wide { "native-stack-wide.png" } else { "failed" },
+                    if narrow { "native-stack-narrow.png" } else { "failed" },
+                    if narrow_layers {
+                        "native-stack-narrow-layers.png"
+                    } else {
+                        "failed"
+                    },
+                    if long_end { "native-stack-long-line-end.png" } else { "failed" },
+                );
+                let _ = std::fs::write(output.join("native-stack-smoke.txt"), report);
+                if !(wide
+                    && narrow
+                    && narrow_layers_opened
+                    && narrow_layers
+                    && narrow_returned
+                    && long_end
+                    && maximum > 0.)
+                {
+                    panic!("native Stack smoke assertions failed");
+                }
+                let _ = window.update(|_, cx| cx.quit());
             })
             .detach();
     }
@@ -5151,6 +5423,11 @@ impl ReviewWorkspace {
         let lifecycle = PrLifecycleController::new(repository.clone(), pull_request.number);
         self.tabs.push(ReviewTab {
             instance_generation: request_generation,
+            stack: StackViewController::new(
+                self.stack_data_root.clone(),
+                &repository,
+                pull_request.number,
+            ),
             repository,
             pull_request,
             session,
@@ -5198,6 +5475,10 @@ impl ReviewWorkspace {
         let index = self.tabs.len() - 1;
         self.active_tab = Some(index);
         self.setup_open = false;
+        #[cfg(feature = "ui-smoke")]
+        if std::env::var_os("CIBERGIT_SMOKE_STACK").is_some() {
+            return;
+        }
         if self.tabs[index].session.is_some() {
             self.rebuild_diff(index, self.wide);
             self.load_interactions(index, cx);
@@ -6573,6 +6854,7 @@ impl ReviewWorkspace {
                 };
                 match result {
                     Ok(pull_request) => {
+                        tab.stack.observe_selected_revision(&pull_request.head_sha);
                         if let Some(session) = &mut tab.canonical_session {
                             session.observe_revision(pull_request.revision());
                         }
@@ -7218,6 +7500,13 @@ impl ReviewWorkspace {
 
     fn navigate_file(&mut self, next: bool, _window: &mut Window, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].stack.visible {
+            if self.tabs[index].stack.navigate_file(next, self.wide) {
+                self.load_selected_stack_local_file(index, cx);
+                cx.notify();
+            }
+            return;
+        }
         if self.tabs[index].write_in_flight {
             self.status =
                 "File navigation is paused while this review write is being reconciled.".into();
@@ -7263,7 +7552,235 @@ impl ReviewWorkspace {
         self.navigate_file(false, window, cx);
     }
 
+    fn refresh_stack(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        self.refresh_stack_at(index, cx);
+    }
+
+    fn refresh_stack_at(&mut self, index: usize, cx: &mut Context<Root>) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let repository = tab.repository.clone();
+        let number = tab.pull_request.number;
+        let token = tab.stack.begin_refresh(&repository);
+        let store = tab.stack.store();
+        let task = cx.background_spawn(async move {
+            let provider = GithubProvider::new(repository.account.clone());
+            load_stack(&provider, &repository, number, &store)
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(tab_index) = this.tabs.iter().position(|tab| {
+                    tab.repository.cache_key() == token.repository_key()
+                        && tab.pull_request.number == token.selected_pull_request()
+                }) else {
+                    return;
+                };
+                if this.tabs[tab_index].stack.accept(&token, result, this.wide) {
+                    this.status = match &this.tabs[tab_index].stack.state {
+                        StackLoadState::Ready => "Stack snapshot ready · read only".into(),
+                        StackLoadState::Unavailable(reason) => {
+                            format!("Stack unavailable · {reason}")
+                        }
+                        StackLoadState::Idle | StackLoadState::Loading(_) => {
+                            "Reading Stack…".into()
+                        }
+                    };
+                    this.load_selected_stack_local_file(tab_index, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn load_selected_stack_local_file(&mut self, index: usize, cx: &mut Context<Root>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(path) = tab.repository.local_path.clone() else {
+            return;
+        };
+        let Some(token) = tab.stack.current_token() else {
+            return;
+        };
+        let Some(session) = tab.stack.session.as_ref() else {
+            return;
+        };
+        let Some(file) = session.selected_file() else {
+            return;
+        };
+        if file.patch.is_some() {
+            return;
+        }
+        let revision = session.revision().clone();
+        let selected_key = file_key(file);
+        let requested_key = selected_key.clone();
+        let task = cx.background_spawn(async move {
+            load_local_file(&path, &revision, &requested_key, false).map(|file| (revision, file))
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(tab_index) = this.tabs.iter().position(|tab| {
+                    tab.stack.accepts(&token)
+                        && tab
+                            .stack
+                            .session
+                            .as_ref()
+                            .and_then(ReviewSession::selected_file)
+                            .is_some_and(|file| file_key(file) == selected_key)
+                }) else {
+                    return;
+                };
+                match result {
+                    Ok((revision, file)) => {
+                        let installed = this.tabs[tab_index]
+                            .stack
+                            .session
+                            .as_mut()
+                            .is_some_and(|session| {
+                                session.install_file_patch(&revision, file).is_ok()
+                            });
+                        if installed {
+                            this.tabs[tab_index].stack.rebuild(this.wide);
+                        }
+                    }
+                    Err(error) => {
+                        this.tabs[tab_index].stack.feedback = Some(format!(
+                            "Selected local file is unavailable for this exact Stack pair: {error:#}"
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_stack(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        self.tabs[index].local_visible = false;
+        self.refresh_stack(cx);
+    }
+
+    fn return_to_pull_request(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        self.tabs[index].stack.capture_scroll();
+        self.tabs[index].stack.close();
+        self.status = "Published pull request review".into();
+        cx.notify();
+    }
+
+    fn toggle_stack_relationships(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if !self.tabs[index].stack.visible {
+            return;
+        }
+        self.tabs[index].stack.narrow_relationships_open =
+            !self.tabs[index].stack.narrow_relationships_open;
+        cx.notify();
+    }
+
+    fn set_stack_parent(
+        &mut self,
+        index: usize,
+        parent: cibergit::stacks::StackPullRequestId,
+        cx: &mut Context<Root>,
+    ) {
+        let repository = self.tabs[index].repository.clone();
+        match self.tabs[index]
+            .stack
+            .prepare_set_selected_parent(&repository, parent)
+        {
+            Ok(write) => self.dispatch_stack_correction(write, cx),
+            Err(error) => {
+                self.status = error;
+                cx.notify();
+            }
+        }
+    }
+
+    fn remove_stack_parent(&mut self, index: usize, cx: &mut Context<Root>) {
+        let repository = self.tabs[index].repository.clone();
+        match self.tabs[index]
+            .stack
+            .prepare_remove_selected_parent(&repository)
+        {
+            Ok(write) => self.dispatch_stack_correction(write, cx),
+            Err(error) => {
+                self.status = error;
+                cx.notify();
+            }
+        }
+    }
+
+    fn reset_stack_relationships(&mut self, index: usize, cx: &mut Context<Root>) {
+        let repository = self.tabs[index].repository.clone();
+        match self.tabs[index]
+            .stack
+            .prepare_reset_corrections(&repository)
+        {
+            Ok(write) => self.dispatch_stack_correction(write, cx),
+            Err(error) => {
+                self.status = error;
+                cx.notify();
+            }
+        }
+    }
+
+    fn dispatch_stack_correction(
+        &mut self,
+        write: stack_view::StackCorrectionWrite,
+        cx: &mut Context<Root>,
+    ) {
+        self.status = "Saving personal relationship locally…".into();
+        let task = cx.background_spawn(async move { write.execute() });
+        cx.spawn(async move |root, cx| {
+            let outcome = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(tab_index) = this
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.stack.accepts(&outcome.token))
+                else {
+                    return;
+                };
+                if !this.tabs[tab_index]
+                    .stack
+                    .accept_correction(&outcome.token, &outcome.result)
+                {
+                    return;
+                }
+                match outcome.result {
+                    Ok(message) => {
+                        this.status = message;
+                        this.refresh_stack_at(tab_index, cx);
+                    }
+                    Err(error) => {
+                        this.status = error;
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Root>) {
+        if self
+            .active_tab
+            .is_some_and(|index| self.tabs[index].stack.visible)
+        {
+            self.refresh_stack(cx);
+            return;
+        }
         self.refresh_all(cx);
         self.refresh_active(cx);
     }
@@ -7293,6 +7810,11 @@ impl ReviewWorkspace {
 
     fn cycle_diff(&mut self, _: &CycleDiffMode, _window: &mut Window, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].stack.visible {
+            self.tabs[index].stack.cycle_diff(self.wide);
+            cx.notify();
+            return;
+        }
         self.capture_scroll(index);
         if let Some(session) = &mut self.tabs[index].session {
             session.set_diff_mode(match session.diff_mode() {
@@ -7370,7 +7892,11 @@ impl ReviewWorkspace {
 
     fn scroll_diff_horizontally(&mut self, amount: Option<f32>, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
-        let handle = &self.tabs[index].diff_horizontal;
+        let handle = if self.tabs[index].stack.visible {
+            &self.tabs[index].stack.horizontal
+        } else {
+            &self.tabs[index].diff_horizontal
+        };
         let current = handle.offset();
         let maximum = handle.max_offset().x.as_f32();
         let target = match amount {
@@ -7534,6 +8060,26 @@ impl ReviewWorkspace {
             .on_action(cx.listener(|root, action: &Refresh, window, cx| {
                 if let Root::Review(this) = root {
                     this.refresh(action, window, cx)
+                }
+            }))
+            .on_action(cx.listener(|root, _: &OpenStackView, _, cx| {
+                if let Root::Review(this) = root {
+                    this.open_stack(cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &RefreshStackView, _, cx| {
+                if let Root::Review(this) = root {
+                    this.refresh_stack(cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &ToggleStackRelationships, _, cx| {
+                if let Root::Review(this) = root {
+                    this.toggle_stack_relationships(cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &ReturnToPullRequest, _, cx| {
+                if let Root::Review(this) = root {
+                    this.return_to_pull_request(cx);
                 }
             }))
             .on_action(cx.listener(|root, action: &NextFile, window, cx| {
@@ -7777,9 +8323,12 @@ impl ReviewWorkspace {
                 if let Root::Review(this) = root
                     && let Some(index) = this.active_tab
                 {
-                    this.tabs[index]
-                        .diff_horizontal
-                        .set_offset(point(px(0.), px(0.)));
+                    let handle = if this.tabs[index].stack.visible {
+                        &this.tabs[index].stack.horizontal
+                    } else {
+                        &this.tabs[index].diff_horizontal
+                    };
+                    handle.set_offset(point(px(0.), px(0.)));
                     cx.notify();
                 }
             }))
@@ -8870,6 +9419,11 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) -> AnyElement {
         let tab = &self.tabs[index];
+        if tab.stack.visible {
+            return self
+                .render_stack(index, colors, window, cx)
+                .into_any_element();
+        }
         if tab.local_visible
             && let Some(local) = tab.local_workspace.clone()
         {
@@ -8951,6 +9505,23 @@ impl ReviewWorkspace {
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .child(tab.pull_request.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id("open-stack-view")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .cursor_pointer()
+                                    .text_color(colors.accent)
+                                    .child("Stack  ⇧⌘S")
+                                    .on_click(cx.listener(|root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.open_stack(cx);
+                                        }
+                                    })),
                             )
                             .child(
                                 div()
@@ -9131,6 +9702,677 @@ impl ReviewWorkspace {
                     }),
             )
             .into_any_element()
+    }
+
+    fn render_stack(
+        &self,
+        index: usize,
+        colors: Palette,
+        _window: &Window,
+        cx: &mut Context<Root>,
+    ) -> impl IntoElement {
+        let stack = &self.tabs[index].stack;
+        let boundary = stack
+            .loaded
+            .as_ref()
+            .map(|loaded| boundary_label(&loaded.selection.effective_boundary))
+            .unwrap_or_else(|| "Net remaining stack".into());
+        let native = stack.loaded.as_ref().map(|loaded| {
+            let label = match loaded.native.availability {
+                cibergit::stacks::NativeStackAvailability::Complete => {
+                    "GitHub stack membership is complete"
+                }
+                cibergit::stacks::NativeStackAvailability::NotMember => {
+                    "No GitHub stack; relationships below are inferred or personal"
+                }
+                cibergit::stacks::NativeStackAvailability::Unsupported => {
+                    "GitHub stack membership is unsupported; relationships below are inferred or personal"
+                }
+                cibergit::stacks::NativeStackAvailability::Partial => {
+                    "GitHub stack membership is incomplete; verified gaps may use inferred or personal relationships"
+                }
+                cibergit::stacks::NativeStackAvailability::Capped => {
+                    "GitHub stack membership exceeded the safe read limit"
+                }
+            };
+            loaded
+                .native
+                .notice
+                .as_ref()
+                .map(|notice| format!("{label} · {notice}"))
+                .unwrap_or_else(|| label.into())
+        });
+        let relationship_summary = stack.loaded.as_ref().map(|loaded| {
+            let selected = loaded.resolution.selected.clone();
+            let provenance = loaded
+                .selection
+                .frozen_edges
+                .iter()
+                .find(|edge| edge.child == selected)
+                .map(|edge| provenance_label(edge.provenance))
+                .unwrap_or("Root");
+            format!(
+                "{} layers · selected #{}: {provenance}",
+                loaded.selection.frozen_layers.len(),
+                selected.number
+            )
+        });
+        div()
+            .key_context("StackView")
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .bg(colors.surface)
+            .child(
+                div()
+                    .px_5()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .id("return-from-stack")
+                                    .cursor_pointer()
+                                    .text_color(colors.accent)
+                                    .child("← Pull request  Esc")
+                                    .on_click(cx.listener(|root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.return_to_pull_request(cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!(
+                                        "#{} · Stack",
+                                        self.tabs[index].pull_request.number
+                                    )),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id("refresh-stack")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .cursor_pointer()
+                                    .text_color(colors.accent)
+                                    .child("Refresh Stack  ⌥⌘R")
+                                    .on_click(cx.listener(|root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.refresh_stack(cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("stack-diff-mode")
+                                    .px_2()
+                                    .cursor_pointer()
+                                    .text_color(colors.accent)
+                                    .child(
+                                        stack
+                                            .session
+                                            .as_ref()
+                                            .map(|session| match session.diff_mode() {
+                                                DiffMode::Auto => "Diff: Auto",
+                                                DiffMode::Unified => "Diff: Unified",
+                                                DiffMode::SideBySide => "Diff: Side by side",
+                                            })
+                                            .unwrap_or("Diff: Auto"),
+                                    )
+                                    .on_click(cx.listener(move |root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.tabs[index].stack.cycle_diff(this.wide);
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .text_color(colors.muted)
+                            .child(boundary)
+                            .when(self.wide, |row| {
+                                row.child("·")
+                                    .child("Read only · review each layer in its pull request")
+                            })
+                            .when_some(relationship_summary, |row, summary| {
+                                row.child("·").child(summary)
+                            })
+                            .when(!self.wide, |row| {
+                                row.child("·").child(
+                                    div()
+                                        .id("toggle-narrow-stack-relationships")
+                                        .cursor_pointer()
+                                        .text_color(colors.accent)
+                                        .child(if stack.narrow_relationships_open {
+                                            "Close layers  ⌥⌘L"
+                                        } else {
+                                            "Layers  ⌥⌘L"
+                                        })
+                                        .on_click(cx.listener(|root, _, _, cx| {
+                                            if let Root::Review(this) = root {
+                                                this.toggle_stack_relationships(cx);
+                                            }
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+            .when_some(native, |view, notice| {
+                view.child(
+                    div()
+                        .px_5()
+                        .py_2()
+                        .bg(colors.elevated)
+                        .text_color(colors.muted)
+                        .child(notice),
+                )
+            })
+            .when_some(stack.state.notice().map(str::to_owned), |view, notice| {
+                view.child(
+                    div()
+                        .px_5()
+                        .py_2()
+                        .bg(colors.elevated)
+                        .text_color(match stack.state {
+                            StackLoadState::Unavailable(_) => colors.amber,
+                            _ => colors.muted,
+                        })
+                        .child(notice),
+                )
+            })
+            .when_some(stack.feedback.clone(), |view, feedback| {
+                view.child(
+                    div()
+                        .px_5()
+                        .py_2()
+                        .bg(colors.elevated)
+                        .text_color(colors.amber)
+                        .child(feedback),
+                )
+            })
+            .child(
+                div()
+                    .id("stack-personal-relationships")
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .when(self.wide, |body| {
+                        body.child(self.render_stack_relationships(index, colors, cx))
+                    })
+                    .when(!self.wide && stack.narrow_relationships_open, |body| {
+                        body.child(self.render_stack_relationships(index, colors, cx))
+                    })
+                    .when(self.wide || !stack.narrow_relationships_open, |body| {
+                        body.child(self.render_stack_files(index, colors, cx))
+                            .child(self.render_stack_diff(index, colors))
+                    }),
+            )
+    }
+
+    fn render_stack_relationships(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> impl IntoElement {
+        let stack = &self.tabs[index].stack;
+        let layers = stack
+            .loaded
+            .as_ref()
+            .map(|loaded| loaded.selection.frozen_layers.clone())
+            .unwrap_or_default();
+        let edges = stack
+            .loaded
+            .as_ref()
+            .map(|loaded| loaded.selection.frozen_edges.clone())
+            .unwrap_or_default();
+        let choices = stack.correction_choices();
+        let has_personal = stack.loaded.as_ref().is_some_and(|loaded| {
+            loaded
+                .corrections
+                .corrections
+                .edges
+                .iter()
+                .any(|edge| edge.child.number == self.tabs[index].pull_request.number)
+        });
+        let has_any_personal = stack
+            .loaded
+            .as_ref()
+            .is_some_and(|loaded| !loaded.corrections.corrections.edges.is_empty());
+        let scroll = stack.relationship_scroll.clone();
+        let correction_scroll = stack.correction_scroll.clone();
+        let correction_editor_open = stack.correction_editor_open;
+        let layer_count = layers.len();
+        let choice_count = choices.len();
+        let root = cx.entity();
+        div()
+            .when(self.wide, |panel| panel.w(px(280.)).min_w(px(220.)))
+            .when(!self.wide, |panel| panel.w_full().min_w_0())
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(colors.border)
+            .bg(colors.canvas)
+            .child(
+                div()
+                    .h(px(38.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(format!("Layers  {layer_count}")),
+            )
+            .child(
+                div()
+                    .h(px(220.))
+                    .min_h(px(100.))
+                    .relative()
+                    .child(
+                        uniform_list(
+                            SharedString::from(format!("stack-layers-{index}")),
+                            layer_count,
+                            move |range: Range<usize>, _, _| {
+                                range
+                                    .map(|row| {
+                                        let layer = &layers[row];
+                                        let provenance = edges
+                                            .iter()
+                                            .find(|edge| edge.child == layer.id)
+                                            .map(|edge| provenance_label(edge.provenance))
+                                            .unwrap_or("Root");
+                                        div()
+                                            .h(px(52.))
+                                            .px_3()
+                                            .py_2()
+                                            .border_b_1()
+                                            .border_color(colors.border)
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .child(format!("#{}  {}", layer.id.number, layer.source.branch))
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(if provenance == "Personal" { colors.amber } else { colors.faint })
+                                                            .child(provenance),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .mt_1()
+                                                    .text_xs()
+                                                    .text_color(colors.muted)
+                                                    .child(format!("→ {} · {:?}", layer.target.branch, layer.state)),
+                                            )
+                                    })
+                                    .collect()
+                            },
+                        )
+                        .track_scroll(&scroll)
+                        .w_full()
+                        .h_full(),
+                    )
+                    .child(
+                        div().absolute().inset_0().child(
+                            Scrollbar::vertical(&scroll)
+                                .id(SharedString::from(format!("stack-layer-scrollbar-{index}")))
+                                .viewport_from_layout(),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("toggle-stack-personal-relationship-actions")
+                    .h(px(42.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .cursor_pointer()
+                    .text_color(colors.accent)
+                    .child("Edit personal relationship")
+                    .child(if correction_editor_open { "▾" } else { "▸" })
+                    .on_click(cx.listener(move |root, _, _, cx| {
+                        if let Root::Review(this) = root {
+                            this.tabs[index].stack.correction_editor_open =
+                                !this.tabs[index].stack.correction_editor_open;
+                            cx.notify();
+                        }
+                    })),
+            )
+            .when(correction_editor_open, |panel| {
+                panel.child(
+                    div()
+                        .id("stack-personal-relationship-actions")
+                        .h(px(268.))
+                        .flex_none()
+                        .min_h_0()
+                        .px_3()
+                        .py_3()
+                        .border_t_1()
+                        .border_color(colors.border)
+                        .overflow_y_scroll()
+                        .child(section_label("PERSONAL RELATIONSHIP FOR THIS PR", colors))
+                        .child(
+                        div()
+                            .mt_2()
+                            .text_xs()
+                            .text_color(colors.muted)
+                            .child("Local only. Choose a labelled parent, then Stack refreshes and validates the full relationship graph."),
+                        )
+                        .child(
+                            div()
+                                .id("stack-parent-choices")
+                                .mt_2()
+                                .h(px(120.))
+                                .min_h(px(72.))
+                                .relative()
+                                .child(
+                                    uniform_list(
+                                        SharedString::from(format!("stack-parent-options-{index}")),
+                                        choice_count,
+                                        move |range: Range<usize>, _, _| {
+                                            range
+                                                .map(|row| {
+                                                    let parent = choices[row].clone();
+                                                    let action_root = root.clone();
+                                                    let number = parent.number;
+                                                    div()
+                                                        .id(SharedString::from(format!("stack-parent-{number}")))
+                                                        .h(px(30.))
+                                                        .flex()
+                                                        .items_center()
+                                                        .cursor_pointer()
+                                                        .text_color(colors.accent)
+                                                        .child(format!("Use #{number} as parent"))
+                                                        .on_click(move |_, _, cx| {
+                                                            action_root.update(cx, |root, cx| {
+                                                                if let Root::Review(this) = root {
+                                                                    this.set_stack_parent(index, parent.clone(), cx);
+                                                                }
+                                                            });
+                                                        })
+                                                })
+                                                .collect()
+                                        },
+                                    )
+                                    .track_scroll(&correction_scroll)
+                                    .w_full()
+                                    .h_full(),
+                                )
+                                .child(
+                                    div().absolute().inset_0().child(
+                                        Scrollbar::vertical(&correction_scroll)
+                                            .id(SharedString::from(format!("stack-parent-scrollbar-{index}")))
+                                            .viewport_from_layout(),
+                                    ),
+                                ),
+                        )
+                        .when(has_personal, |panel| {
+                            panel.child(
+                                div()
+                                    .id("remove-stack-parent")
+                                    .mt_2()
+                                    .cursor_pointer()
+                                    .text_color(colors.amber)
+                                    .child("Remove this personal parent")
+                                    .on_click(cx.listener(move |root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.remove_stack_parent(index, cx);
+                                        }
+                                    })),
+                            )
+                        })
+                        .when(has_any_personal, |panel| {
+                            panel.child(
+                                div()
+                                    .id("reset-stack-relationships")
+                                    .mt_2()
+                                    .cursor_pointer()
+                                    .text_color(colors.red)
+                                    .child("Reset all personal relationships")
+                                    .on_click(cx.listener(move |root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.reset_stack_relationships(index, cx);
+                                        }
+                                    })),
+                            )
+                        }),
+                )
+            })
+    }
+
+    fn render_stack_files(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> impl IntoElement {
+        let stack = &self.tabs[index].stack;
+        let files = stack
+            .session
+            .as_ref()
+            .map(|session| session.comparison().files.clone())
+            .unwrap_or_default();
+        let selected = stack
+            .session
+            .as_ref()
+            .and_then(ReviewSession::selected_file)
+            .map(file_key);
+        let count = files.len();
+        let scroll = stack.file_scroll.clone();
+        let root = cx.entity();
+        div()
+            .w(px(250.))
+            .min_w(px(180.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(colors.border)
+            .bg(colors.canvas)
+            .child(
+                div()
+                    .h(px(38.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(format!("Changed files  {count}"))
+                    .child(div().text_xs().text_color(colors.muted).child("⌘[  ⌘]")),
+            )
+            .child(
+                uniform_list(
+                    SharedString::from(format!("stack-files-{index}")),
+                    count,
+                    move |range: Range<usize>, _, _| {
+                        range
+                            .map(|row| {
+                                let file = &files[row];
+                                let key = file_key(file);
+                                let click_key = key.clone();
+                                let click_root = root.clone();
+                                div()
+                                    .id(SharedString::from(format!("stack-file-{row}")))
+                                    .h(px(64.))
+                                    .px_3()
+                                    .py_2()
+                                    .border_b_1()
+                                    .border_color(colors.border)
+                                    .cursor_pointer()
+                                    .when(selected.as_deref() == Some(key.as_str()), |row| {
+                                        row.bg(colors.selected)
+                                    })
+                                    .child(
+                                        div()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .child(file.path.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt_1()
+                                            .h(px(16.))
+                                            .line_height(px(16.))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_xs()
+                                            .text_color(if file.patch.is_some() {
+                                                colors.muted
+                                            } else {
+                                                colors.faint
+                                            })
+                                            .child(if file.patch.is_some() {
+                                                format!("+{} −{}", file.additions, file.deletions)
+                                            } else {
+                                                "Metadata only · select for details".into()
+                                            }),
+                                    )
+                                    .on_click(move |_, _, cx| {
+                                        click_root.update(cx, |root, cx| {
+                                            if let Root::Review(this) = root
+                                                && this.tabs[index]
+                                                    .stack
+                                                    .select_file(&click_key, this.wide)
+                                            {
+                                                this.load_selected_stack_local_file(index, cx);
+                                                cx.notify();
+                                            }
+                                        });
+                                    })
+                            })
+                            .collect()
+                    },
+                )
+                .track_scroll(&scroll)
+                .flex_1()
+                .min_h_0(),
+            )
+    }
+
+    fn render_stack_diff(&self, index: usize, colors: Palette) -> impl IntoElement {
+        let stack = &self.tabs[index].stack;
+        let header = stack
+            .session
+            .as_ref()
+            .and_then(ReviewSession::selected_file)
+            .map(|file| {
+                if file.patch.is_some() {
+                    format!("{}   +{} −{}", file.path, file.additions, file.deletions)
+                } else {
+                    format!("{}   metadata only", file.path)
+                }
+            })
+            .unwrap_or_else(|| "Select a changed file".into());
+        let rows = stack.diff_rows.clone();
+        let count = rows.len();
+        let split = rows.iter().any(|row| matches!(row, DiffRow::Split(_)));
+        let vertical = stack.diff_scroll.clone();
+        let horizontal = stack.horizontal.clone();
+        let row_horizontal = horizontal.clone();
+        let text_width = if split {
+            split_text_content_width(&rows)
+        } else {
+            unified_text_content_width(&rows)
+        };
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(colors.surface)
+            .child(
+                div()
+                    .h(px(38.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .font_family(CODE_FONT)
+                    .text_sm()
+                    .child(header),
+            )
+            .when(split, |pane| {
+                pane.child(
+                    div()
+                        .h(px(24.))
+                        .flex()
+                        .font_family(CODE_FONT)
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .bg(colors.elevated)
+                        .border_b_1()
+                        .border_color(colors.border)
+                        .child(div().w_1_2().px_3().child("OLD"))
+                        .child(
+                            div()
+                                .w_1_2()
+                                .px_3()
+                                .border_l_1()
+                                .border_color(colors.border)
+                                .child("NEW"),
+                        ),
+                )
+            })
+            .child(if count == 0 {
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(colors.muted)
+                    .child("No text patch is available. Binary and media content is never loaded.")
+                    .into_any_element()
+            } else {
+                div()
+                    .id(SharedString::from(format!("stack-diff-horizontal-{index}")))
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(
+                        list(vertical, move |row, _, _| {
+                            render_read_only_diff_row(
+                                &rows[row],
+                                colors,
+                                &row_horizontal,
+                                text_width,
+                            )
+                        })
+                        .w_full()
+                        .h_full(),
+                    )
+                    .child(diff_horizontal_scrollbar(index + 10_000, &horizontal))
+                    .into_any_element()
+            })
     }
 
     fn render_comparison_picker(
@@ -12982,6 +14224,72 @@ fn render_diff_row(row: &DiffRow, colors: Palette) -> AnyElement {
             .text_xs()
             .child(split_cell(row.old.as_ref(), true, colors))
             .child(split_cell(row.new.as_ref(), false, colors))
+            .into_any_element(),
+        DiffRow::Thread(_) | DiffRow::Composer { .. } => div().into_any_element(),
+    }
+}
+
+fn render_read_only_diff_row(
+    row: &DiffRow,
+    colors: Palette,
+    horizontal: &ScrollHandle,
+    text_width: f32,
+) -> AnyElement {
+    match row {
+        DiffRow::Hunk(_) => render_diff_row(row, colors),
+        DiffRow::Unified(line) => {
+            let (background, foreground, marker) = line_colors(line.kind, colors);
+            div()
+                .h(px(24.))
+                .w_full()
+                .flex()
+                .items_center()
+                .bg(background)
+                .font_family(CODE_FONT)
+                .text_xs()
+                .child(line_number(line.old_line, colors))
+                .child(line_number(line.new_line, colors))
+                .child(
+                    div()
+                        .w(px(18.))
+                        .flex_none()
+                        .text_color(foreground)
+                        .child(marker),
+                )
+                .child(
+                    div()
+                        .id("stack-unified-source")
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .overflow_x_scroll()
+                        .restrict_scroll_to_axis()
+                        .track_scroll(horizontal)
+                        .child(line_text(&line.text, foreground).w(px(text_width)).h_full()),
+                )
+                .into_any_element()
+        }
+        DiffRow::Split(row) => div()
+            .h(px(24.))
+            .w_full()
+            .flex()
+            .overflow_hidden()
+            .font_family(CODE_FONT)
+            .text_xs()
+            .child(split_cell_scrolled(
+                row.old.as_ref(),
+                true,
+                colors,
+                horizontal,
+                text_width,
+            ))
+            .child(split_cell_scrolled(
+                row.new.as_ref(),
+                false,
+                colors,
+                horizontal,
+                text_width,
+            ))
             .into_any_element(),
         DiffRow::Thread(_) | DiffRow::Composer { .. } => div().into_any_element(),
     }

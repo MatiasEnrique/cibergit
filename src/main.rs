@@ -50,6 +50,10 @@ actions!(
         ApplyPrDiscussion,
         ConfirmPrMutation,
         CancelPrMutation,
+        OpenStackView,
+        RefreshStackView,
+        ToggleStackRelationships,
+        ReturnToPullRequest,
     ]
 );
 actions!(
@@ -192,6 +196,10 @@ fn main() {
             KeyBinding::new("ctrl-alt-shift-enter", ApplyPrDiscussion, None),
             KeyBinding::new("ctrl-alt-shift-m", ConfirmPrMutation, None),
             KeyBinding::new("ctrl-alt-escape", CancelPrMutation, None),
+            KeyBinding::new("cmd-shift-s", OpenStackView, None),
+            KeyBinding::new("cmd-alt-r", RefreshStackView, Some("StackView")),
+            KeyBinding::new("cmd-alt-l", ToggleStackRelationships, Some("StackView")),
+            KeyBinding::new("escape", ReturnToPullRequest, Some("StackView")),
             KeyBinding::new("up", FileTreeUp, Some("FileTree")),
             KeyBinding::new("down", FileTreeDown, Some("FileTree")),
             KeyBinding::new("left", FileTreeLeft, Some("FileTree")),

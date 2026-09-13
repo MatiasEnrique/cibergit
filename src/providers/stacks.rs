@@ -10,7 +10,7 @@ use crate::{
         validate_remaining_layer_heads,
     },
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
@@ -20,6 +20,20 @@ const MAX_NATIVE_STACK_PAGES: usize = 10;
 const MAX_REMOTE_PROOF_COMMITS: usize = 1_000;
 
 impl GithubProvider {
+    /// Read every pull request that can participate in repository-local stack
+    /// inference. A candidate set is returned only after two identical,
+    /// terminal, bounded reads; a page-limit prefix is never called complete.
+    pub fn stack_candidates(&self, repo: &Repository) -> Result<Vec<StackLayer>> {
+        self.validate_repo(repo)?;
+        let first = self.read_stack_candidates_once(repo)?;
+        let second = self.read_stack_candidates_once(repo)?;
+        ensure!(
+            first == second,
+            "Stack candidates moved during the bounded read; refresh to retry"
+        );
+        Ok(first)
+    }
+
     /// Read a stable native GitHub stack snapshot twice. Unsupported preview
     /// schema, partial data, movement, and caps remain explicit availability
     /// states so callers may use disclosed coordinate inference.
@@ -330,6 +344,41 @@ impl GithubProvider {
         unreachable!("bounded native stack loop returns")
     }
 
+    fn read_stack_candidates_once(&self, repo: &Repository) -> Result<Vec<StackLayer>> {
+        let mut session = Session::new(self);
+        let mut layers = Vec::new();
+        let mut seen = HashSet::new();
+        for page in 1..=MAX_NATIVE_STACK_PAGES {
+            let pulls: Vec<FrozenApiPull> = session.get(&format!(
+                "repos/{}/pulls?state=all&sort=created&direction=asc&per_page={NATIVE_STACK_PAGE_SIZE}&page={page}",
+                repo.full_name()
+            ))?;
+            ensure!(
+                pulls.len() <= NATIVE_STACK_PAGE_SIZE,
+                "Invalid stack candidate page size"
+            );
+            let terminal = pulls.len() < NATIVE_STACK_PAGE_SIZE;
+            for pull in pulls {
+                ensure!(
+                    seen.insert(pull.number),
+                    "Stack candidate pagination repeated a pull request"
+                );
+                layers.push(pull.into_candidate(repo)?);
+            }
+            ensure!(
+                layers.len() <= crate::stacks::MAX_STACK_LAYERS,
+                "Stack candidates exceed the bounded layer limit"
+            );
+            if terminal {
+                return Ok(layers);
+            }
+        }
+        bail!(
+            "Stack candidate read reached the {}-layer cap; no incomplete prefix was installed",
+            crate::stacks::MAX_STACK_LAYERS
+        )
+    }
+
     fn revalidate_stack_plan(&self, repo: &Repository, plan: &StackNetPlan) -> Result<()> {
         let mut session = Session::new(self);
         for frozen in &plan.frozen_layers {
@@ -563,7 +612,7 @@ fn layer_state(state: &str, merged: bool) -> Result<StackLayerState> {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct FrozenApiPull {
     number: u64,
     state: String,
@@ -574,7 +623,7 @@ struct FrozenApiPull {
     head: FrozenApiRef,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct FrozenApiRef {
     sha: String,
     #[serde(rename = "ref")]
@@ -582,18 +631,86 @@ struct FrozenApiRef {
     repo: Option<FrozenApiRepository>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct FrozenApiRepository {
     name: String,
     owner: FrozenApiOwner,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct FrozenApiOwner {
     login: String,
 }
 
 impl FrozenApiPull {
+    fn into_candidate(self, repo: &Repository) -> Result<StackLayer> {
+        ensure!(
+            self.number > 0
+                && self.html_url
+                    == format!(
+                        "https://{}/{}/pull/{}",
+                        repo.host,
+                        repo.full_name(),
+                        self.number
+                    ),
+            "GitHub returned a foreign stack candidate"
+        );
+        let target = frozen_repository(self.base.repo.as_ref())?
+            .context("Stack candidate target repository is unavailable")?;
+        ensure!(
+            target.matches_repo(repo),
+            "Stack candidate target repository does not match the selected repository"
+        );
+        let source = frozen_repository(self.head.repo.as_ref())?;
+        validate_sha(&self.base.sha)?;
+        validate_sha(&self.head.sha)?;
+        ensure!(
+            valid_branch(&self.base.branch) && valid_branch(&self.head.branch),
+            "Invalid stack candidate branch"
+        );
+        let state = if self.merged_at.is_some() {
+            StackLayerState::Merged
+        } else if self.state == "open" {
+            StackLayerState::Open
+        } else if self.state == "closed" {
+            StackLayerState::ClosedUnmerged
+        } else {
+            bail!("Invalid stack candidate state")
+        };
+        let merged_commit_oid = if state == StackLayerState::Merged {
+            self.merge_commit_sha
+        } else {
+            None
+        };
+        if let Some(oid) = &merged_commit_oid {
+            validate_sha(oid)?;
+        }
+        Ok(StackLayer {
+            id: StackPullRequestId {
+                repository: target.clone(),
+                number: self.number,
+            },
+            native_entry_id: None,
+            native_position: None,
+            source: StackRef {
+                repository: source,
+                branch: self.head.branch,
+                oid: self.head.sha.clone(),
+            },
+            target: StackRef {
+                repository: Some(target),
+                branch: self.base.branch,
+                oid: self.base.sha.clone(),
+            },
+            revision: Revision {
+                base_sha: self.base.sha,
+                head_sha: self.head.sha,
+            },
+            state,
+            merged_commit_oid,
+        })
+    }
+
     fn into_layer(self, repo: &Repository, frozen: &StackLayer) -> Result<StackLayer> {
         ensure!(
             self.number == frozen.id.number
@@ -1129,6 +1246,113 @@ print(json.dumps(step['response']))
             assert!(native.layers.is_empty());
             exhausted(dir.path(), 1);
         }
+    }
+
+    fn candidate_pull(number: u64, head: &str) -> Value {
+        json!({
+            "number": number,
+            "state": "open",
+            "merged_at": null,
+            "merge_commit_sha": null,
+            "html_url": format!("https://github.com/owner/repo/pull/{number}"),
+            "base": {
+                "sha": oid('a'),
+                "ref": "main",
+                "repo": {"name": "repo", "owner": {"login": "owner"}}
+            },
+            "head": {
+                "sha": head,
+                "ref": format!("feature-{number}"),
+                "repo": {"name": "repo", "owner": {"login": "owner"}}
+            }
+        })
+    }
+
+    #[test]
+    fn candidates_require_two_identical_complete_repository_reads() {
+        let pulls = json!([candidate_pull(1, &oid('b')), candidate_pull(2, &oid('c')),]);
+        let endpoint =
+            "repos/owner/repo/pulls?state=all&sort=created&direction=asc&per_page=100&page=1";
+        let (dir, provider) = fixture(vec![get(endpoint, pulls.clone()), get(endpoint, pulls)]);
+        let candidates = provider.stack_candidates(&repo()).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].revision.head_sha, oid('b'));
+        assert_eq!(candidates[1].source.branch, "feature-2");
+        exhausted(dir.path(), 2);
+    }
+
+    #[test]
+    fn moving_candidate_read_installs_no_stale_snapshot() {
+        let endpoint =
+            "repos/owner/repo/pulls?state=all&sort=created&direction=asc&per_page=100&page=1";
+        let (dir, provider) = fixture(vec![
+            get(endpoint, json!([candidate_pull(1, &oid('b'))])),
+            get(endpoint, json!([candidate_pull(1, &oid('c'))])),
+        ]);
+        let error = provider.stack_candidates(&repo()).unwrap_err().to_string();
+        assert!(error.contains("moved"));
+        exhausted(dir.path(), 2);
+    }
+
+    #[test]
+    fn candidate_hydration_freezes_merged_result_and_preserves_deleted_source() {
+        let endpoint =
+            "repos/owner/repo/pulls?state=all&sort=created&direction=asc&per_page=100&page=1";
+        let merged_oid = oid('d');
+        let merged = json!({
+            "number": 1,
+            "state": "closed",
+            "merged_at": "2026-09-13T00:00:00Z",
+            "merge_commit_sha": merged_oid,
+            "html_url": "https://github.com/owner/repo/pull/1",
+            "base": {"sha": oid('a'), "ref": "main", "repo": {"name": "repo", "owner": {"login": "owner"}}},
+            "head": {"sha": oid('b'), "ref": "removed", "repo": null}
+        });
+        let response = json!([merged]);
+        let (dir, provider) = fixture(vec![
+            get(endpoint, response.clone()),
+            get(endpoint, response),
+        ]);
+        let candidates = provider.stack_candidates(&repo()).unwrap();
+        assert_eq!(candidates[0].state, StackLayerState::Merged);
+        assert_eq!(
+            candidates[0].merged_commit_oid.as_deref(),
+            Some(merged_oid.as_str())
+        );
+        assert!(candidates[0].source.repository.is_none());
+        let error = resolve_stack(
+            &repo(),
+            &candidates[0].id,
+            &candidates,
+            &NativeStackRead::not_member(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unavailable source repository"));
+        exhausted(dir.path(), 2);
+    }
+
+    #[test]
+    fn full_candidate_page_limit_is_explicitly_incomplete() {
+        let mut steps = Vec::new();
+        for page in 1..=MAX_NATIVE_STACK_PAGES {
+            let first = (page - 1) * NATIVE_STACK_PAGE_SIZE + 1;
+            let pulls = (first..first + NATIVE_STACK_PAGE_SIZE)
+                .map(|number| candidate_pull(number as u64, &oid('b')))
+                .collect::<Vec<_>>();
+            steps.push(get(
+                &format!(
+                    "repos/owner/repo/pulls?state=all&sort=created&direction=asc&per_page=100&page={page}"
+                ),
+                json!(pulls),
+            ));
+        }
+        let (dir, provider) = fixture(steps);
+        let error = provider.stack_candidates(&repo()).unwrap_err().to_string();
+        assert!(error.contains("cap"));
+        assert!(error.contains("no incomplete prefix"));
+        exhausted(dir.path(), MAX_NATIVE_STACK_PAGES);
     }
 
     fn layer(
