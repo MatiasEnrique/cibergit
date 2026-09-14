@@ -77,7 +77,7 @@ files; it opens a compatibility screen directing you to the PR workspace.
   parents and children, and Return to activate the focused row. Next/previous file navigation
   follows the complete comparison order even when a destination directory is collapsed; its
   ancestors are expanded and the selected row is revealed.
-- Command-Shift-D cycles Auto, Unified, and Side-by-side diff modes. Auto responds to window width; explicit modes do not.
+- A review opens in Unified. Command-Shift-D cycles Auto, Unified, and Side-by-side diff modes, and the selected mode is remembered per pull request. Auto responds to window width; explicit modes do not.
 - The compact Compare bar above the diff switches among Full PR, one commit, a contiguous
   first-parent range, and Since review. Commit and range open the complete immutable commit list;
   each row shows the short and full OID plus its headline. Root commits, merge commits, reversed or

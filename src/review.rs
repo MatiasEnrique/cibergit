@@ -101,7 +101,9 @@ impl ReviewSession {
             file_indices: Arc::default(),
             available_revision: None,
             selected_file,
-            diff_mode: DiffMode::Auto,
+            // A review opens unified. Auto, which follows the window width, and
+            // side-by-side remain a keystroke away and are persisted per PR.
+            diff_mode: DiffMode::Unified,
             metadata: ComparisonMetadata::default(),
             viewed: HashMap::new(),
             scroll_positions: HashMap::new(),

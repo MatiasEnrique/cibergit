@@ -3948,9 +3948,40 @@ impl ReviewWorkspace {
                         .await;
                     captured
                 };
+                // A fresh session now opens unified, so the width-responsive
+                // layout has to be selected before it can be observed at all.
+                let default_mode_verified = if expect_restore {
+                    true
+                } else {
+                    window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                    this.wide
+                                        && this.tabs[index].session.as_ref().is_some_and(|session| session.diff_mode() == DiffMode::Unified)
+                                        && this.tabs[index].diff_rows.iter().all(|row| !matches!(row, DiffRow::Split(_)))
+                                }))
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                };
                 let auto_layout_verified = if expect_restore {
                     true
                 } else {
+                    let _ = window.update(|_, cx| {
+                        let _ = weak.update(cx, |root, cx| {
+                            if let Root::Review(this) = root
+                                && let Some(index) = this.active_tab
+                            {
+                                if let Some(session) = this.tabs[index].session.as_mut() {
+                                    session.set_diff_mode(DiffMode::Auto);
+                                }
+                                this.rebuild_diff(index, this.wide);
+                                cx.notify();
+                            }
+                        });
+                    });
                     let _ = window.update(|window, _| {
                         window.resize(size(px(1040.), px(720.)));
                     });
@@ -4004,6 +4035,7 @@ impl ReviewWorkspace {
                             this.run_primary_smoke_actions(
                                 second_pr,
                                 expect_restore,
+                                default_mode_verified,
                                 auto_layout_verified,
                                 window,
                                 cx,
@@ -9573,7 +9605,8 @@ impl ReviewWorkspace {
                             {
                                 this.tabs[index].stack.select_file(&key, true);
                             }
-                            this.tabs[index].stack.cycle_diff(true);
+                            // One cycle from the unified default reaches the
+                            // side-by-side capture this pair is meant to show.
                             this.tabs[index].stack.cycle_diff(true);
                             this.status = "Synthetic linear Stack · read-only evidence".into();
                             window.resize(size(px(1440.), px(900.)));
@@ -10588,6 +10621,7 @@ impl ReviewWorkspace {
         &mut self,
         second_pr: Option<u64>,
         expect_restore: bool,
+        default_mode_verified: bool,
         auto_layout_verified: bool,
         window: &mut Window,
         cx: &mut Context<Root>,
@@ -10621,10 +10655,6 @@ impl ReviewWorkspace {
         let branches = format!("{} -> {}", source_branch, target_branch);
         let revision = session.revision().head_sha.clone();
         let initial_mode = session.diff_mode();
-        let initial_rows_are_split = tab
-            .diff_rows
-            .iter()
-            .any(|row| matches!(row, DiffRow::Split(_)));
         let actual_diff_width = effective_diff_viewport_width(&tab.diff_rows, &tab.diff_horizontal);
         let calculated_diff_width = self.available_diff_width(window);
         if actual_diff_width <= 0.
@@ -10634,15 +10664,17 @@ impl ReviewWorkspace {
                 "actual diff viewport {actual_diff_width}px differs from pane calculation {calculated_diff_width}px"
             ));
         }
-        if !expect_restore
-            && (initial_mode != DiffMode::Auto || !self.wide || !initial_rows_are_split)
-        {
+        if !expect_restore && !default_mode_verified {
             return Err(format!(
-                "initial wide Auto layout was not split (pane {actual_diff_width}px)"
+                "a fresh wide session did not open unified (pane {actual_diff_width}px)"
             ));
         }
-        if expect_restore && initial_mode == DiffMode::Auto {
-            return Err("explicit diff mode did not restore with the tab".into());
+        // Unified is the default, so only side-by-side distinguishes a restored
+        // session from one that was created fresh and took the default.
+        if expect_restore && initial_mode != DiffMode::SideBySide {
+            return Err(format!(
+                "explicit side-by-side diff mode did not restore with the tab ({initial_mode:?})"
+            ));
         }
         if !auto_layout_verified {
             return Err(
@@ -10713,20 +10745,24 @@ impl ReviewWorkspace {
             return Err("reset-layout action did not restore file-tree width".into());
         }
 
-        if self.tabs[index]
-            .session
-            .as_ref()
-            .is_some_and(|session| session.diff_mode() == DiffMode::Auto)
-        {
+        let side_by_side = |this: &Self| {
+            this.tabs[index]
+                .session
+                .as_ref()
+                .is_some_and(|session| session.diff_mode() == DiffMode::SideBySide)
+        };
+        for _ in 0..3 {
+            if side_by_side(self) {
+                break;
+            }
             self.cycle_diff(&CycleDiffMode, window, cx);
         }
+        if !side_by_side(self) {
+            return Err("cycling never reached an explicit side-by-side diff mode".to_owned());
+        }
         window.resize(size(px(1040.), px(720.)));
-        if self.tabs[index]
-            .session
-            .as_ref()
-            .is_none_or(|session| session.diff_mode() == DiffMode::Auto)
-        {
-            return Err("diff mode was not explicit before resize".to_owned());
+        if !side_by_side(self) {
+            return Err("explicit side-by-side diff mode was lost by the narrow resize".to_owned());
         }
 
         if let Some(second) = second_pr
@@ -10743,7 +10779,7 @@ impl ReviewWorkspace {
         Ok(SmokeActions {
             primary_number: number,
             report: format!(
-                "Real read complete\nRepository: {}\nPR: #{number} {title}\nBranches: {branches}\nRevision: {revision}\nFiles: {file_count}\nSelected: {}\nSidebar and details reads: settled\n{saved_view_report}\nRestart restore observed: {restored}\nInitial actual diff pane: {actual_diff_width}px ({initial_mode:?})\nInitial wide Auto split: {}\nNarrow Auto unified: {}\nCollapsed-directory next/previous reveal: {original_key} -> {next_key} -> {returned_key}\nProgrammatic splitter adjustment and Reset layout: passed\ncli/cli#14130 Markdown probe source: {}\nExplicit diff mode survived narrow resize\n",
+                "Real read complete\nRepository: {}\nPR: #{number} {title}\nBranches: {branches}\nRevision: {revision}\nFiles: {file_count}\nSelected: {}\nSidebar and details reads: settled\n{saved_view_report}\nRestart restore observed: {restored}\nInitial actual diff pane: {actual_diff_width}px ({initial_mode:?})\nFresh session opened unified: {}\nSelected Auto: wide split -> narrow unified -> wide split: {}\nCollapsed-directory next/previous reveal: {original_key} -> {next_key} -> {returned_key}\nProgrammatic splitter adjustment and Reset layout: passed\ncli/cli#14130 Markdown probe source: {}\nExplicit side-by-side diff mode survived narrow and wide resize\n",
                 repository.full_name(),
                 self.tabs[index]
                     .session
@@ -10751,7 +10787,13 @@ impl ReviewWorkspace {
                     .and_then(ReviewSession::selected_file)
                     .map(|file| file.path.as_str())
                     .unwrap_or("none"),
-                !expect_restore,
+                if expect_restore {
+                    "covered by fresh light run"
+                } else if default_mode_verified {
+                    "passed"
+                } else {
+                    "failed"
+                },
                 if expect_restore {
                     "covered by fresh light run"
                 } else if auto_layout_verified {
@@ -10895,9 +10937,9 @@ impl ReviewWorkspace {
         if self.tabs[primary]
             .session
             .as_ref()
-            .is_none_or(|session| session.diff_mode() == DiffMode::Auto)
+            .is_none_or(|session| session.diff_mode() != DiffMode::SideBySide)
         {
-            return Err("explicit diff mode was lost after wide resize".to_owned());
+            return Err("explicit side-by-side diff mode was lost after wide resize".to_owned());
         }
         self.save_workspace();
         Ok(())

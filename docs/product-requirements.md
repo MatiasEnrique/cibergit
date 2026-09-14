@@ -32,7 +32,7 @@ Saved filters include title/number/branch search, author, reviewer, assignee, la
 
 ## Review workspace
 
-PRs open in tabs. Each tab preserves its selected file, scroll position, reviewed revision, and unfinished comments. A file tree drives one selected diff at a time, with next/previous-file navigation. Side-by-side is the default on wide windows; unified is the default on narrow windows. Remember an explicitly selected mode. See Q16 and Q26.
+PRs open in tabs. Each tab preserves its selected file, scroll position, reviewed revision, and unfinished comments. A file tree drives one selected diff at a time, with next/previous-file navigation. A review opens unified at any window width; the user instruction of 2026-09-14 supersedes the earlier width-dependent default. Auto, which still resolves to side-by-side on wide windows and unified on narrow ones, and explicit side-by-side remain selectable, and a selected mode is remembered. See Q16 and Q26.
 
 The PR header presents its title, branches, and review/merge actions. A collapsible right panel contains Overview, Activity, and Checks tabs. Review threads also appear inline in the diff. See Q27.
 
