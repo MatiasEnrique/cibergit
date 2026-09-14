@@ -32,6 +32,11 @@ use checks_view::{
     sha_label,
 };
 #[cfg(feature = "ui-smoke")]
+use cibergit::domain::{
+    ActionsLinkage, CheckAppIdentity, CheckKind, CheckShaClass, CheckSuiteIdentity,
+    ProviderCoordinates, PullRequestCheck, WorkflowRunIdentity,
+};
+#[cfg(feature = "ui-smoke")]
 use cibergit::participation::ReviewOperationPayload;
 use cibergit::{
     comparisons::{
@@ -3040,6 +3045,10 @@ impl ReviewWorkspace {
             self.start_general_sync_smoke(window, cx, output);
             return;
         }
+        if std::env::var_os("CIBERGIT_SMOKE_CHECKS").is_some() {
+            self.start_checks_smoke(window, cx, output);
+            return;
+        }
         if std::env::var_os("CIBERGIT_SMOKE_LOCAL_CHECKOUT").is_some() {
             local_checkout::start_smoke(cx.weak_entity(), output, window, cx);
             return;
@@ -4526,6 +4535,292 @@ impl ReviewWorkspace {
             composition_before.file_drafts.len(),
             submitted_before.drafts.len(),
             journal_before.len(),
+        ))
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn start_checks_smoke(&mut self, window: &mut Window, cx: &mut Context<Root>, output: PathBuf) {
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                let started = std::time::Instant::now();
+                let ready = loop {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.smoke_ready())
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready || started.elapsed() > Duration::from_secs(90) {
+                        break ready;
+                    }
+                };
+                let _ = std::fs::create_dir_all(&output);
+                if !ready {
+                    let failure = "Checks smoke timed out before the real read-only preparation settled.\n";
+                    let _ = std::fs::write(output.join("native-checks-readiness-failure.txt"), failure);
+                    panic!("{failure}");
+                }
+                let setup = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err("Checks smoke left the review workspace".to_owned());
+                            };
+                            this.install_checks_smoke_fixture(cx)
+                        })
+                        .unwrap_or_else(|error| Err(format!("Checks smoke entity unavailable: {error:#}")))
+                    })
+                    .unwrap_or_else(|error| Err(format!("Checks smoke window unavailable: {error:#}")));
+                let preparation = match setup {
+                    Ok(report) => report,
+                    Err(error) => {
+                        let failure = format!("Checks smoke fixture failed: {error}\n");
+                        let _ = std::fs::write(output.join("native-checks-fixture-failure.txt"), &failure);
+                        panic!("{failure}");
+                    }
+                };
+                let appearance = std::env::var("CIBERGIT_SMOKE_APPEARANCE")
+                    .unwrap_or_else(|_| "system".into());
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let first_name = format!("native-checks-source-{appearance}.png");
+                let first_capture = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| image.save(output.join(&first_name)).map_err(Into::into))
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let actions_ready = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return false };
+                            let Some(index) = this.active_tab else { return false };
+                            let ready = {
+                                let tab = &mut this.tabs[index];
+                                let Some(details) = tab.details.as_ref() else { return false };
+                                tab.checks_selection.move_selection(&details.checks, 40);
+                                tab.checks_selection.toggle_selected();
+                                tab.checks_selection.selected_id.as_deref()
+                                    == Some("SYNTHETIC-CHECK-40")
+                                    && tab.checks_selection.expanded_id.as_deref()
+                                        == Some("SYNTHETIC-CHECK-40")
+                            };
+                            this.scroll_selected_check_into_view(index);
+                            cx.notify();
+                            ready
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let actions_name = format!("native-checks-actions-{appearance}.png");
+                let actions_capture = actions_ready
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| image.save(output.join(&actions_name)).map_err(Into::into))
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let status_ready = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return false };
+                            let Some(index) = this.active_tab else { return false };
+                            let ready = {
+                                let tab = &mut this.tabs[index];
+                                let Some(details) = tab.details.as_ref() else { return false };
+                                tab.checks_selection.move_page(&details.checks, 1);
+                                tab.checks_selection.toggle_selected();
+                                tab.checks_selection.page == 2
+                                    && tab.checks_selection.selected_id.as_deref()
+                                        == Some("SYNTHETIC-CHECK-80")
+                                    && tab.checks_selection.expanded_id.as_deref()
+                                        == Some("SYNTHETIC-CHECK-80")
+                            };
+                            this.scroll_selected_check_into_view(index);
+                            cx.notify();
+                            ready
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let status_name = format!("native-checks-status-{appearance}.png");
+                let status_capture = status_ready
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| image.save(output.join(&status_name)).map_err(Into::into))
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let report = format!(
+                    "Native read-only Checks identity smoke ({appearance})\n{preparation}\nSynthetic presentation cases, clearly labelled: 81 bounded rows; complete linked Actions tuple at row 40; spoof-named unlinked CheckRun at row 41; Commit status at row 80\nPage size: 40; page-40 boundary and third page reached: {status_ready}\nSource page capture: {}\nExpanded complete Actions identity capture: {}\nExpanded Commit status capture: {}\nProvider completeness notice retained separately from the 81-row presentation count: true\nActual Root keyboard/navigation regression: separately executed as app::layout_tests::checks_native_navigation_reveals_offscreen_rows_and_preserves_exact_identity\nRemote transport after real preparation: 0; mutation transport: 0\nOS notification/prompt/foreground/focus calls from this capture fixture: 0\nPhysical input and AX are not claimed; internal Checks selection was advanced programmatically for deterministic background capture\n",
+                    if first_capture { &first_name } else { "failed" },
+                    if actions_capture { &actions_name } else { "failed" },
+                    if status_capture { &status_name } else { "failed" },
+                );
+                let _ = std::fs::write(
+                    output.join(format!("native-checks-{appearance}.txt")),
+                    report,
+                );
+                if !first_capture || !actions_capture || !status_capture {
+                    panic!("native Checks smoke capture failed");
+                }
+                let _ = window.update(|_, cx| cx.quit());
+            })
+            .detach();
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn install_checks_smoke_fixture(&mut self, cx: &mut Context<Root>) -> Result<String, String> {
+        let preparation = self.install_general_sync_smoke_fixture(cx)?;
+        let index = self
+            .active_tab
+            .ok_or_else(|| "Checks smoke has no active tab".to_owned())?;
+        let tab = &mut self.tabs[index];
+        let repository = tab.repository.clone();
+        let number = tab.pull_request.number;
+        let pinned_before = serde_json::to_vec(&tab.session).map_err(|error| error.to_string())?;
+        let canonical_before = tab.canonical_full_revision.clone();
+        let composition_before = match &tab.interactions {
+            InteractionState::Ready(controller) => controller.composition.clone(),
+            _ => return Err("Checks smoke interaction controller is not ready".into()),
+        };
+        let submitted_before = tab.submitted_summary_editor.current_snapshot();
+        let journal_before = tab.journal_operations.clone();
+        let selected_file_before = tab
+            .session
+            .as_ref()
+            .and_then(ReviewSession::selected_file)
+            .map(file_key);
+        let details = tab
+            .details
+            .as_mut()
+            .ok_or_else(|| "Checks smoke has no real provider details".to_owned())?;
+        let base = details
+            .base_repository
+            .clone()
+            .ok_or_else(|| "real provider details omitted base repository identity".to_owned())?;
+        let head = details
+            .observed_head_sha
+            .clone()
+            .ok_or_else(|| "real provider details omitted observed head".to_owned())?;
+        let check = |index: usize| PullRequestCheck {
+            coordinates: ProviderCoordinates {
+                provider: "github".into(),
+                host: repository.host.clone(),
+                owner: repository.owner.clone(),
+                repository: repository.name.clone(),
+                pull_request: number,
+                remote_id: format!("SYNTHETIC-CHECK-{index}"),
+            },
+            kind: CheckKind::CheckRun,
+            name: format!("Synthetic read-only check {index}"),
+            status: "COMPLETED".into(),
+            conclusion: Some("SUCCESS".into()),
+            description: None,
+            details_url: Some(format!("https://integrator.invalid/build/{index}")),
+            github_permalink: Some(format!(
+                "https://github.com/{}/{}/runs/{}",
+                repository.owner,
+                repository.name,
+                10_000 + index
+            )),
+            started_at: None,
+            completed_at: None,
+            required: None,
+            database_id: None,
+            suite: None,
+            commit_sha: Some(head.clone()),
+            commit_repository: Some(base.clone()),
+            sha_class: CheckShaClass::Head,
+            actions_linkage: ActionsLinkage::Unknown,
+        };
+        let mut checks = (0..81).map(check).collect::<Vec<_>>();
+        checks[40].name = "Synthetic complete linked workflow".into();
+        checks[40].required = Some(true);
+        checks[40].database_id = Some(10_040);
+        checks[40].suite = Some(CheckSuiteIdentity {
+            node_id: "SYNTHETIC-SUITE-40".into(),
+            database_id: Some(20_040),
+            repository: base.clone(),
+            app: Some(CheckAppIdentity {
+                node_id: "SYNTHETIC-APP-40".into(),
+                name: "Synthetic Builder".into(),
+                slug: "synthetic-builder".into(),
+            }),
+        });
+        checks[40].actions_linkage = ActionsLinkage::Linked(WorkflowRunIdentity {
+            node_id: "SYNTHETIC-RUN-40".into(),
+            database_id: 30_040,
+            run_attempt: 2,
+            run_number: 44,
+            event: "pull_request".into(),
+            github_url: format!(
+                "https://github.com/{}/{}/actions/runs/30040",
+                repository.owner, repository.name
+            ),
+            workflow_node_id: "SYNTHETIC-WORKFLOW-40".into(),
+            workflow_database_id: 40_040,
+            workflow_name: "Synthetic CI".into(),
+        });
+        checks[41].name = "GitHub Actions spoof name, no observed workflow relation".into();
+        checks[41].actions_linkage = ActionsLinkage::NoObservedLink;
+        checks[80].kind = CheckKind::CommitStatus;
+        checks[80].name = "Synthetic commit status named GitHub Actions".into();
+        checks[80].github_permalink = None;
+        checks[80].details_url = Some("https://status.invalid/result".into());
+        checks[80].actions_linkage = ActionsLinkage::NoObservedLink;
+        details.checks = checks;
+        details.checks_complete = false;
+        tab.inspector_section = InspectorSection::Checks;
+        tab.checks_selection = ChecksSelection::default();
+        tab.checks_selection.reconcile(&details.checks);
+        self.inspector_open = true;
+        self.inspector_scroll.set_offset(point(px(0.), px(0.)));
+        let preserved = pinned_before
+            == serde_json::to_vec(&tab.session).map_err(|error| error.to_string())?
+            && canonical_before == tab.canonical_full_revision
+            && composition_before
+                == match &tab.interactions {
+                    InteractionState::Ready(controller) => controller.composition.clone(),
+                    _ => return Err("Checks smoke interaction controller disappeared".into()),
+                }
+            && submitted_before == tab.submitted_summary_editor.current_snapshot()
+            && journal_before == tab.journal_operations
+            && selected_file_before
+                == tab
+                    .session
+                    .as_ref()
+                    .and_then(ReviewSession::selected_file)
+                    .map(file_key);
+        if !preserved {
+            return Err("Checks presentation changed pinned or local recovery state".into());
+        }
+        cx.notify();
+        Ok(format!(
+            "{preparation}\nReal provider details supplied PR/base/head identity before synthetic rows: true\nExact nonempty line draft, FILE draft, submitted-summary draft, local journal operation, pinned comparison and selected file preserved after Checks installation: true"
         ))
     }
 

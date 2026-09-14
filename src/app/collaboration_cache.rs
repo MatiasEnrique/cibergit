@@ -711,6 +711,7 @@ fn validate_check_identities(identity: &CacheIdentity, details: &PullRequestDeta
         }
     }
     for check in &details.checks {
+        validate_cached_node_id(&check.coordinates.remote_id)?;
         if let Some(sha) = &check.commit_sha {
             validate_cached_sha(sha)?;
         }
@@ -729,6 +730,7 @@ fn validate_check_identities(identity: &CacheIdentity, details: &PullRequestDeta
             validate_cached_check_origin(identity, details, repository)?;
         }
         if let Some(suite) = &check.suite {
+            validate_cached_node_id(&suite.node_id)?;
             validate_cached_check_origin(identity, details, &suite.repository)?;
             validate_cached_graphql_database_id(suite.database_id)?;
             if check.kind != CheckKind::CheckRun
@@ -1397,6 +1399,53 @@ mod tests {
 
         assert!(cache.load(&repo, 7).is_err());
         assert_eq!(fs::read(record_path).unwrap(), foreign_bytes);
+    }
+
+    #[test]
+    fn malformed_cached_check_and_suite_node_ids_are_rejected_and_preserved() {
+        for defect in ["check-remote-id", "suite-node-id"] {
+            let root = tempfile::tempdir().unwrap();
+            let cache = CollaborationCache::new(root.path().to_owned());
+            let repo = repository("octo", "one", "alice");
+            let base = CheckRepositoryIdentity {
+                node_id: "R-base".into(),
+                name_with_owner: "octo/one".into(),
+            };
+            let mut value = details(&repo, 7, defect);
+            value.pull_request_node_id = Some("PR-current".into());
+            value.base_repository = Some(base.clone());
+            value.observed_head_sha = Some("a".repeat(40));
+            value.head_repository = Some(base.clone());
+            value.rollup_commit_sha = Some("a".repeat(40));
+            value.rollup_repository = Some(base.clone());
+            value.checks[0].commit_sha = Some("a".repeat(40));
+            value.checks[0].commit_repository = Some(base.clone());
+            value.checks[0].sha_class = CheckShaClass::Head;
+            value.checks[0].suite = Some(CheckSuiteIdentity {
+                node_id: "SUITE-current".into(),
+                database_id: Some(10),
+                repository: base,
+                app: None,
+            });
+            save(&cache, &repo, 7, &value);
+            let record_path = cache.root.join(CacheIdentity::new(&repo, 7).filename());
+            let mut record: CacheRecord =
+                serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+            match defect {
+                "check-remote-id" => {
+                    record.details.checks[0].coordinates.remote_id = "bad check id".into()
+                }
+                "suite-node-id" => {
+                    record.details.checks[0].suite.as_mut().unwrap().node_id = "bad\0suite".into()
+                }
+                _ => unreachable!(),
+            }
+            let malformed = serde_json::to_vec(&record).unwrap();
+            private_write(&record_path, &malformed);
+
+            assert!(cache.load(&repo, 7).is_err(), "{defect}");
+            assert_eq!(fs::read(record_path).unwrap(), malformed, "{defect}");
+        }
     }
 
     #[test]
