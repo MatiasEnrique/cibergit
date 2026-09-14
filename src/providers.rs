@@ -16,9 +16,10 @@ use crate::domain::{
     Comparison, DismissalAuthority, FreshReactionCapability, FreshReviewDismissalCapability,
     IssueComment, LinkedReviewComment, MergeAcknowledgement, MergeAction, MergeEligibility,
     MergeExecutionRequest, MergeMethod, MergePreparation, MutationContext,
-    PendingFileCommentSource, PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome,
-    PullRequest, PullRequestCheck, PullRequestCheckoutSource, PullRequestDetails,
-    PullRequestReview, ReactableKind, ReactionContent, ReactionGroupSnapshot, ReactionSnapshot,
+    PendingFileCommentSource, PendingFileReviewAbsence, PendingReviewObservation,
+    PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome, PullRequest,
+    PullRequestCheck, PullRequestCheckoutSource, PullRequestDetails, PullRequestReview,
+    ReactableKind, ReactionContent, ReactionGroupSnapshot, ReactionSnapshot,
     ReactionSubjectSnapshot, Repository, ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryAction,
     ReviewAuxiliaryRequest, ReviewComment, ReviewSubject, ReviewThread, ReviewWriteAcknowledgement,
     Revision, SelectedViewer, SubmittedReviewEditCapability, WorkflowRunIdentity,
@@ -50,6 +51,7 @@ mod actions_jobs_logs;
 mod conditional;
 mod general_sync;
 pub mod notifications;
+mod pending_review_start;
 mod pr_lifecycle;
 mod reactions;
 mod review_dismissal;
@@ -61,6 +63,7 @@ pub use general_sync::{
     GeneralReadCache, GeneralReadDelay, GeneralReadDirective, GeneralReadFailureKind,
     GeneralReadOutcome,
 };
+pub use pending_review_start::{PreparedPendingFileStartThread, PreparedPendingReviewCreate};
 pub use pr_lifecycle::{AdmittedMutationAttempt, MutationAdmission};
 
 const HOST: &str = "github.com";
@@ -297,6 +300,16 @@ impl GithubProvider {
         repo: &Repository,
         number: u64,
     ) -> Result<Option<PendingReviewSnapshot>> {
+        Ok(self.pending_review_observation(repo, number)?.snapshot)
+    }
+
+    /// Import the selected pending review and, only for a complete exact zero
+    /// result, expose a nonserialized absence capability for FILE review start.
+    pub fn pending_review_observation(
+        &self,
+        repo: &Repository,
+        number: u64,
+    ) -> Result<PendingReviewObservation> {
         self.validate_repo(repo)?;
         ensure!(number > 0 && number <= i32::MAX as u64, "Invalid PR number");
         Session::new(self).pending_review(repo, number)
@@ -2441,7 +2454,7 @@ impl<'a> Session<'a> {
         &mut self,
         repo: &Repository,
         number: u64,
-    ) -> Result<Option<PendingReviewSnapshot>> {
+    ) -> Result<PendingReviewObservation> {
         let response: GraphqlResult<PendingReviewData> = self.graphql(
             PENDING_REVIEW_QUERY,
             json!({"owner": repo.owner, "name": repo.name, "number": number}),
@@ -2487,7 +2500,22 @@ impl<'a> Session<'a> {
             !pull.reviews.page_info.has_next_page && pull.reviews.nodes.iter().all(Option::is_some),
             "Pending-review list exceeds the explicit 100-review import bound"
         );
-        let mut selected = pull.reviews.nodes.into_iter().flatten().filter(|review| {
+        let pending_rows = pull.reviews.nodes.into_iter().flatten().collect::<Vec<_>>();
+        // Legacy import may continue to ignore another account's row, but the
+        // new create path cannot derive absence unless every returned row is
+        // positively classifiable as a PENDING review belonging to a concrete
+        // actor. Unknown rows are not evidence that the selected account has
+        // no pending review.
+        let all_pending_rows_classifiable = pending_rows.iter().all(|review| {
+            review.state == "PENDING"
+                && validate_node_id(&review.id).is_ok()
+                && review.author.as_ref().is_some_and(|author| {
+                    !author.login.is_empty()
+                        && author.login.len() <= 1024
+                        && !author.login.contains(['\0', '\n', '\r'])
+                })
+        });
+        let mut selected = pending_rows.into_iter().filter(|review| {
             review.author.as_ref().is_some_and(|author| {
                 author
                     .login
@@ -2495,7 +2523,31 @@ impl<'a> Session<'a> {
             })
         });
         let Some(review) = selected.next() else {
-            return Ok(None);
+            let absence = (pull.state.as_deref() == Some("OPEN")
+                && pull
+                    .id
+                    .as_ref()
+                    .is_some_and(|id| validate_node_id(id).is_ok())
+                && pull.base_ref_oid.is_some()
+                && pull.head_ref_oid.is_some()
+                && viewer_login.as_ref().is_some_and(|viewer| {
+                    !viewer.is_empty()
+                        && viewer.len() <= 1024
+                        && !viewer.contains(['\0', '\n', '\r'])
+                })
+                && all_pending_rows_classifiable)
+                .then(|| PendingFileReviewAbsence {
+                    viewer_login: viewer_login.expect("checked"),
+                    repository: repo.clone(),
+                    pull_request: coordinates(repo, number, pull.id.expect("checked")),
+                    pull_request_state: pull.state.expect("checked"),
+                    current_base_sha: pull.base_ref_oid.expect("checked"),
+                    current_head_sha: pull.head_ref_oid.expect("checked"),
+                });
+            return Ok(PendingReviewObservation {
+                snapshot: None,
+                absence,
+            });
         };
         ensure!(
             selected.next().is_none(),
@@ -2559,22 +2611,25 @@ impl<'a> Session<'a> {
                 .map(|commit| commit.oid.clone())
                 .unwrap_or_default(),
         });
-        Ok(Some(PendingReviewSnapshot {
-            review: PullRequestReview {
-                coordinates: coordinates(repo, number, review.id),
-                author: review.author.map(|author| author.login),
-                body: review.body,
-                state: review.state,
-                submitted_at: review.submitted_at,
-                commit_sha: review.commit.map(|commit| commit.oid),
-                edit_summary_capability: None,
-                dismissal_capability: None,
-                url: review.url,
-            },
-            comments,
-            comments_complete,
-            file_comment_source,
-        }))
+        Ok(PendingReviewObservation {
+            snapshot: Some(PendingReviewSnapshot {
+                review: PullRequestReview {
+                    coordinates: coordinates(repo, number, review.id),
+                    author: review.author.map(|author| author.login),
+                    body: review.body,
+                    state: review.state,
+                    submitted_at: review.submitted_at,
+                    commit_sha: review.commit.map(|commit| commit.oid),
+                    edit_summary_capability: None,
+                    dismissal_capability: None,
+                    url: review.url,
+                },
+                comments,
+                comments_complete,
+                file_comment_source,
+            }),
+            absence: None,
+        })
     }
 
     fn pull(&mut self, repo: &Repository, number: u64) -> Result<ApiPullRequest> {

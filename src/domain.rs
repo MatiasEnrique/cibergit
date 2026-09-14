@@ -480,6 +480,40 @@ pub struct PendingFileCommentSource {
     pub review_commit_sha: String,
 }
 
+/// Fresh, complete provider proof that the selected account has no pending
+/// review for one exact open pull request and head. This capability is kept
+/// only in memory: cached or restored absence never authorizes review creation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingFileReviewAbsence {
+    pub viewer_login: String,
+    pub repository: Repository,
+    pub pull_request: ProviderCoordinates,
+    pub pull_request_state: String,
+    pub current_base_sha: String,
+    pub current_head_sha: String,
+}
+
+/// One complete selected-account pending-review read. `absence` is present
+/// only for an exact fresh zero-review result and is intentionally not
+/// serializable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingReviewObservation {
+    pub snapshot: Option<PendingReviewSnapshot>,
+    pub absence: Option<PendingFileReviewAbsence>,
+}
+
+/// Compact result of fully validating the empty pending-review creation
+/// acknowledgement. Raw response bodies are never copied into durable state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingReviewCreationAcknowledgement {
+    pub operation_id: String,
+    pub review: ProviderCoordinates,
+    pub review_author: String,
+    pub review_commit_sha: String,
+    pub pull_request: ProviderCoordinates,
+    pub repository_name_with_owner: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MutationContext {
     pub operation_id: String,

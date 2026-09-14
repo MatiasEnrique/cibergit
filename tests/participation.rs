@@ -1,8 +1,8 @@
 use cibergit::{
     domain::{
         Account, ChangedFile, Comparison, MergeEligibility, PendingFileCommentSource,
-        PendingReviewSnapshot, ProviderCoordinates, PullRequestDetails, PullRequestReview,
-        ReviewComment, ReviewSubject, ReviewThread, Revision,
+        PendingFileReviewAbsence, PendingReviewSnapshot, ProviderCoordinates, PullRequestDetails,
+        PullRequestReview, ReviewComment, ReviewSubject, ReviewThread, Revision,
     },
     participation::{
         CanonicalPublishedPatch, DiffSide, DraftDisposition, DraftStore, LineSelection,
@@ -807,6 +807,17 @@ fn pending_file_source(base: &str, head: &str) -> PendingFileCommentSource {
     }
 }
 
+fn pending_file_absence(base: &str, head: &str) -> PendingFileReviewAbsence {
+    PendingFileReviewAbsence {
+        viewer_login: "alice".into(),
+        repository: repository("alice"),
+        pull_request: provider_coordinates("PR_42"),
+        pull_request_state: "OPEN".into(),
+        current_base_sha: base.into(),
+        current_head_sha: head.into(),
+    }
+}
+
 #[test]
 fn canonical_file_target_supports_binary_rename_but_rejects_raw_or_changed_identity() {
     let mut changed = file("assets/new.bin");
@@ -955,4 +966,108 @@ fn pending_file_freshness_witness_never_survives_snapshot_serialization() {
     });
     let decoded_thread: ReviewThread = serde_json::from_value(old_thread).unwrap();
     assert_eq!(decoded_thread.subject, ReviewSubject::Unknown);
+}
+
+#[test]
+fn pending_review_start_freezes_distinct_stages_and_clears_only_exact_predecessor() {
+    let canonical = comparison("base", "head", file("src/lib.rs"));
+    let session = ReviewSession::new(canonical.clone());
+    let target =
+        map_file_to_canonical_published(&session, "src/lib.rs", published(&canonical)).unwrap();
+    let mut state = ReviewComposition::new(key("alice"), revision("base", "head")).unwrap();
+    let draft_id = state
+        .add_file_draft(target.clone(), "frozen whole-file body")
+        .unwrap()
+        .id
+        .clone();
+    let unrelated_id = state
+        .add_file_draft(
+            cibergit::participation::PublishedFile {
+                path: "src/other.rs".into(),
+                file_key: "src/other.rs".into(),
+                ..target.clone()
+            },
+            "unrelated",
+        )
+        .unwrap()
+        .id
+        .clone();
+    let intent = state
+        .prepare_pending_file_review_start(
+            &draft_id,
+            &pending_file_absence("base", "head"),
+            "flow-1".into(),
+            "create-operation-1".into(),
+            "thread-operation-1".into(),
+        )
+        .unwrap();
+    assert_ne!(intent.create_operation_id, intent.thread_operation_id);
+    assert!(matches!(intent.target, ReviewCommentTarget::File(_)));
+
+    state
+        .edit_file_draft(&draft_id, "newer unsent body")
+        .unwrap();
+    state
+        .edit_file_draft(&unrelated_id, "unrelated newer body")
+        .unwrap();
+    state
+        .reconcile_pending_file_review_start_success(
+            &intent,
+            "REVIEW_created".into(),
+            "COMMENT_created".into(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        state.file_draft(&draft_id).unwrap().body,
+        "newer unsent body"
+    );
+    assert!(state.file_draft(&draft_id).unwrap().remote.is_none());
+    assert_eq!(
+        state.file_draft(&unrelated_id).unwrap().body,
+        "unrelated newer body"
+    );
+    assert!(state.file_draft(&unrelated_id).unwrap().remote.is_none());
+    assert_eq!(
+        state.acknowledged_pending_review_id.as_deref(),
+        Some("REVIEW_created")
+    );
+}
+
+#[test]
+fn pending_review_start_rejects_absence_identity_and_duplicate_stage_ids() {
+    let canonical = comparison("base", "head", file("src/lib.rs"));
+    let session = ReviewSession::new(canonical.clone());
+    let target =
+        map_file_to_canonical_published(&session, "src/lib.rs", published(&canonical)).unwrap();
+    let mut state = ReviewComposition::new(key("alice"), revision("base", "head")).unwrap();
+    let draft_id = state
+        .add_file_draft(target, "whole-file body")
+        .unwrap()
+        .id
+        .clone();
+    let mut wrong = pending_file_absence("base", "head");
+    wrong.viewer_login = "mallory".into();
+    assert!(
+        state
+            .prepare_pending_file_review_start(
+                &draft_id,
+                &wrong,
+                "flow-1".into(),
+                "create-1".into(),
+                "thread-1".into(),
+            )
+            .is_err()
+    );
+    assert!(
+        state
+            .prepare_pending_file_review_start(
+                &draft_id,
+                &pending_file_absence("base", "head"),
+                "flow-1".into(),
+                "same".into(),
+                "same".into(),
+            )
+            .is_err()
+    );
 }

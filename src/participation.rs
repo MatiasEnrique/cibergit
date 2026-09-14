@@ -5,8 +5,8 @@
 
 use crate::{
     domain::{
-        Account, ChangedFile, Comparison, PendingFileCommentSource, ProviderCoordinates,
-        PullRequestDetails, Repository, Revision,
+        Account, ChangedFile, Comparison, PendingFileCommentSource, PendingFileReviewAbsence,
+        ProviderCoordinates, PullRequestDetails, Repository, Revision,
     },
     review::{
         ComparisonMetadata, ComparisonMode, DiffLineKind, ReviewSession, file_key, parse_file,
@@ -180,7 +180,7 @@ impl ReviewKey {
         Ok(())
     }
 
-    fn matches(&self, coordinates: &ProviderCoordinates) -> bool {
+    pub(crate) fn matches(&self, coordinates: &ProviderCoordinates) -> bool {
         self.provider == coordinates.provider
             && self.host == coordinates.host
             && self.owner == coordinates.owner
@@ -764,6 +764,24 @@ pub struct PendingFileCommentIntent {
     pub pending: PendingFileReviewTarget,
 }
 
+/// Frozen durable request for the no-existing-pending FILE flow. The fresh
+/// absence witness is validated while constructing this value but is not
+/// serialized into it and therefore cannot survive as provider authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingFileReviewStartIntent {
+    pub flow_id: String,
+    pub create_operation_id: String,
+    pub thread_operation_id: String,
+    pub key: ReviewKey,
+    pub draft_id: String,
+    pub body: String,
+    pub target: ReviewCommentTarget,
+    pub pull_request: ProviderCoordinates,
+    pub selected_author: String,
+    pub observed_base_sha: String,
+    pub observed_head_sha: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImmediateCommentIntent {
     pub operation_id: String,
@@ -1033,6 +1051,62 @@ impl ReviewComposition {
             ReviewOperationPayload::PendingFileComment(Box::new(intent.clone())),
         );
         Ok(intent)
+    }
+
+    pub fn prepare_pending_file_review_start(
+        &self,
+        draft_id: &str,
+        absence: &PendingFileReviewAbsence,
+        flow_id: String,
+        create_operation_id: String,
+        thread_operation_id: String,
+    ) -> Result<PendingFileReviewStartIntent, ParticipationError> {
+        self.ensure_target_available(|_| true)?;
+        for (field, value) in [
+            ("pending start flow", flow_id.as_str()),
+            (
+                "pending start create operation",
+                create_operation_id.as_str(),
+            ),
+            (
+                "pending start thread operation",
+                thread_operation_id.as_str(),
+            ),
+        ] {
+            validate_nonempty_id(field, value)?;
+        }
+        if flow_id == create_operation_id
+            || flow_id == thread_operation_id
+            || create_operation_id == thread_operation_id
+        {
+            return Err(ParticipationError::OperationState(
+                "pending-review start flow and stage operation IDs must be distinct".into(),
+            ));
+        }
+        let draft = self
+            .file_draft(draft_id)
+            .ok_or_else(|| ParticipationError::DraftNotFound(draft_id.into()))?;
+        if draft.disposition != DraftDisposition::Pending || draft.remote.is_some() {
+            return Err(ParticipationError::OperationState(
+                "a completed file comment is historical; create a new draft for another comment"
+                    .into(),
+            ));
+        }
+        validate_nonempty_text("draft text", &draft.body, MAX_DRAFT_TEXT_BYTES)?;
+        validate_pending_file_absence(absence, &self.key, &draft.target)?;
+        Ok(PendingFileReviewStartIntent {
+            flow_id,
+            create_operation_id,
+            thread_operation_id,
+            key: self.key.clone(),
+            draft_id: draft_id.into(),
+            body: draft.body.clone(),
+            target: ReviewCommentTarget::File(draft.target.clone()),
+            pull_request: absence.pull_request.clone(),
+            selected_author: absence.viewer_login.clone(),
+            observed_base_sha: absence.current_base_sha.clone(),
+            observed_head_sha: absence.current_head_sha.clone(),
+        })
     }
 
     pub fn prepare_immediate_comment(
@@ -1419,6 +1493,51 @@ impl ReviewComposition {
                 comment_id: remote_comment_id,
             });
             draft.observed_remote_body = Some(intent.body);
+            draft.dirty = false;
+        }
+        self.acknowledged_pending_review_id = Some(remote_review_id);
+        Ok(())
+    }
+
+    /// Apply a fully acknowledged two-stage FILE result to only its exact
+    /// predecessor. A later body edit remains a fresh unsent local draft.
+    pub fn reconcile_pending_file_review_start_success(
+        &mut self,
+        intent: &PendingFileReviewStartIntent,
+        remote_review_id: String,
+        remote_comment_id: String,
+    ) -> Result<(), ParticipationError> {
+        validate_nonempty_id("remote_review_id", &remote_review_id)?;
+        validate_nonempty_id("remote_comment_id", &remote_comment_id)?;
+        validate_pending_file_review_start_intent(intent)?;
+        if intent.key != self.key || intent.observed_head_sha != self.reviewed_revision.head_sha {
+            return Err(ParticipationError::RemoteState(
+                "pending-review start result belongs to another review composition".into(),
+            ));
+        }
+        let ReviewCommentTarget::File(sent_target) = &intent.target else {
+            return Err(ParticipationError::OperationState(
+                "pending-review start contains a non-file target".into(),
+            ));
+        };
+        let draft = self.file_draft_mut(&intent.draft_id)?;
+        if &draft.target != sent_target {
+            return Err(ParticipationError::RemoteState(
+                "file draft target changed after the frozen pending-review start request".into(),
+            ));
+        }
+        if draft.disposition != DraftDisposition::Pending || draft.remote.is_some() {
+            return Err(ParticipationError::RemoteState(
+                "the exact pending-review start predecessor is no longer an unpublished file draft"
+                    .into(),
+            ));
+        }
+        if draft.body == intent.body {
+            draft.remote = Some(RemoteDraftIds {
+                review_id: Some(remote_review_id.clone()),
+                comment_id: remote_comment_id,
+            });
+            draft.observed_remote_body = Some(intent.body.clone());
             draft.dirty = false;
         }
         self.acknowledged_pending_review_id = Some(remote_review_id);
@@ -2022,6 +2141,100 @@ fn validate_pending_file_source(
         review_commit_sha: source.review_commit_sha.clone(),
     };
     validate_pending_file_target(&target, key, file)
+}
+
+fn validate_pending_file_absence(
+    absence: &PendingFileReviewAbsence,
+    key: &ReviewKey,
+    file: &PublishedFile,
+) -> Result<(), ParticipationError> {
+    if absence.repository.host != key.host
+        || absence.repository.owner != key.owner
+        || absence.repository.name != key.repository
+        || absence.repository.account != key.account
+        || absence.pull_request_state != "OPEN"
+        || !absence
+            .viewer_login
+            .eq_ignore_ascii_case(&key.account.login)
+        || !key.matches(&absence.pull_request)
+        || absence.current_base_sha != file.base_sha
+        || absence.current_head_sha != file.commit_sha
+    {
+        return Err(ParticipationError::RemoteState(
+            "fresh pending-review absence does not match the selected account, pull request, and canonical file"
+                .into(),
+        ));
+    }
+    validate_published_file(
+        file,
+        &Revision {
+            base_sha: absence.current_base_sha.clone(),
+            head_sha: absence.current_head_sha.clone(),
+        },
+    )?;
+    validate_nonempty_id("pending absence viewer", &absence.viewer_login)?;
+    validate_nonempty_id(
+        "pending absence pull request ID",
+        &absence.pull_request.remote_id,
+    )
+}
+
+pub(crate) fn validate_pending_file_review_start_intent(
+    intent: &PendingFileReviewStartIntent,
+) -> Result<(), ParticipationError> {
+    intent.key.validate()?;
+    for (field, value) in [
+        ("pending start flow", intent.flow_id.as_str()),
+        (
+            "pending start create operation",
+            intent.create_operation_id.as_str(),
+        ),
+        (
+            "pending start thread operation",
+            intent.thread_operation_id.as_str(),
+        ),
+        ("pending start draft", intent.draft_id.as_str()),
+        ("pending start author", intent.selected_author.as_str()),
+        (
+            "pending start pull request ID",
+            intent.pull_request.remote_id.as_str(),
+        ),
+    ] {
+        validate_nonempty_id(field, value)?;
+    }
+    if intent.flow_id == intent.create_operation_id
+        || intent.flow_id == intent.thread_operation_id
+        || intent.create_operation_id == intent.thread_operation_id
+    {
+        return Err(ParticipationError::OperationState(
+            "pending-review start flow and stage operation IDs must be distinct".into(),
+        ));
+    }
+    validate_nonempty_text("pending start body", &intent.body, MAX_DRAFT_TEXT_BYTES)?;
+    let ReviewCommentTarget::File(file) = &intent.target else {
+        return Err(ParticipationError::OperationState(
+            "pending-review start contains a non-file target".into(),
+        ));
+    };
+    if !intent
+        .selected_author
+        .eq_ignore_ascii_case(&intent.key.account.login)
+        || !intent.key.matches(&intent.pull_request)
+        || intent.observed_base_sha != file.base_sha
+        || intent.observed_head_sha != file.commit_sha
+    {
+        return Err(ParticipationError::RemoteState(
+            "pending-review start identities do not match its exact selected account and file"
+                .into(),
+        ));
+    }
+    validate_published_file(
+        file,
+        &Revision {
+            base_sha: intent.observed_base_sha.clone(),
+            head_sha: intent.observed_head_sha.clone(),
+        },
+    )
 }
 
 fn validate_pending_file_target(

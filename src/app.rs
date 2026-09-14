@@ -53,14 +53,19 @@ use cibergit::{
     },
     domain::{
         ActionsAttemptLocator, ActionsHeadRelation, DismissalAuthority, MergeAction,
-        MergeExecutionRequest, MergeMethod, MergePreparation, PendingReviewSnapshot,
+        MergeExecutionRequest, MergeMethod, MergePreparation,
+        PendingFileReviewAbsence, PendingReviewCreationAcknowledgement, PendingReviewSnapshot,
         ProviderCoordinates, ProviderMutationOutcome, ProviderReadEvidence, PullRequest,
         PullRequestDetails, PullRequestDiscussionAction, PullRequestLifecycleAction, ReactableKind,
         ReactionAction, ReactionContent, ReactionIntent, ReactionSubjectSnapshot, Repository,
         ReviewAuxiliaryAction, ReviewAuxiliaryRequest, Revision,
         SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
     },
-    participation::{DiffSide, LineSelection, ReviewEvent, ReviewKey},
+    participation::{
+        DiffSide, LineSelection, PendingFileReviewStartIntent, ReviewCommentTarget, ReviewEvent,
+        ReviewKey,
+    },
+    pending_review_start::{PendingReviewStartRecord, PendingReviewStartStage},
     providers::{
         ActionsReadError, ActionsReadErrorCategory, GeneralReadFailureKind, GithubProvider,
     },
@@ -87,8 +92,10 @@ use pr_lifecycle::{ChoiceKind, FrozenMutation, PrLifecycleController, reviewer};
 use review_interactions::{
     ActionJournal, ComposerState, ControllerLoad, InlineThread, JournalOperation, JournalRequest,
     JournalStatus, ReviewInteractionController, ReviewReconciliationItem,
-    ReviewReconciliationOutcome, dispatch_auxiliary, dispatch_merge, load_merge_preference,
-    next_attempt_id, place_threads_with_canonical, save_merge_preference,
+    ReviewReconciliationOutcome, cancel_pending_review_start_before_create, dispatch_auxiliary,
+    dispatch_merge, execute_pending_review_start_create, execute_pending_review_start_thread,
+    finish_pending_review_start_locally, load_merge_preference, next_attempt_id,
+    place_threads_with_canonical, save_merge_preference, stop_pending_review_start_after_create,
 };
 use stack_view::{
     StackLoadState, StackViewController, boundary_label, load_stack, provenance_label,
@@ -1351,6 +1358,7 @@ struct ReviewTab {
     interactions: InteractionState,
     interaction_generation: u64,
     confirmation: Option<NativeConfirmation>,
+    pending_review_start_live: Option<PendingReviewStartConfirmationToken>,
     write_in_flight: bool,
     reaction_in_flight: Option<ReactionCompletionToken>,
     dismissal_editor: DismissalEditor,
@@ -1427,6 +1435,11 @@ enum NativeConfirmation {
         body: String,
         target: cibergit::participation::PublishedFile,
         source: Box<cibergit::domain::PendingFileCommentSource>,
+    },
+    PendingFileReviewStart {
+        generation: u64,
+        intent: Box<PendingFileReviewStartIntent>,
+        mode: Box<PendingReviewStartConfirmationMode>,
     },
     Merge {
         preparation: Box<MergePreparation>,
@@ -1814,6 +1827,115 @@ struct FileCommentConfirmationToken {
     body: String,
     target: cibergit::participation::PublishedFile,
     pending_source: cibergit::domain::PendingFileCommentSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingReviewStartConfirmationMode {
+    Create {
+        absence: PendingFileReviewAbsence,
+    },
+    Continue {
+        source: cibergit::domain::PendingFileCommentSource,
+        creation: PendingReviewCreationAcknowledgement,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingReviewStartConfirmationToken {
+    workspace_instance: u64,
+    tab_instance: u64,
+    repository_key: String,
+    pull_request: u64,
+    generation: u64,
+    intent: PendingFileReviewStartIntent,
+    mode: PendingReviewStartConfirmationMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingReviewStartStopToken {
+    workspace_instance: u64,
+    tab_instance: u64,
+    repository_key: String,
+    pull_request: u64,
+    generation: u64,
+    flow_id: String,
+    thread_operation_id: String,
+}
+
+impl PendingReviewStartStopToken {
+    fn matches(&self, workspace_instance: u64, tab: &ReviewTab) -> bool {
+        self.workspace_instance == workspace_instance
+            && self.tab_instance == tab.instance_generation
+            && self.repository_key == tab.repository.cache_key()
+            && self.pull_request == tab.pull_request.number
+            && self.generation == tab.file_confirmation_generation
+            && tab.write_in_flight
+            && matches!(
+                &tab.interactions,
+                InteractionState::Ready(controller)
+                    if controller.pending_review_start.as_ref().is_some_and(|record|
+                        record.intent.flow_id == self.flow_id
+                            && record.intent.thread_operation_id == self.thread_operation_id
+                            && matches!(
+                                &record.stage,
+                                PendingReviewStartStage::PreparedCreate
+                                    | PendingReviewStartStage::ReviewCreated { .. }
+                                    | PendingReviewStartStage::ThreadAcknowledged { .. }
+                            ))
+            )
+    }
+}
+
+impl PendingReviewStartConfirmationToken {
+    fn matches_confirmation(&self, workspace_instance: u64, tab: &ReviewTab) -> bool {
+        self.matches_confirmation_values(
+            workspace_instance,
+            tab.instance_generation,
+            &tab.repository.cache_key(),
+            tab.pull_request.number,
+            tab.confirmation.as_ref(),
+        )
+    }
+
+    fn matches_confirmation_values(
+        &self,
+        workspace_instance: u64,
+        tab_instance: u64,
+        repository_key: &str,
+        pull_request: u64,
+        confirmation: Option<&NativeConfirmation>,
+    ) -> bool {
+        self.workspace_instance == workspace_instance
+            && self.tab_instance == tab_instance
+            && self.repository_key == repository_key
+            && self.pull_request == pull_request
+            && matches!(
+                confirmation,
+                Some(NativeConfirmation::PendingFileReviewStart {
+                    generation,
+                    intent,
+                    mode,
+                }) if *generation == self.generation
+                    && intent.as_ref() == &self.intent
+                    && mode.as_ref() == &self.mode
+            )
+    }
+
+    fn matches_live(&self, workspace_instance: u64, tab: &ReviewTab) -> bool {
+        self.workspace_instance == workspace_instance
+            && self.tab_instance == tab.instance_generation
+            && self.repository_key == tab.repository.cache_key()
+            && self.pull_request == tab.pull_request.number
+            && tab.pending_review_start_live.as_ref() == Some(self)
+            && tab.write_in_flight
+    }
+}
+
+fn pending_review_start_confirmation_matches_visible_body(
+    token: &PendingReviewStartConfirmationToken,
+    visible_body: &str,
+) -> bool {
+    token.intent.body == visible_body
 }
 
 impl FileCommentConfirmationToken {
@@ -12975,6 +13097,7 @@ impl ReviewWorkspace {
             interactions: InteractionState::Loading,
             interaction_generation: 0,
             confirmation: None,
+            pending_review_start_live: None,
             write_in_flight: false,
             reaction_in_flight: None,
             dismissal_editor: DismissalEditor::default(),
@@ -15296,28 +15419,31 @@ impl ReviewWorkspace {
             return;
         }
         let input_body = self.composer_input.read(cx).value().to_string();
-        let (draft_id, target, durable, staged_body) = match &self.tabs[index].interactions {
-            InteractionState::Ready(controller) => {
-                let Some(composer) = controller.file_composer.as_ref() else {
-                    self.status = "No file-level composer is open.".into();
+        let (draft_id, target, durable, staged_body, absence, start_record) =
+            match &self.tabs[index].interactions {
+                InteractionState::Ready(controller) => {
+                    let Some(composer) = controller.file_composer.as_ref() else {
+                        self.status = "No file-level composer is open.".into();
+                        return;
+                    };
+                    (
+                        composer.draft_id.clone(),
+                        composer.target.clone(),
+                        composer.durable,
+                        composer.body.clone(),
+                        controller.pending_absence.clone(),
+                        controller.pending_review_start.clone(),
+                    )
+                }
+                InteractionState::Loading => {
+                    self.status = "Review recovery is still loading.".into();
                     return;
-                };
-                (
-                    composer.draft_id.clone(),
-                    composer.target.clone(),
-                    composer.durable,
-                    composer.body.clone(),
-                )
-            }
-            InteractionState::Loading => {
-                self.status = "Review recovery is still loading.".into();
-                return;
-            }
-            InteractionState::RecoveryRequired(reason) => {
-                self.status = reason.clone();
-                return;
-            }
-        };
+                }
+                InteractionState::RecoveryRequired(reason) => {
+                    self.status = reason.clone();
+                    return;
+                }
+            };
         if !durable || staged_body != input_body {
             self.persist_composer(cx);
             self.status = "The exact file-level text must finish saving locally; review the write again afterward."
@@ -15332,9 +15458,112 @@ impl ReviewWorkspace {
             self.status = "The file-level draft has no durable identity.".into();
             return;
         };
+        if let Some(record) = start_record.as_ref()
+            && record.may_continue_file_thread()
+        {
+            let Some(creation) = record.creation().cloned() else {
+                self.status =
+                    "The partial pending-review start lacks its exact created review ID. No FILE write was sent."
+                        .into();
+                return;
+            };
+            let Some(source) = self.tabs[index]
+                .pending_snapshot
+                .as_ref()
+                .and_then(|pending| pending.file_comment_source.clone())
+                .filter(|source| {
+                    source.review == creation.review
+                        && source.review_commit_sha == creation.review_commit_sha
+                        && source.current_base_sha == target.base_sha
+                        && source.current_head_sha == target.commit_sha
+                })
+            else {
+                self.status = format!(
+                    "Pending review {} remains, but a fresh sole-exact selected-account read is required before continuing. Refresh Activity; no FILE write was sent.",
+                    creation.review.remote_id
+                );
+                return;
+            };
+            if record.intent.draft_id != draft_id
+                || record.intent.body != input_body
+                || record.intent.target
+                    != cibergit::participation::ReviewCommentTarget::File(target.clone())
+            {
+                self.status = format!(
+                    "Pending review {} remains. The current file draft differs from the frozen predecessor, so no FILE write was sent.",
+                    creation.review.remote_id
+                );
+                return;
+            }
+            let Some(generation) = self.tabs[index].file_confirmation_generation.checked_add(1)
+            else {
+                self.status =
+                    "File-comment confirmation identity is exhausted; reopen this tab.".into();
+                return;
+            };
+            self.tabs[index].file_confirmation_generation = generation;
+            self.tabs[index].confirmation = Some(NativeConfirmation::PendingFileReviewStart {
+                generation,
+                intent: Box::new(record.intent.clone()),
+                mode: Box::new(PendingReviewStartConfirmationMode::Continue { source, creation }),
+            });
+            self.inspector_open = true;
+            self.inspector_scroll.set_offset(point(px(0.), px(0.)));
+            self.status =
+                "Review the exact one-write continuation for the known created pending review."
+                    .into();
+            cx.notify();
+            return;
+        }
+        if start_record
+            .as_ref()
+            .is_some_and(PendingReviewStartRecord::blocks_target_mutations)
+        {
+            self.status =
+                "A pending-review start is prepared or unresolved. It will not replay; use its recovery controls."
+                    .into();
+            return;
+        }
         let Some(pending) = self.tabs[index].pending_snapshot.as_ref() else {
-            self.status = "File-level comments are pending-only in this release, and no existing pending review was observed for the selected account. The local draft is retained; nothing was posted and no pending review was created."
-                .into();
+            let Some(absence) = absence else {
+                self.status = "No complete fresh selected-account pending-review absence is available. Refresh Activity; the local draft is retained and zero writes were sent."
+                    .into();
+                return;
+            };
+            let intent = match &self.tabs[index].interactions {
+                InteractionState::Ready(controller) => controller
+                    .prepare_pending_file_review_start(
+                        &absence,
+                        next_attempt_id("pending-file-start-flow"),
+                        next_attempt_id("pending-file-start-create"),
+                        next_attempt_id("pending-file-start-thread"),
+                    ),
+                _ => unreachable!("checked above"),
+            };
+            let intent = match intent {
+                Ok(intent) => intent,
+                Err(error) => {
+                    self.status = error;
+                    return;
+                }
+            };
+            let Some(generation) = self.tabs[index].file_confirmation_generation.checked_add(1)
+            else {
+                self.status =
+                    "File-comment confirmation identity is exhausted; reopen this tab.".into();
+                return;
+            };
+            self.tabs[index].file_confirmation_generation = generation;
+            self.tabs[index].confirmation = Some(NativeConfirmation::PendingFileReviewStart {
+                generation,
+                intent: Box::new(intent),
+                mode: Box::new(PendingReviewStartConfirmationMode::Create { absence }),
+            });
+            self.inspector_open = true;
+            self.inspector_scroll.set_offset(point(px(0.), px(0.)));
+            self.status =
+                "Review the exact two-write pending-review creation and whole-file comment.".into();
+            cx.notify();
             return;
         };
         let Some(source) = pending.file_comment_source.clone() else {
@@ -15471,6 +15700,875 @@ impl ReviewWorkspace {
         }
         self.tabs[index].confirmation = None;
         self.start_file_comment_write(*source, token, cx);
+    }
+
+    fn cancel_pending_review_start_confirmation(
+        &mut self,
+        token: &PendingReviewStartConfirmationToken,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| token.matches_confirmation(self.workspace_instance, tab))
+        else {
+            self.status =
+                "That pending-review confirmation is no longer current; no new write was sent."
+                    .into();
+            cx.notify();
+            return;
+        };
+        self.tabs[index].confirmation = None;
+        self.status = match &token.mode {
+            PendingReviewStartConfirmationMode::Create { .. } => {
+                "Two-write confirmation cancelled; draft kept and zero provider writes sent.".into()
+            }
+            PendingReviewStartConfirmationMode::Continue { creation, .. } => format!(
+                "Continuation cancelled; pending review {} and draft kept, with zero additional provider writes.",
+                creation.review.remote_id
+            ),
+        };
+        cx.notify();
+    }
+
+    fn confirm_pending_review_start(
+        &mut self,
+        token: PendingReviewStartConfirmationToken,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| token.matches_confirmation(self.workspace_instance, tab))
+        else {
+            self.status =
+                "That pending-review confirmation is stale; no new write was sent and the draft remains."
+                    .into();
+            cx.notify();
+            return;
+        };
+        if !self.shared_composer_admitted(index) {
+            self.status =
+                "The shared FILE input is not owned by this exact tab/action; no new write was sent."
+                    .into();
+            cx.notify();
+            return;
+        }
+        let visible_body = self.composer_input.read(cx).value().to_string();
+        if !pending_review_start_confirmation_matches_visible_body(&token, &visible_body) {
+            self.tabs[index].confirmation = None;
+            self.persist_composer(cx);
+            self.status =
+                "The visible FILE text changed after confirmation opened. No new write was sent; the latest text is being retained and must be confirmed again."
+                    .into();
+            cx.notify();
+            return;
+        }
+        let exact_draft = matches!(
+            &self.tabs[index].interactions,
+            InteractionState::Ready(controller)
+                if controller.file_composer.as_ref().is_some_and(|composer|
+                    composer.durable
+                        && composer.draft_id.as_deref()
+                            == Some(token.intent.draft_id.as_str())
+                        && composer.body == token.intent.body
+                        && token.intent.target
+                            == ReviewCommentTarget::File(composer.target.clone()))
+        );
+        let exact_source = match (&token.mode, &self.tabs[index].interactions) {
+            (
+                PendingReviewStartConfirmationMode::Create { absence },
+                InteractionState::Ready(controller),
+            ) => controller.pending_absence.as_ref() == Some(absence),
+            (
+                PendingReviewStartConfirmationMode::Continue { source, creation },
+                InteractionState::Ready(controller),
+            ) => {
+                controller
+                    .pending_review_start
+                    .as_ref()
+                    .is_some_and(|record| {
+                        record.intent == token.intent
+                            && record.may_continue_file_thread()
+                            && record.creation() == Some(creation)
+                    })
+                    && self.tabs[index]
+                        .pending_snapshot
+                        .as_ref()
+                        .and_then(|pending| pending.file_comment_source.as_ref())
+                        == Some(source)
+            }
+            _ => false,
+        };
+        if !exact_draft || !exact_source {
+            self.tabs[index].confirmation = None;
+            self.status =
+                "The exact durable FILE predecessor or provider source changed. No new write was sent; review the retained draft again."
+                    .into();
+            cx.notify();
+            return;
+        }
+        self.tabs[index].confirmation = None;
+        self.tabs[index].pending_review_start_live = Some(token.clone());
+        self.tabs[index].write_in_flight = true;
+        self.tabs[index].details_generation += 1;
+        self.composer_input
+            .update(cx, |input, cx| input.set_disabled(true, cx));
+        match token.mode {
+            PendingReviewStartConfirmationMode::Create { .. } => {
+                self.start_pending_review_create(token, cx)
+            }
+            PendingReviewStartConfirmationMode::Continue { .. } => {
+                self.start_pending_review_thread(token, cx)
+            }
+        }
+    }
+
+    fn start_pending_review_create(
+        &mut self,
+        token: PendingReviewStartConfirmationToken,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| token.matches_live(self.workspace_instance, tab))
+        else {
+            return;
+        };
+        let (repository, number, store, authority, expected_composition, expected_start) =
+            match &self.tabs[index].interactions {
+                InteractionState::Ready(controller) => (
+                    self.tabs[index].repository.clone(),
+                    self.tabs[index].pull_request.number,
+                    controller.store.clone(),
+                    controller.authority.clone(),
+                    controller.durable_composition.clone(),
+                    controller.pending_review_start.clone(),
+                ),
+                _ => return,
+            };
+        let identity = repository.cache_key();
+        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let completion_latest = latest.clone();
+        let provider = GithubProvider::new(repository.account.clone());
+        let intent = token.intent.clone();
+        let attempt_id = next_attempt_id(&intent.create_operation_id);
+        let task = cx.background_spawn(async move {
+            let _guard = lock
+                .lock()
+                .map_err(|_| "Review recovery save lock failed; zero writes sent.".to_owned())?;
+            if latest.load(Ordering::Acquire) != sequence {
+                return Err(
+                    "A newer review-state write superseded pending-review creation; zero writes sent."
+                        .to_owned(),
+                );
+            }
+            Ok(execute_pending_review_start_create(
+                &authority,
+                &store,
+                expected_composition.as_ref(),
+                expected_start.as_ref(),
+                &provider,
+                &repository,
+                &intent,
+                &attempt_id,
+            ))
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                if this.workspace_instance != token.workspace_instance
+                    || completion_latest.load(Ordering::Acquire) != sequence
+                {
+                    return;
+                }
+                let Some(index) = this
+                    .tabs
+                    .iter()
+                    .position(|tab| token.matches_live(this.workspace_instance, tab))
+                else {
+                    return;
+                };
+                let step = match result {
+                    Ok(step) => step,
+                    Err(reason) => {
+                        this.finish_pending_review_start_live(
+                            index,
+                            format!("Pending-review creation did not start: {reason}"),
+                            cx,
+                        );
+                        return;
+                    }
+                };
+                if let InteractionState::Ready(controller) = &mut this.tabs[index].interactions {
+                    if let Some(composition) = step.composition.clone() {
+                        controller.composition = composition.clone();
+                        controller.durable_composition = Some(composition);
+                    }
+                    controller.pending_review_start = step.record.clone();
+                }
+                match step.outcome {
+                    ProviderMutationOutcome::Acknowledged(creation) => {
+                        let exact_record = step.record.as_ref().is_some_and(|record| {
+                            record.intent == token.intent
+                                && matches!(
+                                    &record.stage,
+                                    PendingReviewStartStage::ReviewCreated {
+                                        creation: saved,
+                                        ..
+                                    } if saved == &creation
+                                )
+                        });
+                        let exact_draft = matches!(
+                            &this.tabs[index].interactions,
+                            InteractionState::Ready(controller)
+                                if controller.file_composer.as_ref().is_some_and(|composer|
+                                    composer.durable
+                                        && composer.draft_id.as_deref()
+                                            == Some(token.intent.draft_id.as_str())
+                                        && composer.body == token.intent.body
+                                        && token.intent.target
+                                            == ReviewCommentTarget::File(composer.target.clone()))
+                        );
+                        let input_owned = this.active_tab == Some(index)
+                            && this.active_tab_input_restore.is_none()
+                            && !this.tabs[index]
+                                .submitted_summary_editor
+                                .close_after_save;
+                        let visible_exact = if input_owned {
+                            this.composer_input.read(cx).value().to_string() == token.intent.body
+                        } else {
+                            this.active_tab != Some(index)
+                        };
+                        if !exact_record || !exact_draft || !visible_exact {
+                            this.finish_pending_review_start_live(
+                                index,
+                                format!(
+                                    "Pending review {} was created and remains unsubmitted, but the original FILE confirmation/input lifetime changed. No FILE write was dispatched; draft kept.",
+                                    creation.review.remote_id
+                                ),
+                                cx,
+                            );
+                            return;
+                        }
+                        this.status = format!(
+                            "Pending review {} is durably recorded. Revalidating the exact sole review before the FILE write…",
+                            creation.review.remote_id
+                        );
+                        this.start_pending_review_thread(token, cx);
+                    }
+                    ProviderMutationOutcome::PreflightRejected { reason } => {
+                        this.finish_pending_review_start_live(
+                            index,
+                            format!(
+                                "Pending review was not created; zero provider writes sent and draft kept: {reason}"
+                            ),
+                            cx,
+                        );
+                    }
+                    ProviderMutationOutcome::Uncertain { reason, .. } => {
+                        this.finish_pending_review_start_live(
+                            index,
+                            format!(
+                                "Pending-review creation is uncertain. No FILE write was attempted and no review ID will be inferred or adopted; draft kept: {reason}"
+                            ),
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_pending_review_thread(
+        &mut self,
+        token: PendingReviewStartConfirmationToken,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| token.matches_live(self.workspace_instance, tab))
+        else {
+            return;
+        };
+        let (repository, number, store, authority, expected_composition, expected_start) =
+            match &self.tabs[index].interactions {
+                InteractionState::Ready(controller) => {
+                    let Some(record) = controller.pending_review_start.clone() else {
+                        self.finish_pending_review_start_live(
+                            index,
+                            "The durable created-review state disappeared. No FILE write was sent."
+                                .into(),
+                            cx,
+                        );
+                        return;
+                    };
+                    (
+                        self.tabs[index].repository.clone(),
+                        self.tabs[index].pull_request.number,
+                        controller.store.clone(),
+                        controller.authority.clone(),
+                        controller.durable_composition.clone(),
+                        record,
+                    )
+                }
+                _ => return,
+            };
+        if expected_start.intent != token.intent || !expected_start.may_continue_file_thread() {
+            let review = expected_start
+                .creation()
+                .map(|creation| creation.review.remote_id.as_str())
+                .unwrap_or("unknown");
+            self.finish_pending_review_start_live(
+                index,
+                format!(
+                    "Pending review {review} remains, but the exact durable continuation is no longer authorized. No FILE write was sent."
+                ),
+                cx,
+            );
+            return;
+        }
+        let identity = repository.cache_key();
+        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let completion_latest = latest.clone();
+        let provider = GithubProvider::new(repository.account.clone());
+        let attempt_id = next_attempt_id(&token.intent.thread_operation_id);
+        let task = cx.background_spawn(async move {
+            let _guard = lock.lock().map_err(|_| {
+                "Review recovery save lock failed; no FILE write was sent.".to_owned()
+            })?;
+            if latest.load(Ordering::Acquire) != sequence {
+                return Err(
+                    "A newer review-state write superseded the FILE stage; no FILE write was sent."
+                        .to_owned(),
+                );
+            }
+            Ok(execute_pending_review_start_thread(
+                &authority,
+                &store,
+                expected_composition.as_ref(),
+                &expected_start,
+                &provider,
+                &repository,
+                &attempt_id,
+            ))
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                if this.workspace_instance != token.workspace_instance
+                    || completion_latest.load(Ordering::Acquire) != sequence
+                {
+                    return;
+                }
+                let Some(index) = this
+                    .tabs
+                    .iter()
+                    .position(|tab| token.matches_live(this.workspace_instance, tab))
+                else {
+                    return;
+                };
+                let step = match result {
+                    Ok(step) => step,
+                    Err(reason) => {
+                        this.finish_pending_review_start_live(index, reason, cx);
+                        return;
+                    }
+                };
+                if let InteractionState::Ready(controller) = &mut this.tabs[index].interactions {
+                    if let Some(composition) = step.composition.clone() {
+                        controller.composition = composition.clone();
+                        controller.durable_composition = Some(composition);
+                    }
+                    controller.pending_review_start = step.record.clone();
+                    if matches!(&step.outcome, ProviderMutationOutcome::Acknowledged(_))
+                        && controller.file_composer.as_ref().is_some_and(|composer| {
+                            composer.draft_id.as_deref()
+                                == Some(token.intent.draft_id.as_str())
+                                && composer.body == token.intent.body
+                                && token.intent.target
+                                    == ReviewCommentTarget::File(composer.target.clone())
+                        })
+                    {
+                        controller.file_composer = None;
+                    }
+                }
+                let status = match step.outcome {
+                    ProviderMutationOutcome::Acknowledged(ack) => format!(
+                        "Created pending review {} and added exact FILE thread {} / comment {}; the review remains unsubmitted.",
+                        ack.review_id.as_deref().unwrap_or("unknown"),
+                        ack.thread_id.as_deref().unwrap_or("unknown"),
+                        ack.comment_id.as_deref().unwrap_or("unknown")
+                    ),
+                    ProviderMutationOutcome::PreflightRejected { reason } => {
+                        let review = step
+                            .record
+                            .as_ref()
+                            .and_then(PendingReviewStartRecord::creation)
+                            .map(|creation| creation.review.remote_id.as_str())
+                            .unwrap_or("unknown");
+                        format!(
+                            "Pending review {review} remains. GitHub did not add the FILE comment; draft kept: {reason}"
+                        )
+                    }
+                    ProviderMutationOutcome::Uncertain { reason, .. } => {
+                        let review = step
+                            .record
+                            .as_ref()
+                            .and_then(PendingReviewStartRecord::creation)
+                            .map(|creation| creation.review.remote_id.as_str())
+                            .unwrap_or("known created review");
+                        format!(
+                            "GitHub may have added the FILE comment to pending review {review}. Draft kept; this stage will not retry or infer IDs: {reason}"
+                        )
+                    }
+                };
+                this.finish_pending_review_start_live(index, status, cx);
+                this.rebuild_diff(index, this.wide);
+                this.refresh_details(index, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn finish_pending_review_start_live(
+        &mut self,
+        index: usize,
+        status: String,
+        cx: &mut Context<Root>,
+    ) {
+        self.tabs[index].pending_review_start_live = None;
+        self.tabs[index].write_in_flight = false;
+        if self.active_tab == Some(index) && self.active_tab_input_restore.is_none() {
+            self.composer_input
+                .update(cx, |input, cx| input.set_disabled(false, cx));
+        }
+        self.status = status;
+    }
+
+    fn continue_pending_review_start(
+        &mut self,
+        flow_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.active_tab else { return };
+        if !self.shared_composer_admitted(index) {
+            self.status =
+                "Wait for shared input restoration or the active local operation before continuing."
+                    .into();
+            cx.notify();
+            return;
+        }
+        let (draft_id, body, creation) = match &self.tabs[index].interactions {
+            InteractionState::Ready(controller) => {
+                let Some(record) = controller.pending_review_start.as_ref().filter(|record| {
+                    record.intent.flow_id == flow_id && record.may_continue_file_thread()
+                }) else {
+                    self.status =
+                        "This created-review continuation is no longer current. No FILE write was sent."
+                            .into();
+                    return;
+                };
+                let Some(creation) = record.creation().cloned() else {
+                    self.status =
+                        "The created review has no exact durable ID; continuation is frozen."
+                            .into();
+                    return;
+                };
+                (
+                    record.intent.draft_id.clone(),
+                    record.intent.body.clone(),
+                    creation,
+                )
+            }
+            _ => return,
+        };
+        let fresh_exact = self.tabs[index]
+            .pending_snapshot
+            .as_ref()
+            .and_then(|pending| pending.file_comment_source.as_ref())
+            .is_some_and(|source| {
+                source.review == creation.review
+                    && source.review_commit_sha == creation.review_commit_sha
+                    && source.current_head_sha == creation.review_commit_sha
+            });
+        if !fresh_exact {
+            self.status = format!(
+                "Pending review {} remains, but Continue requires a fresh sole-exact selected-account read. Refresh Activity first.",
+                creation.review.remote_id
+            );
+            cx.notify();
+            return;
+        }
+        let reopened = match &mut self.tabs[index].interactions {
+            InteractionState::Ready(controller) => controller.reopen_file_draft(&draft_id),
+            _ => return,
+        };
+        if let Err(error) = reopened {
+            self.status = format!(
+                "Pending review {} remains, but its exact local FILE predecessor could not be reopened: {error}",
+                creation.review.remote_id
+            );
+            cx.notify();
+            return;
+        }
+        self.composer_input
+            .update(cx, |input, cx| input.set_value(body, window, cx));
+        self.prepare_file_comment_confirmation(cx);
+    }
+
+    fn stop_pending_review_start(&mut self, flow_id: &str, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if !self.shared_composer_admitted(index) {
+            self.status =
+                "Wait for the active operation or shared input restoration before stopping the continuation."
+                    .into();
+            cx.notify();
+            return;
+        }
+        let Some(generation) = self.tabs[index].file_confirmation_generation.checked_add(1) else {
+            self.status = "Pending-review stop identity is exhausted; reopen this tab.".into();
+            return;
+        };
+        let (repository, number, store, authority, expected_composition, expected_start) =
+            match &self.tabs[index].interactions {
+                InteractionState::Ready(controller) => {
+                    let Some(record) = controller.pending_review_start.as_ref().filter(|record| {
+                        record.intent.flow_id == flow_id && record.may_continue_file_thread()
+                    }) else {
+                        self.status =
+                            "Only a durable ReviewCreated state with no FILE dispatch can be stopped."
+                                .into();
+                        return;
+                    };
+                    (
+                        self.tabs[index].repository.clone(),
+                        self.tabs[index].pull_request.number,
+                        controller.store.clone(),
+                        controller.authority.clone(),
+                        controller.durable_composition.clone(),
+                        record.clone(),
+                    )
+                }
+                _ => return,
+            };
+        let token = PendingReviewStartStopToken {
+            workspace_instance: self.workspace_instance,
+            tab_instance: self.tabs[index].instance_generation,
+            repository_key: repository.cache_key(),
+            pull_request: number,
+            generation,
+            flow_id: expected_start.intent.flow_id.clone(),
+            thread_operation_id: expected_start.intent.thread_operation_id.clone(),
+        };
+        self.tabs[index].file_confirmation_generation = generation;
+        self.tabs[index].write_in_flight = true;
+        let review_id = expected_start
+            .creation()
+            .map(|creation| creation.review.remote_id.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let identity = repository.cache_key();
+        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let completion_latest = latest.clone();
+        let task = cx.background_spawn(async move {
+            let _guard = lock.lock().map_err(|_| {
+                "Review recovery save lock failed; stop disposition is uncertain.".to_owned()
+            })?;
+            if latest.load(Ordering::Acquire) != sequence {
+                return Err(
+                    "A newer review-state write superseded the local stop; disposition is uncertain."
+                        .to_owned(),
+                );
+            }
+            stop_pending_review_start_after_create(
+                &authority,
+                &store,
+                expected_composition.as_ref(),
+                &expected_start,
+            )
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                if this.workspace_instance != token.workspace_instance
+                    || completion_latest.load(Ordering::Acquire) != sequence
+                {
+                    return;
+                }
+                let Some(index) = this
+                    .tabs
+                    .iter()
+                    .position(|tab| token.matches(this.workspace_instance, tab))
+                else {
+                    return;
+                };
+                this.tabs[index].write_in_flight = false;
+                this.status = match result {
+                    Ok(record) => {
+                        if let InteractionState::Ready(controller) =
+                            &mut this.tabs[index].interactions
+                        {
+                            controller.pending_review_start = Some(record);
+                        }
+                        format!(
+                            "Stopped before the FILE write. Pending review {review_id}, local draft, and history were kept; zero additional remote writes were sent. Future actions require fresh existing-pending evidence."
+                        )
+                    }
+                    Err(error) => format!(
+                        "Pending review {review_id} remains, but the local stop persistence is uncertain; no additional remote write was requested: {error}"
+                    ),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn cancel_prepared_pending_review_start(&mut self, flow_id: &str, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if !self.shared_composer_admitted(index) {
+            self.status =
+                "Wait for the active operation or shared input restoration before cancelling the recovered start."
+                    .into();
+            cx.notify();
+            return;
+        }
+        let Some(generation) = self.tabs[index].file_confirmation_generation.checked_add(1) else {
+            self.status =
+                "Pending-review cancellation identity is exhausted; reopen this tab.".into();
+            return;
+        };
+        let (repository, number, store, authority, expected_composition, expected_start) =
+            match &self.tabs[index].interactions {
+                InteractionState::Ready(controller) => {
+                    let Some(record) = controller.pending_review_start.as_ref().filter(|record| {
+                        record.intent.flow_id == flow_id
+                            && matches!(&record.stage, PendingReviewStartStage::PreparedCreate)
+                    }) else {
+                        self.status =
+                            "Only a durable PreparedCreate state can be cancelled as zero transport."
+                                .into();
+                        return;
+                    };
+                    (
+                        self.tabs[index].repository.clone(),
+                        self.tabs[index].pull_request.number,
+                        controller.store.clone(),
+                        controller.authority.clone(),
+                        controller.durable_composition.clone(),
+                        record.clone(),
+                    )
+                }
+                _ => return,
+            };
+        let token = PendingReviewStartStopToken {
+            workspace_instance: self.workspace_instance,
+            tab_instance: self.tabs[index].instance_generation,
+            repository_key: repository.cache_key(),
+            pull_request: number,
+            generation,
+            flow_id: expected_start.intent.flow_id.clone(),
+            thread_operation_id: expected_start.intent.thread_operation_id.clone(),
+        };
+        self.tabs[index].file_confirmation_generation = generation;
+        self.tabs[index].write_in_flight = true;
+        let identity = repository.cache_key();
+        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let completion_latest = latest.clone();
+        let task = cx.background_spawn(async move {
+            let _guard = lock.lock().map_err(|_| {
+                "Review recovery save lock failed; cancellation is uncertain.".to_owned()
+            })?;
+            if latest.load(Ordering::Acquire) != sequence {
+                return Err(
+                    "A newer review-state write superseded cancellation; disposition is uncertain."
+                        .to_owned(),
+                );
+            }
+            cancel_pending_review_start_before_create(
+                &authority,
+                &store,
+                expected_composition.as_ref(),
+                &expected_start,
+            )
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                if this.workspace_instance != token.workspace_instance
+                    || completion_latest.load(Ordering::Acquire) != sequence
+                {
+                    return;
+                }
+                let Some(index) = this
+                    .tabs
+                    .iter()
+                    .position(|tab| token.matches(this.workspace_instance, tab))
+                else {
+                    return;
+                };
+                this.tabs[index].write_in_flight = false;
+                this.status = match result {
+                    Ok(record) => {
+                        if let InteractionState::Ready(controller) =
+                            &mut this.tabs[index].interactions
+                        {
+                            controller.pending_review_start = Some(record);
+                        }
+                        "Recovered prepared start cancelled locally; zero provider writes were sent and the FILE draft was kept."
+                            .into()
+                    }
+                    Err(error) => format!(
+                        "The recovered pre-create cancellation is uncertain; no provider write was requested: {error}"
+                    ),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn finish_acknowledged_pending_review_start(&mut self, flow_id: &str, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if !self.shared_composer_admitted(index) {
+            self.status =
+                "Wait for the active operation or shared input restoration before local completion."
+                    .into();
+            cx.notify();
+            return;
+        }
+        let Some(generation) = self.tabs[index].file_confirmation_generation.checked_add(1) else {
+            self.status =
+                "Pending-review local completion identity is exhausted; reopen this tab.".into();
+            return;
+        };
+        let (repository, number, store, authority, expected_composition, expected_start) =
+            match &self.tabs[index].interactions {
+                InteractionState::Ready(controller) => {
+                    let Some(record) = controller.pending_review_start.as_ref().filter(|record| {
+                        record.intent.flow_id == flow_id
+                            && matches!(
+                                &record.stage,
+                                PendingReviewStartStage::ThreadAcknowledged { .. }
+                            )
+                    }) else {
+                        self.status =
+                            "Only a durable ThreadAcknowledged state can finish locally without another provider write."
+                                .into();
+                        return;
+                    };
+                    (
+                        self.tabs[index].repository.clone(),
+                        self.tabs[index].pull_request.number,
+                        controller.store.clone(),
+                        controller.authority.clone(),
+                        controller.durable_composition.clone(),
+                        record.clone(),
+                    )
+                }
+                _ => return,
+            };
+        let token = PendingReviewStartStopToken {
+            workspace_instance: self.workspace_instance,
+            tab_instance: self.tabs[index].instance_generation,
+            repository_key: repository.cache_key(),
+            pull_request: number,
+            generation,
+            flow_id: expected_start.intent.flow_id.clone(),
+            thread_operation_id: expected_start.intent.thread_operation_id.clone(),
+        };
+        self.tabs[index].file_confirmation_generation = generation;
+        self.tabs[index].write_in_flight = true;
+        let predecessor_draft_id = expected_start.intent.draft_id.clone();
+        let predecessor_body = expected_start.intent.body.clone();
+        let identity = repository.cache_key();
+        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let completion_latest = latest.clone();
+        let task = cx.background_spawn(async move {
+            let _guard = lock.lock().map_err(|_| {
+                "Review recovery save lock failed; local completion is uncertain.".to_owned()
+            })?;
+            if latest.load(Ordering::Acquire) != sequence {
+                return Err(
+                    "A newer review-state write superseded local completion; disposition is uncertain."
+                        .to_owned(),
+                );
+            }
+            Ok(finish_pending_review_start_locally(
+                &authority,
+                &store,
+                expected_composition.as_ref(),
+                &expected_start,
+            ))
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                if this.workspace_instance != token.workspace_instance
+                    || completion_latest.load(Ordering::Acquire) != sequence
+                {
+                    return;
+                }
+                let Some(index) = this
+                    .tabs
+                    .iter()
+                    .position(|tab| token.matches(this.workspace_instance, tab))
+                else {
+                    return;
+                };
+                let status = match result {
+                    Ok(step) => {
+                        if let InteractionState::Ready(controller) =
+                            &mut this.tabs[index].interactions
+                        {
+                            if let Some(composition) = step.composition.clone() {
+                                controller.composition = composition.clone();
+                                controller.durable_composition = Some(composition);
+                            }
+                            controller.pending_review_start = step.record.clone();
+                            if matches!(&step.outcome, ProviderMutationOutcome::Acknowledged(_))
+                                && controller.file_composer.as_ref().is_some_and(|composer| {
+                                    composer.draft_id.as_deref()
+                                        == Some(predecessor_draft_id.as_str())
+                                        && composer.body == predecessor_body
+                                })
+                            {
+                                controller.file_composer = None;
+                            }
+                        }
+                        match step.outcome {
+                            ProviderMutationOutcome::Acknowledged(_) => {
+                                "Finished the already-acknowledged FILE result locally; zero additional provider writes were sent."
+                                    .into()
+                            }
+                            ProviderMutationOutcome::PreflightRejected { reason }
+                            | ProviderMutationOutcome::Uncertain { reason, .. } => format!(
+                                "The FILE result remains frozen for local recovery; zero additional provider writes were requested: {reason}"
+                            ),
+                        }
+                    }
+                    Err(error) => format!(
+                        "The acknowledged FILE result remains frozen; zero additional provider writes were requested: {error}"
+                    ),
+                };
+                this.tabs[index].write_in_flight = false;
+                this.status = status;
+                this.rebuild_diff(index, this.wide);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn start_file_comment_write(
@@ -17177,7 +18275,7 @@ impl ReviewWorkspace {
                     (Ok(prepared), Ok(observed_at)) => Ok((prepared, observed_at)),
                     (Err(error), _) | (_, Err(error)) => Err(error),
                 };
-                let pending = provider.pending_review(&repository, number);
+                let pending = provider.pending_review_observation(&repository, number);
                 let journal = ReviewKey::for_repository("github", &repository, number)
                     .map_err(|error| error.to_string())
                     .and_then(|key| ActionJournal::open(&journal_root, key))
@@ -17243,8 +18341,8 @@ impl ReviewWorkspace {
                     Ok((details, pending, journal, cache_write))
                         if disposition.payload_accepted =>
                     {
-                        let pending = match pending {
-                            Ok(pending) => pending,
+                        let observation = match pending {
+                            Ok(observation) => observation,
                             Err(_) => {
                                 this.queue_collaboration_save(
                                     tab_index,
@@ -17284,6 +18382,8 @@ impl ReviewWorkspace {
                                 return;
                             }
                         };
+                        let pending = observation.snapshot;
+                        let pending_absence = observation.absence;
                         this.queue_collaboration_save(
                             tab_index,
                             details.clone(),
@@ -17317,7 +18417,10 @@ impl ReviewWorkspace {
                                         "Pending-review refresh could not be reconciled: {error}"
                                     ));
                                 }
-                                controller.install_pending_snapshot(pending);
+                                controller.install_pending_observation(
+                                    pending,
+                                    pending_absence,
+                                );
                                 Some((
                                     controller.composition.clone(),
                                     controller.store.clone(),
@@ -22833,9 +23936,23 @@ impl ReviewWorkspace {
                             .collect::<Vec<_>>();
                         let recovery_details_expanded = tab.recovery_details_expanded;
                         let unresolved_reviews = controller.unresolved_operations();
+                        let pending_start = controller.pending_review_start.as_ref();
+                        let pending_start_requires_attention =
+                            pending_start.is_some_and(|record| {
+                                matches!(
+                                    &record.stage,
+                                    PendingReviewStartStage::PreparedCreate
+                                        | PendingReviewStartStage::CreateInFlight { .. }
+                                        | PendingReviewStartStage::ReviewCreated { .. }
+                                        | PendingReviewStartStage::ThreadInFlight { .. }
+                                        | PendingReviewStartStage::ThreadAcknowledged { .. }
+                                        | PendingReviewStartStage::Uncertain { .. }
+                                )
+                            });
                         let has_recovery_details = unresolved_reviews > 0
                             || !controller.reconciliation_results.is_empty()
-                            || !journal_unresolved.is_empty();
+                            || !journal_unresolved.is_empty()
+                            || pending_start_requires_attention;
                         let mut pending_card = div()
                                 .mb_4()
                                 .p_3()
@@ -22899,6 +24016,226 @@ impl ReviewWorkspace {
                                             }),
                                     )
                                 });
+                        if let Some(record) = pending_start {
+                            let start_description = match &record.stage {
+                                PendingReviewStartStage::PreparedCreate => {
+                                    "A two-write request was saved locally but never reached CreateInFlight. It will not start automatically."
+                                        .to_owned()
+                                }
+                                PendingReviewStartStage::CancelledBeforeCreate { reason } => {
+                                    format!(
+                                        "The recovered start was cancelled before create; zero provider writes were sent. Draft kept: {reason}"
+                                    )
+                                }
+                                PendingReviewStartStage::CreateInFlight { .. } => {
+                                    "Pending-review creation may have started, but no exact new review ID is durable. It will not retry or adopt a later review."
+                                        .to_owned()
+                                }
+                                PendingReviewStartStage::ReviewCreated {
+                                    creation,
+                                    stop_reason,
+                                } => format!(
+                                    "Pending review {} was created and remains unsubmitted; no FILE thread is in flight. Draft kept.{}",
+                                    creation.review.remote_id,
+                                    stop_reason
+                                        .as_ref()
+                                        .map(|reason| format!(" Last stop: {reason}"))
+                                        .unwrap_or_default()
+                                ),
+                                PendingReviewStartStage::ThreadInFlight { creation, .. } => format!(
+                                    "Pending review {} remains. The FILE outcome is unresolved and cannot replay.",
+                                    creation.review.remote_id
+                                ),
+                                PendingReviewStartStage::ThreadAcknowledged { creation, thread } => format!(
+                                    "FILE thread {} / comment {} on pending review {} is durably known; only exact local predecessor recovery may remain.",
+                                    thread.thread_id,
+                                    thread.comment_id,
+                                    creation.review.remote_id
+                                ),
+                                PendingReviewStartStage::Acknowledged { creation, thread } => format!(
+                                    "FILE thread {} / comment {} was acknowledged on pending review {}; the review remains unsubmitted.",
+                                    thread.thread_id,
+                                    thread.comment_id,
+                                    creation.review.remote_id
+                                ),
+                                PendingReviewStartStage::StoppedAfterReviewCreated {
+                                    creation,
+                                    ..
+                                } => format!(
+                                    "Continuation was locally stopped. Pending review {} and the FILE draft remain; future writes need fresh existing-pending evidence.",
+                                    creation.review.remote_id
+                                ),
+                                PendingReviewStartStage::CreateNotApplied { evidence, .. } => {
+                                    format!(
+                                        "The last pending-review create attempt was proven not applied: {evidence}"
+                                    )
+                                }
+                                PendingReviewStartStage::ThreadNotApplied {
+                                    creation,
+                                    evidence,
+                                    ..
+                                } => format!(
+                                    "Pending review {} remains; the FILE transport was proven not applied: {evidence}",
+                                    creation.review.remote_id
+                                ),
+                                PendingReviewStartStage::Uncertain {
+                                    creation,
+                                    reason,
+                                    ..
+                                } => format!(
+                                    "{} Outcome is uncertain and frozen: {reason}",
+                                    creation
+                                        .as_ref()
+                                        .map(|creation| format!(
+                                            "Pending review {} remains.",
+                                            creation.review.remote_id
+                                        ))
+                                        .unwrap_or_else(|| {
+                                            "No exact created review ID is durable; no ID will be inferred."
+                                                .into()
+                                        })
+                                ),
+                            };
+                            pending_card = pending_card.child(
+                                div()
+                                    .mt_2()
+                                    .p_2()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(if pending_start_requires_attention {
+                                        colors.amber
+                                    } else {
+                                        colors.border
+                                    })
+                                    .text_xs()
+                                    .child(start_description),
+                            );
+                            if record.may_continue_file_thread() {
+                                let continue_root = cx.entity();
+                                let stop_root = continue_root.clone();
+                                let continue_flow = record.intent.flow_id.clone();
+                                let stop_flow = continue_flow.clone();
+                                pending_card = pending_card.child(
+                                    div()
+                                        .mt_2()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("continue-pending-file-start")
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(colors.border)
+                                                .text_color(colors.accent)
+                                                .disabled(tab.write_in_flight)
+                                                .accessibility_label(
+                                                    "Continue adding exact whole-file comment",
+                                                )
+                                                .on_click(move |_, window, cx| {
+                                                    continue_root.update(cx, |root, cx| {
+                                                        if let Root::Review(this) = root {
+                                                            this.continue_pending_review_start(
+                                                                &continue_flow,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }
+                                                    });
+                                                })
+                                                .child("Continue adding file comment"),
+                                        )
+                                        .child(
+                                            Button::new("stop-pending-file-start")
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(colors.border)
+                                                .text_color(colors.amber)
+                                                .disabled(tab.write_in_flight)
+                                                .accessibility_label(
+                                                    "Stop continuation and keep pending review",
+                                                )
+                                                .on_click(move |_, _, cx| {
+                                                    stop_root.update(cx, |root, cx| {
+                                                        if let Root::Review(this) = root {
+                                                            this.stop_pending_review_start(
+                                                                &stop_flow, cx,
+                                                            );
+                                                        }
+                                                    });
+                                                })
+                                                .child("Stop and keep pending review"),
+                                        ),
+                                );
+                            } else if matches!(
+                                &record.stage,
+                                PendingReviewStartStage::PreparedCreate
+                            ) {
+                                let cancel_root = cx.entity();
+                                let cancel_flow = record.intent.flow_id.clone();
+                                pending_card = pending_card.child(
+                                    div().mt_2().child(
+                                        Button::new("cancel-prepared-pending-file-start")
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(colors.border)
+                                            .text_color(colors.amber)
+                                            .disabled(tab.write_in_flight)
+                                            .accessibility_label(
+                                                "Cancel recovered start before provider create",
+                                            )
+                                            .on_click(move |_, _, cx| {
+                                                cancel_root.update(cx, |root, cx| {
+                                                    if let Root::Review(this) = root {
+                                                        this.cancel_prepared_pending_review_start(
+                                                            &cancel_flow,
+                                                            cx,
+                                                        );
+                                                    }
+                                                });
+                                            })
+                                            .child("Cancel recovered start"),
+                                    ),
+                                );
+                            } else if matches!(
+                                &record.stage,
+                                PendingReviewStartStage::ThreadAcknowledged { .. }
+                            ) {
+                                let finish_root = cx.entity();
+                                let finish_flow = record.intent.flow_id.clone();
+                                pending_card = pending_card.child(
+                                    div().mt_2().child(
+                                        Button::new("finish-acknowledged-pending-file-start")
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(colors.border)
+                                            .text_color(colors.accent)
+                                            .disabled(tab.write_in_flight)
+                                            .accessibility_label(
+                                                "Finish acknowledged file comment locally",
+                                            )
+                                            .on_click(move |_, _, cx| {
+                                                finish_root.update(cx, |root, cx| {
+                                                    if let Root::Review(this) = root {
+                                                        this.finish_acknowledged_pending_review_start(
+                                                            &finish_flow,
+                                                            cx,
+                                                        );
+                                                    }
+                                                });
+                                            })
+                                            .child("Finish local recovery"),
+                                    ),
+                                );
+                            }
+                        }
                         if unresolved_reviews > 0 {
                             let reconcile_root = cx.entity();
                             pending_card = pending_card.child(div().mt_2().child(
@@ -25022,6 +26359,151 @@ impl ReviewWorkspace {
                                         }
                                     });
                                 })),
+                        )
+                        .into_any_element(),
+                )
+            }
+            NativeConfirmation::PendingFileReviewStart {
+                generation,
+                intent,
+                mode,
+            } => {
+                let token = PendingReviewStartConfirmationToken {
+                    workspace_instance: self.workspace_instance,
+                    tab_instance: tab.instance_generation,
+                    repository_key: tab.repository.cache_key(),
+                    pull_request: tab.pull_request.number,
+                    generation: *generation,
+                    intent: intent.as_ref().clone(),
+                    mode: mode.as_ref().clone(),
+                };
+                let confirm_root = cx.entity();
+                let cancel_root = confirm_root.clone();
+                let confirm_token = token.clone();
+                let review_id = match mode.as_ref() {
+                    PendingReviewStartConfirmationMode::Create { .. } => None,
+                    PendingReviewStartConfirmationMode::Continue { creation, .. } => {
+                        Some(creation.review.remote_id.as_str())
+                    }
+                };
+                let ReviewCommentTarget::File(target) = &intent.target else {
+                    return None;
+                };
+                Some(
+                    div()
+                        .mb_5()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.amber)
+                        .child(
+                            div().font_weight(FontWeight::SEMIBOLD).child(if review_id.is_some() {
+                                "Continue adding this whole-file comment?"
+                            } else {
+                                "Create a pending review and add this whole-file comment?"
+                            }),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child(format!(
+                                    "{} · #{} · selected account {}",
+                                    tab.repository.full_name(),
+                                    tab.pull_request.number,
+                                    intent.selected_author
+                                )),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .child(format!("Whole file: {}", target.path)),
+                        )
+                        .child(
+                            div().mt_1().text_xs().child(format!(
+                                "Reviewed commit: {}{}",
+                                intent.observed_head_sha,
+                                review_id
+                                    .map(|id| format!(" · exact pending review {id}"))
+                                    .unwrap_or_default()
+                            )),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .font_family(CODE_FONT)
+                                .child(format!("Exact comment: {:?}", intent.body)),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.amber)
+                                .child(if review_id.is_some() {
+                                    "This sends one GitHub write to add a FILE thread to the exact unsubmitted review shown above. It does not submit or delete the review. If the write is uncertain, the draft is kept and no retry occurs automatically."
+                                } else {
+                                    "This sends exactly two ordered GitHub writes: first an empty PENDING review pinned to this commit, then a FILE thread addressed to the exact new review ID. If the second stage stops or fails, the empty pending review may remain and the draft is kept. Neither write submits or deletes the review."
+                                }),
+                        )
+                        .child(
+                            div()
+                                .mt_3()
+                                .flex()
+                                .flex_wrap()
+                                .gap_3()
+                                .child(
+                                    Button::new("confirm-pending-review-start")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(colors.border)
+                                        .text_color(colors.amber)
+                                        .accessibility_label(if review_id.is_some() {
+                                            "Confirm exact one-write FILE continuation"
+                                        } else {
+                                            "Confirm exact two-write pending review start"
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            let token = confirm_token.clone();
+                                            confirm_root.update(cx, |root, cx| {
+                                                if let Root::Review(this) = root {
+                                                    this.confirm_pending_review_start(token, cx);
+                                                }
+                                            });
+                                        })
+                                        .child(if review_id.is_some() {
+                                            "Continue with one FILE write"
+                                        } else {
+                                            "Create review, then add FILE comment"
+                                        }),
+                                )
+                                .child(
+                                    Button::new("cancel-pending-review-start")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(colors.border)
+                                        .text_color(colors.accent)
+                                        .accessibility_label(
+                                            "Cancel pending review start and retain draft",
+                                        )
+                                        .on_click(move |_, _, cx| {
+                                            let token = token.clone();
+                                            cancel_root.update(cx, |root, cx| {
+                                                if let Root::Review(this) = root {
+                                                    this.cancel_pending_review_start_confirmation(
+                                                        &token, cx,
+                                                    );
+                                                }
+                                            });
+                                        })
+                                        .child("Cancel"),
+                                ),
                         )
                         .into_any_element(),
                 )
@@ -27735,6 +29217,7 @@ mod layout_tests {
         EXCEPTIONAL_LINE_CHUNK_BYTES, FileCommentConfirmationToken, JournalOperation,
         JournalRequest, JournalStatus, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
         MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
+        PendingReviewStartConfirmationMode, PendingReviewStartConfirmationToken,
         ReactionCompletionToken, SubmittedConfirmationToken, SubmittedDraftCallbackToken,
         SubmittedDraftCloseDisposition, SubmittedDraftLoadState, SubmittedSummaryEditor,
         active_review_composer_body, active_review_composer_needs_save, activity_thread_visible,
@@ -27742,7 +29225,8 @@ mod layout_tests {
         bounded_page, collaboration_completion_matches, diff_content_width, display_columns,
         file_confirmation_matches_visible_body, journal_operation_description,
         journal_operation_summary, line_text_chunks, media_free_markdown, observe_auxiliary,
-        resolved_panel_widths_for, review_subject_allows_actions, submitted_review_edit_action,
+        pending_review_start_confirmation_matches_visible_body, resolved_panel_widths_for,
+        review_subject_allows_actions, submitted_review_edit_action,
     };
     #[cfg(feature = "ui-smoke")]
     use super::{
@@ -27752,9 +29236,9 @@ mod layout_tests {
         Startup, ToggleCheckIdentity, check_identity_button, checks_page_button, palette,
     };
     use cibergit::domain::{
-        Account, MergeEligibility, PendingFileCommentSource, ProviderCoordinates,
-        PullRequestDetails, PullRequestReview, ReactionContent, ReactionIntent, Repository,
-        ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewSubject,
+        Account, MergeEligibility, PendingFileCommentSource, PendingFileReviewAbsence,
+        ProviderCoordinates, PullRequestDetails, PullRequestReview, ReactionContent,
+        ReactionIntent, Repository, ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewSubject,
         SubmittedReviewEditCapability,
     };
     #[cfg(feature = "ui-smoke")]
@@ -27766,7 +29250,9 @@ mod layout_tests {
         SelectedViewer, SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
         SubmittedReviewDismissalTarget, WorkflowRunIdentity,
     };
-    use cibergit::participation::PublishedFile;
+    use cibergit::participation::{
+        PendingFileReviewStartIntent, PublishedFile, ReviewCommentTarget, ReviewKey,
+    };
     use cibergit::providers::{GeneralReadDelay, GeneralReadDirective};
     #[cfg(feature = "ui-smoke")]
     use gpui::{Modifiers, WindowAppearance, point, px, size};
@@ -27956,6 +29442,69 @@ mod layout_tests {
             pending_source: source.clone(),
         };
         (repository, source, target, confirmation, token)
+    }
+
+    fn pending_review_start_confirmation_fixture() -> (
+        Repository,
+        PublishedFile,
+        NativeConfirmation,
+        PendingReviewStartConfirmationToken,
+    ) {
+        let (repository, _) = submitted_review_fixture();
+        let target = PublishedFile {
+            base_sha: "1".repeat(40),
+            commit_sha: "2".repeat(40),
+            file_key: "assets/example.bin".into(),
+            path: "assets/example.bin".into(),
+            previous_path: Some("assets/old.bin".into()),
+            raw_previous_path: None,
+        };
+        let pull_request = ProviderCoordinates {
+            provider: "github".into(),
+            host: "github.com".into(),
+            owner: "octo".into(),
+            repository: "repo".into(),
+            pull_request: 7,
+            remote_id: "PR_node".into(),
+        };
+        let intent = PendingFileReviewStartIntent {
+            flow_id: "flow-1".into(),
+            create_operation_id: "create-1".into(),
+            thread_operation_id: "thread-1".into(),
+            key: ReviewKey::for_repository("github", &repository, 7).unwrap(),
+            draft_id: "file-draft-1".into(),
+            body: "Whole-file rationale".into(),
+            target: ReviewCommentTarget::File(target.clone()),
+            pull_request: pull_request.clone(),
+            selected_author: "alice".into(),
+            observed_base_sha: "1".repeat(40),
+            observed_head_sha: "2".repeat(40),
+        };
+        let mode = PendingReviewStartConfirmationMode::Create {
+            absence: PendingFileReviewAbsence {
+                viewer_login: "alice".into(),
+                repository: repository.clone(),
+                pull_request,
+                pull_request_state: "OPEN".into(),
+                current_base_sha: "1".repeat(40),
+                current_head_sha: "2".repeat(40),
+            },
+        };
+        let confirmation = NativeConfirmation::PendingFileReviewStart {
+            generation: 30,
+            intent: Box::new(intent.clone()),
+            mode: Box::new(mode.clone()),
+        };
+        let token = PendingReviewStartConfirmationToken {
+            workspace_instance: 10,
+            tab_instance: 20,
+            repository_key: repository.cache_key(),
+            pull_request: 7,
+            generation: 30,
+            intent,
+            mode,
+        };
+        (repository, target, confirmation, token)
     }
 
     fn details_with_reviews(reviews: Vec<PullRequestReview>) -> PullRequestDetails {
@@ -30526,6 +32075,119 @@ mod layout_tests {
         assert!(review_subject_allows_actions(ReviewSubject::Line));
         assert!(review_subject_allows_actions(ReviewSubject::File));
         assert!(!review_subject_allows_actions(ReviewSubject::Unknown));
+    }
+
+    #[test]
+    fn pending_review_start_confirmation_fences_body_target_account_and_aba() {
+        let (repository, target, confirmation, token) = pending_review_start_confirmation_fixture();
+        let matches = |candidate: &PendingReviewStartConfirmationToken,
+                       workspace,
+                       tab,
+                       repository_key: &str,
+                       pull_request,
+                       confirmation: Option<&NativeConfirmation>| {
+            candidate.matches_confirmation_values(
+                workspace,
+                tab,
+                repository_key,
+                pull_request,
+                confirmation,
+            )
+        };
+        assert!(matches(
+            &token,
+            10,
+            20,
+            &repository.cache_key(),
+            7,
+            Some(&confirmation)
+        ));
+        assert!(!matches(
+            &token,
+            11,
+            20,
+            &repository.cache_key(),
+            7,
+            Some(&confirmation)
+        ));
+        assert!(!matches(
+            &token,
+            10,
+            21,
+            &repository.cache_key(),
+            7,
+            Some(&confirmation)
+        ));
+        assert!(!matches(
+            &token,
+            10,
+            20,
+            "other-account",
+            7,
+            Some(&confirmation)
+        ));
+        assert!(!matches(
+            &token,
+            10,
+            20,
+            &repository.cache_key(),
+            8,
+            Some(&confirmation)
+        ));
+        let repeated_payload = NativeConfirmation::PendingFileReviewStart {
+            generation: 31,
+            intent: Box::new(token.intent.clone()),
+            mode: Box::new(token.mode.clone()),
+        };
+        assert!(!matches(
+            &token,
+            10,
+            20,
+            &repository.cache_key(),
+            7,
+            Some(&repeated_payload)
+        ));
+        let mut changed_intent = token.intent.clone();
+        changed_intent.body = "edited visible body".into();
+        let changed_body = NativeConfirmation::PendingFileReviewStart {
+            generation: 30,
+            intent: Box::new(changed_intent),
+            mode: Box::new(token.mode.clone()),
+        };
+        assert!(!matches(
+            &token,
+            10,
+            20,
+            &repository.cache_key(),
+            7,
+            Some(&changed_body)
+        ));
+        let mut changed_target_intent = token.intent.clone();
+        let mut changed_target = target;
+        changed_target.path = "assets/other.bin".into();
+        changed_target.file_key = "assets/other.bin".into();
+        changed_target_intent.target = ReviewCommentTarget::File(changed_target);
+        let changed_target = NativeConfirmation::PendingFileReviewStart {
+            generation: 30,
+            intent: Box::new(changed_target_intent),
+            mode: Box::new(token.mode.clone()),
+        };
+        assert!(!matches(
+            &token,
+            10,
+            20,
+            &repository.cache_key(),
+            7,
+            Some(&changed_target)
+        ));
+        assert!(pending_review_start_confirmation_matches_visible_body(
+            &token,
+            "Whole-file rationale"
+        ));
+        assert!(!pending_review_start_confirmation_matches_visible_body(
+            &token,
+            "edited visible body"
+        ));
     }
 
     #[test]

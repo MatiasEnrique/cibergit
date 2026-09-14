@@ -5,8 +5,9 @@ use super::*;
 use $crate::{
     domain::{
         Account, ChangedFile, Comparison, MergeAction, MergeExecutionRequest, MergeMethod,
-        PendingFileCommentSource, ProviderCoordinates, ProviderMutationOutcome, Repository,
-        ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewSubject, Revision,
+        PendingFileCommentSource, PendingFileReviewAbsence, ProviderCoordinates,
+        ProviderMutationOutcome, Repository, ReviewAuxiliaryAction, ReviewAuxiliaryRequest,
+        ReviewSubject, Revision,
     },
     participation::{
         CanonicalPublishedPatch, DiffSide, DraftStore, LineSelection, LoadOutcome,
@@ -149,6 +150,60 @@ fn pending_file_preflight(head: &str, author: &str, review_id: &str) -> Value {
             }], "pageInfo": {"hasNextPage": false, "endCursor": null}}
         }}
     }})
+}
+
+fn pending_review_read(nodes: Vec<Value>) -> Value {
+    json!({"data": {
+        "viewer": {"login": "alice"},
+        "repository": {"nameWithOwner": "owner/repo", "pullRequest": {
+            "id": "PR_node", "number": 7,
+            "url": "https://github.com/owner/repo/pull/7", "state": "OPEN",
+            "baseRefOid": OLD, "headRefOid": HEAD,
+            "reviews": {"nodes": nodes,
+                "pageInfo": {"hasNextPage": false, "endCursor": null}}
+        }}
+    }})
+}
+
+fn pending_review_row(id: &str, author: Value) -> Value {
+    json!({
+        "id": id, "author": author, "body": "", "state": "PENDING",
+        "submittedAt": null, "commit": {"oid": HEAD},
+        "url": format!("https://github.com/owner/repo/pull/7#pullrequestreview-{id}"),
+        "comments": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+    })
+}
+
+fn pending_review_create_ack(operation_id: &str, review_id: &str, author: &str) -> Value {
+    json!({"data": {"createEmptyPendingReview": {
+        "clientMutationId": operation_id,
+        "pullRequestReview": {
+            "id": review_id, "state": "PENDING", "submittedAt": null,
+            "author": {"login": author}, "commit": {"oid": HEAD},
+            "pullRequest": {"id": "PR_node", "number": 7,
+                "repository": {"nameWithOwner": "owner/repo"}}
+        }
+    }}})
+}
+
+fn pending_start_intent() -> $crate::participation::PendingFileReviewStartIntent {
+    let (composition, _, draft_id) = composition_with_file_draft();
+    composition
+        .prepare_pending_file_review_start(
+            &draft_id,
+            &PendingFileReviewAbsence {
+                viewer_login: "alice".into(),
+                repository: repo("alice"),
+                pull_request: coordinates("PR_node"),
+                pull_request_state: "OPEN".into(),
+                current_base_sha: OLD.into(),
+                current_head_sha: HEAD.into(),
+            },
+            "pending-start-flow-1".into(),
+            "pending-start-create-1".into(),
+            "pending-start-thread-1".into(),
+        )
+        .unwrap()
 }
 
 fn pending_file_ack(operation_id: &str, subject: &str, body: &str, review_id: &str) -> Value {
@@ -324,6 +379,13 @@ else:
         mutation_input = query.split('addPendingFileReviewThread: addPullRequestReviewThread(input:', 1)[1].split('})', 1)[0]
         for forbidden in ['line:', 'side:', 'startLine:', 'startSide:', 'pullRequestId:', 'event:']:
             assert forbidden not in mutation_input
+    if 'mutation CreateEmptyPendingReview(' in query:
+        assert 'createEmptyPendingReview: addPullRequestReview(input:' in query
+        assert 'commitOID: $commitOID' in query
+        assert 'clientMutationId pullRequestReview { id state submittedAt author { login } commit { oid } pullRequest { id number repository { nameWithOwner } } }' in query
+        assert payload['variables']['event'] is None
+        assert payload['variables']['body'] is None
+        assert payload['variables']['threads'] is None
     if 'mutation UpdateReviewComment(' in query:
         assert 'updatePullRequestReviewComment(input: { pullRequestReviewCommentId: $commentId, body: $body, clientMutationId: $clientMutationId })' in query
     if 'mutation SubmitReview(' in query:
@@ -357,6 +419,10 @@ else:
     if 'query PendingReview' in query:
         assert 'pullRequestReview { id }' in query
     assert payload['variables'] == step['variables']
+    if query.startswith('mutation '):
+        mutations = root / 'mutations'
+        mutation_count = int(mutations.read_text()) if mutations.exists() else 0
+        mutations.write_text(str(mutation_count + 1))
 count.write_text(str(index + 1))
 if step.get('immutable_path'):
     os.chflags(step['immutable_path'], stat.UF_IMMUTABLE)
@@ -688,6 +754,381 @@ fn pending_file_ack_mismatch_is_uncertain_and_cannot_replay() {
         ));
         assert_eq!(count(&dir), 2, "uncertain file writes must never replay");
         assert!(composition.file_draft(&draft_id).unwrap().remote.is_none());
+    }
+}
+
+#[test]
+fn pending_review_start_uses_two_ordered_exact_id_writes() {
+    let intent = pending_start_intent();
+    let create_variables = json!({
+        "pullRequestId": "PR_node",
+        "commitOID": HEAD,
+        "event": null,
+        "body": null,
+        "threads": null,
+        "clientMutationId": "pending-start-create-1",
+    });
+    let thread_variables = json!({
+        "pullRequestReviewId": "REVIEW_created",
+        "body": "exact whole-file comment",
+        "path": "src/lib.rs",
+        "subjectType": "FILE",
+        "clientMutationId": "pending-start-thread-1",
+    });
+    let (transport_fixture, provider) = fixture(
+        "alice",
+        vec![
+            step(
+                "query PendingReview",
+                json!({"owner":"owner","name":"repo","number":7}),
+                pending_review_read(vec![]),
+            ),
+            step(
+                "mutation CreateEmptyPendingReview",
+                create_variables,
+                pending_review_create_ack(
+                    "pending-start-create-1",
+                    "REVIEW_created",
+                    "alice",
+                ),
+            ),
+            step(
+                "query PendingFileCommentPreflight",
+                json!({"owner":"owner","name":"repo","number":7}),
+                pending_file_preflight(HEAD, "alice", "REVIEW_created"),
+            ),
+            step(
+                "mutation AddPendingFileReviewThread",
+                thread_variables,
+                pending_file_ack(
+                    "pending-start-thread-1",
+                    "FILE",
+                    "exact whole-file comment",
+                    "REVIEW_created",
+                ),
+            ),
+        ],
+        Duration::from_secs(2),
+    );
+    let prepared = provider
+        .prepare_pending_review_start_create(&repo("alice"), &intent)
+        .unwrap();
+    let creation = match provider.dispatch_pending_review_start_create(
+        prepared,
+        "create-attempt-1",
+    ) {
+        ProviderMutationOutcome::Acknowledged(ack) => ack,
+        other => panic!("unexpected create outcome: {other:?}"),
+    };
+    assert_eq!(creation.review.remote_id, "REVIEW_created");
+    let prepared = provider
+        .prepare_pending_review_start_thread(&repo("alice"), &intent, &creation)
+        .unwrap();
+    let thread = match provider.dispatch_pending_review_start_thread(
+        prepared,
+        "thread-attempt-1",
+    ) {
+        ProviderMutationOutcome::Acknowledged(ack) => ack,
+        other => panic!("unexpected FILE outcome: {other:?}"),
+    };
+    assert_eq!(thread.review_id.as_deref(), Some("REVIEW_created"));
+    assert_eq!(thread.thread_id.as_deref(), Some("THREAD_new"));
+    assert_eq!(thread.comment_id.as_deref(), Some("COMMENT_new"));
+    assert_eq!(
+        fs::read_to_string(transport_fixture.path().join("mutations")).unwrap(),
+        "2"
+    );
+}
+
+#[test]
+fn pending_review_absence_requires_every_pending_row_to_be_classifiable() {
+    for (name, nodes, absence_expected) in [
+        ("empty", vec![], true),
+        (
+            "known-other-author",
+            vec![pending_review_row(
+                "REVIEW_other",
+                json!({"login":"bob"}),
+            )],
+            true,
+        ),
+        (
+            "null-author",
+            vec![pending_review_row("REVIEW_unknown", Value::Null)],
+            false,
+        ),
+    ] {
+        let (fixture, provider) = fixture(
+            "alice",
+            vec![step(
+                "query PendingReview",
+                json!({"owner":"owner","name":"repo","number":7}),
+                pending_review_read(nodes),
+            )],
+            Duration::from_secs(2),
+        );
+        let observation = provider
+            .pending_review_observation(&repo("alice"), 7)
+            .unwrap();
+        assert_eq!(
+            observation.absence.is_some(),
+            absence_expected,
+            "{name}"
+        );
+        assert!(!fixture.path().join("mutations").exists(), "{name}");
+    }
+
+    let intent = pending_start_intent();
+    let (null_author_fixture, provider) = fixture(
+        "alice",
+        vec![step(
+            "query PendingReview",
+            json!({"owner":"owner","name":"repo","number":7}),
+            pending_review_read(vec![pending_review_row(
+                "REVIEW_unknown",
+                Value::Null,
+            )]),
+        )],
+        Duration::from_secs(2),
+    );
+    assert!(
+        provider
+            .prepare_pending_review_start_create(&repo("alice"), &intent)
+            .is_err()
+    );
+    assert!(!null_author_fixture.path().join("mutations").exists());
+
+    for (name, replacement) in [("missing-pr-id", Value::Null), ("empty-pr-id", json!(""))] {
+        let mut response = pending_review_read(vec![]);
+        response["data"]["repository"]["pullRequest"]["id"] = replacement;
+        let (fixture, provider) = fixture(
+            "alice",
+            vec![step(
+                "query PendingReview",
+                json!({"owner":"owner","name":"repo","number":7}),
+                response,
+            )],
+            Duration::from_secs(2),
+        );
+        let observation = provider
+            .pending_review_observation(&repo("alice"), 7)
+            .unwrap();
+        assert!(observation.absence.is_none(), "{name}");
+        assert!(!fixture.path().join("mutations").exists(), "{name}");
+    }
+}
+
+#[test]
+fn pending_review_start_rejects_frozen_identity_and_body_before_transport() {
+    let (fixture, provider) = fixture("alice", vec![], Duration::from_secs(2));
+    let mut wrong_account = pending_start_intent();
+    wrong_account.selected_author = "mallory".into();
+    assert!(
+        provider
+            .prepare_pending_review_start_create(&repo("alice"), &wrong_account)
+            .is_err()
+    );
+    let mut empty_body = pending_start_intent();
+    empty_body.body.clear();
+    assert!(
+        provider
+            .prepare_pending_review_start_create(&repo("alice"), &empty_body)
+            .is_err()
+    );
+    assert!(!fixture.path().join("count").exists());
+    assert!(!fixture.path().join("mutations").exists());
+}
+
+#[test]
+fn moved_head_between_stages_leaves_exact_created_review_and_sends_one_write() {
+    let intent = pending_start_intent();
+    let (fixture, provider) = fixture(
+        "alice",
+        vec![
+            step(
+                "query PendingReview",
+                json!({"owner":"owner","name":"repo","number":7}),
+                pending_review_read(vec![]),
+            ),
+            step(
+                "mutation CreateEmptyPendingReview",
+                json!({
+                    "pullRequestId":"PR_node", "commitOID":HEAD,
+                    "event":null, "body":null, "threads":null,
+                    "clientMutationId":"pending-start-create-1"
+                }),
+                pending_review_create_ack(
+                    "pending-start-create-1",
+                    "REVIEW_created",
+                    "alice",
+                ),
+            ),
+            step(
+                "query PendingFileCommentPreflight",
+                json!({"owner":"owner","name":"repo","number":7}),
+                pending_file_preflight(NEW, "alice", "REVIEW_created"),
+            ),
+        ],
+        Duration::from_secs(2),
+    );
+    let prepared = provider
+        .prepare_pending_review_start_create(&repo("alice"), &intent)
+        .unwrap();
+    let creation = match provider.dispatch_pending_review_start_create(
+        prepared,
+        "create-attempt",
+    ) {
+        ProviderMutationOutcome::Acknowledged(ack) => ack,
+        other => panic!("unexpected create outcome: {other:?}"),
+    };
+    assert!(
+        provider
+            .prepare_pending_review_start_thread(&repo("alice"), &intent, &creation)
+            .is_err()
+    );
+    assert_eq!(creation.review.remote_id, "REVIEW_created");
+    assert_eq!(fs::read_to_string(fixture.path().join("mutations")).unwrap(), "1");
+    assert_eq!(fs::read_to_string(fixture.path().join("count")).unwrap(), "3");
+}
+
+#[test]
+fn pending_review_create_rich_ack_mismatches_are_uncertain_and_never_reach_file_stage() {
+    let mut cases = Vec::new();
+    let mut wrong_operation = pending_review_create_ack(
+        "pending-start-create-1",
+        "REVIEW_created",
+        "alice",
+    );
+    wrong_operation["data"]["createEmptyPendingReview"]["clientMutationId"] =
+        json!("another-operation");
+    cases.push(("operation", wrong_operation));
+    let mut wrong_author = pending_review_create_ack(
+        "pending-start-create-1",
+        "REVIEW_created",
+        "alice",
+    );
+    wrong_author["data"]["createEmptyPendingReview"]["pullRequestReview"]["author"]["login"] =
+        json!("mallory");
+    cases.push(("author", wrong_author));
+    let mut wrong_state = pending_review_create_ack(
+        "pending-start-create-1",
+        "REVIEW_created",
+        "alice",
+    );
+    wrong_state["data"]["createEmptyPendingReview"]["pullRequestReview"]["state"] =
+        json!("COMMENTED");
+    cases.push(("state", wrong_state));
+    let mut submitted = pending_review_create_ack(
+        "pending-start-create-1",
+        "REVIEW_created",
+        "alice",
+    );
+    submitted["data"]["createEmptyPendingReview"]["pullRequestReview"]["submittedAt"] =
+        json!("2026-09-14T12:00:00Z");
+    cases.push(("submitted", submitted));
+    let mut wrong_commit = pending_review_create_ack(
+        "pending-start-create-1",
+        "REVIEW_created",
+        "alice",
+    );
+    wrong_commit["data"]["createEmptyPendingReview"]["pullRequestReview"]["commit"]["oid"] =
+        json!(NEW);
+    cases.push(("commit", wrong_commit));
+    let mut wrong_pr = pending_review_create_ack(
+        "pending-start-create-1",
+        "REVIEW_created",
+        "alice",
+    );
+    wrong_pr["data"]["createEmptyPendingReview"]["pullRequestReview"]["pullRequest"]["id"] =
+        json!("PR_other");
+    cases.push(("pull-request", wrong_pr));
+    let mut wrong_repo = pending_review_create_ack(
+        "pending-start-create-1",
+        "REVIEW_created",
+        "alice",
+    );
+    wrong_repo["data"]["createEmptyPendingReview"]["pullRequestReview"]["pullRequest"]
+        ["repository"]["nameWithOwner"] = json!("other/repo");
+    cases.push(("repository", wrong_repo));
+    let mut empty_review_id = pending_review_create_ack(
+        "pending-start-create-1",
+        "REVIEW_created",
+        "alice",
+    );
+    empty_review_id["data"]["createEmptyPendingReview"]["pullRequestReview"]["id"] = json!("");
+    cases.push(("review-id", empty_review_id));
+    let mut review_id_is_pull_id = pending_review_create_ack(
+        "pending-start-create-1",
+        "REVIEW_created",
+        "alice",
+    );
+    review_id_is_pull_id["data"]["createEmptyPendingReview"]["pullRequestReview"]["id"] =
+        json!("PR_node");
+    cases.push(("review-id-is-pull-id", review_id_is_pull_id));
+    let mut missing_author = pending_review_create_ack(
+        "pending-start-create-1",
+        "REVIEW_created",
+        "alice",
+    );
+    missing_author["data"]["createEmptyPendingReview"]["pullRequestReview"]["author"] =
+        Value::Null;
+    cases.push(("missing-author", missing_author));
+    let mut missing_commit = pending_review_create_ack(
+        "pending-start-create-1",
+        "REVIEW_created",
+        "alice",
+    );
+    missing_commit["data"]["createEmptyPendingReview"]["pullRequestReview"]["commit"] =
+        Value::Null;
+    cases.push(("missing-commit", missing_commit));
+    let mut wrong_number = pending_review_create_ack(
+        "pending-start-create-1",
+        "REVIEW_created",
+        "alice",
+    );
+    wrong_number["data"]["createEmptyPendingReview"]["pullRequestReview"]["pullRequest"]
+        ["number"] = json!(8);
+    cases.push(("pull-request-number", wrong_number));
+
+    for (name, response) in cases {
+        let intent = pending_start_intent();
+        let (fixture, provider) = fixture(
+            "alice",
+            vec![
+                step(
+                    "query PendingReview",
+                    json!({"owner":"owner","name":"repo","number":7}),
+                    pending_review_read(vec![]),
+                ),
+                step(
+                    "mutation CreateEmptyPendingReview",
+                    json!({
+                        "pullRequestId":"PR_node", "commitOID":HEAD,
+                        "event":null, "body":null, "threads":null,
+                        "clientMutationId":"pending-start-create-1"
+                    }),
+                    response,
+                ),
+            ],
+            Duration::from_secs(2),
+        );
+        let prepared = provider
+            .prepare_pending_review_start_create(&repo("alice"), &intent)
+            .unwrap();
+        assert!(matches!(
+            provider.dispatch_pending_review_start_create(prepared, "create-attempt"),
+            ProviderMutationOutcome::Uncertain { .. }
+        ), "{name}");
+        assert_eq!(
+            fs::read_to_string(fixture.path().join("mutations")).unwrap(),
+            "1",
+            "{name}"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.path().join("count")).unwrap(),
+            "2",
+            "{name}: no stage-2 preflight or write"
+        );
     }
 }
 

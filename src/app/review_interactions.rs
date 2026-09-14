@@ -1,19 +1,23 @@
 use cibergit::{
     domain::{
         MergeAcknowledgement, MergeExecutionRequest, MergeMethod, MergePreparation,
-        MutationAdmissionReceipt, MutationContext, MutationTerminalRecord, PendingReviewSnapshot,
-        ProviderCoordinates, ProviderMutationOutcome, PullRequestDetails,
-        PullRequestDiscussionRequest, PullRequestLifecycleRequest, ReactionRequest, Repository,
-        ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryRequest, ReviewComment, ReviewThread,
-        SubmittedReviewDismissalRequest,
+        MutationAdmissionReceipt, MutationContext, MutationTerminalRecord,
+        PendingFileReviewAbsence, PendingReviewSnapshot, ProviderCoordinates,
+        ProviderMutationOutcome, PullRequestDetails, PullRequestDiscussionRequest,
+        PullRequestLifecycleRequest, ReactionRequest, Repository, ReviewAuxiliaryAcknowledgement,
+        ReviewAuxiliaryRequest, ReviewComment, ReviewThread, SubmittedReviewDismissalRequest,
     },
     participation::{
         CanonicalPublishedPatch, DraftCoordinate, DraftStore, LineSelection, LoadOutcome,
-        PublishedFile, PublishedPosition, ReviewComposition, ReviewEvent, ReviewKey,
-        ReviewOperation, ReviewOperationPayload, ReviewOperationStatus, ReviewOperationTarget,
-        map_file_to_canonical_published, map_to_canonical_published, validate_coordinate,
+        PendingFileReviewStartIntent, PublishedFile, PublishedPosition, ReviewComposition,
+        ReviewEvent, ReviewKey, ReviewOperation, ReviewOperationPayload, ReviewOperationStatus,
+        ReviewOperationTarget, map_file_to_canonical_published, map_to_canonical_published,
+        validate_coordinate,
     },
-    providers::{AdmittedMutationAttempt, MutationAdmission},
+    pending_review_start::{
+        MAX_PENDING_REVIEW_START_BYTES, PendingReviewStartRecord, PendingReviewStartStage,
+    },
+    providers::{AdmittedMutationAttempt, GithubProvider, MutationAdmission},
     review::{ReviewSession, file_key},
 };
 use serde::{Deserialize, Serialize};
@@ -27,13 +31,23 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 const JOURNAL_VERSION: u64 = 1;
+const PENDING_REVIEW_START_JOURNAL_VERSION: u64 = 1;
 const MAX_JOURNAL_BYTES: usize = 512 * 1024;
 const MAX_JOURNAL_OPERATIONS: usize = 96;
 const MAX_JOURNAL_TEXT_BYTES: usize = 64 * 1024;
 const LOCK_UN: c_int = 0x08;
+const LOCK_EX: c_int = 0x02;
+const LOCK_NB: c_int = 0x04;
+#[cfg(not(test))]
+const TARGET_AUTHORITY_WAIT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const TARGET_AUTHORITY_WAIT: Duration = Duration::from_millis(150);
+const TARGET_AUTHORITY_POLL: Duration = Duration::from_millis(20);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -78,6 +92,8 @@ pub struct ReviewInteractionController {
     pub composer: Option<ComposerState>,
     pub file_composer: Option<FileComposerState>,
     pub pending_review: Option<PendingReviewSnapshot>,
+    pub pending_absence: Option<PendingFileReviewAbsence>,
+    pub pending_review_start: Option<PendingReviewStartRecord>,
     pub pending_complete: bool,
     pub notice: Option<String>,
     pub reconciliation_results: Vec<ReviewReconciliationItem>,
@@ -162,7 +178,9 @@ impl ReviewInteractionController {
                 )));
             }
         };
-        let authority = ReviewStateAuthority::open(root.to_owned(), key)?;
+        let authority = ReviewStateAuthority::open(root.to_owned(), key.clone())?;
+        let pending_review_start_journal = PendingReviewStartJournal::open(root, key.clone())?;
+        let pending_review_start = pending_review_start_journal.record()?;
         Ok(ControllerLoad::Ready(Box::new(Self {
             composition,
             store,
@@ -172,6 +190,8 @@ impl ReviewInteractionController {
             composer: None,
             file_composer: None,
             pending_review: None,
+            pending_absence: None,
+            pending_review_start,
             pending_complete: true,
             notice: None,
             reconciliation_results: Vec::new(),
@@ -545,6 +565,25 @@ impl ReviewInteractionController {
         Ok(intent.operation_id)
     }
 
+    pub fn prepare_pending_file_review_start(
+        &self,
+        absence: &PendingFileReviewAbsence,
+        flow_id: String,
+        create_operation_id: String,
+        thread_operation_id: String,
+    ) -> Result<PendingFileReviewStartIntent, String> {
+        let draft_id = self.saved_file_composer_id()?;
+        self.composition
+            .prepare_pending_file_review_start(
+                &draft_id,
+                absence,
+                flow_id,
+                create_operation_id,
+                thread_operation_id,
+            )
+            .map_err(|error| error.to_string())
+    }
+
     pub fn prepare_immediate_with_canonical(
         &mut self,
         displayed: &ReviewSession,
@@ -621,6 +660,19 @@ impl ReviewInteractionController {
             .as_ref()
             .is_none_or(|snapshot| snapshot.comments_complete);
         self.pending_review = snapshot;
+        self.pending_absence = None;
+    }
+
+    pub fn install_pending_observation(
+        &mut self,
+        snapshot: Option<PendingReviewSnapshot>,
+        absence: Option<PendingFileReviewAbsence>,
+    ) {
+        self.pending_complete = snapshot
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.comments_complete);
+        self.pending_review = snapshot;
+        self.pending_absence = absence;
     }
 
     pub fn pending_count(&self) -> usize {
@@ -730,6 +782,730 @@ impl ReviewInteractionController {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PendingReviewStartStep<T> {
+    pub outcome: ProviderMutationOutcome<T>,
+    pub composition: Option<ReviewComposition>,
+    pub record: Option<PendingReviewStartRecord>,
+}
+
+pub fn execute_pending_review_start_create(
+    authority: &ReviewStateAuthority,
+    store: &DraftStore,
+    expected_composition: Option<&ReviewComposition>,
+    expected_start: Option<&PendingReviewStartRecord>,
+    provider: &GithubProvider,
+    repository: &Repository,
+    intent: &PendingFileReviewStartIntent,
+    attempt_id: &str,
+) -> PendingReviewStartStep<cibergit::domain::PendingReviewCreationAcknowledgement> {
+    let fallback_composition = expected_composition.cloned();
+    let fallback_record = expected_start.cloned();
+    let context = pending_start_context(
+        &intent.create_operation_id,
+        attempt_id,
+        "create-empty-pending-review",
+        &intent.flow_id,
+    );
+    let execution = authority.execute_pending_review_start_if_current(
+        store,
+        expected_composition,
+        expected_start,
+        |journal| {
+            let prepared_record = PendingReviewStartRecord::new(intent.clone())?;
+            journal.save_if_current_unlocked(expected_start, &prepared_record)?;
+            let prepared = match provider.prepare_pending_review_start_create(repository, intent) {
+                Ok(prepared) => prepared,
+                Err(reason) => {
+                    let mut terminal = prepared_record.clone();
+                    terminal.mark_create_not_applied(attempt_id.to_owned(), reason.clone())?;
+                    let outcome = match journal
+                        .save_if_current_unlocked(Some(&prepared_record), &terminal)
+                    {
+                        Ok(()) => ProviderMutationOutcome::PreflightRejected { reason },
+                        Err(error) => {
+                            let reason = format!(
+                                "Create preflight sent zero writes, but its terminal durable save failed: {error}"
+                            );
+                            persist_terminal_save_uncertain(
+                                journal,
+                                &prepared_record,
+                                cibergit::pending_review_start::PendingReviewStartWriteStage::CreateReview,
+                                attempt_id,
+                                reason.clone(),
+                            );
+                            ProviderMutationOutcome::Uncertain {
+                                context: context.clone(),
+                                reason,
+                            }
+                        }
+                    };
+                    return Ok(outcome);
+                }
+            };
+            let mut in_flight = prepared_record.clone();
+            in_flight.mark_create_in_flight(attempt_id.to_owned())?;
+            journal.save_if_current_unlocked(Some(&prepared_record), &in_flight)?;
+            let outcome = match provider
+                .dispatch_pending_review_start_create(prepared, attempt_id)
+            {
+                ProviderMutationOutcome::PreflightRejected { reason } => {
+                    let mut terminal = in_flight.clone();
+                    if let Err(error) = terminal.mark_create_not_applied(
+                        attempt_id.to_owned(),
+                        reason.clone(),
+                    ) {
+                        let reason = format!(
+                            "Create transport sent zero writes, but its exact NotApplied transition failed: {error}"
+                        );
+                        persist_pending_start_uncertain(journal, &in_flight, reason.clone());
+                        return Ok(ProviderMutationOutcome::Uncertain {
+                            context: context.clone(),
+                            reason,
+                        });
+                    }
+                    match journal.save_if_current_unlocked(Some(&in_flight), &terminal) {
+                        Ok(()) => ProviderMutationOutcome::PreflightRejected { reason },
+                        Err(error) => {
+                            persist_pending_start_uncertain(
+                                journal,
+                                &in_flight,
+                                format!(
+                                    "Create transport sent zero writes, but its terminal durable save failed: {error}"
+                                ),
+                            );
+                            ProviderMutationOutcome::Uncertain {
+                                context: context.clone(),
+                                reason: format!(
+                                    "Create transport sent zero writes, but its terminal durable save failed: {error}"
+                                ),
+                            }
+                        }
+                    }
+                }
+                ProviderMutationOutcome::Uncertain {
+                    context: provider_context,
+                    reason,
+                } => {
+                    persist_pending_start_uncertain(journal, &in_flight, reason.clone());
+                    ProviderMutationOutcome::Uncertain {
+                        context: provider_context,
+                        reason,
+                    }
+                }
+                ProviderMutationOutcome::Acknowledged(ack) => {
+                    let mut created = in_flight.clone();
+                    if let Err(error) = created.mark_review_created(ack.clone()) {
+                        let reason = format!(
+                            "GitHub created a review, but the validated receipt could not enter durable ReviewCreated state: {error}"
+                        );
+                        persist_pending_start_uncertain(journal, &in_flight, reason.clone());
+                        return Ok(ProviderMutationOutcome::Uncertain {
+                            context: context.clone(),
+                            reason,
+                        });
+                    }
+                    match journal.save_if_current_unlocked(Some(&in_flight), &created) {
+                        Ok(()) => ProviderMutationOutcome::Acknowledged(ack),
+                        Err(error) => {
+                            let reason = format!(
+                                "GitHub created the pending review, but its exact new ID could not be saved durably: {error}. No FILE write was attempted."
+                            );
+                            persist_pending_start_uncertain(journal, &in_flight, reason.clone());
+                            ProviderMutationOutcome::Uncertain {
+                                context: context.clone(),
+                                reason,
+                            }
+                        }
+                    }
+                }
+            };
+            Ok(outcome)
+        },
+    );
+    match execution {
+        PendingReviewStartAuthorityExecution::Completed {
+            value: Ok(outcome),
+            composition,
+            record,
+        } => PendingReviewStartStep {
+            outcome,
+            composition,
+            record,
+        },
+        PendingReviewStartAuthorityExecution::Completed {
+            value: Err(reason),
+            composition,
+            record,
+        } => PendingReviewStartStep {
+            outcome: ProviderMutationOutcome::PreflightRejected { reason },
+            composition,
+            record,
+        },
+        PendingReviewStartAuthorityExecution::NotAdmitted(reason) => PendingReviewStartStep {
+            outcome: ProviderMutationOutcome::PreflightRejected { reason },
+            composition: fallback_composition,
+            record: fallback_record,
+        },
+        PendingReviewStartAuthorityExecution::ReadbackUncertain { value, reason } => {
+            let prior = value.err().unwrap_or_else(|| {
+                "stage execution completed before durable readback failed".into()
+            });
+            PendingReviewStartStep {
+                outcome: ProviderMutationOutcome::Uncertain {
+                    context,
+                    reason: format!(
+                        "Pending-review start executed, but post-execution durable readback failed and cannot be classified as not sent: {reason}; {prior}"
+                    ),
+                },
+                composition: fallback_composition,
+                record: fallback_record,
+            }
+        }
+    }
+}
+
+pub fn execute_pending_review_start_thread(
+    authority: &ReviewStateAuthority,
+    store: &DraftStore,
+    expected_composition: Option<&ReviewComposition>,
+    expected_start: &PendingReviewStartRecord,
+    provider: &GithubProvider,
+    repository: &Repository,
+    attempt_id: &str,
+) -> PendingReviewStartStep<cibergit::domain::ReviewWriteAcknowledgement> {
+    let fallback_composition = expected_composition.cloned();
+    let fallback_record = Some(expected_start.clone());
+    let intent = &expected_start.intent;
+    let context = pending_start_context(
+        &intent.thread_operation_id,
+        attempt_id,
+        "add-pending-file-comment",
+        &intent.flow_id,
+    );
+    let execution = authority.execute_pending_review_start_if_current(
+        store,
+        expected_composition,
+        Some(expected_start),
+        |journal| {
+            let creation = expected_start
+                .creation()
+                .filter(|_| expected_start.may_continue_file_thread())
+                .ok_or_else(|| {
+                    "Only a durable quiescent ReviewCreated state can dispatch the FILE stage."
+                        .to_owned()
+                })?;
+            let prepared = match provider.prepare_pending_review_start_thread(
+                repository,
+                intent,
+                creation,
+            ) {
+                Ok(prepared) => prepared,
+                Err(reason) => {
+                    let mut stopped = expected_start.clone();
+                    stopped.stop_after_review_created(reason.clone())?;
+                    let outcome = match journal
+                        .save_if_current_unlocked(Some(expected_start), &stopped)
+                    {
+                        Ok(()) => ProviderMutationOutcome::PreflightRejected { reason },
+                        Err(error) => {
+                            let reason = format!(
+                                "FILE preflight sent zero writes, but its terminal durable save failed: {error}"
+                            );
+                            persist_terminal_save_uncertain(
+                                journal,
+                                expected_start,
+                                cibergit::pending_review_start::PendingReviewStartWriteStage::AddFileThread,
+                                attempt_id,
+                                reason.clone(),
+                            );
+                            ProviderMutationOutcome::Uncertain {
+                                context: context.clone(),
+                                reason,
+                            }
+                        }
+                    };
+                    return Ok(outcome);
+                }
+            };
+            let mut in_flight = expected_start.clone();
+            in_flight.mark_thread_in_flight(attempt_id.to_owned())?;
+            journal.save_if_current_unlocked(Some(expected_start), &in_flight)?;
+            let outcome = match provider
+                .dispatch_pending_review_start_thread(prepared, attempt_id)
+            {
+                ProviderMutationOutcome::PreflightRejected { reason } => {
+                    let mut terminal = in_flight.clone();
+                    if let Err(error) = terminal.mark_thread_not_applied(reason.clone()) {
+                        let reason = format!(
+                            "FILE transport sent zero writes, but its exact NotApplied transition failed: {error}"
+                        );
+                        persist_pending_start_uncertain(journal, &in_flight, reason.clone());
+                        return Ok(ProviderMutationOutcome::Uncertain {
+                            context: context.clone(),
+                            reason,
+                        });
+                    }
+                    match journal.save_if_current_unlocked(Some(&in_flight), &terminal) {
+                        Ok(()) => ProviderMutationOutcome::PreflightRejected { reason },
+                        Err(error) => {
+                            let reason = format!(
+                                "FILE transport sent zero writes, but its terminal durable save failed: {error}"
+                            );
+                            persist_pending_start_uncertain(journal, &in_flight, reason.clone());
+                            ProviderMutationOutcome::Uncertain {
+                                context: context.clone(),
+                                reason,
+                            }
+                        }
+                    }
+                }
+                ProviderMutationOutcome::Uncertain {
+                    context: provider_context,
+                    reason,
+                } => {
+                    persist_pending_start_uncertain(journal, &in_flight, reason.clone());
+                    ProviderMutationOutcome::Uncertain {
+                        context: provider_context,
+                        reason,
+                    }
+                }
+                ProviderMutationOutcome::Acknowledged(ack) => {
+                    let (Some(review_id), Some(thread_id), Some(comment_id)) = (
+                        ack.review_id.clone(),
+                        ack.thread_id.clone(),
+                        ack.comment_id.clone(),
+                    ) else {
+                        let reason =
+                            "Validated FILE acknowledgement omitted an exact remote ID".to_owned();
+                        persist_pending_start_uncertain(journal, &in_flight, reason.clone());
+                        return Ok(ProviderMutationOutcome::Uncertain {
+                            context: context.clone(),
+                            reason,
+                        });
+                    };
+                    let mut remote_acknowledged = in_flight.clone();
+                    if let Err(error) = remote_acknowledged.mark_thread_acknowledged(
+                        cibergit::pending_review_start::PendingFileThreadReceipt {
+                            operation_id: intent.thread_operation_id.clone(),
+                            review_id: review_id.clone(),
+                            thread_id,
+                            comment_id: comment_id.clone(),
+                        },
+                    ) {
+                        let reason = format!(
+                            "GitHub acknowledged the FILE write, but its validated IDs could not enter durable ThreadAcknowledged state: {error}"
+                        );
+                        persist_pending_start_uncertain(journal, &in_flight, reason.clone());
+                        return Ok(ProviderMutationOutcome::Uncertain {
+                            context: context.clone(),
+                            reason,
+                        });
+                    }
+                    if let Err(error) = journal
+                        .save_if_current_unlocked(Some(&in_flight), &remote_acknowledged)
+                    {
+                        let reason = format!(
+                            "GitHub acknowledged the FILE write, but its exact IDs could not be saved durably: {error}"
+                        );
+                        persist_pending_start_uncertain(journal, &in_flight, reason.clone());
+                        return Ok(ProviderMutationOutcome::Uncertain {
+                            context: context.clone(),
+                            reason,
+                        });
+                    }
+                    let Some(mut composition) = expected_composition.cloned() else {
+                        let reason =
+                            "Durable review composition disappeared after FILE acknowledgement."
+                                .to_owned();
+                        persist_pending_start_uncertain(
+                            journal,
+                            &remote_acknowledged,
+                            reason.clone(),
+                        );
+                        return Ok(ProviderMutationOutcome::Uncertain {
+                            context: context.clone(),
+                            reason,
+                        });
+                    };
+                    if let Err(error) = composition.reconcile_pending_file_review_start_success(
+                        intent,
+                        review_id,
+                        comment_id,
+                    ) {
+                        let reason = format!(
+                            "GitHub acknowledged the FILE write, but exact local predecessor reconciliation failed: {error}"
+                        );
+                        persist_pending_start_uncertain(
+                            journal,
+                            &remote_acknowledged,
+                            reason.clone(),
+                        );
+                        return Ok(ProviderMutationOutcome::Uncertain {
+                            context: context.clone(),
+                            reason,
+                        });
+                    }
+                    if let Err(error) = store.save(&composition) {
+                        let reason = format!(
+                            "GitHub acknowledged the FILE write, but the exact local predecessor could not be saved: {error}"
+                        );
+                        persist_pending_start_uncertain(
+                            journal,
+                            &remote_acknowledged,
+                            reason.clone(),
+                        );
+                        return Ok(ProviderMutationOutcome::Uncertain {
+                            context: context.clone(),
+                            reason,
+                        });
+                    }
+                    let mut completed = remote_acknowledged.clone();
+                    if let Err(error) = completed.mark_acknowledged() {
+                        let reason = format!(
+                            "The exact FILE result is durable, but its terminal state transition failed: {error}"
+                        );
+                        persist_pending_start_uncertain(
+                            journal,
+                            &remote_acknowledged,
+                            reason.clone(),
+                        );
+                        return Ok(ProviderMutationOutcome::Uncertain {
+                            context: context.clone(),
+                            reason,
+                        });
+                    }
+                    if let Err(error) = journal
+                        .save_if_current_unlocked(Some(&remote_acknowledged), &completed)
+                    {
+                        let reason = format!(
+                            "The exact FILE result and local predecessor are durable, but the terminal pending-start save failed: {error}"
+                        );
+                        persist_pending_start_uncertain(
+                            journal,
+                            &remote_acknowledged,
+                            reason.clone(),
+                        );
+                        return Ok(ProviderMutationOutcome::Uncertain {
+                            context: context.clone(),
+                            reason,
+                        });
+                    }
+                    ProviderMutationOutcome::Acknowledged(ack)
+                }
+            };
+            Ok(outcome)
+        },
+    );
+    match execution {
+        PendingReviewStartAuthorityExecution::Completed {
+            value: Ok(outcome),
+            composition,
+            record,
+        } => PendingReviewStartStep {
+            outcome,
+            composition,
+            record,
+        },
+        PendingReviewStartAuthorityExecution::Completed {
+            value: Err(reason),
+            composition,
+            record,
+        } => PendingReviewStartStep {
+            outcome: ProviderMutationOutcome::PreflightRejected { reason },
+            composition,
+            record,
+        },
+        PendingReviewStartAuthorityExecution::NotAdmitted(reason) => PendingReviewStartStep {
+            outcome: ProviderMutationOutcome::PreflightRejected { reason },
+            composition: fallback_composition,
+            record: fallback_record,
+        },
+        PendingReviewStartAuthorityExecution::ReadbackUncertain { value, reason } => {
+            let prior = value.err().unwrap_or_else(|| {
+                "stage execution completed before durable readback failed".into()
+            });
+            PendingReviewStartStep {
+                outcome: ProviderMutationOutcome::Uncertain {
+                    context,
+                    reason: format!(
+                        "Pending-review FILE stage executed, but post-execution durable readback failed and cannot be classified as not sent: {reason}; {prior}"
+                    ),
+                },
+                composition: fallback_composition,
+                record: fallback_record,
+            }
+        }
+    }
+}
+
+pub fn stop_pending_review_start_after_create(
+    authority: &ReviewStateAuthority,
+    store: &DraftStore,
+    expected_composition: Option<&ReviewComposition>,
+    expected_start: &PendingReviewStartRecord,
+) -> Result<PendingReviewStartRecord, String> {
+    let execution = authority.execute_pending_review_start_if_current(
+        store,
+        expected_composition,
+        Some(expected_start),
+        |journal| {
+            let mut stopped = expected_start.clone();
+            stopped.stop_and_keep_created_review(
+                "User explicitly stopped before any FILE thread dispatch; the created pending review and local draft were kept."
+                    .into(),
+            )?;
+            match journal.save_if_current_unlocked(Some(expected_start), &stopped) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let reason = format!(
+                        "The local stop sent zero additional provider writes, but its terminal durable save failed and is uncertain: {error}"
+                    );
+                    persist_terminal_save_uncertain(
+                        journal,
+                        expected_start,
+                        cibergit::pending_review_start::PendingReviewStartWriteStage::AddFileThread,
+                        &expected_start.intent.thread_operation_id,
+                        reason.clone(),
+                    );
+                    Err(reason)
+                }
+            }
+        },
+    );
+    match execution {
+        PendingReviewStartAuthorityExecution::Completed {
+            value: Ok(()),
+            record: Some(record),
+            ..
+        } => Ok(record),
+        PendingReviewStartAuthorityExecution::Completed {
+            value: Ok(()),
+            record: None,
+            ..
+        } => Err("Stopped pending-review start record disappeared after save; local disposition is uncertain.".into()),
+        PendingReviewStartAuthorityExecution::Completed {
+            value: Err(reason), ..
+        }
+        | PendingReviewStartAuthorityExecution::NotAdmitted(reason) => Err(reason),
+        PendingReviewStartAuthorityExecution::ReadbackUncertain { reason, .. } => Err(format!(
+            "The local stop executed, but its durable readback failed and the disposition is uncertain: {reason}"
+        )),
+    }
+}
+
+pub fn cancel_pending_review_start_before_create(
+    authority: &ReviewStateAuthority,
+    store: &DraftStore,
+    expected_composition: Option<&ReviewComposition>,
+    expected_start: &PendingReviewStartRecord,
+) -> Result<PendingReviewStartRecord, String> {
+    let execution = authority.execute_pending_review_start_if_current(
+        store,
+        expected_composition,
+        Some(expected_start),
+        |journal| {
+            let mut cancelled = expected_start.clone();
+            cancelled.cancel_before_create(
+                "User explicitly cancelled a recovered prepared start before any provider dispatch."
+                    .into(),
+            )?;
+            match journal.save_if_current_unlocked(Some(expected_start), &cancelled) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let reason = format!(
+                        "The pre-create cancellation sent zero provider writes, but its terminal durable save failed and is uncertain: {error}"
+                    );
+                    persist_terminal_save_uncertain(
+                        journal,
+                        expected_start,
+                        cibergit::pending_review_start::PendingReviewStartWriteStage::CreateReview,
+                        &expected_start.intent.create_operation_id,
+                        reason.clone(),
+                    );
+                    Err(reason)
+                }
+            }
+        },
+    );
+    match execution {
+        PendingReviewStartAuthorityExecution::Completed {
+            value: Ok(()),
+            record: Some(record),
+            ..
+        } => Ok(record),
+        PendingReviewStartAuthorityExecution::Completed {
+            value: Ok(()),
+            record: None,
+            ..
+        } => Err(
+            "Cancelled pre-create record disappeared after save; local disposition is uncertain."
+                .into(),
+        ),
+        PendingReviewStartAuthorityExecution::Completed {
+            value: Err(reason), ..
+        }
+        | PendingReviewStartAuthorityExecution::NotAdmitted(reason) => Err(reason),
+        PendingReviewStartAuthorityExecution::ReadbackUncertain { reason, .. } => Err(format!(
+            "The pre-create cancellation executed, but its durable readback failed and the disposition is uncertain: {reason}"
+        )),
+    }
+}
+
+pub fn finish_pending_review_start_locally(
+    authority: &ReviewStateAuthority,
+    store: &DraftStore,
+    expected_composition: Option<&ReviewComposition>,
+    expected_start: &PendingReviewStartRecord,
+) -> PendingReviewStartStep<cibergit::domain::ReviewWriteAcknowledgement> {
+    let fallback_composition = expected_composition.cloned();
+    let fallback_record = Some(expected_start.clone());
+    let intent = &expected_start.intent;
+    let context = pending_start_context(
+        &intent.thread_operation_id,
+        &intent.thread_operation_id,
+        "finish-acknowledged-pending-file-comment-locally",
+        &intent.flow_id,
+    );
+    let execution = authority.execute_pending_review_start_if_current(
+        store,
+        expected_composition,
+        Some(expected_start),
+        |journal| {
+            let PendingReviewStartStage::ThreadAcknowledged { creation, thread } =
+                &expected_start.stage
+            else {
+                return Err(
+                    "Only a durable ThreadAcknowledged record can finish locally without a provider write."
+                        .to_owned(),
+                );
+            };
+            let Some(mut composition) = expected_composition.cloned() else {
+                return Err("The exact durable review composition is missing.".to_owned());
+            };
+            composition
+                .reconcile_pending_file_review_start_success(
+                    intent,
+                    thread.review_id.clone(),
+                    thread.comment_id.clone(),
+                )
+                .map_err(|error| error.to_string())?;
+            if let Err(error) = store.save(&composition) {
+                return Err(format!(
+                    "The remote FILE acknowledgement is already durable, but local predecessor reconciliation could not be saved: {error}"
+                ));
+            }
+            let mut completed = expected_start.clone();
+            if let Err(error) = completed.mark_acknowledged() {
+                let reason = format!(
+                    "The remote FILE acknowledgement is durable, but local completion validation failed: {error}"
+                );
+                persist_pending_start_uncertain(journal, expected_start, reason.clone());
+                return Ok(ProviderMutationOutcome::Uncertain {
+                    context: context.clone(),
+                    reason,
+                });
+            }
+            if let Err(error) = journal.save_if_current_unlocked(Some(expected_start), &completed) {
+                let reason = format!(
+                    "The remote FILE acknowledgement and local predecessor are durable, but terminal persistence failed: {error}"
+                );
+                persist_pending_start_uncertain(journal, expected_start, reason.clone());
+                return Ok(ProviderMutationOutcome::Uncertain {
+                    context: context.clone(),
+                    reason,
+                });
+            }
+            Ok(ProviderMutationOutcome::Acknowledged(
+                cibergit::domain::ReviewWriteAcknowledgement {
+                    operation_id: thread.operation_id.clone(),
+                    review_id: Some(creation.review.remote_id.clone()),
+                    comment_id: Some(thread.comment_id.clone()),
+                    thread_id: Some(thread.thread_id.clone()),
+                },
+            ))
+        },
+    );
+    match execution {
+        PendingReviewStartAuthorityExecution::Completed {
+            value: Ok(outcome),
+            composition,
+            record,
+        } => PendingReviewStartStep {
+            outcome,
+            composition,
+            record,
+        },
+        PendingReviewStartAuthorityExecution::Completed {
+            value: Err(reason),
+            composition,
+            record,
+        } => PendingReviewStartStep {
+            outcome: ProviderMutationOutcome::Uncertain { context, reason },
+            composition,
+            record,
+        },
+        PendingReviewStartAuthorityExecution::NotAdmitted(reason) => PendingReviewStartStep {
+            outcome: ProviderMutationOutcome::PreflightRejected { reason },
+            composition: fallback_composition,
+            record: fallback_record,
+        },
+        PendingReviewStartAuthorityExecution::ReadbackUncertain { reason, .. } => {
+            PendingReviewStartStep {
+                outcome: ProviderMutationOutcome::Uncertain {
+                    context,
+                    reason: format!(
+                        "Local acknowledged-FILE completion ran, but durable readback failed: {reason}"
+                    ),
+                },
+                composition: fallback_composition,
+                record: fallback_record,
+            }
+        }
+    }
+}
+
+fn persist_pending_start_uncertain(
+    journal: &PendingReviewStartJournal,
+    durable: &PendingReviewStartRecord,
+    reason: String,
+) {
+    let mut uncertain = durable.clone();
+    if uncertain.mark_uncertain(reason).is_ok() {
+        let _ = journal.save_if_current_unlocked(Some(durable), &uncertain);
+    }
+}
+
+fn persist_terminal_save_uncertain(
+    journal: &PendingReviewStartJournal,
+    durable: &PendingReviewStartRecord,
+    stage: cibergit::pending_review_start::PendingReviewStartWriteStage,
+    attempt_id: &str,
+    reason: String,
+) {
+    let mut uncertain = durable.clone();
+    if uncertain
+        .mark_terminal_persistence_uncertain(stage, attempt_id.to_owned(), reason)
+        .is_ok()
+    {
+        let _ = journal.save_if_current_unlocked(Some(durable), &uncertain);
+    }
+}
+
+fn pending_start_context(
+    operation_id: &str,
+    attempt_id: &str,
+    action: &str,
+    flow_id: &str,
+) -> MutationContext {
+    MutationContext {
+        operation_id: operation_id.to_owned(),
+        attempt_id: attempt_id.to_owned(),
+        action: action.to_owned(),
+        payload: serde_json::json!({"flowId": flow_id}),
+    }
+}
+
 /// The one cross-process authority lane for every provider mutation targeting
 /// an account/repository/pull-request tuple. Durable journals decide whether a
 /// later operation is admissible; this OS lock prevents their critical
@@ -748,9 +1524,23 @@ impl TargetMutationAuthority {
 
     fn acquire(&self) -> Result<TargetMutationGuard, String> {
         let file = open_private_lock(&self.lock_path()?)?;
-        file.lock()
-            .map_err(|error| format!("Cannot lock target mutation authority: {error}"))?;
-        Ok(TargetMutationGuard { file: Some(file) })
+        let deadline = Instant::now() + TARGET_AUTHORITY_WAIT;
+        loop {
+            if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+                return Ok(TargetMutationGuard { file: Some(file) });
+            }
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(11 | 35)) {
+                return Err(format!("Cannot lock target mutation authority: {error}"));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Target mutation authority stayed busy for {} seconds; zero writes sent.",
+                    TARGET_AUTHORITY_WAIT.as_secs()
+                ));
+            }
+            thread::sleep(TARGET_AUTHORITY_POLL);
+        }
     }
 
     fn lock_path(&self) -> Result<PathBuf, String> {
@@ -798,6 +1588,55 @@ pub struct ReviewStateAuthority {
     target: TargetMutationAuthority,
 }
 
+pub enum PendingReviewStartAuthorityExecution<T> {
+    NotAdmitted(String),
+    Completed {
+        value: T,
+        composition: Option<ReviewComposition>,
+        record: Option<PendingReviewStartRecord>,
+    },
+    ReadbackUncertain {
+        value: T,
+        reason: String,
+    },
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_PENDING_START_READBACK_AFTER_EXECUTION: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_PENDING_START_SAVE_STAGE: std::cell::Cell<Option<&'static str>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+thread_local! {
+    static PENDING_START_SAVE_TRACE: std::cell::RefCell<Vec<&'static str>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+fn fail_next_pending_start_readback_after_execution() {
+    FAIL_PENDING_START_READBACK_AFTER_EXECUTION.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn take_pending_start_save_trace() -> Vec<&'static str> {
+    PENDING_START_SAVE_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
+}
+
+#[cfg(test)]
+fn fail_next_pending_start_save(stage: &'static str) {
+    FAIL_PENDING_START_SAVE_STAGE.with(|fail| fail.set(Some(stage)));
+}
+
 impl ReviewStateAuthority {
     pub fn open(root: PathBuf, key: ReviewKey) -> Result<Self, String> {
         Ok(Self {
@@ -840,6 +1679,7 @@ impl ReviewStateAuthority {
                 );
             }
             self.refuse_unresolved_action_journal()?;
+            self.refuse_blocking_pending_review_start()?;
             let result = execute();
             let durable = load_composition(store, &self.key)?;
             Ok((result, durable))
@@ -860,6 +1700,81 @@ impl ReviewStateAuthority {
             );
         }
         Ok(())
+    }
+
+    fn refuse_blocking_pending_review_start(&self) -> Result<(), String> {
+        let journal = PendingReviewStartJournal::open(&self.root, self.key.clone())?;
+        if journal
+            .record_unlocked()?
+            .is_some_and(|record| record.blocks_target_mutations())
+        {
+            return Err(
+                "A two-stage pending-review start is prepared, partial, or unresolved; zero other target writes sent. Continue or explicitly stop only a quiescent ReviewCreated state."
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn execute_pending_review_start_if_current<T>(
+        &self,
+        store: &DraftStore,
+        expected_composition: Option<&ReviewComposition>,
+        expected_start: Option<&PendingReviewStartRecord>,
+        execute: impl FnOnce(&PendingReviewStartJournal) -> T,
+    ) -> PendingReviewStartAuthorityExecution<T> {
+        let admitted = self.with_lock(|| {
+            let current = load_composition(store, &self.key)?;
+            if current.as_ref() != expected_composition {
+                return Err(
+                    "Durable review state changed before pending-review start dispatch; zero writes sent."
+                        .into(),
+                );
+            }
+            self.refuse_unresolved_action_journal()?;
+            let journal = PendingReviewStartJournal::open(&self.root, self.key.clone())?;
+            if journal.record_unlocked()?.as_ref() != expected_start {
+                return Err(
+                    "Durable pending-review start state changed before dispatch; zero writes sent."
+                        .into(),
+                );
+            }
+            let value = execute(&journal);
+            #[cfg(test)]
+            if FAIL_PENDING_START_READBACK_AFTER_EXECUTION.with(|fail| fail.replace(false)) {
+                return Ok((
+                    value,
+                    Err("injected post-execution composition readback failure".into()),
+                    Err("injected post-execution pending-start readback failure".into()),
+                ));
+            }
+            let composition = load_composition(store, &self.key);
+            let record = journal.record_unlocked();
+            Ok((value, composition, record))
+        });
+        match admitted {
+            Err(reason) => PendingReviewStartAuthorityExecution::NotAdmitted(reason),
+            Ok((value, Ok(composition), Ok(record))) => {
+                PendingReviewStartAuthorityExecution::Completed {
+                    value,
+                    composition,
+                    record,
+                }
+            }
+            Ok((value, composition, record)) => {
+                let mut reasons = Vec::new();
+                if let Err(reason) = composition {
+                    reasons.push(format!("review composition readback failed: {reason}"));
+                }
+                if let Err(reason) = record {
+                    reasons.push(format!("pending-start readback failed: {reason}"));
+                }
+                PendingReviewStartAuthorityExecution::ReadbackUncertain {
+                    value,
+                    reason: reasons.join("; "),
+                }
+            }
+        }
     }
 
     /// Reconcile started review-composition operations with fresh read-only
@@ -1929,6 +2844,161 @@ struct JournalRecord {
     operations: Vec<JournalOperation>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingReviewStartStoredRecord {
+    version: u64,
+    key: ReviewKey,
+    record: PendingReviewStartRecord,
+}
+
+/// Persistence seam for the single bounded pending-review start record. Its
+/// methods deliberately reuse the same target lock and private atomic writer
+/// as every other review action in this module.
+#[derive(Clone, Debug)]
+pub struct PendingReviewStartJournal {
+    root: PathBuf,
+    key: ReviewKey,
+    target: TargetMutationAuthority,
+}
+
+impl PendingReviewStartJournal {
+    pub fn open(root: &Path, key: ReviewKey) -> Result<Self, String> {
+        ensure_private_directory(root)?;
+        Ok(Self {
+            root: root.to_owned(),
+            target: TargetMutationAuthority::new(root.to_owned(), key.clone())?,
+            key,
+        })
+    }
+
+    pub fn record(&self) -> Result<Option<PendingReviewStartRecord>, String> {
+        let _lock = self.target.acquire()?;
+        self.record_unlocked()
+    }
+
+    fn record_unlocked(&self) -> Result<Option<PendingReviewStartRecord>, String> {
+        let path = self.path()?;
+        let Some(bytes) = read_bounded(&path, MAX_PENDING_REVIEW_START_BYTES)? else {
+            return Ok(None);
+        };
+        let stored: PendingReviewStartStoredRecord =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                format!(
+                    "Pending-review start record {} is corrupt or missing required fields and was preserved: {error}",
+                    path.display()
+                )
+            })?;
+        if stored.version != PENDING_REVIEW_START_JOURNAL_VERSION {
+            return Err(format!(
+                "Pending-review start record {} uses unsupported version {} and was preserved.",
+                path.display(),
+                stored.version
+            ));
+        }
+        if stored.key != self.key || stored.record.intent.key != self.key {
+            return Err(format!(
+                "Pending-review start record {} belongs to another target and was preserved.",
+                path.display()
+            ));
+        }
+        stored.record.validate().map_err(|error| {
+            format!(
+                "Pending-review start record {} failed bounded state validation and was preserved: {error}",
+                path.display()
+            )
+        })?;
+        Ok(Some(stored.record))
+    }
+
+    fn save_if_current_unlocked(
+        &self,
+        expected: Option<&PendingReviewStartRecord>,
+        replacement: &PendingReviewStartRecord,
+    ) -> Result<(), String> {
+        if self.record_unlocked()?.as_ref() != expected {
+            return Err(
+                "Durable pending-review start state changed; the stale transition was not saved."
+                    .into(),
+            );
+        }
+        self.save_unlocked(replacement)
+    }
+
+    fn save_unlocked(&self, record: &PendingReviewStartRecord) -> Result<(), String> {
+        record.validate()?;
+        if record.intent.key != self.key {
+            return Err("Pending-review start record belongs to another target.".into());
+        }
+        let bytes = serde_json::to_vec(&PendingReviewStartStoredRecord {
+            version: PENDING_REVIEW_START_JOURNAL_VERSION,
+            key: self.key.clone(),
+            record: record.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+        if bytes.len() > MAX_PENDING_REVIEW_START_BYTES {
+            return Err(format!(
+                "Pending-review start record exceeds {MAX_PENDING_REVIEW_START_BYTES} bytes; zero writes sent."
+            ));
+        }
+        #[cfg(test)]
+        {
+            let stage_name = pending_start_stage_name(&record.stage);
+            if FAIL_PENDING_START_SAVE_STAGE
+                .with(|fail| fail.get() == Some(stage_name) && fail.replace(None).is_some())
+            {
+                return Err(format!(
+                    "injected pending-start {stage_name} terminal persistence failure"
+                ));
+            }
+        }
+        atomic_private_write(&self.path()?, &bytes)?;
+        #[cfg(test)]
+        PENDING_START_SAVE_TRACE.with(|trace| {
+            trace
+                .borrow_mut()
+                .push(pending_start_stage_name(&record.stage));
+        });
+        Ok(())
+    }
+
+    fn path(&self) -> Result<PathBuf, String> {
+        let account = stable_component(&(
+            self.key.account.host.as_str(),
+            self.key.account.login.as_str(),
+        ))?;
+        let repository = stable_component(&(
+            self.key.provider.as_str(),
+            self.key.host.as_str(),
+            self.key.owner.as_str(),
+            self.key.repository.as_str(),
+        ))?;
+        Ok(self
+            .root
+            .join("pending-review-start")
+            .join("v1")
+            .join(account)
+            .join(repository)
+            .join(format!("pr-{}.json", self.key.pull_request)))
+    }
+}
+
+#[cfg(test)]
+fn pending_start_stage_name(stage: &PendingReviewStartStage) -> &'static str {
+    match stage {
+        PendingReviewStartStage::PreparedCreate => "PreparedCreate",
+        PendingReviewStartStage::CancelledBeforeCreate { .. } => "CancelledBeforeCreate",
+        PendingReviewStartStage::CreateInFlight { .. } => "CreateInFlight",
+        PendingReviewStartStage::ReviewCreated { .. } => "ReviewCreated",
+        PendingReviewStartStage::ThreadInFlight { .. } => "ThreadInFlight",
+        PendingReviewStartStage::ThreadAcknowledged { .. } => "ThreadAcknowledged",
+        PendingReviewStartStage::ThreadNotApplied { .. } => "ThreadNotApplied",
+        PendingReviewStartStage::Acknowledged { .. } => "Acknowledged",
+        PendingReviewStartStage::StoppedAfterReviewCreated { .. } => "StoppedAfterReviewCreated",
+        PendingReviewStartStage::CreateNotApplied { .. } => "CreateNotApplied",
+        PendingReviewStartStage::Uncertain { .. } => "Uncertain",
+    }
+}
+
 #[derive(Clone, Debug)]
 enum JournalLoad {
     Ready(Vec<JournalOperation>),
@@ -2149,6 +3219,15 @@ impl ActionJournal {
         if self.review_operations_unresolved()? {
             return Err(
                 "A review mutation still needs exact outcome reconciliation; no target mutation was admitted."
+                    .into(),
+            );
+        }
+        if PendingReviewStartJournal::open(&self.root, self.key.clone())?
+            .record_unlocked()?
+            .is_some_and(|record| record.blocks_target_mutations())
+        {
+            return Err(
+                "A two-stage pending-review start is prepared, partial, or unresolved; no auxiliary target mutation was admitted."
                     .into(),
             );
         }
@@ -2586,13 +3665,14 @@ mod tests {
     use cibergit::domain::FreshReviewDismissalCapability;
     use cibergit::domain::{
         Account, ChangedFile, Comparison, DismissalAuthority, LinkedReviewComment,
-        MergeEligibility, PendingFileCommentSource, ProviderCoordinates,
+        MergeEligibility, PendingFileCommentSource, PendingFileReviewAbsence, ProviderCoordinates,
         PullRequestLifecycleAction, PullRequestMutationTarget, PullRequestReview, ReactableKind,
         ReactionAction, ReactionContent, ReactionRequest, ReactionTarget, ReviewComment, Revision,
         SelectedViewer, SubmittedReviewDismissalRequest, SubmittedReviewDismissalTarget,
     };
     use cibergit::participation::{
-        DiffSide, RemoteDraftIds, ReviewCommentTarget, ReviewOperationStatus,
+        DiffSide, PendingFileReviewStartIntent, PublishedFile, RemoteDraftIds, ReviewCommentTarget,
+        ReviewOperationStatus,
     };
     #[cfg(feature = "ui-smoke")]
     use std::{fs, os::unix::fs::PermissionsExt};
@@ -2672,6 +3752,682 @@ mod tests {
             review_author: "reader".into(),
             review_commit_sha: "2222222".into(),
         }
+    }
+
+    fn pending_start_record(body: String) -> PendingReviewStartRecord {
+        PendingReviewStartRecord::new(PendingFileReviewStartIntent {
+            flow_id: "flow-1".into(),
+            create_operation_id: "create-1".into(),
+            thread_operation_id: "thread-1".into(),
+            key: review_key(),
+            draft_id: "file-draft-1".into(),
+            body,
+            target: ReviewCommentTarget::File(PublishedFile {
+                base_sha: "1111111".into(),
+                commit_sha: "2222222".into(),
+                file_key: "src/lib.rs".into(),
+                path: "src/lib.rs".into(),
+                previous_path: None,
+                raw_previous_path: None,
+            }),
+            pull_request: ProviderCoordinates {
+                provider: "github".into(),
+                host: "github.com".into(),
+                owner: "octo".into(),
+                repository: "repo".into(),
+                pull_request: 7,
+                remote_id: "PR_node".into(),
+            },
+            selected_author: "reader".into(),
+            observed_base_sha: "1111111".into(),
+            observed_head_sha: "2222222".into(),
+        })
+        .unwrap()
+    }
+
+    fn pending_start_creation() -> cibergit::domain::PendingReviewCreationAcknowledgement {
+        cibergit::domain::PendingReviewCreationAcknowledgement {
+            operation_id: "create-1".into(),
+            review: ProviderCoordinates {
+                provider: "github".into(),
+                host: "github.com".into(),
+                owner: "octo".into(),
+                repository: "repo".into(),
+                pull_request: 7,
+                remote_id: "REVIEW_created".into(),
+            },
+            review_author: "reader".into(),
+            review_commit_sha: "2222222".into(),
+            pull_request: ProviderCoordinates {
+                provider: "github".into(),
+                host: "github.com".into(),
+                owner: "octo".into(),
+                repository: "repo".into(),
+                pull_request: 7,
+                remote_id: "PR_node".into(),
+            },
+            repository_name_with_owner: "octo/repo".into(),
+        }
+    }
+
+    #[test]
+    fn pending_start_journal_accepts_near_bound_body_and_fails_closed_on_corruption() {
+        let directory = tempdir().unwrap();
+        let journal = PendingReviewStartJournal::open(directory.path(), review_key()).unwrap();
+        let record =
+            pending_start_record("x".repeat(cibergit::participation::MAX_DRAFT_TEXT_BYTES));
+        journal.save_if_current_unlocked(None, &record).unwrap();
+        assert_eq!(journal.record().unwrap(), Some(record));
+        let path = journal.path().unwrap();
+        assert!(
+            std::fs::metadata(&path).unwrap().len()
+                < cibergit::pending_review_start::MAX_PENDING_REVIEW_START_BYTES as u64
+        );
+
+        std::fs::write(&path, b"{not-json").unwrap();
+        let error = journal.record().unwrap_err();
+        assert!(error.contains("corrupt"), "{error}");
+        let controller =
+            ReviewInteractionController::load(directory.path(), &repository(), 7, &session());
+        assert!(
+            controller.is_err(),
+            "corrupt pending-start authority must fail closed"
+        );
+    }
+
+    #[test]
+    fn pending_start_journal_rejects_future_version_and_over_bound_body() {
+        let directory = tempdir().unwrap();
+        let journal = PendingReviewStartJournal::open(directory.path(), review_key()).unwrap();
+        let record = pending_start_record("exact".into());
+        journal.save_if_current_unlocked(None, &record).unwrap();
+        let path = journal.path().unwrap();
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        stored["version"] = serde_json::json!(2);
+        std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+        assert!(
+            journal
+                .record()
+                .unwrap_err()
+                .contains("unsupported version")
+        );
+
+        assert!(
+            PendingReviewStartRecord::new(PendingFileReviewStartIntent {
+                body: "x".repeat(cibergit::participation::MAX_DRAFT_TEXT_BYTES + 1),
+                ..pending_start_record("seed".into()).intent
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pending_start_blocks_same_account_target_until_explicit_stop_but_not_other_account() {
+        let directory = tempdir().unwrap();
+        let store = DraftStore::open(directory.path()).unwrap();
+        let authority =
+            ReviewStateAuthority::open(directory.path().to_owned(), review_key()).unwrap();
+        let journal = PendingReviewStartJournal::open(directory.path(), review_key()).unwrap();
+        let mut record = pending_start_record("exact".into());
+        record
+            .mark_create_in_flight("create-attempt".into())
+            .unwrap();
+        record
+            .mark_review_created(pending_start_creation())
+            .unwrap();
+        journal.save_if_current_unlocked(None, &record).unwrap();
+        let calls = AtomicUsize::new(0);
+        assert!(
+            authority
+                .execute_if_current(&store, None, || calls.fetch_add(1, Ordering::SeqCst))
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let stopped =
+            stop_pending_review_start_after_create(&authority, &store, None, &record).unwrap();
+        assert!(matches!(
+            stopped.stage,
+            PendingReviewStartStage::StoppedAfterReviewCreated { .. }
+        ));
+        authority
+            .execute_if_current(&store, None, || calls.fetch_add(1, Ordering::SeqCst))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut other_key = review_key();
+        other_key.account.login = "other-reader".into();
+        let other_store = DraftStore::open(directory.path()).unwrap();
+        let other = ReviewStateAuthority::open(directory.path().to_owned(), other_key).unwrap();
+        other
+            .execute_if_current(&other_store, None, || calls.fetch_add(1, Ordering::SeqCst))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn target_authority_contention_is_bounded_and_sends_no_work() {
+        let directory = tempdir().unwrap();
+        let authority =
+            TargetMutationAuthority::new(directory.path().to_owned(), review_key()).unwrap();
+        let guard = authority.acquire().unwrap();
+        let started = Instant::now();
+        let error = authority.acquire().unwrap_err();
+        assert!(error.contains("stayed busy"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(guard);
+        authority.acquire().unwrap();
+    }
+
+    #[test]
+    fn local_ack_finish_preserves_newer_file_text_and_unrelated_drafts() {
+        let directory = tempdir().unwrap();
+        let store = DraftStore::open(directory.path()).unwrap();
+        let authority =
+            ReviewStateAuthority::open(directory.path().to_owned(), review_key()).unwrap();
+        let mut composition = ReviewComposition::new(
+            review_key(),
+            cibergit::domain::Revision {
+                base_sha: "1111111".into(),
+                head_sha: "2222222".into(),
+            },
+        )
+        .unwrap();
+        let ReviewCommentTarget::File(target) = pending_start_record("exact".into()).intent.target
+        else {
+            unreachable!()
+        };
+        let draft_id = composition
+            .add_file_draft(target.clone(), "exact")
+            .unwrap()
+            .id
+            .clone();
+        assert_eq!(draft_id, "file-draft-1");
+        let mut other_target = target;
+        other_target.path = "src/other.rs".into();
+        other_target.file_key = "src/other.rs".into();
+        let other_id = composition
+            .add_file_draft(other_target, "unrelated")
+            .unwrap()
+            .id
+            .clone();
+        let mut record = pending_start_record("exact".into());
+        record
+            .mark_create_in_flight("create-attempt".into())
+            .unwrap();
+        record
+            .mark_review_created(pending_start_creation())
+            .unwrap();
+        record
+            .mark_thread_in_flight("thread-attempt".into())
+            .unwrap();
+        record
+            .mark_thread_acknowledged(cibergit::pending_review_start::PendingFileThreadReceipt {
+                operation_id: "thread-1".into(),
+                review_id: "REVIEW_created".into(),
+                thread_id: "THREAD_created".into(),
+                comment_id: "COMMENT_created".into(),
+            })
+            .unwrap();
+        let journal = PendingReviewStartJournal::open(directory.path(), review_key()).unwrap();
+        journal.save_if_current_unlocked(None, &record).unwrap();
+        composition
+            .edit_file_draft(&draft_id, "newer text")
+            .unwrap();
+        store.save(&composition).unwrap();
+
+        let step =
+            finish_pending_review_start_locally(&authority, &store, Some(&composition), &record);
+        assert!(matches!(
+            step.outcome,
+            ProviderMutationOutcome::Acknowledged(_)
+        ));
+        let durable = step.composition.unwrap();
+        assert_eq!(durable.file_draft(&draft_id).unwrap().body, "newer text");
+        assert!(durable.file_draft(&draft_id).unwrap().remote.is_none());
+        assert_eq!(durable.file_draft(&other_id).unwrap().body, "unrelated");
+        assert!(matches!(
+            step.record.unwrap().stage,
+            PendingReviewStartStage::Acknowledged { .. }
+        ));
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn pending_start_create_fixture(
+        include_thread: bool,
+        deny_absence: bool,
+    ) -> (tempfile::TempDir, cibergit::providers::GithubProvider) {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("gh");
+        fs::write(
+            &executable,
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+root = pathlib.Path(__file__).parent
+args = sys.argv[1:]
+if args == ['auth', 'token', '--hostname', 'github.com']:
+    print('private-reader')
+    sys.exit(0)
+assert os.environ.get('GH_TOKEN') == 'private-reader'
+payload = json.load(sys.stdin)
+count_path = root / 'count'
+index = int(count_path.read_text()) if count_path.exists() else 0
+query = ' '.join(payload['query'].split())
+if index == 0:
+    assert 'query PendingReview' in query
+    assert payload['variables'] == {'owner':'octo','name':'repo','number':7}
+    rows = [] if not (root / 'deny-absence').exists() else [{
+        'id':'REVIEW_existing', 'author': {'login':'reader'}, 'body':'', 'state':'PENDING',
+        'submittedAt':None, 'commit': {'oid':'2222222'},
+        'url':'https://github.com/octo/repo/pull/7#pullrequestreview-existing',
+        'comments': {'nodes':[], 'pageInfo': {'hasNextPage':False, 'endCursor':None}}
+    }]
+    response = {'data': {'viewer': {'login':'reader'}, 'repository': {
+        'nameWithOwner':'octo/repo', 'pullRequest': {
+            'id':'PR_node', 'number':7, 'url':'https://github.com/octo/repo/pull/7',
+            'state':'OPEN', 'baseRefOid':'1111111', 'headRefOid':'2222222',
+            'reviews': {'nodes':rows, 'pageInfo': {'hasNextPage':False, 'endCursor':None}}
+        }
+    }}}
+elif index == 1:
+    assert 'mutation CreateEmptyPendingReview' in query
+    assert payload['variables'] == {
+        'pullRequestId':'PR_node', 'commitOID':'2222222', 'event':None,
+        'body':None, 'threads':None, 'clientMutationId':'create-operation'
+    }
+    (root / 'mutations').write_text('1')
+    response = {'data': {'createEmptyPendingReview': {
+        'clientMutationId':'create-operation', 'pullRequestReview': {
+            'id':'REVIEW_created', 'state':'PENDING', 'submittedAt':None,
+            'author': {'login':'reader'}, 'commit': {'oid':'2222222'},
+            'pullRequest': {'id':'PR_node', 'number':7,
+                'repository': {'nameWithOwner':'octo/repo'}}
+        }
+    }}}
+elif index == 2 and (root / 'include-thread').exists():
+    assert 'query PendingFileCommentPreflight' in query
+    assert payload['variables'] == {'owner':'octo','name':'repo','number':7}
+    response = {'data': {'viewer': {'login':'reader'}, 'repository': {
+        'nameWithOwner':'octo/repo', 'pullRequest': {
+            'id':'PR_node', 'number':7, 'url':'https://github.com/octo/repo/pull/7',
+            'state':'OPEN', 'baseRefOid':'1111111', 'headRefOid':'2222222',
+            'reviews': {'nodes':[{
+                'id':'REVIEW_created', 'state':'PENDING', 'submittedAt':None,
+                'author': {'login':'reader'}, 'commit': {'oid':'2222222'}
+            }], 'pageInfo': {'hasNextPage':False, 'endCursor':None}}
+        }
+    }}}
+elif index == 3 and (root / 'include-thread').exists():
+    assert 'mutation AddPendingFileReviewThread' in query
+    assert payload['variables'] == {
+        'pullRequestReviewId':'REVIEW_created', 'body':'exact whole-file comment',
+        'path':'src/lib.rs', 'subjectType':'FILE', 'clientMutationId':'thread-operation'
+    }
+    (root / 'mutations').write_text('2')
+    response = {'data': {'addPendingFileReviewThread': {'clientMutationId':'thread-operation',
+        'thread': {'id':'THREAD_created', 'path':'src/lib.rs', 'subjectType':'FILE',
+        'comments': {'totalCount':1, 'pageInfo': {'hasNextPage':False, 'endCursor':None}, 'nodes':[{
+            'id':'COMMENT_created', 'body':'exact whole-file comment', 'path':'src/lib.rs',
+            'subjectType':'FILE', 'author': {'login':'reader'},
+            'pullRequestReview': {'id':'REVIEW_created', 'state':'PENDING',
+                'submittedAt':None, 'author': {'login':'reader'},
+                'commit': {'oid':'2222222'}, 'pullRequest': {'id':'PR_node', 'number':7,
+                    'repository': {'nameWithOwner':'octo/repo'}}}
+        }]}}}}}
+else:
+    raise AssertionError('unexpected extra request')
+count_path.write_text(str(index + 1))
+print(json.dumps(response))
+"#,
+        )
+        .unwrap();
+        if include_thread {
+            fs::write(directory.path().join("include-thread"), b"1").unwrap();
+        }
+        if deny_absence {
+            fs::write(directory.path().join("deny-absence"), b"1").unwrap();
+        }
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let provider = cibergit::providers::GithubProvider::synthetic_with_gh(
+            repository().account,
+            executable,
+            Duration::from_secs(5),
+        );
+        (directory, provider)
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn pending_start_controller_and_intent(
+        root: &Path,
+    ) -> (
+        Box<ReviewInteractionController>,
+        PendingFileReviewStartIntent,
+    ) {
+        let session = session();
+        let mut controller =
+            match ReviewInteractionController::load(root, &repository(), 7, &session).unwrap() {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+        controller
+            .select_file_with_canonical(&session, &session)
+            .unwrap();
+        let saved = controller
+            .stage_composer_text("exact whole-file comment".into())
+            .unwrap();
+        controller.store.save(&saved).unwrap();
+        let draft_id = controller
+            .file_composer
+            .as_ref()
+            .and_then(|composer| composer.draft_id.clone())
+            .unwrap();
+        controller.finish_composer_save(&saved, &draft_id, "exact whole-file comment", Ok(()));
+        let intent = controller
+            .prepare_pending_file_review_start(
+                &PendingFileReviewAbsence {
+                    viewer_login: "reader".into(),
+                    repository: repository(),
+                    pull_request: ProviderCoordinates {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        owner: "octo".into(),
+                        repository: "repo".into(),
+                        pull_request: 7,
+                        remote_id: "PR_node".into(),
+                    },
+                    pull_request_state: "OPEN".into(),
+                    current_base_sha: "1111111".into(),
+                    current_head_sha: "2222222".into(),
+                },
+                "flow-operation".into(),
+                "create-operation".into(),
+                "thread-operation".into(),
+            )
+            .unwrap();
+        (controller, intent)
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[test]
+    fn post_dispatch_readback_failure_is_uncertain_after_actual_create_write() {
+        let root = tempdir().unwrap();
+        let session = session();
+        let mut controller =
+            match ReviewInteractionController::load(root.path(), &repository(), 7, &session)
+                .unwrap()
+            {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+        controller
+            .select_file_with_canonical(&session, &session)
+            .unwrap();
+        let saved = controller
+            .stage_composer_text("exact whole-file comment".into())
+            .unwrap();
+        controller.store.save(&saved).unwrap();
+        let draft_id = controller
+            .file_composer
+            .as_ref()
+            .and_then(|composer| composer.draft_id.clone())
+            .unwrap();
+        controller.finish_composer_save(&saved, &draft_id, "exact whole-file comment", Ok(()));
+        let absence = PendingFileReviewAbsence {
+            viewer_login: "reader".into(),
+            repository: repository(),
+            pull_request: ProviderCoordinates {
+                provider: "github".into(),
+                host: "github.com".into(),
+                owner: "octo".into(),
+                repository: "repo".into(),
+                pull_request: 7,
+                remote_id: "PR_node".into(),
+            },
+            pull_request_state: "OPEN".into(),
+            current_base_sha: "1111111".into(),
+            current_head_sha: "2222222".into(),
+        };
+        let intent = controller
+            .prepare_pending_file_review_start(
+                &absence,
+                "flow-operation".into(),
+                "create-operation".into(),
+                "thread-operation".into(),
+            )
+            .unwrap();
+        let (transport, provider) = pending_start_create_fixture(false, false);
+        fail_next_pending_start_readback_after_execution();
+        let step = execute_pending_review_start_create(
+            &controller.authority,
+            &controller.store,
+            controller.durable_composition.as_ref(),
+            None,
+            &provider,
+            &repository(),
+            &intent,
+            "create-attempt",
+        );
+        assert!(matches!(
+            step.outcome,
+            ProviderMutationOutcome::Uncertain { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(transport.path().join("count")).unwrap(),
+            "2"
+        );
+        assert_eq!(
+            fs::read_to_string(transport.path().join("mutations")).unwrap(),
+            "1"
+        );
+        let durable = PendingReviewStartJournal::open(root.path(), review_key())
+            .unwrap()
+            .record()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            durable.stage,
+            PendingReviewStartStage::ReviewCreated { .. }
+        ));
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[test]
+    fn actual_provider_and_durable_authority_save_both_stages_in_order() {
+        let _ = take_pending_start_save_trace();
+        let root = tempdir().unwrap();
+        let session = session();
+        let mut controller =
+            match ReviewInteractionController::load(root.path(), &repository(), 7, &session)
+                .unwrap()
+            {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+        controller
+            .select_file_with_canonical(&session, &session)
+            .unwrap();
+        let saved = controller
+            .stage_composer_text("exact whole-file comment".into())
+            .unwrap();
+        controller.store.save(&saved).unwrap();
+        let draft_id = controller
+            .file_composer
+            .as_ref()
+            .and_then(|composer| composer.draft_id.clone())
+            .unwrap();
+        controller.finish_composer_save(&saved, &draft_id, "exact whole-file comment", Ok(()));
+        let intent = controller
+            .prepare_pending_file_review_start(
+                &PendingFileReviewAbsence {
+                    viewer_login: "reader".into(),
+                    repository: repository(),
+                    pull_request: ProviderCoordinates {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        owner: "octo".into(),
+                        repository: "repo".into(),
+                        pull_request: 7,
+                        remote_id: "PR_node".into(),
+                    },
+                    pull_request_state: "OPEN".into(),
+                    current_base_sha: "1111111".into(),
+                    current_head_sha: "2222222".into(),
+                },
+                "flow-operation".into(),
+                "create-operation".into(),
+                "thread-operation".into(),
+            )
+            .unwrap();
+        let (transport, provider) = pending_start_create_fixture(true, false);
+        let create = execute_pending_review_start_create(
+            &controller.authority,
+            &controller.store,
+            controller.durable_composition.as_ref(),
+            None,
+            &provider,
+            &repository(),
+            &intent,
+            "create-attempt",
+        );
+        assert!(matches!(
+            &create.outcome,
+            ProviderMutationOutcome::Acknowledged(_)
+        ));
+        let created = create.record.unwrap();
+        assert!(matches!(
+            &created.stage,
+            PendingReviewStartStage::ReviewCreated { .. }
+        ));
+        let thread = execute_pending_review_start_thread(
+            &controller.authority,
+            &controller.store,
+            create.composition.as_ref(),
+            &created,
+            &provider,
+            &repository(),
+            "thread-attempt",
+        );
+        assert!(matches!(
+            &thread.outcome,
+            ProviderMutationOutcome::Acknowledged(_)
+        ));
+        assert!(matches!(
+            thread.record.as_ref().map(|record| &record.stage),
+            Some(PendingReviewStartStage::Acknowledged { .. })
+        ));
+        assert_eq!(
+            take_pending_start_save_trace(),
+            vec![
+                "PreparedCreate",
+                "CreateInFlight",
+                "ReviewCreated",
+                "ThreadInFlight",
+                "ThreadAcknowledged",
+                "Acknowledged",
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(transport.path().join("count")).unwrap(),
+            "4"
+        );
+        assert_eq!(
+            fs::read_to_string(transport.path().join("mutations")).unwrap(),
+            "2"
+        );
+        let durable = thread.composition.unwrap();
+        let file = durable.file_draft(&draft_id).unwrap();
+        assert_eq!(
+            file.remote
+                .as_ref()
+                .and_then(|remote| remote.review_id.as_deref()),
+            Some("REVIEW_created")
+        );
+        assert_eq!(
+            file.remote
+                .as_ref()
+                .and_then(|remote| remote.comment_id.as_deref()),
+            Some("COMMENT_created")
+        );
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[test]
+    fn create_ack_terminal_save_failure_is_durable_uncertain_after_one_write() {
+        let root = tempdir().unwrap();
+        let (controller, intent) = pending_start_controller_and_intent(root.path());
+        let (transport, provider) = pending_start_create_fixture(false, false);
+        fail_next_pending_start_save("ReviewCreated");
+        let step = execute_pending_review_start_create(
+            &controller.authority,
+            &controller.store,
+            controller.durable_composition.as_ref(),
+            None,
+            &provider,
+            &repository(),
+            &intent,
+            "create-attempt",
+        );
+        assert!(matches!(
+            step.outcome,
+            ProviderMutationOutcome::Uncertain { .. }
+        ));
+        let durable = PendingReviewStartJournal::open(root.path(), review_key())
+            .unwrap()
+            .record()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            durable.stage,
+            PendingReviewStartStage::Uncertain {
+                stage: cibergit::pending_review_start::PendingReviewStartWriteStage::CreateReview,
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read_to_string(transport.path().join("mutations")).unwrap(),
+            "1"
+        );
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[test]
+    fn zero_transport_terminal_save_failure_is_still_durable_uncertain() {
+        let root = tempdir().unwrap();
+        let (controller, intent) = pending_start_controller_and_intent(root.path());
+        let (transport, provider) = pending_start_create_fixture(false, true);
+        fail_next_pending_start_save("CreateNotApplied");
+        let step = execute_pending_review_start_create(
+            &controller.authority,
+            &controller.store,
+            controller.durable_composition.as_ref(),
+            None,
+            &provider,
+            &repository(),
+            &intent,
+            "create-attempt",
+        );
+        assert!(matches!(
+            step.outcome,
+            ProviderMutationOutcome::Uncertain { .. }
+        ));
+        let durable = PendingReviewStartJournal::open(root.path(), review_key())
+            .unwrap()
+            .record()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            durable.stage,
+            PendingReviewStartStage::Uncertain {
+                stage: cibergit::pending_review_start::PendingReviewStartWriteStage::CreateReview,
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read_to_string(transport.path().join("count")).unwrap(),
+            "1"
+        );
+        assert!(!transport.path().join("mutations").exists());
     }
 
     #[test]
