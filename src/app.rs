@@ -4641,6 +4641,49 @@ impl ReviewWorkspace {
                                 .is_ok()
                         })
                         .unwrap_or(false);
+                let actions_continuation_ready = actions_capture
+                    && window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return false;
+                                };
+                                let viewport = this.inspector_scroll.bounds();
+                                let Some(row) = this.inspector_scroll.bounds_for_item(2) else {
+                                    return false;
+                                };
+                                if row.size.height <= viewport.size.height {
+                                    return false;
+                                }
+                                this.inspector_scroll.set_offset(point(
+                                    px(0.),
+                                    viewport.bottom() - row.bottom(),
+                                ));
+                                cx.notify();
+                                true
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let actions_continuation_name =
+                    format!("native-checks-actions-continuation-{appearance}.png");
+                let actions_continuation_capture = actions_continuation_ready
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join(&actions_continuation_name))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
                 let status_ready = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
@@ -4679,16 +4722,25 @@ impl ReviewWorkspace {
                         })
                         .unwrap_or(false);
                 let report = format!(
-                    "Native read-only Checks identity smoke ({appearance})\n{preparation}\nSynthetic presentation cases, clearly labelled: 81 bounded rows; complete linked Actions tuple at row 40; spoof-named unlinked CheckRun at row 41; Commit status at row 80\nPage size: 40; page-40 boundary and third page reached: {status_ready}\nSource page capture: {}\nExpanded complete Actions identity capture: {}\nExpanded Commit status capture: {}\nProvider completeness notice retained separately from the 81-row presentation count: true\nActual Root keyboard/navigation regression: separately executed as app::layout_tests::checks_native_navigation_reveals_offscreen_rows_and_preserves_exact_identity\nRemote transport after real preparation: 0; mutation transport: 0\nOS notification/prompt/foreground/focus calls from this capture fixture: 0\nPhysical input and AX are not claimed; internal Checks selection was advanced programmatically for deterministic background capture\n",
+                    "Native read-only Checks identity smoke ({appearance})\n{preparation}\nSynthetic presentation cases, clearly labelled: 81 bounded rows; complete linked Actions tuple at row 40; spoof-named unlinked CheckRun at row 41; Commit status at row 80\nPage size: 40; page-40 boundary and third page reached: {status_ready}\nSource page capture: {}\nExpanded complete Actions identity capture: {}\nMeasured continuation of the same expanded Actions row: {}\nExpanded Commit status capture: {}\nProvider completeness notice retained separately from the 81-row presentation count: true\nActual Root keyboard/navigation regression: separately executed as app::layout_tests::checks_native_navigation_reveals_offscreen_rows_and_preserves_exact_identity\nRemote transport after real preparation: 0; mutation transport: 0\nOS notification/prompt/foreground/focus calls from this capture fixture: 0\nPhysical input and AX are not claimed; internal Checks selection was advanced programmatically for deterministic background capture\n",
                     if first_capture { &first_name } else { "failed" },
                     if actions_capture { &actions_name } else { "failed" },
+                    if actions_continuation_capture {
+                        &actions_continuation_name
+                    } else {
+                        "failed"
+                    },
                     if status_capture { &status_name } else { "failed" },
                 );
                 let _ = std::fs::write(
                     output.join(format!("native-checks-{appearance}.txt")),
                     report,
                 );
-                if !first_capture || !actions_capture || !status_capture {
+                if !first_capture
+                    || !actions_capture
+                    || !actions_continuation_capture
+                    || !status_capture
+                {
                     panic!("native Checks smoke capture failed");
                 }
                 let _ = window.update(|_, cx| cx.quit());
