@@ -38411,7 +38411,8 @@ mod layout_tests {
     fn auto_uses_remaining_diff_pane_instead_of_whole_window() {
         let layout = PanelLayout::default();
         let wide_diff = available_diff_width_for(&layout, true, 1440.);
-        assert_eq!(wide_diff, 606.);
+        // 1440 minus the default 292/250/274 panels and three 8px dividers.
+        assert_eq!(wide_diff, 600.);
         assert!(wide_diff >= MIN_SPLIT_DIFF_WIDTH);
 
         let narrow_diff = available_diff_width_for(&layout, true, 1180.);
