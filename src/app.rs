@@ -2660,6 +2660,10 @@ impl ReviewWorkspace {
             self.start_notifications_smoke(window, cx, output);
             return;
         }
+        if std::env::var_os("CIBERGIT_SMOKE_GENERAL_SYNC").is_some() {
+            self.start_general_sync_smoke(window, cx, output);
+            return;
+        }
         if std::env::var_os("CIBERGIT_SMOKE_LOCAL_CHECKOUT").is_some() {
             local_checkout::start_smoke(cx.weak_entity(), output, window, cx);
             return;
@@ -3679,6 +3683,381 @@ impl ReviewWorkspace {
                 });
             })
             .detach();
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn start_general_sync_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+        output: PathBuf,
+    ) {
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                let started = std::time::Instant::now();
+                loop {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.smoke_ready())
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready || started.elapsed() > Duration::from_secs(90) {
+                        break;
+                    }
+                }
+                let _ = std::fs::create_dir_all(&output);
+                let conditional_fixture =
+                    cibergit::providers::synthetic_exact_304_smoke_fixture();
+                let root_fixture = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err("general-sync smoke left the review workspace".into());
+                            };
+                            this.install_general_sync_smoke_fixture(cx)
+                        })
+                        .unwrap_or_else(|error| {
+                            Err(format!("smoke entity unavailable: {error:#}"))
+                        })
+                    })
+                    .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")));
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let appearance = std::env::var("CIBERGIT_SMOKE_APPEARANCE")
+                    .unwrap_or_else(|_| "system".into());
+                let rate_name = format!("native-general-sync-rate-{appearance}.png");
+                let rate_capture = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image.save(output.join(&rate_name)).map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.status = read_sync::POLL_DEFERRED_NOTICE.into();
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let poll_name = format!("native-general-sync-poll-{appearance}.png");
+                let poll_capture = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image.save(output.join(&poll_name)).map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.status = general_read_failure_notice(Some(
+                                GeneralReadFailureKind::Unavailable,
+                            ))
+                            .into();
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let unavailable_name =
+                    format!("native-general-sync-unavailable-{appearance}.png");
+                let unavailable_capture = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join(&unavailable_name))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let report = format!(
+                    "Bounded general-read synchronization native smoke ({appearance})\n{}\n{}\nRate notice capture: {}\nPoll notice capture: {}\nUnavailable notice capture: {}\nSynthetic directive timers: 90 seconds with injected monotonic/wall clocks; no real sleeps\nRemote mutation transport from harness: 0\nOS notification/prompt/focus/global-setting calls from harness: 0\nThe ordinary preparation read is real and read-only. Scheduling directives and the exact 200/304 sequence are synthetic; no live 304 is claimed.\n",
+                    root_fixture.as_deref().unwrap_or("Root fixture: failed"),
+                    conditional_fixture
+                        .as_deref()
+                        .unwrap_or("Synthetic conditional fixture: failed"),
+                    if rate_capture { &rate_name } else { "failed" },
+                    if poll_capture { &poll_name } else { "failed" },
+                    if unavailable_capture {
+                        &unavailable_name
+                    } else {
+                        "failed"
+                    },
+                );
+                let report_name = format!("native-general-sync-{appearance}.txt");
+                let _ = std::fs::write(output.join(&report_name), report);
+                if root_fixture.is_err()
+                    || conditional_fixture.is_err()
+                    || !rate_capture
+                    || !poll_capture
+                    || !unavailable_capture
+                {
+                    panic!(
+                        "general-sync native smoke failed: root={root_fixture:?}, conditional={conditional_fixture:?}"
+                    );
+                }
+                let _ = window.update(|_, cx| cx.quit());
+            })
+            .detach();
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn install_general_sync_smoke_fixture(
+        &mut self,
+        cx: &mut Context<Root>,
+    ) -> Result<String, String> {
+        let index = self
+            .active_tab
+            .ok_or_else(|| "general-sync smoke has no active tab".to_owned())?;
+        let repository = self.tabs[index].repository.clone();
+        let number = self.tabs[index].pull_request.number;
+        let session = self.tabs[index]
+            .session
+            .clone()
+            .ok_or_else(|| "general-sync smoke has no pinned session".to_owned())?;
+        let canonical = self.tabs[index]
+            .canonical_session
+            .clone()
+            .unwrap_or_else(|| session.clone());
+        let selection = canonical
+            .selected_file()
+            .into_iter()
+            .flat_map(|file| build_rows(parse_file(file), DiffMode::Unified))
+            .find_map(|row| match row {
+                DiffRow::Unified(line) => line
+                    .new_line
+                    .map(|line| LineSelection::single(DiffSide::New, line))
+                    .or_else(|| {
+                        line.old_line
+                            .map(|line| LineSelection::single(DiffSide::Old, line))
+                    }),
+                _ => None,
+            })
+            .ok_or_else(|| "general-sync smoke needs one selectable canonical line".to_owned())?;
+        let synthetic_review = self.tabs[index]
+            .details
+            .as_ref()
+            .and_then(|details| details.reviews.first().cloned())
+            .unwrap_or_else(|| cibergit::domain::PullRequestReview {
+                coordinates: cibergit::domain::ProviderCoordinates {
+                    provider: "github".into(),
+                    host: repository.host.clone(),
+                    owner: repository.owner.clone(),
+                    repository: repository.name.clone(),
+                    pull_request: number,
+                    remote_id: "SYNTHETIC_GENERAL_SYNC_SUBMITTED_DRAFT".into(),
+                },
+                author: Some(repository.account.login.clone()),
+                body: "synthetic observed submitted summary".into(),
+                state: "COMMENTED".into(),
+                submitted_at: Some("2026-09-13T12:00:00Z".into()),
+                commit_sha: Some(canonical.revision().head_sha.clone()),
+                edit_summary_capability: None,
+                url: String::new(),
+            });
+        {
+            let tab = &mut self.tabs[index];
+            let InteractionState::Ready(controller) = &mut tab.interactions else {
+                return Err("general-sync smoke interaction controller is not ready".into());
+            };
+            controller.select_line_with_canonical(&canonical, &canonical, selection)?;
+            let coordinate = controller
+                .composer
+                .as_ref()
+                .ok_or_else(|| "general-sync inline composer did not open".to_owned())?
+                .coordinate
+                .clone();
+            controller
+                .composition
+                .add_draft(coordinate, "synthetic retained line draft")
+                .map_err(|error| error.to_string())?;
+            controller.composer = None;
+            controller.select_file_with_canonical(&canonical, &canonical)?;
+            let target = controller
+                .file_composer
+                .as_ref()
+                .ok_or_else(|| "general-sync FILE composer did not open".to_owned())?
+                .target
+                .clone();
+            controller
+                .composition
+                .add_file_draft(target, "synthetic retained FILE draft")
+                .map_err(|error| error.to_string())?;
+            let editor = &mut tab.submitted_summary_editor;
+            editor.begin(synthetic_review);
+            editor.store_active_body("synthetic retained submitted-summary draft".into());
+            tab.journal_operations.push(JournalOperation {
+                request: JournalRequest::Auxiliary(Box::new(ReviewAuxiliaryRequest {
+                    operation_id: "synthetic-general-sync-journal".into(),
+                    attempt_id: "synthetic-general-sync-journal-attempt".into(),
+                    action: ReviewAuxiliaryAction::Reply {
+                        thread: cibergit::domain::ProviderCoordinates {
+                            provider: "github".into(),
+                            host: repository.host.clone(),
+                            owner: repository.owner.clone(),
+                            repository: repository.name.clone(),
+                            pull_request: number,
+                            remote_id: "synthetic-general-sync-thread".into(),
+                        },
+                        pending_review: None,
+                        body: "synthetic retained journal body".into(),
+                    },
+                })),
+                status: JournalStatus::Uncertain {
+                    reason: "synthetic unresolved outcome; no dispatch".into(),
+                },
+            });
+        }
+
+        let pinned_before =
+            serde_json::to_vec(&self.tabs[index].session).map_err(|error| error.to_string())?;
+        let canonical_before = self.tabs[index].canonical_full_revision.clone();
+        let composition_before = match &self.tabs[index].interactions {
+            InteractionState::Ready(controller) => controller.composition.clone(),
+            _ => return Err("general-sync smoke interaction controller disappeared".into()),
+        };
+        let submitted_before = self.tabs[index].submitted_summary_editor.current_snapshot();
+        let journal_before = self.tabs[index].journal_operations.clone();
+        let shared_inputs_before = (
+            self.composer_input.read(cx).value().to_string(),
+            self.submitted_summary_input.read(cx).value().to_string(),
+            self.review_summary_input.read(cx).value().to_string(),
+        );
+
+        let now = std::time::Instant::now();
+        let wall_now = std::time::SystemTime::now();
+        let (primary_token, _) = self
+            .general_reads
+            .begin_at(&repository.account, now)
+            .map_err(|deferral| format!("real account was not idle before fixture: {deferral:?}"))?
+            .into_parts();
+        let independent = cibergit::domain::Account {
+            host: repository.account.host.clone(),
+            login: format!("{}-synthetic-independent", repository.account.login),
+        };
+        let (independent_token, _) = self
+            .general_reads
+            .begin_at(&independent, now)
+            .map_err(|deferral| format!("independent account was not admitted: {deferral:?}"))?
+            .into_parts();
+        let independent_disposition = self.general_reads.complete_at(
+            &independent_token,
+            &cibergit::providers::GeneralReadDirective::default(),
+            None,
+            false,
+            now,
+            wall_now,
+        );
+        if !independent_disposition.matching_operation_released {
+            return Err("independent account did not release its owned operation".into());
+        }
+        let rate_directive = cibergit::providers::GeneralReadDirective {
+            x_poll_interval: None,
+            rate_limit: Some(cibergit::providers::GeneralReadDelay::Seconds(90)),
+        };
+        let rate_disposition = self.general_reads.complete_at(
+            &primary_token,
+            &rate_directive,
+            None,
+            false,
+            now,
+            wall_now,
+        );
+        if !rate_disposition.matching_operation_released || rate_disposition.payload_accepted {
+            return Err("rate completion did not reject payload and release its exact slot".into());
+        }
+        self.refresh_metadata(index, true, cx);
+        if self.status != read_sync::RATE_DEFERRED_NOTICE
+            || !self.tabs[index].metadata_refresh.has_deferred()
+        {
+            return Err("real Root metadata path did not retain the rate deferral".into());
+        }
+
+        let poll_account = cibergit::domain::Account {
+            host: repository.account.host.clone(),
+            login: format!("{}-synthetic-poll", repository.account.login),
+        };
+        let (poll_token, _) = self
+            .general_reads
+            .begin_at(&poll_account, now)
+            .map_err(|deferral| format!("poll fixture account was not admitted: {deferral:?}"))?
+            .into_parts();
+        self.general_reads.complete_at(
+            &poll_token,
+            &cibergit::providers::GeneralReadDirective {
+                x_poll_interval: Some(cibergit::providers::GeneralReadDelay::Seconds(90)),
+                rate_limit: None,
+            },
+            None,
+            false,
+            now,
+            wall_now,
+        );
+        if !matches!(
+            self.general_reads.begin_at(&poll_account, now),
+            Err(read_sync::ReadDeferral::Server(notice))
+                if notice == read_sync::POLL_DEFERRED_NOTICE
+        ) {
+            return Err("synthetic poll directive did not defer later admission".into());
+        }
+
+        let composition_after = match &self.tabs[index].interactions {
+            InteractionState::Ready(controller) => &controller.composition,
+            _ => return Err("general-sync smoke interaction controller disappeared".into()),
+        };
+        let preserved = pinned_before
+            == serde_json::to_vec(&self.tabs[index].session).map_err(|error| error.to_string())?
+            && canonical_before == self.tabs[index].canonical_full_revision
+            && composition_before == *composition_after
+            && submitted_before == self.tabs[index].submitted_summary_editor.current_snapshot()
+            && journal_before == self.tabs[index].journal_operations
+            && shared_inputs_before
+                == (
+                    self.composer_input.read(cx).value().to_string(),
+                    self.submitted_summary_input.read(cx).value().to_string(),
+                    self.review_summary_input.read(cx).value().to_string(),
+                );
+        if !preserved {
+            return Err("a pinned session, draft, journal, or shared input changed".into());
+        }
+        Ok(format!(
+            "Real read-only preparation settled: {}/{} #{number} at {}\nActual Root metadata deferral path retained explicit follow-up: true\nMatching rate completion rejected payload and released its slot: true\nSame-lifetime other-account admission while primary was active: true\nSynthetic poll directive deferred later same-account admission: true\nPinned session/canonical comparison unchanged: true\nLocal recovery unchanged during deferral: line drafts={}, FILE drafts={}, submitted drafts={}, journal operations={}\nShared composer inputs unchanged: true",
+            repository.owner,
+            repository.name,
+            short_sha(&canonical.revision().head_sha),
+            composition_before.drafts.len(),
+            composition_before.file_drafts.len(),
+            submitted_before.drafts.len(),
+            journal_before.len(),
+        ))
     }
 
     #[cfg(feature = "ui-smoke")]

@@ -44,6 +44,8 @@ mod general_sync;
 pub mod notifications;
 mod pr_lifecycle;
 mod stacks;
+#[cfg(feature = "ui-smoke")]
+pub use general_sync::synthetic_exact_304_smoke_fixture;
 pub use general_sync::{
     GeneralReadCache, GeneralReadDelay, GeneralReadDirective, GeneralReadFailureKind,
     GeneralReadOutcome,

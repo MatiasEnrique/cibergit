@@ -235,26 +235,7 @@ impl GithubProvider {
             &endpoint,
             cached.as_ref().map(|entry| &entry.validators),
         )?;
-        let (pull, validators, body_bytes) = match response {
-            ConditionalGet::Modified { value, metadata } => {
-                (value, metadata.validators, metadata.body_bytes)
-            }
-            ConditionalGet::NotModified { metadata } => {
-                let entry = cached.ok_or_else(|| {
-                    anyhow::anyhow!("Conditional PR metadata had no exact retained response body")
-                })?;
-                let CachedBody::Pull(value) = entry.body else {
-                    bail!("Conditional PR metadata cache representation mismatch")
-                };
-                (
-                    *value,
-                    entry
-                        .validators
-                        .merged_after_not_modified(&metadata.validators),
-                    entry.body_bytes,
-                )
-            }
-        };
+        let (pull, validators, body_bytes) = resolve_pull_response(cached, response)?;
         pull.validate(repo, Some(number))?;
         let retained = cacheable(
             &key,
@@ -268,6 +249,125 @@ impl GithubProvider {
         install(&mut cache, key, retained);
         Ok((pulls.pop().expect("one PR"), cache))
     }
+}
+
+fn resolve_pull_response(
+    cached: Option<CachedGeneralRestBody>,
+    response: ConditionalGet<ApiPullRequest>,
+) -> Result<(ApiPullRequest, RestValidators, usize)> {
+    match response {
+        ConditionalGet::Modified { value, metadata } => {
+            Ok((value, metadata.validators, metadata.body_bytes))
+        }
+        ConditionalGet::NotModified { metadata } => {
+            let entry = cached.ok_or_else(|| {
+                anyhow::anyhow!("Conditional PR metadata had no exact retained response body")
+            })?;
+            let CachedBody::Pull(value) = entry.body else {
+                bail!("Conditional PR metadata cache representation mismatch")
+            };
+            Ok((
+                *value,
+                entry
+                    .validators
+                    .merged_after_not_modified(&metadata.validators),
+                entry.body_bytes,
+            ))
+        }
+    }
+}
+
+/// Pure in-memory native evidence fixture. It exercises the same exact-body
+/// resolver as production, but it does not claim or perform a live HTTP 304.
+#[cfg(feature = "ui-smoke")]
+pub fn synthetic_exact_304_smoke_fixture() -> Result<String, String> {
+    use super::conditional::{RestPollDirective, RestResponseMetadata};
+    use crate::domain::Account;
+    use serde_json::json;
+
+    let account = Account {
+        host: "github.com".into(),
+        login: "synthetic-general-sync".into(),
+    };
+    let repository = Repository {
+        host: "github.com".into(),
+        owner: "fixture-owner".into(),
+        name: "fixture-repo".into(),
+        account: account.clone(),
+        local_path: None,
+    };
+    let provider = GithubProvider::new(account);
+    let key = pull_key(&provider, &repository, 7);
+    let value: ApiPullRequest = serde_json::from_value(json!({
+        "number": 7,
+        "title": "synthetic retained body",
+        "body": "synthetic fixture only",
+        "user": {"login": "fixture-author"},
+        "state": "open",
+        "draft": false,
+        "merged_at": null,
+        "html_url": "https://github.com/fixture-owner/fixture-repo/pull/7",
+        "base": {"sha": "1".repeat(40), "ref": "main", "repo": {"name": "fixture-repo", "owner": {"login": "fixture-owner"}}},
+        "head": {"sha": "2".repeat(40), "ref": "topic", "repo": {"name": "fixture-repo", "owner": {"login": "fixture-owner"}}},
+        "requested_reviewers": [],
+        "requested_teams": [],
+        "assignees": [],
+        "labels": [],
+        "changed_files": 1,
+        "updated_at": "2026-09-13T12:00:00Z"
+    }))
+    .map_err(|error| error.to_string())?;
+    let metadata = |etag: &str, body_bytes| RestResponseMetadata {
+        validators: RestValidators {
+            etag: Some(etag.into()),
+            last_modified: None,
+        },
+        link: None,
+        poll: RestPollDirective::default(),
+        graphql_rate_limit: None,
+        body_bytes,
+    };
+    let (modified, validators, body_bytes) = resolve_pull_response(
+        None,
+        ConditionalGet::Modified {
+            value,
+            metadata: metadata("\"fixture-v1\"", 512),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let retained = cacheable(
+        &key,
+        CachedBody::Pull(Box::new(modified)),
+        validators,
+        body_bytes,
+        1,
+    )
+    .ok_or_else(|| "synthetic 200 body was not retained".to_owned())?;
+    let (reused, validators, reused_bytes) = resolve_pull_response(
+        Some(retained),
+        ConditionalGet::NotModified {
+            metadata: metadata("\"fixture-v2\"", 0),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if reused.number != 7
+        || reused.title != "synthetic retained body"
+        || validators.etag.as_deref() != Some("\"fixture-v2\"")
+        || reused_bytes != 512
+    {
+        return Err("synthetic exact retained-body identity changed".into());
+    }
+    if resolve_pull_response(
+        None,
+        ConditionalGet::NotModified {
+            metadata: metadata("\"orphan\"", 0),
+        },
+    )
+    .is_ok()
+    {
+        return Err("synthetic bodyless 304 was accepted without an exact body".into());
+    }
+    Ok("synthetic exact 200/304 fixture retained PR #7 and rejected an orphan 304; no live 304 is claimed".into())
 }
 
 impl<T> GeneralReadOutcome<(T, GeneralReadCache)> {
@@ -906,5 +1006,13 @@ sys.exit(0 if status in [200, 304] else 1)
                 .sum::<usize>()
                 <= GENERAL_READ_CACHE_MAX_BYTES
         );
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[test]
+    fn native_synthetic_304_fixture_uses_exact_production_resolver() {
+        let report = synthetic_exact_304_smoke_fixture().unwrap();
+        assert!(report.contains("rejected an orphan 304"));
+        assert!(report.contains("no live 304 is claimed"));
     }
 }
