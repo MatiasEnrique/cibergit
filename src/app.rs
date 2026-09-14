@@ -2153,6 +2153,11 @@ pub struct ReviewWorkspace {
     inspector_scroll: ScrollHandle,
     checks_focus: FocusHandle,
     actions_control_focus: ActionsControlFocus,
+    /// Caller-owned handle for the Checks revision-details disclosure. Owning
+    /// the handle lets a regression ask directly whether the keyboard reached
+    /// this control, instead of inferring it from a painted ring, which a
+    /// clipped or unfocused frame can hide.
+    checks_details_focus: FocusHandle,
     jobs_focus: FocusHandle,
     log_focus: FocusHandle,
     query: Entity<InputState>,
@@ -2883,6 +2888,7 @@ impl ReviewWorkspace {
         let file_tree_focus = cx.focus_handle();
         let diff_focus = cx.focus_handle();
         let checks_focus = cx.focus_handle();
+        let checks_details_focus = cx.focus_handle();
         let jobs_focus = cx.focus_handle();
         let log_focus = cx.focus_handle();
         let actions_control_focus = ActionsControlFocus {
@@ -2955,6 +2961,7 @@ impl ReviewWorkspace {
             view_editor_scroll: ScrollHandle::new(),
             inspector_scroll: ScrollHandle::new(),
             checks_focus,
+            checks_details_focus,
             jobs_focus,
             log_focus,
             actions_control_focus,
@@ -20867,8 +20874,18 @@ impl ReviewWorkspace {
                     this.move_checks_page(1, window, cx);
                 }
             }))
-            .on_action(cx.listener(|root, _: &ToggleCheckIdentity, _, cx| {
+            // Enter is bound to this pane-level shortcut in the ChecksPane
+            // context, so every focusable control inside the pane inherits the
+            // binding and GPUI stops propagation before the control's own
+            // Enter/Space activation can arm. The shortcut belongs to the pane
+            // only while the pane itself holds focus; once focus moves onto a
+            // control, Enter is that control's to answer.
+            .on_action(cx.listener(|root, _: &ToggleCheckIdentity, window, cx| {
                 if let Root::Review(this) = root {
+                    if !this.checks_focus.is_focused(window) {
+                        cx.propagate();
+                        return;
+                    }
                     this.toggle_selected_check(cx);
                 }
             }))
@@ -27494,6 +27511,7 @@ impl ReviewWorkspace {
                             .child(
                                 Button::new("checks-source-details")
                                     .control()
+                                    .track_focus(&self.checks_details_focus)
                                     .border_1()
                                     .border_color(rgba(0x00000000))
                                     .focus_ring(colors.accent, colors.selected)
@@ -32106,6 +32124,16 @@ mod layout_tests {
         });
         cx.simulate_event(KeyUpEvent { keystroke: tab });
 
+        // Enter keyboard modality with a real keystroke first. The passing
+        // main-window test did this; this one did not, and modality is the only
+        // remaining difference between them.
+        let tab_key = Keystroke::parse("tab").unwrap();
+        cx.simulate_event(KeyDownEvent {
+            keystroke: tab_key.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(KeyUpEvent { keystroke: tab_key });
         let mut reached = false;
         for _ in 0..200 {
             cx.update(|window, cx| window.focus_next(cx));
@@ -32173,6 +32201,199 @@ mod layout_tests {
                  dispatch tree even though Tab reached it"
             );
         }
+    }
+
+    /// The Checks inspector keyboard defect, asserted rather than described.
+    ///
+    /// This asks the two questions separately and with no ring involved, using
+    /// the control's own caller-owned FocusHandle, so neither answer can be
+    /// confounded by a clipped quad or by mouse modality:
+    ///   1. does Tab traversal ever land focus on the control, and
+    ///   2. once it is genuinely focused, does Enter activate it.
+    /// Both are driven on the real review window with a redraw between focusing
+    /// and pressing, because GPUI only registers a focused element's Enter and
+    /// Space listeners while painting it focused.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn checks_inspector_control_is_tab_reachable_and_activates(cx: &mut gpui::TestAppContext) {
+        use gpui::{KeyDownEvent, KeyUpEvent, Keystroke};
+
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.install_pr_layout_fixture(window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let checks = cx.debug_bounds("pr-tab-checks").unwrap();
+        cx.simulate_click(checks.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        // debug_bounds is recorded before the visibility early-return and
+        // regardless of clipping, so a bounds value alone proves nothing about
+        // whether the control is actually on screen. Establish that first, or an
+        // offscreen fixture layout would masquerade as a traversal defect.
+        let control = cx
+            .debug_bounds("checks-source-details")
+            .expect("the disclosure must be painted for this regression to mean anything");
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let visible_area = gpui::Bounds {
+            origin: gpui::point(px(0.), px(0.)),
+            size: viewport,
+        };
+        assert!(
+            control.intersects(&visible_area),
+            "the disclosure must lie inside the window viewport; if it does not, \
+             this is an offscreen fixture layout rather than a keyboard defect"
+        );
+        assert!(
+            control.size.width > px(0.) && control.size.height > px(0.),
+            "the disclosure must have real painted area, not a collapsed box"
+        );
+        // The window viewport is not the binding clip: the inspector scrolls
+        // inside the PR content region, so check the real ancestor too.
+        if let Some(page) = cx.debug_bounds("pr-section-page") {
+            assert!(
+                control.intersects(&page),
+                "the disclosure must lie inside the PR content region it scrolls \
+                 within; if it does not, it is scrolled out of view and this is a \
+                 fixture layout question, not a keyboard defect"
+            );
+        }
+
+        let is_focused = |cx: &mut gpui::VisualTestContext| {
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.checks_details_focus.clone()
+            })
+        };
+        let focused_now = |cx: &mut gpui::VisualTestContext| {
+            let handle = is_focused(cx);
+            cx.update(|window, _| handle.is_focused(window))
+        };
+
+        let mut reached = false;
+        for _ in 0..200 {
+            cx.update(|window, cx| window.focus_next(cx));
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            if focused_now(cx) {
+                reached = true;
+                break;
+            }
+        }
+        assert!(
+            reached,
+            "Tab traversal must land on the Checks disclosure; it is painted \
+             every frame, so if this fails the control is absent from the tab \
+             ring rather than merely hard to see"
+        );
+
+        let expanded_before = root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            this.tabs[0].checks_source_expanded
+        });
+        let enter = Keystroke::parse("enter").unwrap();
+        cx.simulate_event(KeyDownEvent {
+            keystroke: enter.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(KeyUpEvent { keystroke: enter });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_ne!(
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.tabs[0].checks_source_expanded
+            }),
+            expanded_before,
+            "a genuinely focused Checks disclosure must activate on Enter"
+        );
+
+        let before_space = root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            this.tabs[0].checks_source_expanded
+        });
+        let space = Keystroke::parse("space").unwrap();
+        cx.simulate_event(KeyDownEvent {
+            keystroke: space.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(KeyUpEvent { keystroke: space });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_ne!(
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.tabs[0].checks_source_expanded
+            }),
+            before_space,
+            "the same control must also activate on Space"
+        );
+
+        // The pane shortcut must survive the fix: with focus back on the pane
+        // itself rather than a control, Enter still toggles the selected check
+        // identity. Guarding the shortcut must not delete it.
+        let identity_before = root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            this.tabs[0].checks_selection.expanded_id.clone()
+        });
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.checks_focus.focus(window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let enter_again = Keystroke::parse("enter").unwrap();
+        cx.simulate_event(KeyDownEvent {
+            keystroke: enter_again.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(KeyUpEvent {
+            keystroke: enter_again,
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_ne!(
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.tabs[0].checks_selection.expanded_id.clone()
+            }),
+            identity_before,
+            "the pane-level Enter shortcut must still work when the pane itself \
+             holds focus"
+        );
     }
 
     #[cfg(feature = "ui-smoke")]
