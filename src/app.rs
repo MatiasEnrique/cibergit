@@ -3671,7 +3671,7 @@ impl ReviewWorkspace {
 
                 let prepared = if opened.is_ok() && durable {
                     window
-                        .update(|_, cx| {
+                        .update(|window, cx| {
                             weak.update(cx, |root, cx| {
                                 let Root::Review(this) = root else {
                                     return Err("pending-file smoke left the review workspace".to_owned());
@@ -3740,6 +3740,7 @@ impl ReviewWorkspace {
                                 this.tabs[index].inspector_section = InspectorSection::Activity;
                                 this.inspector_open = true;
                                 this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                                window.resize(size(px(1440.), px(1050.)));
                                 this.prepare_file_comment_confirmation(cx);
                                 let generation = match &this.tabs[index].confirmation {
                                     Some(NativeConfirmation::PendingFileComment {
