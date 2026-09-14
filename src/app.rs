@@ -5218,6 +5218,34 @@ impl ReviewWorkspace {
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
                         if let Root::Review(this) = root {
+                            let middle = this.inspector_scroll.max_offset().y / 2.;
+                            this.inspector_scroll
+                                .set_offset(point(px(0.), -middle));
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let activity_review_name =
+                    format!("native-reactions-{appearance}-activity-review.png");
+                let activity_review = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join(&activity_review_name))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
                             this.inspector_scroll.scroll_to_bottom();
                             cx.notify();
                         }
@@ -5405,11 +5433,16 @@ impl ReviewWorkspace {
                     })
                     .unwrap_or(false);
                 let report = format!(
-                    "Native reaction smoke ({appearance})\nReal read-only provider details: true; provider-supplied PR node present; reaction subjects={}\nReal targeted reaction preparation completed without dispatch: {}\nSynthetic reaction authority: clearly labelled, isolated, selected viewer node/login explicit; subject authors differ\nOverview reaction-row capture: {}\nActivity top capture (discussion/review rows): {}\nActivity bottom capture (FILE-thread continuation): {}\nActual reaction handler entered background targeted preparation: {}\nHandler settled with zero-write preflight refusal: {}\nFull stale success and stale error apply paths preserved newer identical-action busy token/status: {}\nExact seeded line+FILE draft identities/bodies, submitted-summary identity/body, local journal operation, canonical/displayed revisions, selected files, and diff modes preserved: {}\nSynthetic local journal witness: terminal and isolated; provider transport zero\nMutation transport: HARD ZERO under CIBERGIT_SMOKE_REACTIONS; GraphQL mutation dispatch is suppressed before credentials/transport\nProvider activity from the handler: read-only targeted preparation only\nFocus/physical input/OS calls: none; no focus request and no physical input is implied\n",
+                    "Native reaction smoke ({appearance})\nReal read-only provider details: true; provider-supplied PR node present; reaction subjects={}\nReal targeted reaction preparation completed without dispatch: {}\nSynthetic reaction authority: clearly labelled, isolated, selected viewer node/login explicit; subject authors differ\nOverview PR reaction-row capture: {}\nActivity top discussion-row capture: {}\nActivity middle review-row continuation capture: {}\nActivity bottom capture (all three FILE-thread comment reaction rows): {}\nActual reaction handler entered background targeted preparation: {}\nHandler settled with zero-write preflight refusal: {}\nFull stale success and stale error apply paths preserved newer identical-action busy token/status: {}\nExact seeded line+FILE draft identities/bodies, submitted-summary identity/body, local journal operation, canonical/displayed revisions, selected files, and diff modes preserved: {}\nSynthetic local journal witness: terminal and isolated; provider transport zero\nMutation transport: HARD ZERO under CIBERGIT_SMOKE_REACTIONS; GraphQL mutation dispatch is suppressed before credentials/transport\nProvider activity from the handler: read-only targeted preparation only\nFocus/physical input/OS calls: none; no focus request and no physical input is implied\n",
                     setup.2,
                     real_preparation,
                     if overview { &overview_name } else { "failed" },
                     if activity_top { &activity_top_name } else { "failed" },
+                    if activity_review {
+                        &activity_review_name
+                    } else {
+                        "failed"
+                    },
                     if activity_bottom { &activity_bottom_name } else { "failed" },
                     handler_started,
                     handler_settled,
@@ -5425,6 +5458,7 @@ impl ReviewWorkspace {
                 assert!(
                     overview
                         && activity_top
+                        && activity_review
                         && activity_bottom
                         && real_preparation
                         && handler_started
