@@ -16331,9 +16331,12 @@ impl ReviewWorkspace {
         }
         #[cfg(feature = "ui-smoke")]
         if self.provider_reads_disabled {
-            self.status =
-                "Provider reads are disabled in this synthetic scene; no Actions control was prepared and zero writes were sent."
-                    .into();
+            // Naming the action lets a native test prove which control it
+            // actually activated, rather than only that some control did.
+            self.status = format!(
+                "Provider reads are disabled in this synthetic scene; {} was not prepared and zero writes were sent.",
+                action.label()
+            );
             cx.notify();
             return;
         }
@@ -34880,12 +34883,19 @@ mod layout_tests {
             window.draw(cx).clear(cx);
         });
 
-        // Every control is rendered for a fully identified run; the fresh
+        // Every control resolves for a fully identified run; the fresh
         // preparation read decides which one GitHub can accept.
+        //
+        // This is deliberately weak evidence and is not relied on: GPUI
+        // inserts debug bounds before its visibility early-return, so an
+        // element can resolve here every frame and still be absent from
+        // layout and from the tab ring. The real evidence is the pointer
+        // activation below, which goes through actual hit testing and asserts
+        // the specific control that ran.
         for action in RUN_CONTROLS {
             assert!(
                 cx.debug_bounds(action.control_element_id()).is_some(),
-                "{} is not rendered",
+                "{} does not resolve",
                 action.label()
             );
         }
@@ -34920,6 +34930,12 @@ mod layout_tests {
             let Root::Review(this) = root else {
                 unreachable!()
             };
+            assert!(
+                this.status
+                    .contains(ActionsRunControlAction::CancelRun.label()),
+                "the pointer press did not reach the cancel control: {}",
+                this.status
+            );
             assert!(this.status.contains("zero writes"), "{}", this.status);
         });
 
@@ -34975,8 +34991,10 @@ mod layout_tests {
                     let Root::Review(this) = root else {
                         unreachable!()
                     };
+                    // The status names the exact control, so a press that
+                    // landed on a different element cannot satisfy this.
                     assert!(
-                        this.status.contains("zero writes"),
+                        this.status.contains(action.label()) && this.status.contains("zero writes"),
                         "{} did not reach the controller: {}",
                         action.label(),
                         this.status
