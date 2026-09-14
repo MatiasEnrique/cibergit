@@ -91,9 +91,10 @@ use gpui_base::{
 use pr_lifecycle::{ChoiceKind, FrozenMutation, PrLifecycleController, reviewer};
 use review_interactions::{
     ActionJournal, ComposerState, ControllerLoad, InlineThread, JournalOperation, JournalRequest,
-    JournalStatus, ReviewInteractionController, ReviewReconciliationItem,
-    ReviewReconciliationOutcome, cancel_pending_review_start_before_create, dispatch_auxiliary,
-    dispatch_merge, execute_pending_review_start_create, execute_pending_review_start_thread,
+    JournalStatus, PendingReviewStartExpected, ReviewInteractionController,
+    ReviewReconciliationItem, ReviewReconciliationOutcome,
+    cancel_pending_review_start_before_create, dispatch_auxiliary, dispatch_merge,
+    execute_pending_review_start_create, execute_pending_review_start_thread,
     finish_pending_review_start_locally, load_merge_preference, next_attempt_id,
     place_threads_with_canonical, save_merge_preference, stop_pending_review_start_after_create,
 };
@@ -1849,7 +1850,7 @@ enum PendingReviewStartConfirmationMode {
         absence: PendingFileReviewAbsence,
     },
     Continue {
-        source: cibergit::domain::PendingFileCommentSource,
+        source: Box<cibergit::domain::PendingFileCommentSource>,
         creation: PendingReviewCreationAcknowledgement,
     },
 }
@@ -15520,7 +15521,10 @@ impl ReviewWorkspace {
             self.tabs[index].confirmation = Some(NativeConfirmation::PendingFileReviewStart {
                 generation,
                 intent: Box::new(record.intent.clone()),
-                mode: Box::new(PendingReviewStartConfirmationMode::Continue { source, creation }),
+                mode: Box::new(PendingReviewStartConfirmationMode::Continue {
+                    source: Box::new(source),
+                    creation,
+                }),
             });
             self.inspector_open = true;
             self.inspector_scroll.set_offset(point(px(0.), px(0.)));
@@ -15811,7 +15815,7 @@ impl ReviewWorkspace {
                         .pending_snapshot
                         .as_ref()
                         .and_then(|pending| pending.file_comment_source.as_ref())
-                        == Some(source)
+                        == Some(source.as_ref())
             }
             _ => false,
         };
@@ -15882,8 +15886,7 @@ impl ReviewWorkspace {
             Ok(execute_pending_review_start_create(
                 &authority,
                 &store,
-                expected_composition.as_ref(),
-                expected_start.as_ref(),
+                PendingReviewStartExpected { composition: expected_composition.as_ref(), record: expected_start.as_ref() },
                 &provider,
                 &repository,
                 &intent,
@@ -15953,7 +15956,7 @@ impl ReviewWorkspace {
                                 .submitted_summary_editor
                                 .close_after_save;
                         let visible_exact = if input_owned {
-                            this.composer_input.read(cx).value().to_string() == token.intent.body
+                            this.composer_input.read(cx).value() == token.intent.body
                         } else {
                             this.active_tab != Some(index)
                         };

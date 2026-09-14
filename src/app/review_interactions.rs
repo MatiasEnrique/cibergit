@@ -806,16 +806,24 @@ pub struct PendingReviewStartStep<T> {
     pub record: Option<PendingReviewStartRecord>,
 }
 
+pub struct PendingReviewStartExpected<'a> {
+    pub composition: Option<&'a ReviewComposition>,
+    pub record: Option<&'a PendingReviewStartRecord>,
+}
+
 pub fn execute_pending_review_start_create(
     authority: &ReviewStateAuthority,
     store: &DraftStore,
-    expected_composition: Option<&ReviewComposition>,
-    expected_start: Option<&PendingReviewStartRecord>,
+    expected: PendingReviewStartExpected<'_>,
     provider: &GithubProvider,
     repository: &Repository,
     intent: &PendingFileReviewStartIntent,
     attempt_id: &str,
 ) -> PendingReviewStartStep<cibergit::domain::PendingReviewCreationAcknowledgement> {
+    let PendingReviewStartExpected {
+        composition: expected_composition,
+        record: expected_start,
+    } = expected;
     let fallback_composition = expected_composition.cloned();
     let fallback_record = expected_start.cloned();
     let fallback_context = pending_start_context(
@@ -950,8 +958,8 @@ pub fn execute_pending_review_start_create(
             record,
         } => PendingReviewStartStep {
             outcome,
-            composition,
-            record,
+            composition: composition.map(|value| *value),
+            record: record.map(|value| *value),
         },
         PendingReviewStartAuthorityExecution::Completed {
             value: Err(reason),
@@ -959,8 +967,8 @@ pub fn execute_pending_review_start_create(
             record,
         } => PendingReviewStartStep {
             outcome: ProviderMutationOutcome::PreflightRejected { reason },
-            composition,
-            record,
+            composition: composition.map(|value| *value),
+            record: record.map(|value| *value),
         },
         PendingReviewStartAuthorityExecution::NotAdmitted(reason) => PendingReviewStartStep {
             outcome: ProviderMutationOutcome::PreflightRejected { reason },
@@ -1228,8 +1236,8 @@ pub fn execute_pending_review_start_thread(
             record,
         } => PendingReviewStartStep {
             outcome,
-            composition,
-            record,
+            composition: composition.map(|value| *value),
+            record: record.map(|value| *value),
         },
         PendingReviewStartAuthorityExecution::Completed {
             value: Err(reason),
@@ -1237,8 +1245,8 @@ pub fn execute_pending_review_start_thread(
             record,
         } => PendingReviewStartStep {
             outcome: ProviderMutationOutcome::PreflightRejected { reason },
-            composition,
-            record,
+            composition: composition.map(|value| *value),
+            record: record.map(|value| *value),
         },
         PendingReviewStartAuthorityExecution::NotAdmitted(reason) => PendingReviewStartStep {
             outcome: ProviderMutationOutcome::PreflightRejected { reason },
@@ -1303,7 +1311,7 @@ pub fn stop_pending_review_start_after_create(
             value: Ok(()),
             record: Some(record),
             ..
-        } => Ok(record),
+        } => Ok(*record),
         PendingReviewStartAuthorityExecution::Completed {
             value: Ok(()),
             record: None,
@@ -1358,7 +1366,7 @@ pub fn cancel_pending_review_start_before_create(
             value: Ok(()),
             record: Some(record),
             ..
-        } => Ok(record),
+        } => Ok(*record),
         PendingReviewStartAuthorityExecution::Completed {
             value: Ok(()),
             record: None,
@@ -1458,8 +1466,8 @@ pub fn finish_pending_review_start_locally(
             record,
         } => PendingReviewStartStep {
             outcome,
-            composition,
-            record,
+            composition: composition.map(|value| *value),
+            record: record.map(|value| *value),
         },
         PendingReviewStartAuthorityExecution::Completed {
             value: Err(reason),
@@ -1467,8 +1475,8 @@ pub fn finish_pending_review_start_locally(
             record,
         } => PendingReviewStartStep {
             outcome: ProviderMutationOutcome::Uncertain { context, reason },
-            composition,
-            record,
+            composition: composition.map(|value| *value),
+            record: record.map(|value| *value),
         },
         PendingReviewStartAuthorityExecution::NotAdmitted(reason) => PendingReviewStartStep {
             outcome: ProviderMutationOutcome::PreflightRejected { reason },
@@ -1617,8 +1625,8 @@ pub enum PendingReviewStartAuthorityExecution<T> {
     NotAdmitted(String),
     Completed {
         value: T,
-        composition: Option<ReviewComposition>,
-        record: Option<PendingReviewStartRecord>,
+        composition: Option<Box<ReviewComposition>>,
+        record: Option<Box<PendingReviewStartRecord>>,
     },
     ReadbackUncertain {
         value: T,
@@ -1782,8 +1790,8 @@ impl ReviewStateAuthority {
             Ok((value, Ok(composition), Ok(record))) => {
                 PendingReviewStartAuthorityExecution::Completed {
                     value,
-                    composition,
-                    record,
+                    composition: composition.map(Box::new),
+                    record: record.map(Box::new),
                 }
             }
             Ok((value, composition, record)) => {
@@ -4287,8 +4295,10 @@ print(json.dumps(response))
         let step = execute_pending_review_start_create(
             &controller.authority,
             &controller.store,
-            controller.durable_composition.as_ref(),
-            None,
+            PendingReviewStartExpected {
+                composition: controller.durable_composition.as_ref(),
+                record: None,
+            },
             &provider,
             &repository(),
             &intent,
@@ -4384,8 +4394,10 @@ print(json.dumps(response))
         let create = execute_pending_review_start_create(
             &controller.authority,
             &controller.store,
-            controller.durable_composition.as_ref(),
-            None,
+            PendingReviewStartExpected {
+                composition: controller.durable_composition.as_ref(),
+                record: None,
+            },
             &provider,
             &repository(),
             &intent,
@@ -4463,8 +4475,10 @@ print(json.dumps(response))
         let create = execute_pending_review_start_create(
             &controller.authority,
             &controller.store,
-            controller.durable_composition.as_ref(),
-            None,
+            PendingReviewStartExpected {
+                composition: controller.durable_composition.as_ref(),
+                record: None,
+            },
             &provider,
             &repository(),
             &intent,
@@ -4542,8 +4556,10 @@ print(json.dumps(response))
         let create = execute_pending_review_start_create(
             &controller.authority,
             &controller.store,
-            controller.durable_composition.as_ref(),
-            None,
+            PendingReviewStartExpected {
+                composition: controller.durable_composition.as_ref(),
+                record: None,
+            },
             &provider,
             &repository(),
             &intent,
@@ -4601,8 +4617,10 @@ print(json.dumps(response))
         let step = execute_pending_review_start_create(
             &controller.authority,
             &controller.store,
-            controller.durable_composition.as_ref(),
-            None,
+            PendingReviewStartExpected {
+                composition: controller.durable_composition.as_ref(),
+                record: None,
+            },
             &provider,
             &repository(),
             &intent,
@@ -4649,8 +4667,10 @@ print(json.dumps(response))
         let step = execute_pending_review_start_create(
             &controller.authority,
             &controller.store,
-            controller.durable_composition.as_ref(),
-            None,
+            PendingReviewStartExpected {
+                composition: controller.durable_composition.as_ref(),
+                record: None,
+            },
             &provider,
             &repository(),
             &intent,
