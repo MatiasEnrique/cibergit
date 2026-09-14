@@ -34,7 +34,7 @@ use checks_view::{
 #[cfg(feature = "ui-smoke")]
 use cibergit::domain::{
     ActionsLinkage, CheckAppIdentity, CheckKind, CheckShaClass, CheckSuiteIdentity,
-    ProviderCoordinates, PullRequestCheck, WorkflowRunIdentity,
+    PullRequestCheck, WorkflowRunIdentity,
 };
 #[cfg(feature = "ui-smoke")]
 use cibergit::participation::ReviewOperationPayload;
@@ -26016,14 +26016,15 @@ mod layout_tests {
         ToggleCheckIdentity, check_identity_button, checks_page_button, palette,
     };
     use cibergit::domain::{
-        Account, ActionsLinkage, CheckKind, CheckShaClass, MergeEligibility,
-        PendingFileCommentSource, ProviderCoordinates, PullRequestCheck, PullRequestDetails,
-        PullRequestReview, ReactionContent, ReactionIntent, Repository, ReviewAuxiliaryAction,
-        ReviewAuxiliaryRequest, ReviewSubject, SubmittedReviewEditCapability,
+        Account, MergeEligibility, PendingFileCommentSource, ProviderCoordinates,
+        PullRequestDetails, PullRequestReview, ReactionContent, ReactionIntent, Repository,
+        ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewSubject,
+        SubmittedReviewEditCapability,
     };
     #[cfg(feature = "ui-smoke")]
     use cibergit::domain::{
-        DismissalAuthority, FreshReviewDismissalCapability, ProviderMutationOutcome, PullRequest,
+        ActionsLinkage, CheckKind, CheckShaClass, DismissalAuthority,
+        FreshReviewDismissalCapability, ProviderMutationOutcome, PullRequest, PullRequestCheck,
         SelectedViewer, SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
         SubmittedReviewDismissalTarget,
     };
