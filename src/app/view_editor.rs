@@ -2,7 +2,7 @@ use cibergit::{
     domain::{PullRequest, Repository},
     workspace::{Filter, GroupBy, PersonalFilter, SavedView, WorkspaceState, group_path},
 };
-use std::cmp::Reverse;
+use std::{cmp::Reverse, rc::Rc, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum GroupKind {
@@ -284,10 +284,56 @@ pub(super) enum SidebarRow {
     },
 }
 
-struct GroupedPull {
+/// Keeps the last immutable inventory alive so pointer identity cannot be reused.
+#[derive(Default)]
+pub(super) struct SidebarCache {
+    view: Option<SavedView>,
+    inventories: Vec<(Repository, Arc<Vec<PullRequest>>)>,
+    rows: Rc<[SidebarRow]>,
+    pub participating_incomplete: bool,
+}
+
+impl SidebarCache {
+    pub fn rows_for(
+        &mut self,
+        repositories: &[(Repository, Arc<Vec<PullRequest>>)],
+        view: &SavedView,
+    ) -> Rc<[SidebarRow]> {
+        if self.view.as_ref() != Some(view)
+            || self.inventories.len() != repositories.len()
+            || self
+                .inventories
+                .iter()
+                .zip(repositories)
+                .any(|((old_repo, old), (repo, pulls))| {
+                    old_repo != repo || !Arc::ptr_eq(old, pulls)
+                })
+        {
+            let inventories = repositories
+                .iter()
+                .enumerate()
+                .map(|(index, (repository, pulls))| RepositoryPulls {
+                    index,
+                    repository,
+                    pull_requests: pulls,
+                })
+                .collect::<Vec<_>>();
+            self.rows = compose_sidebar_rows(&inventories, view).into();
+            self.participating_incomplete = view.filter.personal == PersonalFilter::Participating
+                && repositories
+                    .iter()
+                    .any(|(_, pulls)| pulls.iter().any(|pull| !pull.participants_complete));
+            self.inventories = repositories.to_vec();
+            self.view = Some(view.clone());
+        }
+        self.rows.clone()
+    }
+}
+
+struct GroupedPull<'a> {
     repository_index: usize,
     repository_key: String,
-    pull_request: PullRequest,
+    pull_request: &'a PullRequest,
     path: Vec<String>,
 }
 
@@ -308,7 +354,7 @@ pub(super) fn compose_sidebar_rows(
                 .map(move |pull_request| GroupedPull {
                     repository_index: runtime.index,
                     repository_key: runtime.repository.cache_key(),
-                    pull_request: pull_request.clone(),
+                    pull_request,
                     path: group_path(
                         runtime.repository,
                         pull_request,
@@ -327,7 +373,7 @@ pub(super) fn compose_sidebar_rows(
                 })
         })
         .collect::<Vec<_>>();
-    pulls.sort_by_key(|pull| {
+    pulls.sort_by_cached_key(|pull| {
         (
             pull.path
                 .iter()
@@ -357,7 +403,7 @@ pub(super) fn compose_sidebar_rows(
         rows.push(SidebarRow::Pull {
             repository_index: pull.repository_index,
             repository_key: pull.repository_key,
-            pull_request: Box::new(pull.pull_request),
+            pull_request: Box::new(pull.pull_request.clone()),
         });
     }
     rows
@@ -399,6 +445,34 @@ mod tests {
             check_status: "PASSING".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn sidebar_cache_reuses_inventory_and_invalidates_same_length_refresh_and_account() {
+        let mut inventories = vec![(
+            repo("one", "maya"),
+            Arc::new(vec![PullRequest {
+                number: 7,
+                title: "Original".into(),
+                state: "OPEN".into(),
+                ..Default::default()
+            }]),
+        )];
+        let mut cache = SidebarCache::default();
+        let mut view = SavedView::default();
+        let original = cache.rows_for(&inventories, &view);
+        assert!(Rc::ptr_eq(&original, &cache.rows_for(&inventories, &view)));
+        Arc::make_mut(&mut inventories[0].1)[0].title = "Replacement".into();
+        let updated = cache.rows_for(&inventories, &view);
+        assert!(!Rc::ptr_eq(&original, &updated));
+        assert!(
+            matches!(&updated[1], SidebarRow::Pull { pull_request, .. } if pull_request.title == "Replacement")
+        );
+        inventories[0].0.account.login = "other".into();
+        let account_changed = cache.rows_for(&inventories, &view);
+        assert!(!Rc::ptr_eq(&updated, &account_changed));
+        view.filter.search = "No match".into();
+        assert!(cache.rows_for(&inventories, &view).is_empty());
     }
 
     #[test]

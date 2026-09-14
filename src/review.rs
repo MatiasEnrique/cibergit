@@ -12,7 +12,7 @@ use std::{
     path::Path,
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -81,7 +81,9 @@ pub struct ViewedFile {
 /// snapshot; a new revision is only installed by an explicit user action.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReviewSession {
-    comparison: Comparison,
+    comparison: Arc<Comparison>,
+    #[serde(skip)]
+    file_indices: Arc<OnceLock<HashMap<String, usize>>>,
     available_revision: Option<Revision>,
     selected_file: Option<String>,
     diff_mode: DiffMode,
@@ -95,7 +97,8 @@ impl ReviewSession {
     pub fn new(comparison: Comparison) -> Self {
         let selected_file = comparison.files.first().map(file_key);
         Self {
-            comparison,
+            comparison: Arc::new(comparison),
+            file_indices: Arc::default(),
             available_revision: None,
             selected_file,
             diff_mode: DiffMode::Auto,
@@ -135,12 +138,24 @@ impl ReviewSession {
     pub fn submission_revision(&self) -> &Revision {
         self.revision()
     }
+    fn file_index(&self, key: &str) -> Option<usize> {
+        self.file_indices
+            .get_or_init(|| {
+                let mut indices = HashMap::with_capacity(self.comparison.files.len());
+                for (index, file) in self.comparison.files.iter().enumerate() {
+                    indices.entry(file_key(file)).or_insert(index);
+                }
+                indices
+            })
+            .get(key)
+            .copied()
+    }
     pub fn selected_file(&self) -> Option<&ChangedFile> {
-        let path = self.selected_file.as_ref()?;
-        self.comparison.files.iter().find(|f| file_key(f) == *path)
+        let index = self.file_index(self.selected_file.as_deref()?)?;
+        self.comparison.files.get(index)
     }
     pub fn select_file(&mut self, path: &str) -> bool {
-        if self.comparison.files.iter().any(|f| file_key(f) == path) {
+        if self.file_index(path).is_some() {
             self.selected_file = Some(path.to_owned());
             true
         } else {
@@ -156,10 +171,9 @@ impl ReviewSession {
     }
     fn navigate(&mut self, direction: isize) -> bool {
         let Some(index) = self
-            .comparison
-            .files
-            .iter()
-            .position(|f| Some(&file_key(f)) == self.selected_file.as_ref())
+            .selected_file
+            .as_deref()
+            .and_then(|key| self.file_index(key))
         else {
             return false;
         };
@@ -263,7 +277,7 @@ impl ReviewSession {
         {
             self.viewed.remove(&key);
         }
-        self.comparison.files[index] = file;
+        Arc::make_mut(&mut self.comparison).files[index] = file;
         Ok(())
     }
     /// Reject an outdated background load if another revision was observed meanwhile.
@@ -305,7 +319,8 @@ impl ReviewSession {
         {
             self.selected_file = comparison.files.first().map(file_key);
         }
-        self.comparison = comparison;
+        self.comparison = Arc::new(comparison);
+        self.file_indices = Arc::default();
     }
 }
 

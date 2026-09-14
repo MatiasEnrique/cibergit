@@ -23,7 +23,7 @@ const MAX_TAB_PRESENTATION_BYTES: usize = 256 * 1024;
 const MAX_POLL_BACKOFF_SHIFT: u32 = 5;
 const MAX_REVIEW_CONTEXT_BYTES: usize = 32 * 1024 * 1024;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Filter {
     pub search: String,
     pub author: String,
@@ -57,7 +57,7 @@ pub enum GroupBy {
     SourcePrefix(String),
     Stack,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedView {
     pub name: String,
     pub filter: Filter,

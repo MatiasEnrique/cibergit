@@ -166,3 +166,61 @@ fn horizontal_scroll_is_file_scoped_and_old_records_restore_at_start() {
     let old: ReviewSession = serde_json::from_value(legacy).unwrap();
     assert_eq!(old.horizontal_scroll_position(), 0.);
 }
+
+#[test]
+fn cloned_sessions_share_code_but_keep_selection_and_lazy_patches_isolated() {
+    let mut original = ReviewSession::new(comparison(
+        revision('a', 'b'),
+        vec![file("one.rs", "one"), file("two.rs", "two")],
+    ));
+    let snapshot = original.clone();
+    assert!(std::ptr::eq(original.comparison(), snapshot.comparison()));
+    original.select_file("two.rs");
+    assert_eq!(snapshot.selected_file().unwrap().path, "one.rs");
+    original
+        .install_file_patch(&revision('a', 'b'), file("two.rs", "loaded"))
+        .unwrap();
+    assert!(!std::ptr::eq(original.comparison(), snapshot.comparison()));
+    assert!(
+        snapshot.comparison().files[1]
+            .patch
+            .as_ref()
+            .unwrap()
+            .contains("+two")
+    );
+    let encoded = serde_json::to_value(&original).unwrap();
+    assert_eq!(
+        encoded["comparison"],
+        serde_json::to_value(original.comparison()).unwrap()
+    );
+    let restored: ReviewSession = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(serde_json::to_value(restored).unwrap(), encoded);
+}
+
+#[test]
+#[ignore = "performance measurement; run explicitly with --release --ignored --nocapture"]
+fn benchmark_navigation_snapshot_copy_vs_shared_comparison() {
+    if cfg!(debug_assertions) {
+        panic!("measure optimized builds only");
+    }
+    let session = ReviewSession::new(comparison(
+        revision('a', 'b'),
+        (0..500)
+            .map(|index| file(&format!("file-{index}.rs"), &"x".repeat(32768)))
+            .collect(),
+    ));
+    let iterations = 100;
+    let started = std::time::Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(session.comparison().clone());
+    }
+    let copying = started.elapsed();
+    let started = std::time::Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(session.clone());
+    }
+    let shared = started.elapsed();
+    println!(
+        "500 files / 16 MiB patch bytes / {iterations} navigation snapshots: full comparison copies {copying:?}; shared session snapshots {shared:?}"
+    );
+}

@@ -119,7 +119,7 @@ use submitted_review_drafts::{
     DraftSnapshot as SubmittedDraftStoreSnapshot, SubmittedReviewDraftStore, SubmittedSummaryDraft,
     same_draft_history, same_review_coordinates,
 };
-use view_editor::{RepositoryPulls, SidebarRow, ViewEditorController, compose_sidebar_rows};
+use view_editor::{SidebarRow, ViewEditorController};
 
 const UI_FONT: &str = "IBM Plex Sans";
 const CODE_FONT: &str = "Menlo";
@@ -547,7 +547,7 @@ impl LoadState {
 
 struct RepoRuntime {
     repository: Repository,
-    pull_requests: Vec<PullRequest>,
+    pull_requests: Arc<Vec<PullRequest>>,
     state: LoadState,
     generation: u64,
     refresh: RefreshGate,
@@ -1341,7 +1341,9 @@ struct ReviewTab {
     inventory_generation: u64,
     metadata_generation: u64,
     metadata_refresh: RefreshGate,
-    diff_rows: Vec<DiffRow>,
+    diff_rows: Rc<Vec<DiffRow>>,
+    diff_split: bool,
+    diff_text_width: f32,
     diff_scroll: ListState,
     diff_horizontal: ScrollHandle,
     diff_content_width: f32,
@@ -2093,6 +2095,10 @@ pub struct ReviewWorkspace {
     repository_picker_open: bool,
     sidebar_search_generation: u64,
     sidebar_search_open: bool,
+    sidebar_cache: std::cell::RefCell<view_editor::SidebarCache>,
+    sidebar_scroll: UniformListScrollHandle,
+    #[cfg(feature = "ui-smoke")]
+    sidebar_materializations: Cell<usize>,
     command_palette: bool,
     creation_dialog: Option<Entity<pr_creation::PrCreationDialog>>,
     creation_subscription: Option<Subscription>,
@@ -2847,7 +2853,7 @@ impl ReviewWorkspace {
                     .and_then(|store| store.load_pull_requests(&repository).ok());
                 RepoRuntime {
                     repository,
-                    pull_requests: cached.clone().unwrap_or_default(),
+                    pull_requests: Arc::new(cached.clone().unwrap_or_default()),
                     state: if cached.is_some() {
                         LoadState::Cached("Cached PR list · refreshing…".into())
                     } else {
@@ -2884,6 +2890,10 @@ impl ReviewWorkspace {
             repository_picker_open: false,
             sidebar_search_generation: 0,
             sidebar_search_open: false,
+            sidebar_cache: Default::default(),
+            sidebar_scroll: UniformListScrollHandle::new(),
+            #[cfg(feature = "ui-smoke")]
+            sidebar_materializations: Cell::new(0),
             command_palette: false,
             creation_dialog: None,
             creation_subscription: None,
@@ -5269,7 +5279,7 @@ impl ReviewWorkspace {
         };
         self.repositories.push(RepoRuntime {
             repository: repository.clone(),
-            pull_requests: vec![pull.clone()],
+            pull_requests: Arc::new(vec![pull.clone()]),
             state: LoadState::Ready,
             generation: 0,
             refresh: RefreshGate::default(),
@@ -5450,7 +5460,7 @@ impl ReviewWorkspace {
                                 ..Default::default()
                             }).collect();
                             this.repositories.push(RepoRuntime {
-                                repository, pull_requests, state: LoadState::Ready,
+                                repository, pull_requests: Arc::new(pull_requests), state: LoadState::Ready,
                                 generation: 0, refresh: RefreshGate::default(),
                             });
                         }
@@ -9396,22 +9406,24 @@ impl ReviewWorkspace {
         self.rebuild_diff(index, self.wide);
         let long = "review-interaction-horizontal-smoke-".repeat(150);
         match mode {
-            DiffMode::SideBySide => self.tabs[index].diff_rows.push(DiffRow::Split(AlignedRow {
-                old: Some(DiffLine {
-                    kind: DiffLineKind::Deletion,
-                    old_line: Some(99_999),
-                    new_line: None,
-                    text: format!("OLD {long}"),
-                }),
-                new: Some(DiffLine {
-                    kind: DiffLineKind::Addition,
-                    old_line: None,
-                    new_line: Some(99_999),
-                    text: format!("NEW {long}"),
-                }),
-            })),
+            DiffMode::SideBySide => {
+                Rc::make_mut(&mut self.tabs[index].diff_rows).push(DiffRow::Split(AlignedRow {
+                    old: Some(DiffLine {
+                        kind: DiffLineKind::Deletion,
+                        old_line: Some(99_999),
+                        new_line: None,
+                        text: format!("OLD {long}"),
+                    }),
+                    new: Some(DiffLine {
+                        kind: DiffLineKind::Addition,
+                        old_line: None,
+                        new_line: Some(99_999),
+                        text: format!("NEW {long}"),
+                    }),
+                }))
+            }
             DiffMode::Auto | DiffMode::Unified => {
-                self.tabs[index].diff_rows.push(DiffRow::Unified(DiffLine {
+                Rc::make_mut(&mut self.tabs[index].diff_rows).push(DiffRow::Unified(DiffLine {
                     kind: DiffLineKind::Addition,
                     old_line: None,
                     new_line: Some(99_999),
@@ -9419,6 +9431,10 @@ impl ReviewWorkspace {
                 }));
             }
         }
+        (
+            self.tabs[index].diff_split,
+            self.tabs[index].diff_text_width,
+        ) = diff_text_metrics(&self.tabs[index].diff_rows);
         self.tabs[index].diff_content_width = diff_content_width(&self.tabs[index].diff_rows, mode);
         self.tabs[index].diff_scroll = ListState::new(
             self.tabs[index].diff_rows.len(),
@@ -9936,7 +9952,11 @@ impl ReviewWorkspace {
             session.set_diff_mode(mode);
         }
         self.tabs[index].diff_content_width = diff_content_width(&rows, mode);
-        self.tabs[index].diff_rows = rows;
+        self.tabs[index].diff_rows = Rc::new(rows);
+        (
+            self.tabs[index].diff_split,
+            self.tabs[index].diff_text_width,
+        ) = diff_text_metrics(&self.tabs[index].diff_rows);
         self.tabs[index].diff_scroll = ListState::new(
             self.tabs[index].diff_rows.len(),
             ListAlignment::Top,
@@ -11538,7 +11558,7 @@ impl ReviewWorkspace {
                             this.workspace.add_repository(repository.clone());
                             this.repositories.push(RepoRuntime {
                                 repository: repository.clone(),
-                                pull_requests: Vec::new(),
+                                pull_requests: Arc::default(),
                                 state: LoadState::Loading("Loading pull requests…".into()),
                                 generation: 0,
                                 refresh: RefreshGate::default(),
@@ -12881,7 +12901,7 @@ impl ReviewWorkspace {
                                 let _ =
                                     store.save_pull_requests(&runtime.repository, &pull_requests);
                             }
-                            runtime.pull_requests = pull_requests;
+                            runtime.pull_requests = Arc::new(pull_requests);
                             runtime.state = LoadState::Ready;
                             this.schedule.succeeded(&format!("sidebar:{repo_key}"));
                         }
@@ -13032,7 +13052,7 @@ impl ReviewWorkspace {
                             .iter()
                             .any(|listed| listed.number == pull_request.number)
                         {
-                            runtime.pull_requests.push(pull_request.clone());
+                            Arc::make_mut(&mut runtime.pull_requests).push(pull_request.clone());
                         }
                         let Some(repository) = this
                             .repositories
@@ -13474,7 +13494,9 @@ impl ReviewWorkspace {
             inventory_generation: request_generation,
             metadata_generation: 0,
             metadata_refresh: RefreshGate::default(),
-            diff_rows: Vec::new(),
+            diff_rows: Rc::default(),
+            diff_split: false,
+            diff_text_width: 1.,
             diff_scroll: ListState::new(0, ListAlignment::Top, px(480.)),
             diff_horizontal: ScrollHandle::new(),
             diff_content_width: 0.,
@@ -18964,7 +18986,9 @@ impl ReviewWorkspace {
         };
         let Some(session) = &tab.session else { return };
         let Some(file) = session.selected_file() else {
-            tab.diff_rows.clear();
+            tab.diff_rows = Rc::default();
+            tab.diff_split = false;
+            tab.diff_text_width = 1.;
             return;
         };
         let selected_key = file_key(file);
@@ -18985,7 +19009,13 @@ impl ReviewWorkspace {
             InteractionState::Ready(controller) => controller.composer.as_ref(),
             InteractionState::Loading | InteractionState::RecoveryRequired(_) => None,
         };
-        tab.diff_rows = attach_inline_rows(base_rows, &selected_key, &threads, composer);
+        tab.diff_rows = Rc::new(attach_inline_rows(
+            base_rows,
+            &selected_key,
+            &threads,
+            composer,
+        ));
+        (tab.diff_split, tab.diff_text_width) = diff_text_metrics(&tab.diff_rows);
         tab.diff_content_width = diff_content_width(&tab.diff_rows, resolved_mode);
         tab.diff_scroll = ListState::new(tab.diff_rows.len(), ListAlignment::Top, px(480.));
         if scroll_position > 0. {
@@ -19548,6 +19578,7 @@ impl ReviewWorkspace {
 
     fn apply_filter(&mut self, personal: PersonalFilter, cx: &mut Context<Root>) {
         self.sidebar_search_generation += 1;
+        self.sidebar_scroll.scroll_to_item(0, ScrollStrategy::Top);
         let mut view = self.workspace.view();
         view.filter.search = self.query.read(cx).value().trim().to_owned();
         view.filter.personal = personal;
@@ -19656,6 +19687,7 @@ impl ReviewWorkspace {
             return;
         }
         self.workspace.selected_view = index;
+        self.sidebar_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.view_editor.cancel();
         let search = self.workspace.view().filter.search;
         self.query
@@ -20185,6 +20217,139 @@ impl ReviewWorkspace {
             ))
     }
 
+    fn render_sidebar_row(
+        &self,
+        row: &SidebarRow,
+        colors: Palette,
+        root: Entity<Root>,
+    ) -> AnyElement {
+        #[cfg(feature = "ui-smoke")]
+        self.sidebar_materializations
+            .set(self.sidebar_materializations.get() + 1);
+        match row {
+            SidebarRow::Group { depth, label } => div()
+                .h(px(34.))
+                .pl(px(16. + *depth as f32 * 14.))
+                .pr_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_color(colors.muted)
+                .child(sidebar_icon(
+                    if *depth == 0 { "folder" } else { "branch" },
+                    colors.muted,
+                ))
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(label.clone()),
+                )
+                .into_any_element(),
+            SidebarRow::Pull {
+                repository_index,
+                repository_key,
+                pull_request,
+            } => {
+                let pull_request = pull_request.as_ref();
+                let repository_index = *repository_index;
+                let selected = self
+                    .active_tab
+                    .and_then(|index| self.tabs.get(index))
+                    .is_some_and(|tab| {
+                        tab.repository.cache_key() == *repository_key
+                            && tab.pull_request.number == pull_request.number
+                    });
+                let number = pull_request.number;
+                let Some(runtime) = self
+                    .repositories
+                    .get(repository_index)
+                    .filter(|runtime| runtime.repository.cache_key() == *repository_key)
+                else {
+                    return div().h(px(34.)).into_any_element();
+                };
+                let click_repository = runtime.repository.clone();
+                let unread = self.notifications.unread_for(
+                    &self.repositories[repository_index].repository.account,
+                    &self.repositories[repository_index].repository.owner,
+                    &self.repositories[repository_index].repository.name,
+                    number,
+                );
+                div()
+                    .w_full()
+                    .h(px(34.))
+                    .px_2()
+                    .py_px()
+                    .child(
+                        Button::new(format!("pr-{repository_index}-{number}"))
+                            .debug_selector(move || format!("sidebar-pr-{number}"))
+                            .w_full()
+                            .min_w_0()
+                            .h(px(32.))
+                            .pl(px(30.))
+                            .pr_2()
+                            .rounded_md()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .selected(selected)
+                            .text_color(colors.muted)
+                            .when(selected, |row| {
+                                row.bg(colors.selected).text_color(colors.text)
+                            })
+                            .hover(|row| row.bg(colors.selected))
+                            .accessibility_label(format!(
+                                "{} · #{number} by {}{}",
+                                pull_request.title,
+                                pull_request.author,
+                                if unread > 0 {
+                                    ", unread notifications"
+                                } else {
+                                    ""
+                                }
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(pull_request.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(if unread > 0 {
+                                        colors.accent
+                                    } else {
+                                        colors.faint
+                                    })
+                                    .child(format!("#{number}")),
+                            )
+                            .on_click(move |_, window, cx| {
+                                root.update(cx, |root, cx| {
+                                    if let Root::Review(this) = root
+                                        && this.repositories.get(repository_index).is_some_and(
+                                            |runtime| runtime.repository == click_repository,
+                                        )
+                                    {
+                                        this.open_pr_in_window(
+                                            repository_index,
+                                            number,
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                });
+                            }),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
     fn render_sidebar(&self, colors: Palette, window: &Window, cx: &mut Context<Root>) -> Div {
         let (sidebar_width, _, _) = self.resolved_panel_widths(window);
         if self.panel_layout.sidebar_collapsed {
@@ -20233,125 +20398,17 @@ impl ReviewWorkspace {
                     }
                 }))
             });
-        let participating_incomplete = view.filter.personal == PersonalFilter::Participating
-            && self.repositories.iter().any(|runtime| {
-                runtime
-                    .pull_requests
-                    .iter()
-                    .any(|pull_request| !pull_request.participants_complete)
-            });
         let inventories = self
             .repositories
             .iter()
-            .enumerate()
-            .map(|(index, runtime)| RepositoryPulls {
-                index,
-                repository: &runtime.repository,
-                pull_requests: &runtime.pull_requests,
-            })
+            .map(|runtime| (runtime.repository.clone(), runtime.pull_requests.clone()))
             .collect::<Vec<_>>();
+        let mut cache = self.sidebar_cache.borrow_mut();
+        let sidebar_rows = cache.rows_for(&inventories, &view);
+        let participating_incomplete = cache.participating_incomplete;
+        drop(cache);
         let mut rows = Vec::new();
-        for row in compose_sidebar_rows(&inventories, &view) {
-            match row {
-                SidebarRow::Group { depth, label } => rows.push(
-                    div()
-                        .h(px(34.))
-                        .pl(px(16. + depth as f32 * 14.))
-                        .pr_3()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_color(colors.muted)
-                        .child(sidebar_icon(
-                            if depth == 0 { "folder" } else { "branch" },
-                            colors.muted,
-                        ))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .child(label),
-                        )
-                        .into_any_element(),
-                ),
-                SidebarRow::Pull {
-                    repository_index,
-                    repository_key,
-                    pull_request,
-                } => {
-                    let pull_request = *pull_request;
-                    let selected = self
-                        .active_tab
-                        .and_then(|index| self.tabs.get(index))
-                        .is_some_and(|tab| {
-                            tab.repository.cache_key() == repository_key
-                                && tab.pull_request.number == pull_request.number
-                        });
-                    let number = pull_request.number;
-                    let unread = self.notifications.unread_for(
-                        &self.repositories[repository_index].repository.account,
-                        &self.repositories[repository_index].repository.owner,
-                        &self.repositories[repository_index].repository.name,
-                        number,
-                    );
-                    rows.push(
-                        Button::new(format!("pr-{repository_index}-{number}"))
-                            .mx_2()
-                            .my_px()
-                            .h(px(32.))
-                            .pl(px(30.))
-                            .pr_2()
-                            .rounded_md()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .selected(selected)
-                            .text_color(colors.muted)
-                            .when(selected, |row| {
-                                row.bg(colors.selected).text_color(colors.text)
-                            })
-                            .hover(|row| row.bg(colors.selected))
-                            .accessibility_label(format!(
-                                "{} · #{number} by {}{}",
-                                pull_request.title,
-                                pull_request.author,
-                                if unread > 0 {
-                                    ", unread notifications"
-                                } else {
-                                    ""
-                                }
-                            ))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .child(pull_request.title),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_xs()
-                                    .text_color(if unread > 0 {
-                                        colors.accent
-                                    } else {
-                                        colors.faint
-                                    })
-                                    .child(format!("#{number}")),
-                            )
-                            .on_click(cx.listener(move |root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.open_pr_in_window(repository_index, number, window, cx)
-                                }
-                            }))
-                            .into_any_element(),
-                    );
-                }
-            }
-        }
-        if rows.is_empty() {
+        if sidebar_rows.is_empty() {
             rows.push(
                 div()
                     .px_4().py_5()
@@ -20642,11 +20699,51 @@ impl ReviewWorkspace {
             })
             .child(
                 div()
-                    .id("sidebar-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .pb_3()
+                    .flex()
+                    .flex_col()
+                    .when(!sidebar_rows.is_empty(), |panel| {
+                        let root = cx.entity();
+                        panel.child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .relative()
+                                .child(
+                                    uniform_list(
+                                        "sidebar-scroll",
+                                        sidebar_rows.len(),
+                                        move |range: Range<usize>, _, cx| {
+                                            root.read_with(cx, |workspace, _| {
+                                                let Root::Review(this) = workspace else {
+                                                    return Vec::new();
+                                                };
+                                                range
+                                                    .map(|index| {
+                                                        this.render_sidebar_row(
+                                                            &sidebar_rows[index],
+                                                            colors,
+                                                            root.clone(),
+                                                        )
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            })
+                                        },
+                                    )
+                                    .track_scroll(&self.sidebar_scroll)
+                                    .h_full()
+                                    .w_full(),
+                                )
+                                .child(
+                                    div().absolute().inset_0().child(
+                                        Scrollbar::vertical(&self.sidebar_scroll)
+                                            .id("sidebar-scrollbar")
+                                            .viewport_from_layout(),
+                                    ),
+                                ),
+                        )
+                    })
                     .children(rows),
             )
             .child(
@@ -22725,21 +22822,6 @@ impl ReviewWorkspace {
             .as_ref()
             .and_then(ReviewSession::selected_file)
             .map(file_key);
-        let viewed = tab
-            .session
-            .as_ref()
-            .map(|session| {
-                session
-                    .comparison()
-                    .files
-                    .iter()
-                    .map(|file| {
-                        let key = file_key(file);
-                        (key.clone(), session.is_viewed(&key))
-                    })
-                    .collect::<HashMap<_, _>>()
-            })
-            .unwrap_or_default();
         let scroll = tab.file_tree_scroll.clone();
         let cursor = tab.file_tree.cursor_index();
         let local_inventory = tab.local_inventory;
@@ -22837,7 +22919,25 @@ impl ReviewWorkspace {
                         uniform_list(
                             SharedString::from(format!("changed-file-tree-{index}")),
                             count,
-                            move |range: Range<usize>, _, _| {
+                            move |range: Range<usize>, _, cx| {
+                                let viewed = root.read_with(cx, |root, _| {
+                                    let Root::Review(this) = root else {
+                                        return HashMap::new();
+                                    };
+                                    let session =
+                                        this.tabs.get(index).and_then(|tab| tab.session.as_ref());
+                                    range
+                                        .clone()
+                                        .filter_map(|row| rows[row].file_key())
+                                        .map(|key| {
+                                            (
+                                                key.to_owned(),
+                                                session
+                                                    .is_some_and(|session| session.is_viewed(key)),
+                                            )
+                                        })
+                                        .collect::<HashMap<_, _>>()
+                                });
                                 range
                                     .map(|row_index| {
                                         let row = rows[row_index].clone();
@@ -22850,6 +22950,9 @@ impl ReviewWorkspace {
                                         let is_cursor = cursor == Some(row_index);
                                         let mut item = div()
                                             .id(SharedString::from(format!("tree-{row_identity}")))
+                                            .debug_selector(move || {
+                                                format!("file-tree-row-{row_index}")
+                                            })
                                             .h(px(28.))
                                             .pl(px(8. + row.depth as f32 * 14.))
                                             .pr_2()
@@ -23098,11 +23201,11 @@ impl ReviewWorkspace {
             .unwrap_or_else(|| "Select a changed file".into());
         let rows = tab.diff_rows.clone();
         let count = rows.len();
-        let split_mode = rows.iter().any(|row| matches!(row, DiffRow::Split(_)));
+        let split_mode = tab.diff_split;
         let scroll = tab.diff_scroll.clone();
         let horizontal = tab.diff_horizontal.clone();
-        let split_text_width = split_text_content_width(&rows);
-        let unified_text_width = unified_text_content_width(&rows);
+        let split_text_width = tab.diff_text_width;
+        let unified_text_width = tab.diff_text_width;
         let focus = self.diff_focus.clone();
         let root = cx.entity();
         let file_action_root = root.clone();
@@ -29037,6 +29140,18 @@ fn diff_content_width(rows: &[DiffRow], mode: DiffMode) -> f32 {
     maximum.max(minimum)
 }
 
+fn diff_text_metrics(rows: &[DiffRow]) -> (bool, f32) {
+    let split = rows.iter().any(|row| matches!(row, DiffRow::Split(_)));
+    (
+        split,
+        if split {
+            split_text_content_width(rows)
+        } else {
+            unified_text_content_width(rows)
+        },
+    )
+}
+
 fn split_text_content_width(rows: &[DiffRow]) -> f32 {
     rows.iter()
         .filter_map(|row| match row {
@@ -30334,6 +30449,158 @@ mod layout_tests {
         });
     }
 
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn large_sidebar_virtualizes_rows_and_reuses_diff_and_tree_on_redraw(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::rc::Rc;
+        use std::sync::Arc;
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        let (tree_rows, diff_rows) = cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.install_pr_layout_fixture(window, cx);
+                let mut pulls = (204..5204)
+                    .map(|number| PullRequest {
+                        number,
+                        title: format!("Large inventory PR {number}"),
+                        state: "OPEN".into(),
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>();
+                pulls.push(this.tabs[0].pull_request.clone());
+                this.repositories[0].pull_requests = Arc::new(pulls);
+                this.inspector_open = false;
+                let template = this.tabs[0].session.as_ref().unwrap().comparison().files[0].clone();
+                let files = (0..5000)
+                    .map(|number| {
+                        let mut file = template.clone();
+                        file.path = format!("src/file-{number}.rs");
+                        file
+                    })
+                    .collect::<Vec<_>>();
+                this.tabs[0].file_tree.sync(&files);
+                let comparison = cibergit::domain::Comparison {
+                    revision: this.tabs[0].session.as_ref().unwrap().revision().clone(),
+                    files,
+                    complete: true,
+                    notice: None,
+                };
+                this.tabs[0].session = Some(cibergit::review::ReviewSession::new(comparison));
+                this.tabs[0].canonical_session = this.tabs[0].session.clone();
+                this.store = None;
+                this.tabs[0].diff_rows = Rc::new(
+                    (0..20000)
+                        .map(|number| {
+                            DiffRow::Unified(DiffLine {
+                                kind: DiffLineKind::Addition,
+                                old_line: None,
+                                new_line: Some(number + 1),
+                                text: "Long diff fixture".repeat(8),
+                            })
+                        })
+                        .collect(),
+                );
+                (this.tabs[0].diff_split, this.tabs[0].diff_text_width) =
+                    super::diff_text_metrics(&this.tabs[0].diff_rows);
+                this.tabs[0].diff_scroll =
+                    gpui::ListState::new(20000, gpui::ListAlignment::Top, gpui::px(480.));
+                cx.notify();
+                (
+                    this.tabs[0].file_tree.rows(),
+                    this.tabs[0].diff_rows.clone(),
+                )
+            })
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let first = this.sidebar_materializations.replace(0);
+                assert!(first > 0 && first < 80, "rendered {first} of 5002 rows");
+                this.sidebar_scroll
+                    .scroll_to_item(5001, gpui::ScrollStrategy::Bottom);
+                this.tabs[0]
+                    .file_tree_scroll
+                    .scroll_to_item(5000, gpui::ScrollStrategy::Bottom);
+                this.tabs[0].diff_scroll.scroll_to_reveal_item(19999);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let last = cx
+            .debug_bounds("sidebar-pr-203")
+            .expect("last PR is reachable");
+        cx.update(|_, cx| {
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let rendered = this.sidebar_materializations.get();
+                assert!(
+                    rendered > 0 && rendered < 80,
+                    "rendered {rendered} rows after end scroll"
+                );
+                assert!(Rc::ptr_eq(&tree_rows, &this.tabs[0].file_tree.rows()));
+                assert!(Rc::ptr_eq(&diff_rows, &this.tabs[0].diff_rows));
+                assert_eq!(
+                    this.tabs[0].file_tree.rows()[5000].file_key(),
+                    Some("src/file-4999.rs")
+                );
+            })
+        });
+        let last_file = cx
+            .debug_bounds("file-tree-row-5000")
+            .expect("last file is reachable");
+        cx.simulate_click(last_file.center(), Modifiers::default());
+        cx.update(|_, cx| {
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    this.tabs[0]
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .selected_file()
+                        .unwrap()
+                        .path,
+                    "src/file-4999.rs"
+                );
+            })
+        });
+        cx.simulate_click(last.center(), Modifiers::default());
+        cx.update(|_, cx| {
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert_eq!(this.tabs[this.active_tab.unwrap()].pull_request.number, 203);
+                assert!(!this.tabs[0].write_in_flight);
+            })
+        });
+    }
+
     fn submitted_review_fixture() -> (Repository, PullRequestReview) {
         let repository = Repository {
             host: "github.com".into(),
@@ -31002,7 +31269,7 @@ mod layout_tests {
                 };
                 this.repositories.push(RepoRuntime {
                     repository: repository.clone(),
-                    pull_requests: vec![pull.clone()],
+                    pull_requests: Arc::new(vec![pull.clone()]),
                     state: LoadState::Ready,
                     generation: 0,
                     refresh: Default::default(),
@@ -32175,7 +32442,7 @@ mod layout_tests {
                 };
                 this.repositories.push(RepoRuntime {
                     repository: repository.clone(),
-                    pull_requests: vec![pull_a.clone(), pull_b.clone(), pull_c.clone()],
+                    pull_requests: Arc::new(vec![pull_a.clone(), pull_b.clone(), pull_c.clone()]),
                     state: LoadState::Ready,
                     generation: 0,
                     refresh: Default::default(),

@@ -1,5 +1,9 @@
 use cibergit::{domain::ChangedFile, review::file_key};
-use std::collections::HashSet;
+use std::{
+    cell::OnceCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum TreeRowKind {
@@ -84,6 +88,13 @@ pub(super) struct FileTree {
     roots: Vec<TreeNode>,
     collapsed: HashSet<String>,
     cursor_identity: Option<String>,
+    visible: OnceCell<VisibleRows>,
+}
+
+#[derive(Clone, Debug)]
+struct VisibleRows {
+    rows: Rc<[TreeRow]>,
+    indices: HashMap<String, usize>,
 }
 
 impl FileTree {
@@ -94,6 +105,7 @@ impl FileTree {
     }
 
     pub fn sync(&mut self, files: &[ChangedFile]) {
+        self.visible.take();
         self.roots.clear();
         for file in files {
             self.insert(file);
@@ -109,17 +121,31 @@ impl FileTree {
         }
     }
 
-    pub fn rows(&self) -> Vec<TreeRow> {
-        let mut rows = Vec::new();
-        self.flatten(&self.roots, 0, &mut rows);
-        rows
+    fn visible_rows(&self) -> &VisibleRows {
+        self.visible.get_or_init(|| {
+            let mut rows = Vec::new();
+            self.flatten(&self.roots, 0, &mut rows);
+            let mut indices = HashMap::with_capacity(rows.len());
+            for (index, row) in rows.iter().enumerate() {
+                indices.entry(row.identity()).or_insert(index);
+            }
+            VisibleRows {
+                rows: rows.into(),
+                indices,
+            }
+        })
+    }
+
+    // Scrolling shares the flattened inventory; only structural changes invalidate it.
+    pub fn rows(&self) -> Rc<[TreeRow]> {
+        self.visible_rows().rows.clone()
     }
 
     pub fn cursor_index(&self) -> Option<usize> {
-        let identity = self.cursor_identity.as_ref()?;
-        self.rows()
-            .iter()
-            .position(|row| row.identity() == *identity)
+        self.visible_rows()
+            .indices
+            .get(self.cursor_identity.as_ref()?)
+            .copied()
     }
 
     pub fn set_cursor(&mut self, identity: String) {
@@ -134,6 +160,7 @@ impl FileTree {
         if !self.directory_keys().contains(key) {
             return false;
         }
+        self.visible.take();
         if !self.collapsed.insert(key.to_owned()) {
             self.collapsed.remove(key);
         }
@@ -149,12 +176,12 @@ impl FileTree {
             return None;
         }
         for ancestor in ancestors {
-            self.collapsed.remove(&ancestor);
+            if self.collapsed.remove(&ancestor) {
+                self.visible.take();
+            }
         }
         self.cursor_identity = Some(format!("f:{wanted}"));
-        self.rows()
-            .iter()
-            .position(|row| row.file_key() == Some(wanted))
+        self.cursor_index()
     }
 
     #[cfg(feature = "ui-smoke")]
@@ -165,6 +192,7 @@ impl FileTree {
         }
         let ancestor = ancestors.last()?.clone();
         self.collapsed.insert(ancestor.clone());
+        self.visible.take();
         Some(ancestor)
     }
 
@@ -208,6 +236,7 @@ impl FileTree {
         } = &row.kind
         {
             self.collapsed.insert(directory_key.clone());
+            self.visible.take();
             return;
         }
         if row.depth == 0 {
@@ -234,6 +263,7 @@ impl FileTree {
                 ..
             } => {
                 self.collapsed.remove(directory_key);
+                self.visible.take();
                 None
             }
             TreeRowKind::Directory { expanded: true, .. } => {
@@ -436,15 +466,39 @@ mod tests {
     }
 
     #[test]
+    fn repeated_tree_reads_share_rows_and_structural_changes_invalidate_them() {
+        let files = (0..5000)
+            .map(|index| changed(&format!("src/file-{index}.rs")))
+            .collect::<Vec<_>>();
+        let mut tree = FileTree::new(&files);
+        let rows = tree.rows();
+        tree.reveal_file("src/file-4999.rs");
+        for _ in 0..100 {
+            assert!(Rc::ptr_eq(&rows, &tree.rows()));
+            assert_eq!(tree.cursor_index(), Some(5000));
+        }
+        let TreeRowKind::Directory { directory_key, .. } = &rows[0].kind else {
+            panic!("missing directory")
+        };
+        tree.toggle_directory(directory_key);
+        assert_eq!(tree.rows().len(), 1);
+        tree.reveal_file("src/file-4999.rs");
+        assert_eq!(tree.rows().len(), 5001);
+        assert!(!Rc::ptr_eq(&rows, &tree.rows()));
+        tree.sync(&[changed("replacement.rs")]);
+        assert_eq!(tree.rows()[0].file_key(), Some("replacement.rs"));
+    }
+
+    #[test]
     fn collapse_and_reveal_restore_selected_ancestors() {
         let files = vec![changed("src/app/main.rs"), changed("docs/main.rs")];
         let mut tree = FileTree::new(&files);
         let src = tree
             .rows()
-            .into_iter()
-            .find_map(|row| match row.kind {
+            .iter()
+            .find_map(|row| match &row.kind {
                 TreeRowKind::Directory { directory_key, .. } if row.label == "src" => {
-                    Some(directory_key)
+                    Some(directory_key.clone())
                 }
                 _ => None,
             })
@@ -465,7 +519,7 @@ mod tests {
         let tree = FileTree::new(&files);
         let keys = tree
             .rows()
-            .into_iter()
+            .iter()
             .filter(|row| row.label == "main.rs")
             .filter_map(|row| row.file_key().map(str::to_owned))
             .collect::<HashSet<_>>();
@@ -512,10 +566,10 @@ mod tests {
         let mut tree = FileTree::new(&files);
         let b = tree
             .rows()
-            .into_iter()
-            .find_map(|row| match row.kind {
+            .iter()
+            .find_map(|row| match &row.kind {
                 TreeRowKind::Directory { directory_key, .. } if row.label == "b" => {
-                    Some(directory_key)
+                    Some(directory_key.clone())
                 }
                 _ => None,
             })
@@ -533,11 +587,8 @@ mod tests {
         file.previous_path = Some("viejo/archivo.rs".into());
         file.status = "renamed".into();
         let tree = FileTree::new(&[file]);
-        let row = tree
-            .rows()
-            .into_iter()
-            .find(|row| row.file_key().is_some())
-            .unwrap();
+        let rows = tree.rows();
+        let row = rows.iter().find(|row| row.file_key().is_some()).unwrap();
         assert_eq!(row.label, "archivo.rs");
         assert_eq!(row.file_key(), Some("nuevo/archivo.rs"));
         assert!(matches!(
