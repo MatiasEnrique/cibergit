@@ -16,6 +16,15 @@ CARGO_TARGET_DIR=/tmp/cibergit-native-target cargo build --locked
 CARGO_TARGET_DIR=/tmp/cibergit-native-target cargo run --locked
 ```
 
+For normal use, build the optimized app to avoid development-build overhead:
+
+```sh
+CARGO_TARGET_DIR=/tmp/cibergit-native-target cargo build --locked --release
+/tmp/cibergit-native-target/aarch64-apple-darwin/release/cibergit
+```
+
+Quit an older running copy before launching the rebuilt app. Building a new binary does not update a process that is already running.
+
 Keep each worktree's writable target directory isolated. A copied dependency seed is safe, but multiple worktrees must not share the same writable `CARGO_TARGET_DIR`.
 
 ## Review workspace startup

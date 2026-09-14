@@ -14,6 +14,8 @@ Multiple-tip stacks now require an explicit tip choice when more than one candid
 
 Actions run controls now prepare and confirm one exact run/attempt, admit the frozen request through the durable action journal, repeat the provider preflight, and send one rerun-all, rerun-failed, or cancel request. Ambiguous outcomes remain unresolved without automatic replay. See [run controls](actions-run-controls.md). Automated write verification uses synthetic transports only.
 
+At `44c662bdd6db7ee9b7b1ef3fb5dc2bc62cbb0ed5`, the full default suite passed 708 tests with 14 ignored, and the full all-feature suite passed 800 with 15 ignored. Both strict all-target Clippy configurations, formatting, and the optimized arm64 build passed. Fourteen fresh synthetic PR-layout captures cover light/dark, wide/narrow, and keyboard focus; all were visually inspected. The final confirmation regression executes Enter and Space on each of the five Actions controls. Original fixture-startup failures and the obsolete divider-width assertion remain in the report alongside their corrections.
+
 Combined validation and release-binary attribution are recorded in the integration report under `.bb-artifacts/opus-wave-integration/`. Worker results apply only to their reported commits; they do not substitute for the combined gate. Full V1 and signed/notarized distribution remain open. Stack aggregate review, ordered merge, descendant rewriting, and broader Actions management remain absent.
 
 ## Execution checkpoint — 2026-09-13
@@ -169,7 +171,7 @@ Dependencies name tasks or `G0` through `G5`, the runnable milestone gates below
 | M4-REBASE | Linear graphical plan, edit/split and dirty preparation; B01-B03, E14 | M4 | Accepted M3 backend; G3 for final native gate | C0 | running | Lifecycle651037f and native N1 correction565b61f independently accepted | art_63cc3dbd-330a-43ae-a827-c4c6fe20b43e |
 | M4-CONFLICT | Editable three-way result, external resolution and recovery; B04, B05, E14 | M4 | M4-REBASE, accepted Document backend; native M3-EXTERNAL | Coordinator | running | Native three-way 4b5c43e independently accepted; final G4 input validation pending | Three-way reports above |
 | M4-PUBLISH | Inspect rewritten commits, explicit lease-protected push; B06, E15 | M4 | M4-CONFLICT, M3-GIT | C0 | running | Native source/destination plus exact recovery ea28933 independently accepted; final G4/live-write gate open | Publish recovery reports above |
-| M4-TIPS | Explicit multiple-tip choice and evidence | M4 | M4-STACK, D60 | C0 | awaiting integration validation | `8a63157`, `6410b90` | Current checkpoint and integration report |
+| M4-TIPS | Explicit multiple-tip choice and evidence | M4 | M4-STACK, D60 | C0 | verified | `8a63157`, `6410b90`; combined `44c662b` | Current checkpoint and integration report |
 | M4-COMMENT | Implement accepted aggregate comment routing and evidence | M4 | M4-STACK, M2-REVIEW, D61 | U | dependent | pending | pending |
 | M4-GROUP | Implement accepted grouped review behavior and evidence | M4 | M4-STACK, M2-REVIEW, D62 | U | dependent | pending | pending |
 | M4-MERGE | Implement accepted stack integration behavior and evidence | M4 | M4-STACK, M2-MERGE, D63 | U | dependent | pending | pending |
