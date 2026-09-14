@@ -725,7 +725,7 @@ pub struct ReviewOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewOperationPayload {
     PendingComment(PendingCommentIntent),
-    PendingFileComment(PendingFileCommentIntent),
+    PendingFileComment(Box<PendingFileCommentIntent>),
     ImmediateComment(ImmediateCommentIntent),
     Submission(SubmissionIntent),
 }
@@ -1029,8 +1029,9 @@ impl ReviewComposition {
             target,
             pending,
         };
-        self.operation_mut(&intent.operation_id)?.payload =
-            Some(ReviewOperationPayload::PendingFileComment(intent.clone()));
+        self.operation_mut(&intent.operation_id)?.payload = Some(
+            ReviewOperationPayload::PendingFileComment(Box::new(intent.clone())),
+        );
         Ok(intent)
     }
 
