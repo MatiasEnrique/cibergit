@@ -26323,17 +26323,19 @@ mod layout_tests {
             }
         }
 
-        struct AccessibilityProbe {
-            captured: Rc<
-                RefCell<
-                    Option<(
-                        Option<gpui::Role>,
-                        accesskit::Node,
-                        Option<gpui::Role>,
-                        accesskit::Node,
-                    )>,
-                >,
+        type CapturedAccessibility = Rc<
+            RefCell<
+                Option<(
+                    Option<gpui::Role>,
+                    accesskit::Node,
+                    Option<gpui::Role>,
+                    accesskit::Node,
+                )>,
             >,
+        >;
+
+        struct AccessibilityProbe {
+            captured: CapturedAccessibility,
         }
 
         impl Render for AccessibilityProbe {
