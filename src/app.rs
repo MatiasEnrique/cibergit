@@ -25942,7 +25942,8 @@ mod layout_tests {
     #[cfg(feature = "ui-smoke")]
     use cibergit::domain::{
         DismissalAuthority, FreshReviewDismissalCapability, PullRequest, SelectedViewer,
-        SubmittedReviewDismissalRequest, SubmittedReviewDismissalTarget,
+        SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
+        SubmittedReviewDismissalTarget,
     };
     use cibergit::participation::PublishedFile;
     use cibergit::providers::{GeneralReadDelay, GeneralReadDirective};
@@ -27287,6 +27288,67 @@ mod layout_tests {
                 );
                 assert!(this.tabs[0].write_in_flight);
                 assert!(this.tabs[0].confirmation.is_none());
+                this.tabs[0].write_in_flight = false;
+
+                this.tabs[0].dismissal_confirmation_generation = 40;
+                let old_request = dismissal_request(
+                    &repository,
+                    &review,
+                    "exact reason",
+                    "dismiss-stale-completion",
+                    "attempt-stale-completion",
+                );
+                this.tabs[0].confirmation = Some(NativeConfirmation::DismissSubmittedReview {
+                    generation: 40,
+                    request: Box::new(old_request.clone()),
+                });
+                let old_completion = DismissalConfirmationToken {
+                    workspace_instance: this.workspace_instance,
+                    tab_instance: this.tabs[0].instance_generation,
+                    repository_key: repository.cache_key(),
+                    pull_request: 7,
+                    generation: 40,
+                    request: old_request.clone(),
+                };
+                this.tabs[0].dismissal_confirmation_generation = 41;
+                this.tabs[0].confirmation = Some(NativeConfirmation::DismissSubmittedReview {
+                    generation: 41,
+                    request: Box::new(old_request.clone()),
+                });
+                this.tabs[0].write_in_flight = true;
+                let sentinel = "newer identical dismissal lifetime";
+                this.status = sentinel.into();
+                for stale_outcome in [
+                    ProviderMutationOutcome::Acknowledged(
+                        SubmittedReviewDismissalAcknowledgement {
+                            operation_id: old_request.operation_id.clone(),
+                            target: old_request.target.clone(),
+                            viewer: old_request.viewer.clone(),
+                            final_state: "DISMISSED".into(),
+                        },
+                    ),
+                    ProviderMutationOutcome::Uncertain {
+                        context: cibergit::domain::MutationContext {
+                            operation_id: old_request.operation_id.clone(),
+                            attempt_id: old_request.attempt_id.clone(),
+                            action: "dismiss-submitted-review".into(),
+                            payload: serde_json::json!({"request": old_request}),
+                        },
+                        reason: "synthetic stale error".into(),
+                    },
+                ] {
+                    assert_eq!(
+                        this.apply_dismissal_completion(&old_completion, stale_outcome),
+                        None,
+                        "stale completion must not apply to a newer byte-identical confirmation"
+                    );
+                    assert!(this.tabs[0].write_in_flight);
+                    assert_eq!(this.status, sentinel);
+                    assert!(matches!(
+                        this.tabs[0].confirmation.as_ref(),
+                        Some(NativeConfirmation::DismissSubmittedReview { generation: 41, .. })
+                    ));
+                }
                 this.tabs[0].write_in_flight = false;
             });
         });
