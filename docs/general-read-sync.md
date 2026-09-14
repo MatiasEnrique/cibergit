@@ -11,7 +11,7 @@ The application admits these top-level lanes through one `GeneralReadController`
 | Sidebar repository | `list_pull_requests_conditional` | REST list pages in order; one or more live GraphQL metadata hydrations for each accepted page |
 | Open-tab metadata | `pull_request_conditional` | One REST PR object; live GraphQL metadata hydration |
 | Open-tab details | `general_read(details + pending_review)` | Live GraphQL details pages, nested review/thread/comment pages, then the pending-review read; the local action journal is historical recovery, not provider authority |
-| Open-tab lifecycle | `general_read(pull_request_lifecycle)` | Live GraphQL lifecycle snapshot and its bounded nested connections |
+| Open-tab lifecycle | `general_read(pr_lifecycle_snapshot + pr_lifecycle_choices)` | Live GraphQL lifecycle snapshot, then bounded REST choice pages for branches, labels, assignees, collaborators (reviewer users), and teams |
 
 An admitted operation owns one account generation. A recognized rate response stops every later, not-yet-started nested read in that operation immediately. Later admissions for the same credential observe the retained floor; a different account remains independently admissible. Deferred automatic work is distinct from a coalesced explicit refresh, and the rotating follow-up cursor prevents a fast metadata lane from starving details, lifecycle, or later repositories on the same account.
 
@@ -66,7 +66,7 @@ The opt-in native harness waits for the ordinary real, read-only workspace prepa
 4. proves a different synthetic account is admitted while the primary account operation is active;
 5. installs a separate synthetic poll directive and verifies later same-account deferral;
 6. compares the serialized pinned session, canonical revision, recovery collections, journal, and shared input text exactly;
-7. captures the fixed rate, poll, and unavailable notices;
+7. captures the actual Root metadata rate-deferral notice, then directly presents the fixed poll and unavailable notices after their controller/mapping assertions; the latter two are presentation checks, not simulated provider callbacks;
 8. runs a pure in-memory exact `200` then `304` fixture through the production single-PR retained-body resolver and rejects an orphan `304`.
 
 The scheduling directives and conditional sequence are synthetic fixtures. The report explicitly states that no live `304` is claimed. The harness issues zero remote mutations and invokes no OS notification, prompt, focus, preview, PID, or global-setting path.

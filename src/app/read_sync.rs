@@ -128,6 +128,24 @@ impl Default for GeneralReadController {
 }
 
 impl GeneralReadController {
+    #[cfg(feature = "ui-smoke")]
+    pub(super) fn selected_account_readiness_at(
+        &self,
+        account: &Account,
+        now: Instant,
+    ) -> Result<(), ReadDeferral> {
+        let Some(state) = self.accounts.get(&account_key(account)) else {
+            return Ok(());
+        };
+        if let Some(notice) = state.floor.notice(now) {
+            return Err(ReadDeferral::Server(notice));
+        }
+        if state.active_generation.is_some() {
+            return Err(ReadDeferral::Busy);
+        }
+        Ok(())
+    }
+
     pub(super) fn begin(&mut self, account: &Account) -> Result<ReadAdmission, ReadDeferral> {
         self.begin_at(account, Instant::now())
     }

@@ -3696,7 +3696,7 @@ impl ReviewWorkspace {
         window
             .spawn(cx, async move |window| {
                 let started = std::time::Instant::now();
-                loop {
+                let ready = loop {
                     window
                         .background_executor()
                         .timer(Duration::from_millis(250))
@@ -3704,14 +3704,61 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.smoke_ready())
+                                matches!(root, Root::Review(this) if this.smoke_ready()
+                                    && this.active_tab.is_some_and(|index| {
+                                        this.general_reads
+                                            .selected_account_readiness_at(
+                                                &this.tabs[index].repository.account,
+                                                std::time::Instant::now(),
+                                            )
+                                            .is_ok()
+                                    }))
                             })
                             .unwrap_or(false)
                         })
                         .unwrap_or(false);
-                    if ready || started.elapsed() > Duration::from_secs(90) {
-                        break;
+                    if ready {
+                        break true;
                     }
+                    if started.elapsed() > Duration::from_secs(90) {
+                        break false;
+                    }
+                };
+                if !ready {
+                    let _ = std::fs::create_dir_all(&output);
+                    let diagnostic = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| match root {
+                                Root::Review(this) => {
+                                    let readiness = this.active_tab.map(|index| {
+                                        this.general_reads.selected_account_readiness_at(
+                                            &this.tabs[index].repository.account,
+                                            std::time::Instant::now(),
+                                        )
+                                    });
+                                    format!(
+                                        "General-sync readiness timed out before synthetic scenes.\nworkspace_ready={}\nactive_tab={:?}\nselected_account_readiness={readiness:?}\n",
+                                        this.smoke_ready(),
+                                        this.active_tab,
+                                    )
+                                }
+                                Root::Editor(_) => {
+                                    "General-sync readiness timed out outside the review workspace.\n"
+                                        .into()
+                                }
+                            })
+                            .unwrap_or_else(|error| {
+                                format!("General-sync readiness entity unavailable: {error:#}\n")
+                            })
+                        })
+                        .unwrap_or_else(|error| {
+                            format!("General-sync readiness window unavailable: {error:#}\n")
+                        });
+                    let _ = std::fs::write(
+                        output.join("native-general-sync-readiness-failure.txt"),
+                        &diagnostic,
+                    );
+                    panic!("{diagnostic}");
                 }
                 let _ = std::fs::create_dir_all(&output);
                 let conditional_fixture =
@@ -3817,7 +3864,7 @@ impl ReviewWorkspace {
                     })
                     .unwrap_or(false);
                 let report = format!(
-                    "Bounded general-read synchronization native smoke ({appearance})\n{}\n{}\nRate notice capture: {}\nPoll notice capture: {}\nUnavailable notice capture: {}\nSynthetic directive timers: 90 seconds with injected monotonic/wall clocks; no real sleeps\nRemote mutation transport from harness: 0\nOS notification/prompt/focus/global-setting calls from harness: 0\nThe ordinary preparation read is real and read-only. Scheduling directives and the exact 200/304 sequence are synthetic; no live 304 is claimed.\n",
+                    "Bounded general-read synchronization native smoke ({appearance})\n{}\n{}\nActual Root metadata rate-deferral notice capture: {}\nFixed poll-notice presentation capture (set directly after the controller assertion; not a provider callback): {}\nFixed unavailable-notice presentation capture (set directly; not a provider callback): {}\nSynthetic directive timers: 90 seconds with injected monotonic/wall clocks; no real sleeps\nRemote mutation transport from harness: 0\nOS notification/prompt/focus/global-setting calls from harness: 0\nThe ordinary preparation read is real and read-only. Scheduling directives and the exact 200/304 sequence are synthetic; no live 304 is claimed.\n",
                     root_fixture.as_deref().unwrap_or("Root fixture: failed"),
                     conditional_fixture
                         .as_deref()
