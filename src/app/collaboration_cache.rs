@@ -1,5 +1,8 @@
 use anyhow::{Context as _, Result, bail};
-use cibergit::domain::{ProviderCoordinates, PullRequestDetails, Repository};
+use cibergit::domain::{
+    ActionsLinkage, CheckKind, CheckRepositoryIdentity, CheckShaClass, ProviderCoordinates,
+    PullRequestDetails, Repository,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -630,7 +633,251 @@ fn validate_details(identity: &CacheIdentity, details: &PullRequestDetails) -> R
             _ => bail!("refuse collaboration cache payload with invalid reaction parent shape"),
         }
     }
+    validate_check_identities(identity, details)?;
     Ok(())
+}
+
+fn validate_check_identities(identity: &CacheIdentity, details: &PullRequestDetails) -> Result<()> {
+    if let Some(node_id) = &details.pull_request_node_id {
+        validate_cached_node_id(node_id)?;
+    }
+    for sha in [
+        details.observed_head_sha.as_deref(),
+        details.rollup_commit_sha.as_deref(),
+        details.potential_merge_commit_sha.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_cached_sha(sha)?;
+    }
+    for repository in [
+        details.base_repository.as_ref(),
+        details.head_repository.as_ref(),
+        details.rollup_repository.as_ref(),
+        details.potential_merge_commit_repository.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_cached_repository(repository)?;
+    }
+    if let Some(base) = &details.base_repository
+        && !base
+            .name_with_owner
+            .eq_ignore_ascii_case(&format!("{}/{}", identity.owner, identity.repository))
+    {
+        bail!("refuse collaboration cache payload with foreign base repository identity");
+    }
+    if details.pull_request_node_id.is_some() != details.base_repository.is_some() {
+        bail!("refuse collaboration cache payload with incomplete PR/base identity");
+    }
+    if details.rollup_commit_sha.is_some() != details.rollup_repository.is_some() {
+        bail!("refuse collaboration cache payload with incomplete rollup commit identity");
+    }
+    if details.potential_merge_commit_sha.is_some()
+        != details.potential_merge_commit_repository.is_some()
+    {
+        bail!("refuse collaboration cache payload with incomplete merge-candidate identity");
+    }
+    if let Some(repository) = &details.rollup_repository {
+        let base_matches = details.base_repository.as_ref().map_or_else(
+            || {
+                repository
+                    .name_with_owner
+                    .eq_ignore_ascii_case(&format!("{}/{}", identity.owner, identity.repository))
+            },
+            |base| same_cached_repository(base, repository),
+        );
+        let head_matches = details
+            .head_repository
+            .as_ref()
+            .is_some_and(|head| same_cached_repository(head, repository));
+        if !base_matches && !head_matches {
+            bail!("refuse collaboration cache payload with foreign rollup repository");
+        }
+    }
+    if let Some(repository) = &details.potential_merge_commit_repository {
+        let base_matches = details.base_repository.as_ref().map_or_else(
+            || {
+                repository
+                    .name_with_owner
+                    .eq_ignore_ascii_case(&format!("{}/{}", identity.owner, identity.repository))
+            },
+            |base| same_cached_repository(base, repository),
+        );
+        if !base_matches {
+            bail!("refuse collaboration cache payload with foreign merge-candidate repository");
+        }
+    }
+    for check in &details.checks {
+        if let Some(sha) = &check.commit_sha {
+            validate_cached_sha(sha)?;
+        }
+        let expected_class = match check.commit_sha.as_deref() {
+            Some(sha) if details.observed_head_sha.as_deref() == Some(sha) => CheckShaClass::Head,
+            Some(sha) if details.potential_merge_commit_sha.as_deref() == Some(sha) => {
+                CheckShaClass::MergeCandidate
+            }
+            Some(_) => CheckShaClass::Other,
+            None => CheckShaClass::Unknown,
+        };
+        if check.sha_class != expected_class {
+            bail!("refuse collaboration cache payload with inconsistent check SHA class");
+        }
+        if let Some(repository) = &check.commit_repository {
+            validate_cached_check_origin(identity, details, repository)?;
+        }
+        if let Some(suite) = &check.suite {
+            validate_cached_check_origin(identity, details, &suite.repository)?;
+            validate_cached_graphql_database_id(suite.database_id)?;
+            if check.kind != CheckKind::CheckRun
+                || check.commit_repository.as_ref() != Some(&suite.repository)
+            {
+                bail!("refuse collaboration cache payload with inconsistent check-suite origin");
+            }
+            if let Some(app) = &suite.app {
+                validate_cached_node_id(&app.node_id)?;
+                validate_cached_text(&app.name)?;
+                validate_cached_text(&app.slug)?;
+            }
+        }
+        validate_cached_graphql_database_id(check.database_id)?;
+        match (&check.kind, &check.actions_linkage) {
+            (CheckKind::CommitStatus, ActionsLinkage::Linked(_)) => {
+                bail!("refuse collaboration cache status context with Actions identity")
+            }
+            (_, ActionsLinkage::Linked(run)) => {
+                if check.suite.is_none() {
+                    bail!("refuse collaboration cache Actions identity without a check suite");
+                }
+                validate_cached_node_id(&run.node_id)?;
+                validate_cached_node_id(&run.workflow_node_id)?;
+                validate_cached_graphql_database_id(Some(run.database_id))?;
+                validate_cached_graphql_database_id(Some(run.workflow_database_id))?;
+                validate_cached_graphql_database_id(Some(run.run_attempt))?;
+                validate_cached_graphql_database_id(Some(run.run_number))?;
+                validate_cached_text(&run.event)?;
+                validate_cached_text(&run.workflow_name)?;
+                if !run.github_url.starts_with("https://github.com/")
+                    || !valid_cached_uri(&run.github_url)
+                {
+                    bail!("refuse collaboration cache payload with invalid GitHub run URL");
+                }
+            }
+            _ => {}
+        }
+        if check.kind == CheckKind::CommitStatus
+            && (check.database_id.is_some()
+                || check.suite.is_some()
+                || check.github_permalink.is_some())
+        {
+            bail!("refuse collaboration cache status context with CheckRun identity");
+        }
+        if let Some(permalink) = &check.github_permalink
+            && (!permalink.starts_with("https://github.com/") || !valid_cached_uri(permalink))
+        {
+            bail!("refuse collaboration cache payload with invalid GitHub check permalink");
+        }
+        if let Some(url) = &check.details_url
+            && !valid_cached_uri(url)
+        {
+            bail!("refuse collaboration cache payload with invalid display-only integrator URL");
+        }
+    }
+    Ok(())
+}
+
+fn validate_cached_check_origin(
+    identity: &CacheIdentity,
+    details: &PullRequestDetails,
+    repository: &CheckRepositoryIdentity,
+) -> Result<()> {
+    validate_cached_repository(repository)?;
+    let base_name = format!("{}/{}", identity.owner, identity.repository);
+    let base_allowed = details.base_repository.as_ref().map_or_else(
+        || repository.name_with_owner.eq_ignore_ascii_case(&base_name),
+        |base| same_cached_repository(base, repository),
+    );
+    let allowed = base_allowed
+        || details
+            .head_repository
+            .as_ref()
+            .is_some_and(|candidate| same_cached_repository(candidate, repository))
+        || details
+            .rollup_repository
+            .as_ref()
+            .is_some_and(|candidate| same_cached_repository(candidate, repository));
+    if !allowed {
+        bail!("refuse collaboration cache payload with foreign nested check repository");
+    }
+    Ok(())
+}
+
+fn same_cached_repository(left: &CheckRepositoryIdentity, right: &CheckRepositoryIdentity) -> bool {
+    left.node_id == right.node_id
+        && left
+            .name_with_owner
+            .eq_ignore_ascii_case(&right.name_with_owner)
+}
+
+fn validate_cached_repository(repository: &CheckRepositoryIdentity) -> Result<()> {
+    validate_cached_node_id(&repository.node_id)?;
+    let Some((owner, name)) = repository.name_with_owner.split_once('/') else {
+        bail!("refuse collaboration cache payload with invalid repository coordinates");
+    };
+    if owner.is_empty()
+        || name.is_empty()
+        || owner.len() > 100
+        || name.len() > 100
+        || owner.contains('/')
+        || name.contains('/')
+        || owner.chars().any(char::is_whitespace)
+        || name.chars().any(char::is_whitespace)
+    {
+        bail!("refuse collaboration cache payload with invalid repository coordinates");
+    }
+    Ok(())
+}
+
+fn validate_cached_sha(sha: &str) -> Result<()> {
+    if sha.len() != 40
+        || !sha
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("refuse collaboration cache payload with invalid exact check SHA");
+    }
+    Ok(())
+}
+
+fn validate_cached_node_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 1024 || id.contains('\0') || id.chars().any(char::is_whitespace)
+    {
+        bail!("refuse collaboration cache payload with invalid opaque check node ID");
+    }
+    Ok(())
+}
+
+fn validate_cached_graphql_database_id(id: Option<u64>) -> Result<()> {
+    if id.is_some_and(|id| id == 0 || id > i32::MAX as u64) {
+        bail!("refuse collaboration cache payload with out-of-range GraphQL database ID");
+    }
+    Ok(())
+}
+
+fn validate_cached_text(value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
+        bail!("refuse collaboration cache payload with invalid check identity text");
+    }
+    Ok(())
+}
+
+fn valid_cached_uri(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 16 * 1024
+        && !value.chars().any(char::is_control)
+        && !value.chars().any(char::is_whitespace)
 }
 
 fn validate_observed_at(observed_at_unix_ms: u64) -> Result<()> {
@@ -868,8 +1115,9 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use cibergit::domain::{
-        Account, CheckKind, IssueComment, MergeEligibility, PullRequestCheck, PullRequestReview,
-        ReactableKind, ReactionSnapshot, ReactionSubjectSnapshot, ReviewComment, ReviewThread,
+        Account, CheckKind, CheckRepositoryIdentity, CheckSuiteIdentity, IssueComment,
+        MergeEligibility, PullRequestCheck, PullRequestReview, ReactableKind, ReactionSnapshot,
+        ReactionSubjectSnapshot, ReviewComment, ReviewThread,
     };
     use std::{env, os::unix::fs::symlink, process::Command, time::Instant};
 
@@ -900,6 +1148,14 @@ mod tests {
     fn details(repository: &Repository, number: u64, marker: &str) -> PullRequestDetails {
         PullRequestDetails {
             number,
+            pull_request_node_id: None,
+            base_repository: None,
+            observed_head_sha: None,
+            rollup_commit_sha: None,
+            potential_merge_commit_sha: None,
+            head_repository: None,
+            rollup_repository: None,
+            potential_merge_commit_repository: None,
             body: format!("Overview {marker}"),
             requested_reviewers: vec!["reviewer".into()],
             labels: vec!["cache".into()],
@@ -978,9 +1234,16 @@ mod tests {
                 conclusion: Some("SUCCESS".into()),
                 description: Some("cached check".into()),
                 details_url: Some("https://example.test/check-1".into()),
+                github_permalink: None,
                 started_at: Some("2026-09-13T12:00:00Z".into()),
                 completed_at: Some("2026-09-13T12:03:00Z".into()),
                 required: Some(true),
+                database_id: None,
+                suite: None,
+                commit_sha: None,
+                commit_repository: None,
+                sha_class: CheckShaClass::Unknown,
+                actions_linkage: ActionsLinkage::Unknown,
             }],
             activity_complete: false,
             checks_complete: false,
@@ -1091,6 +1354,49 @@ mod tests {
 
         assert!(cache.load(&repo, 7).is_err());
         assert_eq!(fs::read(record_path).unwrap(), foreign);
+    }
+
+    #[test]
+    fn foreign_nested_check_origin_is_rejected_and_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = CollaborationCache::new(root.path().to_owned());
+        let repo = repository("octo", "one", "alice");
+        let base = CheckRepositoryIdentity {
+            node_id: "R-base".into(),
+            name_with_owner: "octo/one".into(),
+        };
+        let mut value = details(&repo, 7, "check-origin");
+        value.pull_request_node_id = Some("PR-current".into());
+        value.base_repository = Some(base.clone());
+        value.observed_head_sha = Some("a".repeat(40));
+        value.head_repository = Some(base.clone());
+        value.rollup_commit_sha = Some("a".repeat(40));
+        value.rollup_repository = Some(base.clone());
+        value.checks[0].commit_sha = Some("a".repeat(40));
+        value.checks[0].commit_repository = Some(base.clone());
+        value.checks[0].sha_class = CheckShaClass::Head;
+        value.checks[0].suite = Some(CheckSuiteIdentity {
+            node_id: "SUITE-current".into(),
+            database_id: Some(10),
+            repository: base,
+            app: None,
+        });
+        save(&cache, &repo, 7, &value);
+        let record_path = cache.root.join(CacheIdentity::new(&repo, 7).filename());
+        let mut record: CacheRecord =
+            serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        let foreign = CheckRepositoryIdentity {
+            node_id: "R-foreign".into(),
+            name_with_owner: "mallory/other".into(),
+        };
+        record.details.rollup_repository = Some(foreign.clone());
+        record.details.checks[0].commit_repository = Some(foreign.clone());
+        record.details.checks[0].suite.as_mut().unwrap().repository = foreign;
+        let foreign_bytes = serde_json::to_vec(&record).unwrap();
+        private_write(&record_path, &foreign_bytes);
+
+        assert!(cache.load(&repo, 7).is_err());
+        assert_eq!(fs::read(record_path).unwrap(), foreign_bytes);
     }
 
     #[test]

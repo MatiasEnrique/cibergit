@@ -154,6 +154,14 @@ fn details(
         .collect();
     PullRequestDetails {
         number: 42,
+        pull_request_node_id: None,
+        base_repository: None,
+        observed_head_sha: None,
+        rollup_commit_sha: None,
+        potential_merge_commit_sha: None,
+        head_repository: None,
+        rollup_repository: None,
+        potential_merge_commit_repository: None,
         body: String::new(),
         requested_reviewers: vec![],
         labels: vec![],

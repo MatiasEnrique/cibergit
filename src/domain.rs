@@ -928,6 +928,67 @@ pub enum CheckKind {
     CommitStatus,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CheckShaClass {
+    Head,
+    MergeCandidate,
+    Other,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckRepositoryIdentity {
+    pub node_id: String,
+    pub name_with_owner: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckAppIdentity {
+    pub node_id: String,
+    pub name: String,
+    pub slug: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckSuiteIdentity {
+    pub node_id: String,
+    /// Nullable GitHub GraphQL `Int`, widened after its signed 32-bit bounds
+    /// are validated. This is never derived from the opaque node ID.
+    pub database_id: Option<u64>,
+    pub repository: CheckRepositoryIdentity,
+    pub app: Option<CheckAppIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunIdentity {
+    pub node_id: String,
+    pub database_id: u64,
+    pub run_attempt: u64,
+    pub run_number: u64,
+    pub event: String,
+    pub github_url: String,
+    pub workflow_node_id: String,
+    pub workflow_database_id: u64,
+    pub workflow_name: String,
+}
+
+/// Exact evidence returned for the check suite's optional Actions relation.
+/// `NoObservedLink` is deliberately not a third-party classification.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    rename_all = "SCREAMING_SNAKE_CASE",
+    tag = "state",
+    content = "identity"
+)]
+pub enum ActionsLinkage {
+    #[default]
+    Unknown,
+    NoObservedLink,
+    Linked(WorkflowRunIdentity),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestCheck {
     pub coordinates: ProviderCoordinates,
@@ -936,10 +997,30 @@ pub struct PullRequestCheck {
     pub status: String,
     pub conclusion: Option<String>,
     pub description: Option<String>,
+    /// Integrator-controlled destination (`detailsUrl` / `targetUrl`). It is
+    /// display-only and is never treated as GitHub identity or fetched.
     pub details_url: Option<String>,
+    /// GitHub's own stable CheckRun summary URL. Commit statuses do not have
+    /// this field.
+    #[serde(default)]
+    pub github_permalink: Option<String>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    /// `None` means GitHub did not provide complete requiredness evidence.
     pub required: Option<bool>,
+    /// Nullable GitHub GraphQL `Int`, widened only after exact bounds checks.
+    #[serde(default)]
+    pub database_id: Option<u64>,
+    #[serde(default)]
+    pub suite: Option<CheckSuiteIdentity>,
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub commit_repository: Option<CheckRepositoryIdentity>,
+    #[serde(default)]
+    pub sha_class: CheckShaClass,
+    #[serde(default)]
+    pub actions_linkage: ActionsLinkage,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -963,6 +1044,24 @@ pub struct MergeEligibility {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestDetails {
     pub number: u64,
+    /// Source identities observed with this mutable collaboration snapshot.
+    /// They are history only and never advance the displayed review revision.
+    #[serde(default)]
+    pub pull_request_node_id: Option<String>,
+    #[serde(default)]
+    pub base_repository: Option<CheckRepositoryIdentity>,
+    #[serde(default)]
+    pub observed_head_sha: Option<String>,
+    #[serde(default)]
+    pub rollup_commit_sha: Option<String>,
+    #[serde(default)]
+    pub potential_merge_commit_sha: Option<String>,
+    #[serde(default)]
+    pub head_repository: Option<CheckRepositoryIdentity>,
+    #[serde(default)]
+    pub rollup_repository: Option<CheckRepositoryIdentity>,
+    #[serde(default)]
+    pub potential_merge_commit_repository: Option<CheckRepositoryIdentity>,
     pub body: String,
     pub requested_reviewers: Vec<String>,
     pub labels: Vec<String>,
@@ -1079,7 +1178,16 @@ mod reaction_serialization_tests {
             "issue_comments": [],
             "reviews": [],
             "review_threads": [],
-            "checks": [],
+            "checks": [{
+                "coordinates": {
+                    "provider": "github", "host": "github.com", "owner": "owner",
+                    "repository": "repo", "pull_request": 7, "remote_id": "CHECK-old"
+                },
+                "kind": "CHECK_RUN", "name": "old check", "status": "COMPLETED",
+                "conclusion": "SUCCESS", "description": null,
+                "details_url": "https://integrator.example/old", "started_at": null,
+                "completed_at": null, "required": null
+            }],
             "activity_complete": false,
             "checks_complete": false,
             "notice": "legacy v1 cache"
@@ -1087,5 +1195,13 @@ mod reaction_serialization_tests {
         let details: PullRequestDetails = serde_json::from_value(old).unwrap();
         assert!(details.reactions.is_empty());
         assert!(!details.activity_complete);
+        assert!(details.pull_request_node_id.is_none());
+        assert!(details.base_repository.is_none());
+        assert!(details.observed_head_sha.is_none());
+        assert!(details.potential_merge_commit_repository.is_none());
+        assert_eq!(details.checks[0].required, None);
+        assert_eq!(details.checks[0].sha_class, CheckShaClass::Unknown);
+        assert_eq!(details.checks[0].actions_linkage, ActionsLinkage::Unknown);
+        assert!(details.checks[0].suite.is_none());
     }
 }

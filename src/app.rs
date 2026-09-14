@@ -10,6 +10,7 @@ use crate::{
     SelectSinceLastReview, SidebarNarrower, SidebarWider, SubmitReview, ToggleComparisonPicker,
     ToggleFileTree, ToggleInspector, TogglePalette, ToggleSidebar, ToggleStackRelationships,
 };
+mod checks_view;
 mod collaboration_cache;
 mod comparison_picker;
 mod file_tree;
@@ -25,6 +26,11 @@ mod stack_view;
 mod submitted_review_drafts;
 mod view_editor;
 
+use checks_view::{
+    ChecksSelection, NextCheck, NextCheckPage, OpenChecks, PreviousCheck, PreviousCheckPage,
+    ToggleCheckIdentity, checks_page, identity_fields, kind_label, linkage_label, required_label,
+    sha_label,
+};
 #[cfg(feature = "ui-smoke")]
 use cibergit::participation::ReviewOperationPayload;
 use cibergit::{
@@ -1229,6 +1235,7 @@ struct ReviewTab {
     file_tree: FileTree,
     file_tree_scroll: UniformListScrollHandle,
     inspector_section: InspectorSection,
+    checks_selection: ChecksSelection,
     local_inventory: bool,
     session_persistence_error: Option<String>,
     details: Option<PullRequestDetails>,
@@ -1859,6 +1866,7 @@ pub struct ReviewWorkspace {
     panel_layout: PanelLayout,
     view_editor_scroll: ScrollHandle,
     inspector_scroll: ScrollHandle,
+    checks_focus: FocusHandle,
     query: Entity<InputState>,
     composer_input: Entity<TextareaState>,
     review_summary_input: Entity<TextareaState>,
@@ -2000,6 +2008,108 @@ impl ReviewWorkspace {
         cx.notify();
     }
 
+    fn open_checks(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        self.inspector_open = true;
+        self.tabs[index].inspector_section = InspectorSection::Checks;
+        let tab = &mut self.tabs[index];
+        let checks = tab
+            .details
+            .as_ref()
+            .or_else(|| {
+                tab.cached_collaboration
+                    .as_ref()
+                    .map(|cached| &cached.details)
+            })
+            .map(|details| details.checks.as_slice())
+            .unwrap_or_default();
+        tab.checks_selection.reconcile(checks);
+        self.scroll_selected_check_into_view(index);
+        self.refresh_auto_layout(window);
+        self.checks_focus.focus(window, cx);
+        self.command_palette = false;
+        cx.notify();
+    }
+
+    fn move_check_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        let tab = &mut self.tabs[index];
+        let checks = tab
+            .details
+            .as_ref()
+            .or_else(|| {
+                tab.cached_collaboration
+                    .as_ref()
+                    .map(|cached| &cached.details)
+            })
+            .map(|details| details.checks.as_slice())
+            .unwrap_or_default();
+        tab.checks_selection.move_selection(checks, delta);
+        self.scroll_selected_check_into_view(index);
+        self.checks_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn move_checks_page(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        let tab = &mut self.tabs[index];
+        let checks = tab
+            .details
+            .as_ref()
+            .or_else(|| {
+                tab.cached_collaboration
+                    .as_ref()
+                    .map(|cached| &cached.details)
+            })
+            .map(|details| details.checks.as_slice())
+            .unwrap_or_default();
+        tab.checks_selection.move_page(checks, delta);
+        self.scroll_selected_check_into_view(index);
+        self.checks_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_selected_check(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        self.tabs[index].checks_selection.toggle_selected();
+        self.scroll_selected_check_into_view(index);
+        cx.notify();
+    }
+
+    fn activate_check(&mut self, remote_id: &str, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        self.tabs[index].checks_selection.activate(remote_id);
+        self.scroll_selected_check_into_view(index);
+        cx.notify();
+    }
+
+    fn scroll_selected_check_into_view(&self, index: usize) {
+        let tab = &self.tabs[index];
+        let details = tab.details.as_ref().or_else(|| {
+            tab.cached_collaboration
+                .as_ref()
+                .map(|cached| &cached.details)
+        });
+        let Some((checks, selected)) = details.zip(tab.checks_selection.selected_id.as_ref())
+        else {
+            self.inspector_scroll.set_offset(point(px(0.), px(0.)));
+            return;
+        };
+        let Some(position) = checks
+            .checks
+            .iter()
+            .position(|check| check.coordinates.remote_id == *selected)
+        else {
+            self.inspector_scroll.set_offset(point(px(0.), px(0.)));
+            return;
+        };
+        let row_on_page = position % checks_view::CHECKS_PAGE_SIZE;
+        // Status and source identity are the first two direct scroll children.
+        // GPUI resolves the row's measured bounds during prepaint, so wrapped
+        // labels and an expanded disclosure cannot invalidate this navigation.
+        self.inspector_scroll.scroll_to_top_of_item(row_on_page + 2);
+    }
+
     fn new(window: &mut Window, cx: &mut Context<Root>, startup: Startup) -> Self {
         let data_root = startup.data_dir.clone().unwrap_or_else(|| {
             std::env::var_os("HOME")
@@ -2022,6 +2132,12 @@ impl ReviewWorkspace {
                 local_workspace::LocalReplace,
                 Some("LocalWorkspace"),
             ),
+            KeyBinding::new("cmd-shift-c", OpenChecks, None),
+            KeyBinding::new("up", PreviousCheck, Some("ChecksPane")),
+            KeyBinding::new("down", NextCheck, Some("ChecksPane")),
+            KeyBinding::new("enter", ToggleCheckIdentity, Some("ChecksPane")),
+            KeyBinding::new("pageup", PreviousCheckPage, Some("ChecksPane")),
+            KeyBinding::new("pagedown", NextCheckPage, Some("ChecksPane")),
         ]);
         let store_result = startup
             .data_dir
@@ -2090,6 +2206,7 @@ impl ReviewWorkspace {
         let focus = cx.focus_handle();
         let file_tree_focus = cx.focus_handle();
         let diff_focus = cx.focus_handle();
+        let checks_focus = cx.focus_handle();
         window.focus(&focus, cx);
         let repositories = workspace
             .repositories
@@ -2145,6 +2262,7 @@ impl ReviewWorkspace {
             panel_layout: PanelLayout::default(),
             view_editor_scroll: ScrollHandle::new(),
             inspector_scroll: ScrollHandle::new(),
+            checks_focus,
             query,
             composer_input,
             review_summary_input,
@@ -10784,6 +10902,7 @@ impl ReviewWorkspace {
             file_tree,
             file_tree_scroll: UniformListScrollHandle::new(),
             inspector_section: InspectorSection::Overview,
+            checks_selection: ChecksSelection::default(),
             local_inventory,
             session_persistence_error,
             details: None,
@@ -14828,6 +14947,9 @@ impl ReviewWorkspace {
                             _ => None,
                         };
                         tab.cached_collaboration = Some(observation);
+                        if let Some(cached) = &tab.cached_collaboration {
+                            tab.checks_selection.reconcile(&cached.details.checks);
+                        }
                         tab.details_state = LoadState::Cached(match prior_failure {
                             Some(error) => format!(
                                 "Cached collaboration observed {age} · current read failed: {error}"
@@ -14845,6 +14967,9 @@ impl ReviewWorkspace {
                             "Offline collaboration cache was refused and preserved: {error:#}"
                         ));
                     }
+                }
+                if tab.inspector_section == InspectorSection::Checks {
+                    this.scroll_selected_check_into_view(tab_index);
                 }
                 cx.notify();
             });
@@ -15079,6 +15204,9 @@ impl ReviewWorkspace {
                                 let tab = &mut this.tabs[tab_index];
                                 tab.details = Some(details);
                                 tab.cached_collaboration = None;
+                                if let Some(details) = &tab.details {
+                                    tab.checks_selection.reconcile(&details.checks);
+                                }
                                 let notice = "PR details updated; pending review data is incomplete and previous linkage was retained."
                                     .to_owned();
                                 tab.details_state = LoadState::Cached(notice.clone());
@@ -15094,6 +15222,11 @@ impl ReviewWorkspace {
                                     controller.notice = Some(notice);
                                 }
                                 this.rebuild_diff(tab_index, this.wide);
+                                if this.tabs[tab_index].inspector_section
+                                    == InspectorSection::Checks
+                                {
+                                    this.scroll_selected_check_into_view(tab_index);
+                                }
                                 this.resume_general_read_followups(cx);
                                 cx.notify();
                                 return;
@@ -15109,6 +15242,9 @@ impl ReviewWorkspace {
                             let tab = &mut this.tabs[tab_index];
                             tab.details = Some(details);
                             tab.cached_collaboration = None;
+                            if let Some(details) = &tab.details {
+                                tab.checks_selection.reconcile(&details.checks);
+                            }
                             tab.pending_snapshot = pending.clone();
                             match journal {
                                 Ok(operations) => {
@@ -15207,6 +15343,9 @@ impl ReviewWorkspace {
                             .detach();
                         }
                         this.rebuild_diff(tab_index, this.wide);
+                        if this.tabs[tab_index].inspector_section == InspectorSection::Checks {
+                            this.scroll_selected_check_into_view(tab_index);
+                        }
                     }
                     Ok(_) => {}
                     Err(_) => {
@@ -16057,6 +16196,36 @@ impl ReviewWorkspace {
                     this.inspector_open = !this.inspector_open;
                     this.refresh_auto_layout(window);
                     cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|root, _: &OpenChecks, window, cx| {
+                if let Root::Review(this) = root {
+                    this.open_checks(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &PreviousCheck, window, cx| {
+                if let Root::Review(this) = root {
+                    this.move_check_selection(-1, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &NextCheck, window, cx| {
+                if let Root::Review(this) = root {
+                    this.move_check_selection(1, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &PreviousCheckPage, window, cx| {
+                if let Root::Review(this) = root {
+                    this.move_checks_page(-1, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &NextCheckPage, window, cx| {
+                if let Root::Review(this) = root {
+                    this.move_checks_page(1, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &ToggleCheckIdentity, _, cx| {
+                if let Root::Review(this) = root {
+                    this.toggle_selected_check(cx);
                 }
             }))
             .on_action(cx.listener(|root, action: &CycleDiffMode, window, cx| {
@@ -19842,19 +20011,39 @@ impl ReviewWorkspace {
         let current = tab.inspector_section;
         let root = cx.entity();
         let section_root = root.clone();
+        let section_checks_focus = self.checks_focus.clone();
         let section = move |name: &'static str, value: InspectorSection| {
             let root = section_root.clone();
+            let checks_focus = section_checks_focus.clone();
             side_control(name, current == value, colors)
                 .id(SharedString::from(format!("inspector-{name}")))
-                .on_click(move |_, _, cx| {
+                .on_click(move |_, window, cx| {
                     root.update(cx, |root, cx| {
                         if let Root::Review(this) = root
                             && let Some(index) = this.active_tab
                         {
                             this.tabs[index].inspector_section = value;
+                            if value == InspectorSection::Checks {
+                                let tab = &mut this.tabs[index];
+                                let checks = tab
+                                    .details
+                                    .as_ref()
+                                    .or_else(|| {
+                                        tab.cached_collaboration
+                                            .as_ref()
+                                            .map(|cached| &cached.details)
+                                    })
+                                    .map(|details| details.checks.as_slice())
+                                    .unwrap_or_default();
+                                tab.checks_selection.reconcile(checks);
+                                this.scroll_selected_check_into_view(index);
+                            }
                             cx.notify();
                         }
                     });
+                    if value == InspectorSection::Checks {
+                        checks_focus.focus(window, cx);
+                    }
                 })
         };
         let content = match current {
@@ -19933,7 +20122,7 @@ impl ReviewWorkspace {
                     colors,
                     &root,
                 );
-                if cached_observation.is_some() {
+                vec![if cached_observation.is_some() {
                     div()
                         .children(fields)
                         .child(pr_reactions)
@@ -19945,7 +20134,7 @@ impl ReviewWorkspace {
                         .child(pr_reactions)
                         .children(fields)
                         .into_any_element()
-                }
+                }]
             }
             InspectorSection::Activity => {
                 let mut activity = Vec::new();
@@ -21396,43 +21585,251 @@ impl ReviewWorkspace {
                             .child("No activity returned for this pull request."),
                     );
                 }
-                div().children(activity).into_any_element()
+                vec![div().children(activity).into_any_element()]
             }
             InspectorSection::Checks => {
-                let mut checks = vec![detail(
-                    "Status",
-                    empty_unknown(&tab.pull_request.check_status),
-                    colors,
-                )];
+                let mut checks: Vec<AnyElement> = vec![
+                    detail(
+                        "Status",
+                        empty_unknown(&tab.pull_request.check_status),
+                        colors,
+                    )
+                    .into_any_element(),
+                ];
+                let source_identity = displayed_details
+                    .map(|details| {
+                        let repository =
+                            |repository: Option<&cibergit::domain::CheckRepositoryIdentity>| {
+                                repository
+                                    .map(|repository| repository.name_with_owner.clone())
+                                    .unwrap_or_else(|| "Unknown".into())
+                            };
+                        div()
+                            .mb_2()
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border)
+                            .child(detail(
+                                "Observed PR head",
+                                details
+                                    .observed_head_sha
+                                    .clone()
+                                    .unwrap_or_else(|| "Unknown".into()),
+                                colors,
+                            ))
+                            .child(detail(
+                                "Checks rollup commit",
+                                details
+                                    .rollup_commit_sha
+                                    .clone()
+                                    .unwrap_or_else(|| "No rollup observed".into()),
+                                colors,
+                            ))
+                            .child(detail(
+                                "Merge candidate",
+                                details
+                                    .potential_merge_commit_sha
+                                    .clone()
+                                    .unwrap_or_else(|| "Not observed".into()),
+                                colors,
+                            ))
+                            .child(detail(
+                                "Base repository",
+                                repository(details.base_repository.as_ref()),
+                                colors,
+                            ))
+                            .child(detail(
+                                "Head repository",
+                                repository(details.head_repository.as_ref()),
+                                colors,
+                            ))
+                            .child(detail(
+                                "Rollup repository",
+                                repository(details.rollup_repository.as_ref()),
+                                colors,
+                            ))
+                    })
+                    .unwrap_or_else(|| {
+                        div()
+                            .mb_2()
+                            .text_xs()
+                            .text_color(colors.muted)
+                            .child("Observed Checks source identity is unavailable.")
+                    });
+                checks.push(source_identity.into_any_element());
                 if let Some(details) = displayed_details {
-                    for check in details.checks.iter().take(40) {
-                        checks.push(div().mb_3().child(check.name.clone()).child(
-                            div().text_xs().text_color(colors.muted).child(format!(
-                                            "{}{}",
-                                            check.status,
-                                            check
-                                                .conclusion
-                                                .as_ref()
-                                                .map(|value| format!(" · {value}"))
-                                                .unwrap_or_default()
-                                        )),
-                        ));
+                    let (page, pages, range) =
+                        checks_page(details.checks.len(), tab.checks_selection.page);
+                    for check in &details.checks[range.clone()] {
+                        let remote_id = check.coordinates.remote_id.clone();
+                        let selected =
+                            tab.checks_selection.selected_id.as_deref() == Some(remote_id.as_str());
+                        let expanded =
+                            tab.checks_selection.expanded_id.as_deref() == Some(remote_id.as_str());
+                        let row_root = root.clone();
+                        let row_focus = self.checks_focus.clone();
+                        let mut row =
+                            div()
+                                .id(SharedString::from(format!("check-row-{remote_id}")))
+                                .mb_2()
+                                .p_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(if selected {
+                                    colors.accent
+                                } else {
+                                    colors.border
+                                })
+                                .when(selected, |row| row.bg(colors.selected))
+                                .cursor_pointer()
+                                .hover(|row| row.bg(colors.selected))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(check.name.clone())
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(colors.muted)
+                                                .child(if expanded { "Hide" } else { "Details" }),
+                                        ),
+                                )
+                                .child(div().mt_1().text_xs().text_color(colors.muted).child(
+                                    format!(
+                                        "{} · {}{}",
+                                        kind_label(check),
+                                        check.status,
+                                        check
+                                            .conclusion
+                                            .as_ref()
+                                            .map(|value| format!(" · {value}"))
+                                            .unwrap_or_default()
+                                    ),
+                                ))
+                                .child(div().text_xs().text_color(colors.faint).child(format!(
+                                    "{} · {} · {}",
+                                    required_label(check),
+                                    sha_label(check),
+                                    linkage_label(check)
+                                )))
+                                .on_click(move |_, window, cx| {
+                                    row_root.update(cx, |root, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.activate_check(&remote_id, cx);
+                                        }
+                                    });
+                                    row_focus.focus(window, cx);
+                                });
+                        if expanded {
+                            row = row.child(
+                                div()
+                                    .mt_2()
+                                    .pt_2()
+                                    .border_t_1()
+                                    .border_color(colors.border)
+                                    .children(identity_fields(check).into_iter().map(
+                                        |(label, value)| {
+                                            div()
+                                                .mb_1()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(colors.muted)
+                                                        .child(label),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(colors.text)
+                                                        .child(value),
+                                                )
+                                        },
+                                    )),
+                            );
+                        }
+                        checks.push(row.into_any_element());
+                    }
+                    if !details.checks.is_empty() {
+                        checks.push(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child(format!(
+                                    "Showing {}–{} of {} observed checks · page {} of {}.",
+                                    range.start + 1,
+                                    range.end,
+                                    details.checks.len(),
+                                    page + 1,
+                                    pages
+                                ))
+                                .into_any_element(),
+                        );
+                    }
+                    if pages > 1 {
+                        let previous_root = root.clone();
+                        let next_root = root.clone();
+                        let previous_focus = self.checks_focus.clone();
+                        let next_focus = self.checks_focus.clone();
+                        checks.push(
+                            div()
+                                .mt_2()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    action_link_with_id(
+                                        "checks-previous-page".into(),
+                                        "Previous 40",
+                                        colors,
+                                    )
+                                    .when(page == 0, |button| button.text_color(colors.faint))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            previous_root.update(cx, |root, cx| {
+                                                if let Root::Review(this) = root {
+                                                    this.move_checks_page(-1, window, cx);
+                                                }
+                                            });
+                                            previous_focus.focus(window, cx);
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    action_link_with_id(
+                                        "checks-next-page".into(),
+                                        "Next 40",
+                                        colors,
+                                    )
+                                    .when(page + 1 == pages, |button| {
+                                        button.text_color(colors.faint)
+                                    })
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            next_root.update(cx, |root, cx| {
+                                                if let Root::Review(this) = root {
+                                                    this.move_checks_page(1, window, cx);
+                                                }
+                                            });
+                                            next_focus.focus(window, cx);
+                                        },
+                                    ),
+                                )
+                                .into_any_element(),
+                        );
                     }
                     if !details.checks_complete {
                         checks.push(
                             div()
                                 .text_color(colors.amber)
-                                .child("Check results are incomplete."),
+                                .child("GitHub did not return complete check identity evidence.")
+                                .into_any_element(),
                         );
                     }
-                    if cached_observation.is_some() && details.checks.len() > 40 {
-                        checks.push(div().text_color(colors.amber).child(format!(
-                            "Cached snapshot contains {} checks; this view displays the first 40.",
-                            details.checks.len()
-                        )));
-                    }
                 }
-                div().children(checks).into_any_element()
+                checks
             }
         };
         let (_, _, details_width) = self.resolved_panel_widths(window);
@@ -21518,7 +21915,12 @@ impl ReviewWorkspace {
                         self.render_lifecycle_confirmation(index, colors, cx),
                         |panel, confirmation| panel.child(confirmation),
                     )
-                    .when(!confirmation_open, |panel| panel.child(content))
+                    .when(!confirmation_open, |panel| panel.children(content))
+                    .when(current == InspectorSection::Checks, |panel| {
+                        panel
+                            .key_context("ChecksPane")
+                            .track_focus(&self.checks_focus)
+                    })
                     .track_scroll(&self.inspector_scroll),
             )
     }
@@ -22417,6 +22819,17 @@ impl ReviewWorkspace {
                                     this.refresh_auto_layout(window);
                                     this.command_palette = false;
                                     cx.notify();
+                                }
+                            })),
+                    )
+                    .child(
+                        command_row("Open Checks", "⇧⌘C", colors)
+                            .id("command-checks")
+                            .cursor_pointer()
+                            .hover(|row| row.bg(colors.selected))
+                            .on_click(cx.listener(|root, _, window, cx| {
+                                if let Root::Review(this) = root {
+                                    this.open_checks(window, cx);
                                 }
                             })),
                     )
@@ -24582,14 +24995,14 @@ mod layout_tests {
     };
     #[cfg(feature = "ui-smoke")]
     use super::{
-        DismissalConfirmationToken, DismissalPreparationToken, InstallTabOptions, LoadState,
-        RepoRuntime, Root, Startup,
+        DismissalConfirmationToken, DismissalPreparationToken, InspectorSection, InstallTabOptions, LoadState, NextCheck, NextCheckPage, OpenChecks,
+        RepoRuntime, Root, Startup, ToggleCheckIdentity,
     };
     use cibergit::domain::{
-        Account, MergeEligibility, PendingFileCommentSource, ProviderCoordinates,
-        PullRequestDetails, PullRequestReview, ReactionContent, ReactionIntent, Repository,
-        ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewSubject,
-        SubmittedReviewEditCapability,
+        Account, ActionsLinkage, CheckKind, CheckShaClass, MergeEligibility,
+        PendingFileCommentSource, ProviderCoordinates, PullRequestCheck, PullRequestDetails,
+        PullRequestReview, ReactionContent, ReactionIntent, Repository, ReviewAuxiliaryAction,
+        ReviewAuxiliaryRequest, ReviewSubject, SubmittedReviewEditCapability,
     };
     #[cfg(feature = "ui-smoke")]
     use cibergit::domain::{
@@ -24598,6 +25011,8 @@ mod layout_tests {
     };
     use cibergit::participation::PublishedFile;
     use cibergit::providers::{GeneralReadDelay, GeneralReadDirective};
+    #[cfg(feature = "ui-smoke")]
+    use gpui::{point, px};
     use std::time::{Duration, Instant, UNIX_EPOCH};
     #[cfg(feature = "ui-smoke")]
     use tempfile::tempdir;
@@ -24782,6 +25197,14 @@ mod layout_tests {
             .unwrap_or(7);
         PullRequestDetails {
             number,
+            pull_request_node_id: None,
+            base_repository: None,
+            observed_head_sha: None,
+            rollup_commit_sha: None,
+            potential_merge_commit_sha: None,
+            head_repository: None,
+            rollup_repository: None,
+            potential_merge_commit_repository: None,
             body: String::new(),
             requested_reviewers: Vec::new(),
             labels: Vec::new(),
@@ -24808,6 +25231,222 @@ mod layout_tests {
             checks_complete: true,
             notice: None,
         }
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn checks_navigation_fixture(repository: &Repository, count: usize) -> PullRequestDetails {
+        let mut details = details_with_reviews(Vec::new());
+        details.number = 7;
+        details.observed_head_sha = Some("2".repeat(40));
+        details.checks = (0..count)
+            .map(|index| PullRequestCheck {
+                coordinates: ProviderCoordinates {
+                    provider: "github".into(),
+                    host: repository.host.clone(),
+                    owner: repository.owner.clone(),
+                    repository: repository.name.clone(),
+                    pull_request: 7,
+                    remote_id: format!("CHECK-{index}"),
+                },
+                kind: CheckKind::CheckRun,
+                name: format!("Synthetic read-only check {index}"),
+                status: "COMPLETED".into(),
+                conclusion: Some("SUCCESS".into()),
+                description: None,
+                details_url: None,
+                github_permalink: None,
+                started_at: None,
+                completed_at: None,
+                required: None,
+                database_id: None,
+                suite: None,
+                commit_sha: Some("2".repeat(40)),
+                commit_repository: None,
+                sha_class: CheckShaClass::Head,
+                actions_linkage: ActionsLinkage::Unknown,
+            })
+            .collect();
+        details
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn checks_native_navigation_reveals_offscreen_rows_and_preserves_exact_identity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    ..Default::default()
+                },
+            )
+        });
+        let (repository, _) = submitted_review_fixture();
+        let pull = transition_pull_request(7);
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.repositories.push(RepoRuntime {
+                    repository: repository.clone(),
+                    pull_requests: vec![pull.clone()],
+                    state: LoadState::Ready,
+                    generation: 0,
+                    refresh: Default::default(),
+                });
+                this.install_tab_with_restore(
+                    repository.clone(),
+                    pull,
+                    None,
+                    InstallTabOptions {
+                        activate: true,
+                        window: Some(window),
+                        start_background_work: false,
+                    },
+                    cx,
+                );
+                this.tabs[0].details = Some(checks_navigation_fixture(&repository, 81));
+                this.tabs[0].details_state = LoadState::Ready;
+                this.inspector_scroll.set_offset(point(px(0.), px(-900.)));
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        cx.dispatch_action(OpenChecks);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert!(matches!(
+                this.tabs[0].inspector_section,
+                InspectorSection::Checks
+            ));
+            assert_eq!(
+                this.tabs[0].checks_selection.selected_id.as_deref(),
+                Some("CHECK-0")
+            );
+        });
+
+        for _ in 0..39 {
+            cx.dispatch_action(NextCheck);
+        }
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert_eq!(
+                this.tabs[0].checks_selection.selected_id.as_deref(),
+                Some("CHECK-39")
+            );
+            assert_eq!(this.tabs[0].checks_selection.page, 0);
+            assert!(this.inspector_scroll.top_item() <= 41);
+            assert!(this.inspector_scroll.bottom_item() >= 41);
+        });
+
+        cx.dispatch_action(NextCheck);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert_eq!(
+                this.tabs[0].checks_selection.selected_id.as_deref(),
+                Some("CHECK-40")
+            );
+            assert_eq!(this.tabs[0].checks_selection.page, 1);
+            assert!(this.inspector_scroll.top_item() <= 2);
+            assert!(this.inspector_scroll.bottom_item() >= 2);
+        });
+
+        cx.dispatch_action(ToggleCheckIdentity);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert_eq!(
+                this.tabs[0].checks_selection.expanded_id.as_deref(),
+                Some("CHECK-40")
+            );
+            assert!(this.inspector_scroll.top_item() <= 2);
+            assert!(this.inspector_scroll.bottom_item() >= 2);
+        });
+
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let tab = &mut this.tabs[0];
+                let details = tab.details.as_mut().unwrap();
+                details.checks.rotate_left(17);
+                tab.checks_selection.reconcile(&details.checks);
+                this.scroll_selected_check_into_view(0);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert_eq!(
+                this.tabs[0].checks_selection.selected_id.as_deref(),
+                Some("CHECK-40")
+            );
+            assert_eq!(
+                this.tabs[0].checks_selection.expanded_id.as_deref(),
+                Some("CHECK-40")
+            );
+        });
+
+        cx.dispatch_action(NextCheckPage);
+        cx.dispatch_action(NextCheckPage);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert_eq!(this.tabs[0].checks_selection.page, 2);
+            assert!(this.inspector_scroll.top_item() <= 2);
+            assert!(this.inspector_scroll.bottom_item() >= 2);
+        });
+
+        cx.dispatch_action(ToggleCheckIdentity);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        root.update(cx, |root, cx| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            let selected = this.tabs[0].checks_selection.selected_id.clone().unwrap();
+            let tab = &mut this.tabs[0];
+            let details = tab.details.as_mut().unwrap();
+            details
+                .checks
+                .retain(|check| check.coordinates.remote_id != selected);
+            let expected = details
+                .checks
+                .first()
+                .map(|check| check.coordinates.remote_id.clone());
+            tab.checks_selection.reconcile(&details.checks);
+            assert!(tab.checks_selection.expanded_id.is_none());
+            assert_eq!(
+                tab.checks_selection.selected_id.as_deref(),
+                expected.as_deref()
+            );
+            cx.notify();
+        });
     }
 
     #[test]

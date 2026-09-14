@@ -3245,6 +3245,14 @@ print(json.dumps(step['response']))
     fn details(reviews: Vec<PullRequestReview>, complete: bool) -> PullRequestDetails {
         PullRequestDetails {
             number: 7,
+            pull_request_node_id: None,
+            base_repository: None,
+            observed_head_sha: None,
+            rollup_commit_sha: None,
+            potential_merge_commit_sha: None,
+            head_repository: None,
+            rollup_repository: None,
+            potential_merge_commit_repository: None,
             body: String::new(),
             requested_reviewers: Vec::new(),
             labels: Vec::new(),
@@ -4740,6 +4748,14 @@ print(json.dumps(step['response']))
         let displayed = session.revision().clone();
         let details = PullRequestDetails {
             number: 7,
+            pull_request_node_id: None,
+            base_repository: None,
+            observed_head_sha: None,
+            rollup_commit_sha: None,
+            potential_merge_commit_sha: None,
+            head_repository: None,
+            rollup_repository: None,
+            potential_merge_commit_repository: None,
             body: String::new(),
             requested_reviewers: Vec::new(),
             labels: Vec::new(),

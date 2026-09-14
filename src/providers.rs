@@ -11,16 +11,17 @@ use crate::comparisons::{
     CommitInventory, CommitInventoryEntry, InventoryAvailability, MAX_COMMIT_INVENTORY,
 };
 use crate::domain::{
-    Account, BranchDeletionAcknowledgement, BranchDeletionRequest, ChangedFile, CheckKind,
-    Comparison, DismissalAuthority, FreshReactionCapability, FreshReviewDismissalCapability,
-    IssueComment, LinkedReviewComment, MergeAcknowledgement, MergeAction, MergeEligibility,
-    MergeExecutionRequest, MergeMethod, MergePreparation, MutationContext,
-    PendingFileCommentSource, PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome,
-    PullRequest, PullRequestCheck, PullRequestCheckoutSource, PullRequestDetails,
-    PullRequestReview, ReactableKind, ReactionContent, ReactionGroupSnapshot, ReactionSnapshot,
-    ReactionSubjectSnapshot, Repository, ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryAction,
-    ReviewAuxiliaryRequest, ReviewComment, ReviewSubject, ReviewThread, ReviewWriteAcknowledgement,
-    Revision, SelectedViewer, SubmittedReviewEditCapability,
+    Account, ActionsLinkage, BranchDeletionAcknowledgement, BranchDeletionRequest, ChangedFile,
+    CheckAppIdentity, CheckKind, CheckRepositoryIdentity, CheckShaClass, CheckSuiteIdentity,
+    Comparison, DismissalAuthority, FreshReviewDismissalCapability, FreshReactionCapability, IssueComment, LinkedReviewComment, MergeAcknowledgement,
+    MergeAction, MergeEligibility, MergeExecutionRequest, MergeMethod, MergePreparation,
+    MutationContext, PendingFileCommentSource, PendingReviewSnapshot, ProviderCoordinates,
+    ProviderMutationOutcome, PullRequest, PullRequestCheck, PullRequestCheckoutSource,
+    PullRequestDetails, PullRequestReview, ReactableKind, ReactionContent, ReactionGroupSnapshot,
+    ReactionSnapshot, ReactionSubjectSnapshot, Repository, ReviewAuxiliaryAcknowledgement,
+    ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewComment, ReviewSubject, ReviewThread,
+    ReviewWriteAcknowledgement, Revision, SelectedViewer, SubmittedReviewEditCapability,
+    WorkflowRunIdentity,
 };
 use crate::participation::{
     DraftStore, PendingCommentIntent, PendingFileCommentIntent, ReviewCommentTarget,
@@ -28,7 +29,7 @@ use crate::participation::{
     SubmissionIntent,
 };
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -2315,10 +2316,11 @@ impl<'a> Session<'a> {
                 "GitHub details repository mismatch"
             );
             let viewer_can_administer = repository.viewer_can_administer;
+            validate_node_id(&repository.id)?;
             let pull = repository
                 .pull_request
                 .context("PR details are unavailable or inaccessible")?;
-            pull.validate(repo, number)?;
+            pull.validate(repo, number, &repository.id)?;
             let next = builder.absorb(
                 repo,
                 pull,
@@ -2326,6 +2328,7 @@ impl<'a> Session<'a> {
                 viewer_can_administer,
                 response.partial,
                 page == 0,
+                cursors.checks.include,
             )?;
             if next.done() {
                 return builder.finish(number);
@@ -4854,9 +4857,12 @@ const DETAILS_QUERY: &str = r#"query PullRequestDetails(
 ) {
   viewer { id login }
   repository(owner: $owner, name: $name) {
-    nameWithOwner viewerCanAdminister
+    id nameWithOwner viewerCanAdminister
     pullRequest(number: $number) {
       id number url headRefOid body state isDraft maintainerCanModify canBeRebased viewerCanReact
+      repository { id nameWithOwner }
+      headRepository { id nameWithOwner }
+      potentialMergeCommit { oid repository { id nameWithOwner } }
       reactionGroups { content viewerHasReacted users { totalCount } }
       viewerCanUpdateBranch mergeable mergeStateStatus reviewDecision
       autoMergeRequest { enabledAt }
@@ -4900,16 +4906,29 @@ const DETAILS_QUERY: &str = r#"query PullRequestDetails(
       }
       statusCheckRollup {
         state
+        commit { oid repository { id nameWithOwner } }
         contexts(first: 50, after: $checksCursor) @include(if: $includeChecks) {
           nodes {
             __typename
             ... on CheckRun {
-              id name status conclusion detailsUrl startedAt completedAt
+              id databaseId name status conclusion permalink detailsUrl startedAt completedAt
               isRequired(pullRequestNumber: $number)
+              repository { id nameWithOwner }
+              checkSuite {
+                id databaseId
+                repository { id nameWithOwner }
+                commit { oid repository { id nameWithOwner } }
+                app { id name slug }
+                workflowRun {
+                  id databaseId runAttempt runNumber event url
+                  workflow { id databaseId name }
+                }
+              }
             }
             ... on StatusContext {
               id context state description targetUrl createdAt updatedAt
               isRequired(pullRequestNumber: $number)
+              commit { oid repository { id nameWithOwner } }
             }
           }
           pageInfo { hasNextPage endCursor }
@@ -4994,6 +5013,7 @@ struct DetailsViewer {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DetailsRepository {
+    id: String,
     name_with_owner: String,
     viewer_can_administer: bool,
     pull_request: Option<DetailsPull>,
@@ -5006,6 +5026,11 @@ struct DetailsPull {
     number: u64,
     url: String,
     head_ref_oid: String,
+    repository: DetailsRepositoryIdentity,
+    #[serde(default)]
+    head_repository: ObservedNullable<DetailsRepositoryIdentity>,
+    #[serde(default)]
+    potential_merge_commit: ObservedNullable<DetailsCommitIdentity>,
     body: String,
     state: String,
     is_draft: bool,
@@ -5025,18 +5050,92 @@ struct DetailsPull {
     comments: Option<GraphqlConnection<DetailsIssueComment>>,
     reviews: Option<GraphqlConnection<DetailsReview>>,
     review_threads: Option<GraphqlConnection<DetailsThread>>,
-    status_check_rollup: Option<DetailsRollup>,
+    #[serde(default)]
+    status_check_rollup: ObservedNullable<DetailsRollup>,
 }
 
 impl DetailsPull {
-    fn validate(&self, repo: &Repository, number: u64) -> Result<()> {
+    fn validate(&self, repo: &Repository, number: u64, repository_id: &str) -> Result<()> {
         ensure!(
             self.number == number
                 && self.url == format!("https://{}/{}/pull/{number}", repo.host, repo.full_name()),
             "GitHub details PR identity mismatch"
         );
+        self.repository.validate(repo, Some(repository_id))?;
+        if let ObservedNullable::Value(head_repository) = &self.head_repository {
+            head_repository.validate_components()?;
+        }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum ObservedNullable<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<T> ObservedNullable<T> {
+    fn as_ref(&self) -> ObservedNullable<&T> {
+        match self {
+            Self::Missing => ObservedNullable::Missing,
+            Self::Null => ObservedNullable::Null,
+            Self::Value(value) => ObservedNullable::Value(value),
+        }
+    }
+
+    fn value(&self) -> Option<&T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Missing | Self::Null => None,
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for ObservedNullable<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DetailsRepositoryIdentity {
+    id: String,
+    name_with_owner: String,
+}
+
+impl DetailsRepositoryIdentity {
+    fn validate_components(&self) -> Result<()> {
+        validate_node_id(&self.id)?;
+        let (owner, name) = self
+            .name_with_owner
+            .split_once('/')
+            .context("GitHub nested repository omitted owner/name coordinates")?;
+        validate_component(owner, false)?;
+        validate_component(name, true)
+    }
+
+    fn validate(&self, repo: &Repository, expected_node_id: Option<&str>) -> Result<()> {
+        self.validate_components()?;
+        ensure!(
+            self.name_with_owner.eq_ignore_ascii_case(&repo.full_name())
+                && expected_node_id.is_none_or(|id| id == self.id),
+            "GitHub nested repository identity mismatch"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct DetailsCommitIdentity {
+    oid: String,
+    repository: DetailsRepositoryIdentity,
 }
 
 #[derive(Deserialize)]
@@ -5155,41 +5254,97 @@ struct DetailsReviewComment {
 
 #[derive(Deserialize)]
 struct DetailsRollup {
-    state: String,
-    contexts: Option<GraphqlConnection<DetailsCheckNode>>,
+    state: Option<String>,
+    #[serde(default)]
+    commit: ObservedNullable<DetailsCommitIdentity>,
+    #[serde(default)]
+    contexts: ObservedNullable<GraphqlConnection<DetailsCheckNode>>,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "__typename")]
 enum DetailsCheckNode {
     CheckRun {
-        id: String,
-        name: String,
-        status: String,
+        id: Option<String>,
+        #[serde(rename = "databaseId", default)]
+        database_id: ObservedNullable<i64>,
+        name: Option<String>,
+        status: Option<String>,
         conclusion: Option<String>,
+        permalink: Option<String>,
         #[serde(rename = "detailsUrl")]
         details_url: Option<String>,
         #[serde(rename = "startedAt")]
         started_at: Option<String>,
         #[serde(rename = "completedAt")]
         completed_at: Option<String>,
-        #[serde(rename = "isRequired")]
-        required: bool,
+        #[serde(rename = "isRequired", default)]
+        required: Option<bool>,
+        repository: Option<DetailsRepositoryIdentity>,
+        #[serde(rename = "checkSuite")]
+        check_suite: Option<Box<DetailsCheckSuite>>,
     },
     StatusContext {
-        id: String,
-        context: String,
-        state: String,
+        id: Option<String>,
+        context: Option<String>,
+        state: Option<String>,
         description: Option<String>,
         #[serde(rename = "targetUrl")]
         target_url: Option<String>,
         #[serde(rename = "createdAt")]
-        created_at: String,
+        created_at: Option<String>,
         #[serde(rename = "updatedAt")]
-        updated_at: String,
-        #[serde(rename = "isRequired")]
-        required: bool,
+        updated_at: Option<String>,
+        #[serde(rename = "isRequired", default)]
+        required: Option<bool>,
+        #[serde(default)]
+        commit: ObservedNullable<DetailsCommitIdentity>,
     },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsCheckSuite {
+    id: Option<String>,
+    #[serde(default)]
+    database_id: ObservedNullable<i64>,
+    repository: Option<DetailsRepositoryIdentity>,
+    commit: Option<DetailsCommitIdentity>,
+    #[serde(default)]
+    app: ObservedNullable<DetailsCheckApp>,
+    #[serde(default)]
+    workflow_run: ObservedNullable<DetailsWorkflowRun>,
+}
+
+#[derive(Deserialize)]
+struct DetailsCheckApp {
+    id: Option<String>,
+    name: Option<String>,
+    slug: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsWorkflowRun {
+    id: Option<String>,
+    #[serde(default)]
+    database_id: ObservedNullable<i64>,
+    run_attempt: Option<i64>,
+    run_number: Option<i64>,
+    event: Option<String>,
+    url: Option<String>,
+    workflow: Option<DetailsWorkflow>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsWorkflow {
+    id: Option<String>,
+    #[serde(default)]
+    database_id: ObservedNullable<i64>,
+    name: Option<String>,
 }
 
 struct DetailsOverview {
@@ -5272,8 +5427,128 @@ fn reaction_subject_snapshot(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DetailsSourceIdentity {
+    base_repository: DetailsRepositoryIdentity,
+    pull_request_node_id: String,
+    head_repository: ObservedNullable<DetailsRepositoryIdentity>,
+    head_sha: String,
+    rollup_commit: ObservedNullable<ObservedCommitIdentity>,
+    potential_merge_commit: ObservedNullable<ObservedCommitIdentity>,
+    complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ObservedCommitIdentity {
+    sha: String,
+    repository: DetailsRepositoryIdentity,
+}
+
+impl DetailsSourceIdentity {
+    fn from_pull(repo: &Repository, pull: &DetailsPull) -> Result<Self> {
+        pull.repository.validate(repo, None)?;
+        let base_repository = pull.repository.clone();
+        let rollup_commit = match &pull.status_check_rollup {
+            ObservedNullable::Missing => ObservedNullable::Missing,
+            ObservedNullable::Null => ObservedNullable::Null,
+            ObservedNullable::Value(rollup) => validate_commit_observation(rollup.commit.as_ref())?,
+        };
+        let potential_merge_commit =
+            validate_commit_observation(pull.potential_merge_commit.as_ref())?;
+        if let ObservedNullable::Value(commit) = &rollup_commit {
+            ensure!(
+                same_repository(&commit.repository, &base_repository)
+                    || matches!(
+                        &pull.head_repository,
+                        ObservedNullable::Value(head)
+                            if same_repository(&commit.repository, head)
+                    ),
+                "GitHub PR rollup repository is neither the base nor observed head repository"
+            );
+        }
+        if let ObservedNullable::Value(commit) = &potential_merge_commit {
+            ensure!(
+                same_repository(&commit.repository, &base_repository),
+                "GitHub potential merge commit belongs to another repository"
+            );
+        }
+        let rollup_state_complete = matches!(
+            &pull.status_check_rollup,
+            ObservedNullable::Null | ObservedNullable::Value(DetailsRollup { state: Some(_), .. })
+        );
+        let complete = !matches!(&pull.head_repository, ObservedNullable::Missing)
+            && rollup_state_complete
+            && !matches!(&rollup_commit, ObservedNullable::Missing)
+            && !matches!(&potential_merge_commit, ObservedNullable::Missing);
+        Ok(Self {
+            base_repository,
+            pull_request_node_id: pull.id.clone(),
+            head_repository: pull.head_repository.clone(),
+            head_sha: pull.head_ref_oid.clone(),
+            rollup_commit,
+            potential_merge_commit,
+            complete,
+        })
+    }
+
+    fn rollup_commit_sha(&self) -> Option<&str> {
+        self.rollup_commit.value().map(|commit| commit.sha.as_str())
+    }
+
+    fn potential_merge_commit_sha(&self) -> Option<&str> {
+        self.potential_merge_commit
+            .value()
+            .map(|commit| commit.sha.as_str())
+    }
+
+    fn allows_check_repository(&self, repository: &DetailsRepositoryIdentity) -> bool {
+        same_repository(repository, &self.base_repository)
+            || matches!(
+                &self.head_repository,
+                ObservedNullable::Value(head) if same_repository(repository, head)
+            )
+            || matches!(
+                &self.rollup_commit,
+                ObservedNullable::Value(rollup)
+                    if same_repository(repository, &rollup.repository)
+            )
+    }
+}
+
+fn validate_commit_observation(
+    commit: ObservedNullable<&DetailsCommitIdentity>,
+) -> Result<ObservedNullable<ObservedCommitIdentity>> {
+    Ok(match commit {
+        ObservedNullable::Missing => ObservedNullable::Missing,
+        ObservedNullable::Null => ObservedNullable::Null,
+        ObservedNullable::Value(commit) => {
+            validate_sha(&commit.oid)?;
+            commit.repository.validate_components()?;
+            ObservedNullable::Value(ObservedCommitIdentity {
+                sha: commit.oid.clone(),
+                repository: commit.repository.clone(),
+            })
+        }
+    })
+}
+
+fn same_repository(left: &DetailsRepositoryIdentity, right: &DetailsRepositoryIdentity) -> bool {
+    left.id == right.id
+        && left
+            .name_with_owner
+            .eq_ignore_ascii_case(&right.name_with_owner)
+}
+
+fn domain_repository(repository: &DetailsRepositoryIdentity) -> CheckRepositoryIdentity {
+    CheckRepositoryIdentity {
+        node_id: repository.id.clone(),
+        name_with_owner: repository.name_with_owner.clone(),
+    }
+}
+
 struct DetailsBuilder {
     head_oid: Option<String>,
+    source_identity: Option<DetailsSourceIdentity>,
     viewer: Option<SelectedViewer>,
     pull_request: Option<ProviderCoordinates>,
     viewer_can_administer: Option<bool>,
@@ -5297,6 +5572,7 @@ impl Default for DetailsBuilder {
     fn default() -> Self {
         Self {
             head_oid: None,
+            source_identity: None,
             viewer: None,
             pull_request: None,
             viewer_can_administer: None,
@@ -5327,8 +5603,18 @@ impl DetailsBuilder {
         viewer_can_administer: bool,
         partial: bool,
         first: bool,
+        checks_requested: bool,
     ) -> Result<DetailsCursors> {
         let number = pull.number;
+        let source_identity = DetailsSourceIdentity::from_pull(repo, &pull)?;
+        if let Some(prior) = &self.source_identity {
+            ensure!(
+                prior == &source_identity,
+                "PR Checks source identity changed during pagination; refresh to retry"
+            );
+        } else {
+            self.source_identity = Some(source_identity.clone());
+        }
         validate_node_id(&viewer.id)?;
         ensure!(
             viewer.login.eq_ignore_ascii_case(&repo.account.login),
@@ -5379,6 +5665,12 @@ impl DetailsBuilder {
             self.notice("GitHub returned partial collaboration data; unavailable fields were not treated as complete.");
             self.reaction_authority_complete = false;
             self.dismissal_authority_complete = false;
+        }
+        if !source_identity.complete {
+            self.checks_complete = false;
+            self.notice(
+                "GitHub omitted requested Checks source identity; the checks snapshot is partial.",
+            );
         }
         if first {
             self.reactions.push(reaction_subject_snapshot(
@@ -5449,8 +5741,8 @@ impl DetailsBuilder {
                         .into(),
                     check_status: map_check_status(
                         pull.status_check_rollup
-                            .as_ref()
-                            .map(|rollup| rollup.state.as_str()),
+                            .value()
+                            .and_then(|rollup| rollup.state.as_deref()),
                         partial,
                     )
                     .into(),
@@ -5571,8 +5863,22 @@ impl DetailsBuilder {
                     .push(thread.into_domain(repo, number, comments_complete));
             }
         }
-        if let Some(rollup) = pull.status_check_rollup
-            && let Some(connection) = rollup.contexts
+        let checks_response_present = matches!(
+            &pull.status_check_rollup,
+            ObservedNullable::Null
+                | ObservedNullable::Value(DetailsRollup {
+                    contexts: ObservedNullable::Value(_),
+                    ..
+                })
+        );
+        if checks_requested && !checks_response_present {
+            self.checks_complete = false;
+            self.notice(
+                "GitHub omitted the requested Checks page; the checks snapshot is partial.",
+            );
+        }
+        if let ObservedNullable::Value(rollup) = pull.status_check_rollup
+            && let ObservedNullable::Value(connection) = rollup.contexts
         {
             next.checks = next_cursor(&connection.page_info)?;
             if connection.nodes.iter().any(Option::is_none) {
@@ -5582,12 +5888,18 @@ impl DetailsBuilder {
                 );
             }
             for check in connection.nodes.into_iter().flatten() {
-                let id = check.id();
-                ensure!(
-                    self.check_ids.insert(id.to_owned()),
-                    "PR checks changed during pagination; refresh to retry"
-                );
-                self.checks.push(check.into_domain(repo, number));
+                let mapped = check.into_domain(repo, number, &source_identity)?;
+                if !mapped.complete {
+                    self.checks_complete = false;
+                    self.notice("Checks omitted exact identity fields; affected rows remain read-only and unknown.");
+                }
+                if let Some(check) = mapped.check {
+                    ensure!(
+                        self.check_ids.insert(check.coordinates.remote_id.clone()),
+                        "PR checks changed during pagination; refresh to retry"
+                    );
+                    self.checks.push(check);
+                }
             }
         }
         Ok(next)
@@ -5615,6 +5927,42 @@ impl DetailsBuilder {
         }
         Ok(PullRequestDetails {
             number,
+            pull_request_node_id: self
+                .source_identity
+                .as_ref()
+                .map(|source| source.pull_request_node_id.clone()),
+            base_repository: self
+                .source_identity
+                .as_ref()
+                .map(|source| domain_repository(&source.base_repository)),
+            observed_head_sha: self
+                .source_identity
+                .as_ref()
+                .map(|source| source.head_sha.clone()),
+            rollup_commit_sha: self
+                .source_identity
+                .as_ref()
+                .and_then(|source| source.rollup_commit_sha().map(str::to_owned)),
+            potential_merge_commit_sha: self
+                .source_identity
+                .as_ref()
+                .and_then(|source| source.potential_merge_commit_sha().map(str::to_owned)),
+            head_repository: self
+                .source_identity
+                .as_ref()
+                .and_then(|source| source.head_repository.value().map(domain_repository)),
+            rollup_repository: self.source_identity.as_ref().and_then(|source| {
+                source
+                    .rollup_commit
+                    .value()
+                    .map(|commit| domain_repository(&commit.repository))
+            }),
+            potential_merge_commit_repository: self.source_identity.as_ref().and_then(|source| {
+                source
+                    .potential_merge_commit
+                    .value()
+                    .map(|commit| domain_repository(&commit.repository))
+            }),
             body: overview.body,
             requested_reviewers: overview.requested_reviewers,
             labels: overview.labels,
@@ -5775,35 +6123,72 @@ impl DetailsReviewComment {
 }
 
 impl DetailsCheckNode {
-    fn id(&self) -> &str {
-        match self {
-            Self::CheckRun { id, .. } | Self::StatusContext { id, .. } => id,
-        }
-    }
-
-    fn into_domain(self, repo: &Repository, number: u64) -> PullRequestCheck {
+    fn into_domain(
+        self,
+        repo: &Repository,
+        number: u64,
+        source: &DetailsSourceIdentity,
+    ) -> Result<MappedCheck> {
         match self {
             Self::CheckRun {
                 id,
+                database_id,
                 name,
                 status,
                 conclusion,
+                permalink,
                 details_url,
                 started_at,
                 completed_at,
                 required,
-            } => PullRequestCheck {
-                coordinates: coordinates(repo, number, id),
-                kind: CheckKind::CheckRun,
-                name,
-                status,
-                conclusion,
-                description: None,
-                details_url,
-                started_at,
-                completed_at,
-                required: Some(required),
-            },
+                repository,
+                check_suite,
+            } => {
+                let (Some(id), Some(name), Some(status)) = (id, name, status) else {
+                    return Ok(MappedCheck::missing());
+                };
+                if validate_node_id(&id).is_err()
+                    || !valid_identity_text(&name)
+                    || !valid_identity_text(&status)
+                {
+                    return Ok(MappedCheck::missing());
+                }
+                let mut complete = required.is_some();
+                complete &= validate_nested_repository(source, repository.as_ref())?;
+                let (database_id, database_id_complete) = optional_graphql_database_id(database_id);
+                complete &= database_id_complete;
+                let (github_permalink, permalink_complete) = required_github_url(permalink);
+                complete &= permalink_complete;
+                let (details_url, details_url_complete) = optional_display_uri(details_url);
+                complete &= details_url_complete;
+                let suite =
+                    map_check_suite(source, repository.as_ref(), check_suite.map(|suite| *suite))?;
+                complete &= suite.complete;
+                let commit_sha = suite.commit_sha;
+                let sha_class = classify_check_sha(commit_sha.as_deref(), source);
+                Ok(MappedCheck {
+                    check: Some(PullRequestCheck {
+                        coordinates: coordinates(repo, number, id),
+                        kind: CheckKind::CheckRun,
+                        name,
+                        status,
+                        conclusion,
+                        description: None,
+                        details_url,
+                        github_permalink,
+                        started_at,
+                        completed_at,
+                        required,
+                        database_id,
+                        suite: suite.identity,
+                        commit_sha,
+                        commit_repository: suite.commit_repository,
+                        sha_class,
+                        actions_linkage: suite.actions_linkage,
+                    }),
+                    complete,
+                })
+            }
             Self::StatusContext {
                 id,
                 context,
@@ -5813,19 +6198,343 @@ impl DetailsCheckNode {
                 created_at,
                 updated_at,
                 required,
-            } => PullRequestCheck {
-                coordinates: coordinates(repo, number, id),
-                kind: CheckKind::CommitStatus,
-                name: context,
-                status: state,
-                conclusion: None,
-                description,
-                details_url: target_url,
-                started_at: Some(created_at),
-                completed_at: Some(updated_at),
-                required: Some(required),
-            },
+                commit,
+            } => {
+                let (Some(id), Some(context), Some(state)) = (id, context, state) else {
+                    return Ok(MappedCheck::missing());
+                };
+                if validate_node_id(&id).is_err()
+                    || !valid_identity_text(&context)
+                    || !valid_identity_text(&state)
+                {
+                    return Ok(MappedCheck::missing());
+                }
+                let commit_repository = commit_repository_for_status(commit.as_ref());
+                let (commit_sha, commit_complete) = map_optional_check_commit(source, commit)?;
+                let (details_url, details_url_complete) = optional_display_uri(target_url);
+                let complete = required.is_some()
+                    && created_at.is_some()
+                    && updated_at.is_some()
+                    && commit_complete
+                    && details_url_complete;
+                Ok(MappedCheck {
+                    check: Some(PullRequestCheck {
+                        coordinates: coordinates(repo, number, id),
+                        kind: CheckKind::CommitStatus,
+                        name: context,
+                        status: state,
+                        conclusion: None,
+                        description,
+                        details_url,
+                        github_permalink: None,
+                        started_at: created_at,
+                        completed_at: updated_at,
+                        required,
+                        database_id: None,
+                        suite: None,
+                        sha_class: classify_check_sha(commit_sha.as_deref(), source),
+                        commit_sha,
+                        commit_repository,
+                        actions_linkage: ActionsLinkage::NoObservedLink,
+                    }),
+                    complete,
+                })
+            }
+            Self::Unknown => Ok(MappedCheck::missing()),
         }
+    }
+}
+
+struct MappedCheck {
+    check: Option<PullRequestCheck>,
+    complete: bool,
+}
+
+impl MappedCheck {
+    fn missing() -> Self {
+        Self {
+            check: None,
+            complete: false,
+        }
+    }
+}
+
+struct MappedCheckSuite {
+    identity: Option<CheckSuiteIdentity>,
+    commit_sha: Option<String>,
+    commit_repository: Option<CheckRepositoryIdentity>,
+    actions_linkage: ActionsLinkage,
+    complete: bool,
+}
+
+fn map_check_suite(
+    source: &DetailsSourceIdentity,
+    check_repository: Option<&DetailsRepositoryIdentity>,
+    suite: Option<DetailsCheckSuite>,
+) -> Result<MappedCheckSuite> {
+    let Some(suite) = suite else {
+        return Ok(MappedCheckSuite {
+            identity: None,
+            commit_sha: None,
+            commit_repository: None,
+            actions_linkage: ActionsLinkage::Unknown,
+            complete: false,
+        });
+    };
+    let mut complete = validate_nested_repository(source, suite.repository.as_ref())?;
+    if let (Some(check_repository), Some(suite_repository)) =
+        (check_repository, suite.repository.as_ref())
+    {
+        ensure!(
+            same_repository(check_repository, suite_repository),
+            "GitHub CheckRun and CheckSuite repository identities disagree"
+        );
+    }
+    let suite_repository = suite.repository;
+    let commit_sha = if let Some(commit) = suite.commit {
+        validate_sha(&commit.oid)?;
+        ensure!(
+            source.allows_check_repository(&commit.repository),
+            "GitHub check-suite commit belongs to an unrelated repository"
+        );
+        if let Some(suite_repository) = &suite_repository {
+            ensure!(
+                same_repository(&commit.repository, suite_repository),
+                "GitHub CheckSuite and its commit repository identities disagree"
+            );
+        }
+        Some(commit.oid)
+    } else {
+        complete = false;
+        None
+    };
+    let (database_id, database_id_complete) = optional_graphql_database_id(suite.database_id);
+    complete &= database_id_complete;
+    let app = match suite.app {
+        ObservedNullable::Missing => {
+            complete = false;
+            None
+        }
+        ObservedNullable::Null => None,
+        ObservedNullable::Value(app) => {
+            let (Some(node_id), Some(name), Some(slug)) = (app.id, app.name, app.slug) else {
+                return finish_check_suite(
+                    suite.id,
+                    database_id,
+                    suite_repository,
+                    None,
+                    commit_sha,
+                    ActionsLinkage::Unknown,
+                    false,
+                );
+            };
+            if validate_node_id(&node_id).is_err()
+                || !valid_identity_text(&name)
+                || !valid_identity_text(&slug)
+            {
+                complete = false;
+                None
+            } else {
+                Some(CheckAppIdentity {
+                    node_id,
+                    name,
+                    slug,
+                })
+            }
+        }
+    };
+    let actions_linkage = match suite.workflow_run {
+        ObservedNullable::Missing => {
+            complete = false;
+            ActionsLinkage::Unknown
+        }
+        ObservedNullable::Null => ActionsLinkage::NoObservedLink,
+        ObservedNullable::Value(run) => match map_workflow_run(run) {
+            Some(run) => ActionsLinkage::Linked(run),
+            None => {
+                complete = false;
+                ActionsLinkage::Unknown
+            }
+        },
+    };
+    finish_check_suite(
+        suite.id,
+        database_id,
+        suite_repository,
+        app,
+        commit_sha,
+        actions_linkage,
+        complete,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_check_suite(
+    node_id: Option<String>,
+    database_id: Option<u64>,
+    repository: Option<DetailsRepositoryIdentity>,
+    app: Option<CheckAppIdentity>,
+    commit_sha: Option<String>,
+    actions_linkage: ActionsLinkage,
+    mut complete: bool,
+) -> Result<MappedCheckSuite> {
+    let identity = match (node_id, repository.as_ref()) {
+        (Some(node_id), Some(repository)) if validate_node_id(&node_id).is_ok() => {
+            Some(CheckSuiteIdentity {
+                node_id,
+                database_id,
+                repository: domain_repository(repository),
+                app,
+            })
+        }
+        _ => {
+            complete = false;
+            None
+        }
+    };
+    Ok(MappedCheckSuite {
+        identity,
+        commit_sha,
+        commit_repository: repository.as_ref().map(domain_repository),
+        actions_linkage,
+        complete,
+    })
+}
+
+fn map_workflow_run(run: DetailsWorkflowRun) -> Option<WorkflowRunIdentity> {
+    let workflow = run.workflow?;
+    let node_id = run.id?;
+    let database_id = required_graphql_database_id(run.database_id)?;
+    let run_attempt = required_graphql_int(run.run_attempt)?;
+    let run_number = required_graphql_int(run.run_number)?;
+    let event = run.event?;
+    let github_url = run.url?;
+    let workflow_node_id = workflow.id?;
+    let workflow_database_id = required_graphql_database_id(workflow.database_id)?;
+    let workflow_name = workflow.name?;
+    (validate_node_id(&node_id).is_ok()
+        && validate_node_id(&workflow_node_id).is_ok()
+        && valid_identity_text(&event)
+        && valid_identity_text(&workflow_name)
+        && valid_github_url(&github_url))
+    .then_some(WorkflowRunIdentity {
+        node_id,
+        database_id,
+        run_attempt,
+        run_number,
+        event,
+        github_url,
+        workflow_node_id,
+        workflow_database_id,
+        workflow_name,
+    })
+}
+
+fn map_optional_check_commit(
+    source: &DetailsSourceIdentity,
+    commit: ObservedNullable<DetailsCommitIdentity>,
+) -> Result<(Option<String>, bool)> {
+    Ok(match commit {
+        ObservedNullable::Missing => (None, false),
+        ObservedNullable::Null => (None, true),
+        ObservedNullable::Value(commit) => {
+            validate_sha(&commit.oid)?;
+            ensure!(
+                source.allows_check_repository(&commit.repository),
+                "GitHub status context belongs to an unrelated repository"
+            );
+            (Some(commit.oid), true)
+        }
+    })
+}
+
+fn validate_nested_repository(
+    source: &DetailsSourceIdentity,
+    repository: Option<&DetailsRepositoryIdentity>,
+) -> Result<bool> {
+    let Some(repository) = repository else {
+        return Ok(false);
+    };
+    repository.validate_components()?;
+    ensure!(
+        source.allows_check_repository(repository),
+        "GitHub check belongs to an unrelated repository"
+    );
+    Ok(true)
+}
+
+fn commit_repository_for_status(
+    commit: ObservedNullable<&DetailsCommitIdentity>,
+) -> Option<CheckRepositoryIdentity> {
+    commit
+        .value()
+        .map(|commit| domain_repository(&commit.repository))
+}
+
+fn classify_check_sha(commit_sha: Option<&str>, source: &DetailsSourceIdentity) -> CheckShaClass {
+    match commit_sha {
+        Some(sha) if sha == source.head_sha => CheckShaClass::Head,
+        Some(sha) if Some(sha) == source.potential_merge_commit_sha() => {
+            CheckShaClass::MergeCandidate
+        }
+        Some(_) => CheckShaClass::Other,
+        None => CheckShaClass::Unknown,
+    }
+}
+
+fn optional_graphql_database_id(value: ObservedNullable<i64>) -> (Option<u64>, bool) {
+    match value {
+        ObservedNullable::Missing => (None, false),
+        ObservedNullable::Null => (None, true),
+        ObservedNullable::Value(value) => match required_graphql_int(Some(value)) {
+            Some(value) => (Some(value), true),
+            None => (None, false),
+        },
+    }
+}
+
+fn required_graphql_database_id(value: ObservedNullable<i64>) -> Option<u64> {
+    match value {
+        ObservedNullable::Value(value) => required_graphql_int(Some(value)),
+        ObservedNullable::Missing | ObservedNullable::Null => None,
+    }
+}
+
+fn required_graphql_int(value: Option<i64>) -> Option<u64> {
+    value
+        .filter(|value| (1..=i64::from(i32::MAX)).contains(value))
+        .and_then(|value| u64::try_from(value).ok())
+}
+
+fn valid_identity_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 4096
+        && !value.chars().any(|character| character.is_control())
+}
+
+fn valid_display_uri(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 16 * 1024
+        && !value.chars().any(|character| character.is_control())
+        && !value.chars().any(char::is_whitespace)
+}
+
+fn valid_github_url(value: &str) -> bool {
+    value.starts_with("https://github.com/") && valid_display_uri(value)
+}
+
+fn optional_display_uri(value: Option<String>) -> (Option<String>, bool) {
+    match value {
+        Some(value) if valid_display_uri(&value) => (Some(value), true),
+        Some(_) => (None, false),
+        None => (None, true),
+    }
+}
+
+fn required_github_url(value: Option<String>) -> (Option<String>, bool) {
+    match value {
+        Some(value) if valid_github_url(&value) => (Some(value), true),
+        Some(_) | None => (None, false),
     }
 }
 
@@ -6622,6 +7331,9 @@ else:
             "id": "PR1",
             "number": 1,
             "headRefOid": "b".repeat(40),
+            "repository": {"id": "R-base", "nameWithOwner": "owner/repo"},
+            "headRepository": {"id": "R-base", "nameWithOwner": "owner/repo"},
+            "potentialMergeCommit": null,
             "url": "https://github.com/owner/repo/pull/1",
             "body": "Overview body",
             "state": "OPEN",
@@ -6634,6 +7346,7 @@ else:
             "reviewDecision": "APPROVED",
             "autoMergeRequest": null,
             "isInMergeQueue": false,
+            "statusCheckRollup": null,
             "viewerCanReact": true,
             "reactionGroups": [],
             "reviewRequests": {"nodes": [{"requestedReviewer": {"login": "reviewer"}}, {"requestedReviewer": {"slug": "maintainers"}}], "pageInfo": {"hasNextPage": false, "endCursor": null}},
@@ -6647,12 +7360,477 @@ else:
             "data": {
                 "viewer": {"id": "U-alice", "login": "alice"},
                 "repository": {
+                    "id": "R-base",
                     "nameWithOwner": "owner/repo",
                     "viewerCanAdminister": false,
                     "pullRequest": pull
                 }
             }
         })
+    }
+
+    fn repository_identity(id: &str, name_with_owner: &str) -> Value {
+        json!({"id": id, "nameWithOwner": name_with_owner})
+    }
+
+    fn complete_check_run(
+        check_id: &str,
+        commit_sha: &str,
+        repository: Value,
+        workflow_run: Value,
+    ) -> Value {
+        json!({
+            "__typename": "CheckRun",
+            "id": check_id,
+            "databaseId": 101,
+            "name": "CI / build",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "permalink": "https://github.com/owner/repo/runs/101",
+            "detailsUrl": "https://integrator.example/build?id=101",
+            "startedAt": "2026-09-14T10:00:00Z",
+            "completedAt": "2026-09-14T10:01:00Z",
+            "isRequired": true,
+            "repository": repository.clone(),
+            "checkSuite": {
+                "id": "SUITE-1",
+                "databaseId": 202,
+                "repository": repository.clone(),
+                "commit": {"oid": commit_sha, "repository": repository},
+                "app": {"id": "APP-1", "name": "Builder", "slug": "builder"},
+                "workflowRun": workflow_run
+            }
+        })
+    }
+
+    fn complete_workflow_run() -> Value {
+        json!({
+            "id": "RUN-node",
+            "databaseId": 303,
+            "runAttempt": 2,
+            "runNumber": 44,
+            "event": "pull_request",
+            "url": "https://github.com/owner/repo/actions/runs/303",
+            "workflow": {"id": "WORKFLOW-node", "databaseId": 404, "name": "CI"}
+        })
+    }
+
+    fn install_rollup(pull: &mut Value, commit_sha: &str, repository: Value, nodes: Value) {
+        pull["statusCheckRollup"] = json!({
+            "state": "SUCCESS",
+            "commit": {"oid": commit_sha, "repository": repository},
+            "contexts": {
+                "nodes": nodes,
+                "pageInfo": {"hasNextPage": false, "endCursor": null}
+            }
+        });
+    }
+
+    #[test]
+    fn checks_identity_query_uses_current_exact_schema_fields_without_logs_or_actions() {
+        for field in [
+            "id databaseId name status conclusion permalink detailsUrl",
+            "repository { id nameWithOwner }",
+            "commit { oid repository { id nameWithOwner } }",
+            "app { id name slug }",
+            "id databaseId runAttempt runNumber event url",
+            "workflow { id databaseId name }",
+        ] {
+            assert!(
+                DETAILS_QUERY.contains(field),
+                "missing query field: {field}"
+            );
+        }
+        for excluded in ["annotations", "steps", "jobs", "mutation"] {
+            assert!(
+                !DETAILS_QUERY.contains(excluded),
+                "unexpected field: {excluded}"
+            );
+        }
+    }
+
+    #[test]
+    fn checks_identity_complete_actions_preserves_exact_identity_and_separate_urls() {
+        let head = "b".repeat(40);
+        let base = repository_identity("R-base", "owner/repo");
+        let mut pull = details_overview();
+        install_rollup(
+            &mut pull,
+            &head,
+            base.clone(),
+            json!([complete_check_run(
+                "CHECK-node",
+                &head,
+                base,
+                complete_workflow_run(),
+            )]),
+        );
+        let (dir, provider) = fixture(
+            "alice",
+            vec![details_step(details_response(pull), json!({"number": 1}))],
+        );
+        let details = provider.details(&repo("alice"), 1).unwrap();
+        assert!(details.checks_complete);
+        assert_eq!(details.observed_head_sha.as_deref(), Some(head.as_str()));
+        assert_eq!(details.rollup_commit_sha.as_deref(), Some(head.as_str()));
+        assert_eq!(details.pull_request_node_id.as_deref(), Some("PR1"));
+        assert_eq!(details.base_repository.as_ref().unwrap().node_id, "R-base");
+        let check = &details.checks[0];
+        assert_eq!(check.database_id, Some(101));
+        assert_eq!(check.sha_class, CheckShaClass::Head);
+        assert_eq!(
+            check.github_permalink.as_deref(),
+            Some("https://github.com/owner/repo/runs/101")
+        );
+        assert_eq!(
+            check.details_url.as_deref(),
+            Some("https://integrator.example/build?id=101")
+        );
+        let suite = check.suite.as_ref().unwrap();
+        assert_eq!(suite.database_id, Some(202));
+        assert_eq!(suite.app.as_ref().unwrap().slug, "builder");
+        let ActionsLinkage::Linked(run) = &check.actions_linkage else {
+            panic!("complete workflow relation must be linked")
+        };
+        assert_eq!(
+            (run.database_id, run.run_attempt, run.run_number),
+            (303, 2, 44)
+        );
+        assert_eq!(run.workflow_database_id, 404);
+        assert_eq!(run.workflow_name, "CI");
+        exhausted(&dir, 1);
+    }
+
+    #[test]
+    fn checks_identity_null_unlinked_and_spoofed_slug_never_classify_as_actions() {
+        let head = "b".repeat(40);
+        let base = repository_identity("R-base", "owner/repo");
+        let mut pull = details_overview();
+        let mut check = complete_check_run("CHECK-unlinked", &head, base.clone(), Value::Null);
+        check["name"] = json!("GitHub Actions / deploy");
+        check["checkSuite"]["app"]["slug"] = json!("github-actions");
+        install_rollup(&mut pull, &head, base, json!([check]));
+        let (dir, provider) = fixture(
+            "alice",
+            vec![details_step(details_response(pull), json!({"number": 1}))],
+        );
+        let details = provider.details(&repo("alice"), 1).unwrap();
+        assert!(details.checks_complete);
+        assert_eq!(details.checks[0].kind, CheckKind::CheckRun);
+        assert_eq!(
+            details.checks[0].actions_linkage,
+            ActionsLinkage::NoObservedLink
+        );
+        exhausted(&dir, 1);
+    }
+
+    #[test]
+    fn checks_identity_status_context_named_ci_remains_commit_status() {
+        let head = "b".repeat(40);
+        let base = repository_identity("R-base", "owner/repo");
+        let mut pull = details_overview();
+        install_rollup(
+            &mut pull,
+            &head,
+            base.clone(),
+            json!([{
+                "__typename": "StatusContext", "id": "STATUS-node", "context": "GitHub Actions CI",
+                "state": "SUCCESS", "description": "complete", "targetUrl": "https://ci.example/status",
+                "createdAt": "2026-09-14T10:00:00Z", "updatedAt": "2026-09-14T10:01:00Z",
+                "isRequired": false, "commit": {"oid": head, "repository": base}
+            }]),
+        );
+        let (dir, provider) = fixture(
+            "alice",
+            vec![details_step(details_response(pull), json!({"number": 1}))],
+        );
+        let details = provider.details(&repo("alice"), 1).unwrap();
+        let check = &details.checks[0];
+        assert_eq!(check.kind, CheckKind::CommitStatus);
+        assert!(check.database_id.is_none() && check.suite.is_none());
+        assert_eq!(check.actions_linkage, ActionsLinkage::NoObservedLink);
+        exhausted(&dir, 1);
+    }
+
+    #[test]
+    fn checks_identity_merge_candidate_sha_is_not_presented_as_pr_head() {
+        let merge = "c".repeat(40);
+        let base = repository_identity("R-base", "owner/repo");
+        let mut pull = details_overview();
+        pull["potentialMergeCommit"] = json!({"oid": merge, "repository": base.clone()});
+        install_rollup(
+            &mut pull,
+            &"b".repeat(40),
+            base.clone(),
+            json!([complete_check_run("CHECK-merge", &merge, base, Value::Null,)]),
+        );
+        let (dir, provider) = fixture(
+            "alice",
+            vec![details_step(details_response(pull), json!({"number": 1}))],
+        );
+        let details = provider.details(&repo("alice"), 1).unwrap();
+        assert_eq!(details.checks[0].sha_class, CheckShaClass::MergeCandidate);
+        assert_eq!(
+            details
+                .potential_merge_commit_repository
+                .as_ref()
+                .unwrap()
+                .node_id,
+            "R-base"
+        );
+        exhausted(&dir, 1);
+    }
+
+    #[test]
+    fn checks_identity_exact_fork_origin_accepted_but_foreign_origin_rejected() {
+        let head = "b".repeat(40);
+        let fork = repository_identity("R-fork", "contributor/fork");
+        let mut pull = details_overview();
+        pull["headRepository"] = fork.clone();
+        install_rollup(
+            &mut pull,
+            &head,
+            fork.clone(),
+            json!([complete_check_run("CHECK-fork", &head, fork, Value::Null)]),
+        );
+        let (dir, provider) = fixture(
+            "alice",
+            vec![details_step(details_response(pull), json!({"number": 1}))],
+        );
+        let details = provider.details(&repo("alice"), 1).unwrap();
+        assert_eq!(
+            details.checks[0]
+                .commit_repository
+                .as_ref()
+                .unwrap()
+                .name_with_owner,
+            "contributor/fork"
+        );
+        exhausted(&dir, 1);
+
+        let foreign = repository_identity("R-foreign", "mallory/other");
+        let mut pull = details_overview();
+        install_rollup(
+            &mut pull,
+            &head,
+            repository_identity("R-base", "owner/repo"),
+            json!([complete_check_run(
+                "CHECK-foreign",
+                &head,
+                foreign,
+                Value::Null,
+            )]),
+        );
+        let (dir, provider) = fixture(
+            "alice",
+            vec![details_step(details_response(pull), json!({"number": 1}))],
+        );
+        assert!(provider.details(&repo("alice"), 1).is_err());
+        exhausted(&dir, 1);
+    }
+
+    #[test]
+    fn checks_identity_omitted_partial_and_out_of_range_fields_remain_unknown() {
+        for defect in [
+            "workflow-omitted",
+            "workflow-db-null",
+            "check-db-wide",
+            "required-omitted",
+        ] {
+            let head = "b".repeat(40);
+            let base = repository_identity("R-base", "owner/repo");
+            let mut pull = details_overview();
+            let mut check = complete_check_run(
+                "CHECK-partial",
+                &head,
+                base.clone(),
+                complete_workflow_run(),
+            );
+            match defect {
+                "workflow-omitted" => {
+                    check["checkSuite"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("workflowRun");
+                }
+                "workflow-db-null" => {
+                    check["checkSuite"]["workflowRun"]["databaseId"] = Value::Null
+                }
+                "check-db-wide" => check["databaseId"] = json!(i64::from(i32::MAX) + 1),
+                "required-omitted" => {
+                    check.as_object_mut().unwrap().remove("isRequired");
+                }
+                _ => unreachable!(),
+            }
+            install_rollup(&mut pull, &head, base, json!([check]));
+            let (dir, provider) = fixture(
+                "alice",
+                vec![details_step(details_response(pull), json!({"number": 1}))],
+            );
+            let details = provider.details(&repo("alice"), 1).unwrap();
+            assert!(!details.checks_complete, "{defect}");
+            match defect {
+                "workflow-omitted" | "workflow-db-null" => {
+                    assert_eq!(details.checks[0].actions_linkage, ActionsLinkage::Unknown)
+                }
+                "check-db-wide" => assert_eq!(details.checks[0].database_id, None),
+                "required-omitted" => assert_eq!(details.checks[0].required, None),
+                _ => unreachable!(),
+            }
+            exhausted(&dir, 1);
+        }
+    }
+
+    #[test]
+    fn checks_identity_null_rollup_differs_from_missing_or_null_page_data() {
+        for defect in [
+            "null-rollup",
+            "missing-rollup",
+            "null-contexts",
+            "null-node",
+            "unknown-node",
+            "empty-terminal",
+        ] {
+            let mut pull = details_overview();
+            match defect {
+                "null-rollup" => pull["statusCheckRollup"] = Value::Null,
+                "missing-rollup" => {
+                    pull.as_object_mut().unwrap().remove("statusCheckRollup");
+                }
+                "null-contexts" => {
+                    pull["statusCheckRollup"] = json!({
+                        "state": "SUCCESS",
+                        "commit": {"oid": "b".repeat(40), "repository": repository_identity("R-base", "owner/repo")},
+                        "contexts": null
+                    });
+                }
+                "null-node" => install_rollup(
+                    &mut pull,
+                    &"b".repeat(40),
+                    repository_identity("R-base", "owner/repo"),
+                    json!([null]),
+                ),
+                "unknown-node" => install_rollup(
+                    &mut pull,
+                    &"b".repeat(40),
+                    repository_identity("R-base", "owner/repo"),
+                    json!([{"__typename": "FutureCheckContext", "id": "FUTURE-1"}]),
+                ),
+                "empty-terminal" => install_rollup(
+                    &mut pull,
+                    &"b".repeat(40),
+                    repository_identity("R-base", "owner/repo"),
+                    json!([]),
+                ),
+                _ => unreachable!(),
+            }
+            let (dir, provider) = fixture(
+                "alice",
+                vec![details_step(details_response(pull), json!({"number": 1}))],
+            );
+            let details = provider.details(&repo("alice"), 1).unwrap();
+            let expected_complete = matches!(defect, "null-rollup" | "empty-terminal");
+            assert_eq!(details.checks_complete, expected_complete, "{defect}");
+            assert!(details.checks.is_empty());
+            exhausted(&dir, 1);
+        }
+    }
+
+    #[test]
+    fn checks_identity_moving_rollup_or_merge_candidate_rejects_the_prefix() {
+        for moving_field in ["rollup-sha", "rollup-repository", "merge-candidate"] {
+            let base = repository_identity("R-base", "owner/repo");
+            let mut first = details_overview();
+            first["potentialMergeCommit"] =
+                json!({"oid": "c".repeat(40), "repository": base.clone()});
+            install_rollup(&mut first, &"b".repeat(40), base.clone(), json!([]));
+            first["statusCheckRollup"]["contexts"]["pageInfo"] =
+                json!({"hasNextPage": true, "endCursor": "checks-next"});
+
+            let mut second = first.clone();
+            second["statusCheckRollup"]["contexts"]["pageInfo"] =
+                json!({"hasNextPage": false, "endCursor": null});
+            match moving_field {
+                "rollup-sha" => {
+                    second["statusCheckRollup"]["commit"]["oid"] = json!("d".repeat(40));
+                }
+                "rollup-repository" => {
+                    let fork = repository_identity("R-fork", "contributor/fork");
+                    second["headRepository"] = fork.clone();
+                    second["statusCheckRollup"]["commit"]["repository"] = fork;
+                }
+                "merge-candidate" => {
+                    second["potentialMergeCommit"]["oid"] = json!("e".repeat(40));
+                }
+                _ => unreachable!(),
+            }
+            let (dir, provider) = fixture(
+                "alice",
+                vec![
+                    details_step(
+                        details_response(first),
+                        json!({"checksCursor": null, "includeChecks": true}),
+                    ),
+                    details_step(
+                        details_response(second),
+                        json!({"checksCursor": "checks-next", "includeChecks": true}),
+                    ),
+                ],
+            );
+            let error = provider.details(&repo("alice"), 1).unwrap_err();
+            assert!(
+                error.to_string().contains("source identity changed"),
+                "{moving_field}: {error:#}"
+            );
+            exhausted(&dir, 2);
+        }
+    }
+
+    #[test]
+    fn checks_identity_completed_cursor_does_not_penalize_omitted_later_contexts() {
+        let base = repository_identity("R-base", "owner/repo");
+        let mut first = details_overview();
+        first["comments"] = json!({
+            "nodes": [],
+            "pageInfo": {"hasNextPage": true, "endCursor": "comments-next"}
+        });
+        install_rollup(&mut first, &"b".repeat(40), base.clone(), json!([]));
+
+        let mut second = details_overview();
+        second["comments"] = json!({
+            "nodes": [],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        });
+        second["statusCheckRollup"] = json!({
+            "state": "SUCCESS",
+            "commit": {"oid": "b".repeat(40), "repository": base}
+        });
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                details_step(
+                    details_response(first),
+                    json!({"commentsCursor": null, "includeComments": true, "includeChecks": true}),
+                ),
+                details_step(
+                    details_response(second),
+                    json!({"commentsCursor": "comments-next", "includeComments": true, "includeChecks": false}),
+                ),
+            ],
+        );
+        let details = provider.details(&repo("alice"), 1).unwrap();
+        assert!(details.checks_complete);
+        assert!(details.checks.is_empty());
+        exhausted(&dir, 2);
+    }
+
+    #[test]
+    fn checks_identity_selected_viewer_mismatch_rejects_before_admission() {
+        let mut response = details_response(details_overview());
+        response["data"]["viewer"]["login"] = json!("mallory");
+        let (dir, provider) = fixture("alice", vec![details_step(response, json!({"number": 1}))]);
+        assert!(provider.details(&repo("alice"), 1).is_err());
+        exhausted(&dir, 1);
     }
 
     #[test]
