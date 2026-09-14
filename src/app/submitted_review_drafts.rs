@@ -509,7 +509,15 @@ impl SubmittedReviewDraftStore {
         expected_target: Option<&fs::Metadata>,
         bytes: &[u8],
     ) -> Result<()> {
-        self.atomic_write_after_check(root, name, expected_target, bytes, || Ok(()), || Ok(()))
+        self.atomic_write_after_check(
+            root,
+            name,
+            expected_target,
+            bytes,
+            |_, _| Ok(()),
+            || Ok(()),
+            || Ok(()),
+        )
     }
 
     fn atomic_write_after_check(
@@ -518,6 +526,7 @@ impl SubmittedReviewDraftStore {
         name: &str,
         expected_target: Option<&fs::Metadata>,
         bytes: &[u8],
+        after_create: impl FnOnce(&File, &str) -> Result<()>,
         before_install: impl FnOnce() -> Result<()>,
         after_mutated_error_sync: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
@@ -549,11 +558,13 @@ impl SubmittedReviewDraftStore {
         let mut directory_mutated = false;
         let result = (|| {
             let mut file = create_private_file_at(root, &temporary)?;
-            validate_open_file_at(root, &temporary, &file, None, MAX_RECORD_BYTES)?;
+            directory_mutated = true;
             let metadata = file
                 .metadata()
                 .context("capture submitted-review draft temp identity")?;
             created_identity = Some((metadata.dev(), metadata.ino()));
+            after_create(root, &temporary)?;
+            validate_open_file_at(root, &temporary, &file, None, MAX_RECORD_BYTES)?;
             file.write_all(bytes)
                 .context("write submitted-review draft temp")?;
             file.sync_all()
@@ -1661,6 +1672,7 @@ mod tests {
                 &identity.filename(),
                 Some(&current.metadata),
                 &candidate,
+                |_, _| Ok(()),
                 || {
                     fs::rename(&target, &preserved_original)?;
                     let mut file = OpenOptions::new()
@@ -1692,5 +1704,49 @@ mod tests {
         let original_record: DraftRecord =
             serde_json::from_slice(&fs::read(preserved_original).unwrap()).unwrap();
         assert_eq!(original_record.drafts[0].body, "original");
+    }
+
+    #[test]
+    fn submitted_post_create_and_cleanup_failure_still_syncs_retained_temp() {
+        let directory = tempdir().unwrap();
+        let repository = repository("alice");
+        let store = SubmittedReviewDraftStore::new(directory.path().to_owned());
+        let identity = PullRequestIdentity::new(&repository, 7).unwrap();
+        assert!(store.ensure_root(true).unwrap());
+        let retained_name = std::cell::RefCell::new(None::<String>);
+        let recovery_was_durably_observed = std::cell::Cell::new(false);
+
+        let result = store.with_lock(false, |root| {
+            store.atomic_write_after_check(
+                root,
+                &identity.filename(),
+                None,
+                b"forced candidate",
+                |_, temporary| {
+                    retained_name.replace(Some(temporary.to_owned()));
+                    fs::set_permissions(
+                        store.root.join(temporary),
+                        fs::Permissions::from_mode(0o644),
+                    )?;
+                    bail!("forced post-create failure")
+                },
+                || unreachable!("post-create failure stops before install"),
+                || {
+                    let temporary = retained_name
+                        .borrow()
+                        .clone()
+                        .expect("post-create hook captured candidate name");
+                    let metadata = fs::symlink_metadata(store.root.join(temporary))?;
+                    assert!(metadata.is_file());
+                    assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+                    recovery_was_durably_observed.set(true);
+                    Ok(())
+                },
+            )
+        });
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("forced post-create failure"), "{error}");
+        assert!(error.contains("exact temporary cleanup failed"));
+        assert!(recovery_was_durably_observed.get());
     }
 }
