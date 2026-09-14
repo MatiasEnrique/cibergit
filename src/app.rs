@@ -3101,7 +3101,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.checks_smoke_ready())
+                                matches!(root, Root::Review(this) if this.smoke_ready())
                             })
                             .unwrap_or(false)
                         })
@@ -4556,7 +4556,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.smoke_ready())
+                                matches!(root, Root::Review(this) if this.checks_smoke_ready())
                             })
                             .unwrap_or(false)
                         })
