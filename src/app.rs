@@ -5894,21 +5894,30 @@ impl ReviewWorkspace {
                             .is_ok()
                     })
                     .unwrap_or(false);
-                let _ = window.update(|_, cx| {
-                    let _ = weak.update(cx, |root, cx| {
+                let continuation_scrolled = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
                         if let Root::Review(this) = root {
-                            this.inspector_scroll.set_offset(point(px(0.), px(720.)));
+                            let maximum = this.inspector_scroll.max_offset().y;
+                            this.inspector_scroll
+                                .set_offset(point(px(0.), -maximum));
                             cx.notify();
+                            maximum > px(0.)
+                        } else {
+                            false
                         }
-                    });
-                });
+                    })
+                    .unwrap_or(false)
+                })
+                .unwrap_or(false);
                 window
                     .background_executor()
                     .timer(Duration::from_millis(250))
                     .await;
                 let bottom_name =
                     format!("native-dismissal-confirmation-bottom-{appearance}.png");
-                let bottom = window
+                let bottom = continuation_scrolled
+                    && window
                     .update(|window, _| {
                         window
                             .render_to_image()
@@ -5919,7 +5928,7 @@ impl ReviewWorkspace {
                     })
                     .unwrap_or(false);
                 let report = format!(
-                    "Native submitted-review dismissal smoke ({appearance})\nReal GitHub read-only preparation: review {} on {} #{} frozen successfully; durable admission and second exact read completed\nSynthetic dismissal authority: explicit Unknown; GitHub decides authorization\nExact frozen target: {} #{} review {} with nullable author and older commit\nExact nonempty reason: {:?}\nPost-preflight race and state-alone reason uncertainty: rendered in native confirmation\nActual cancellation handler retained reason: {}\nActual confirm handler rejected edited visible reason with zero dispatch and retained it: {}\nCancelled/reprepared stale completion apply preserved newer confirmation: {}\nNonempty exact LINE/FILE/submitted drafts, local journal operation, canonical and selected comparison identities preserved: {}\nTop capture: {}\nBottom capture: {}\nMutation transport: HARD ZERO under CIBERGIT_SMOKE_DISMISSAL before mutation credential resolution; durable NotStarted recorded\nLive GitHub writes, OS notifications, global settings, focus requests, and physical input: none\n",
+                    "Native submitted-review dismissal smoke ({appearance})\nReal GitHub read-only preparation: review {} on {} #{} frozen successfully; durable admission and second exact read completed\nSynthetic dismissal authority: explicit Unknown; GitHub decides authorization\nExact frozen target: {} #{} review {} with nullable author and older commit\nExact nonempty reason: {:?}\nPost-preflight race and state-alone reason uncertainty: rendered in native confirmation\nActual cancellation handler retained reason: {}\nActual confirm handler rejected edited visible reason with zero dispatch and retained it: {}\nCancelled/reprepared stale completion apply preserved newer confirmation: {}\nNonempty exact LINE/FILE/submitted drafts, local journal operation, canonical and selected comparison identities preserved: {}\nTop capture: {}\nMeasured full inspector continuation scrolled: {}\nBottom capture: {}\nMutation transport: HARD ZERO under CIBERGIT_SMOKE_DISMISSAL before mutation credential resolution; durable NotStarted recorded\nLive GitHub writes, OS notifications, global settings, focus requests, and physical input: none\n",
                     real_request.target.review.remote_id,
                     real_request.target.repository.full_name(),
                     real_request.target.pull_request.pull_request,
@@ -5932,6 +5941,7 @@ impl ReviewWorkspace {
                     setup.2,
                     setup.3,
                     if top { &top_name } else { "failed" },
+                    continuation_scrolled,
                     if bottom { &bottom_name } else { "failed" },
                 );
                 fs::write(
@@ -25940,6 +25950,8 @@ mod layout_tests {
     use gpui::{point, px};
     use std::time::{Duration, Instant, UNIX_EPOCH};
     #[cfg(feature = "ui-smoke")]
+    use std::{cell::Cell, rc::Rc};
+    #[cfg(feature = "ui-smoke")]
     use tempfile::tempdir;
 
     fn submitted_review_fixture() -> (Repository, PullRequestReview) {
@@ -26975,12 +26987,45 @@ mod layout_tests {
                         .store_active_reason(reason.into());
                 }
                 this.activate_tab_in_window(0, false, window, cx);
-                let old_entity = this.dismissal_reason_input.entity_id();
-                this.activate_tab_context(1, false, cx);
-                old_entity
+                this.dismissal_reason_input.entity_id()
             })
         });
+        let mounted_notification = Rc::new(Cell::new(0usize));
+        let mounted_notification_witness = mounted_notification.clone();
+        let review_b_coordinates = review_b.coordinates.clone();
+        let _notification_subscription = cx.update(|_, cx| {
+            cx.observe(&root, move |root, cx| {
+                if root
+                    .read_with(cx, |root, _| {
+                        matches!(root, Root::Review(this)
+                        if this.active_tab == Some(1)
+                            && this.active_tab_input_restore.is_none()
+                            && this.dismissal_reason_input_owner.as_ref().is_some_and(
+                                |owner| owner.review.as_ref() == Some(&review_b_coordinates)
+                            ))
+                    })
+                    .unwrap_or(false)
+                {
+                    mounted_notification_witness
+                        .set(mounted_notification_witness.get().saturating_add(1));
+                }
+            })
+        });
+        cx.update(|_, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.activate_tab_context(1, false, cx);
+                assert!(this.active_tab_input_restore.is_some());
+            });
+        });
         cx.update(|_, _| {});
+        assert_eq!(
+            mounted_notification.get(),
+            1,
+            "deferred entity replacement must notify the mounted Root exactly once"
+        );
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
                 let Root::Review(this) = root else {
@@ -27023,19 +27068,20 @@ mod layout_tests {
             });
             window.draw(cx).clear(cx);
         });
-        let capture_dir = std::env::var_os("CIBERGIT_DISMISSAL_CAPTURE_DIR")
-            .map(PathBuf::from)
-            .expect("CIBERGIT_DISMISSAL_CAPTURE_DIR is required for this focused native witness");
-        fs::create_dir_all(&capture_dir).unwrap();
-        cx.update(|window, _| {
-            window
-                .render_to_image()
-                .unwrap()
-                .save(capture_dir.join(format!(
-                    "native-dismissal-mounted-confirmation-{appearance}.png"
-                )))
-                .unwrap();
-        });
+        if let Some(capture_dir) =
+            std::env::var_os("CIBERGIT_DISMISSAL_CAPTURE_DIR").map(PathBuf::from)
+        {
+            fs::create_dir_all(&capture_dir).unwrap();
+            cx.update(|window, _| {
+                window
+                    .render_to_image()
+                    .unwrap()
+                    .save(capture_dir.join(format!(
+                        "native-dismissal-mounted-confirmation-{appearance}.png"
+                    )))
+                    .unwrap();
+            });
+        }
     }
 
     #[cfg(feature = "ui-smoke")]
