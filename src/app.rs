@@ -5172,6 +5172,12 @@ impl ReviewWorkspace {
                         break ready;
                     }
                 };
+                if log_ready {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(300))
+                        .await;
+                }
                 let tail_requested = log_ready
                     && window
                         .update(|window, cx| {
@@ -5183,6 +5189,9 @@ impl ReviewWorkspace {
                                 tab.log_horizontal.set_offset(point(px(0.), px(0.)));
                                 tab.log_scroll
                                     .scroll_to_item_strict(199_999, ScrollStrategy::Bottom);
+                                let inspector_maximum = this.inspector_scroll.max_offset().y;
+                                this.inspector_scroll
+                                    .set_offset(point(px(0.), -inspector_maximum));
                                 this.status = "SYNTHETIC maximum-line Actions log · final row left edge · zero credentials/provider/storage".into();
                                 this.focus_current_ci_pane(0, window, cx);
                                 cx.notify();
@@ -5207,18 +5216,24 @@ impl ReviewWorkspace {
                                 .is_ok()
                         })
                         .unwrap_or(false);
-                let (left_materialized, maximum_rendered, horizontal_maximum) = window
+                let (
+                    left_materialized,
+                    maximum_rendered,
+                    horizontal_maximum,
+                    inspector_bottom_reached,
+                ) = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
                             let Root::Review(this) = root else {
-                                return (false, 0, 0.);
+                                return (false, 0, 0., false);
                             };
                             let Some(tab) = this.tabs.first() else {
-                                return (false, 0, 0.);
+                                return (false, 0, 0., false);
                             };
                             let Some(fixture) = &this.actions_read_fixture else {
-                                return (false, 0, 0.);
+                                return (false, 0, 0., false);
                             };
+                            let inspector_maximum = this.inspector_scroll.max_offset().y.as_f32();
                             let valid_log = tab.ci_read.log.visible().is_some_and(|log| {
                                 log.line_count == 200_000
                                     && log
@@ -5236,13 +5251,19 @@ impl ReviewWorkspace {
                                     .maximum_rendered_log_rows
                                     .load(Ordering::Relaxed),
                                 tab.log_horizontal.max_offset().x.as_f32(),
+                                inspector_maximum > 0.
+                                    && (-this.inspector_scroll.offset().y.as_f32()
+                                        - inspector_maximum)
+                                        .abs()
+                                        < 1.,
                             )
                         })
-                        .unwrap_or((false, 0, 0.))
+                        .unwrap_or((false, 0, 0., false))
                     })
-                    .unwrap_or((false, 0, 0.));
+                    .unwrap_or((false, 0, 0., false));
                 let right_requested = left_capture
                     && left_materialized
+                    && inspector_bottom_reached
                     && maximum_rendered > 0
                     && maximum_rendered <= MAX_RENDERED_LOG_ROWS as u64
                     && horizontal_maximum > 1_000.
@@ -5313,6 +5334,7 @@ impl ReviewWorkspace {
                     && log_ready
                     && left_capture
                     && left_materialized
+                    && inspector_bottom_reached
                     && right_capture
                     && right_offset_reached
                     && jobs_dispatches == 1
@@ -5320,7 +5342,7 @@ impl ReviewWorkspace {
                     && final_materializations > 0
                     && maximum_rendered <= MAX_RENDERED_LOG_ROWS as u64;
                 let report = format!(
-                    "Native Actions Jobs/Logs synthetic scene ({appearance})\nDisposable data state was empty before scene installation: true\nBootstrap/account/notification/provider reads disabled by smoke-only Startup gate: true\nFixture credential/provider/storage capability: ZERO\nActual Root + GeneralReadController Jobs admission/completion/apply dispatch count: {jobs_dispatches}\nActual Root + GeneralReadController Log admission/completion/apply dispatch count: {log_dispatches}\nJobs capture: {}\nFinal displayed row materializations: {final_materializations}\nMaximum rows in one native render request: {maximum_rendered} (bound {MAX_RENDERED_LOG_ROWS})\nHorizontal maximum: {horizontal_maximum:.1}px\nFinal row left-edge capture: {}\nFinal row far-right capture: {}\nFar-right offset reached: {right_offset_reached}\nAll identities, jobs, and log text: explicitly synthetic; no live transport or storage compatibility claim\nCredential resolution, /user, API, storage, mutation, OS notification, foreground/focus request, settings, preview, and physical input calls from scene: 0\n",
+                    "Native Actions Jobs/Logs synthetic scene ({appearance})\nDisposable data state was empty before scene installation: true\nBootstrap/account/notification/provider reads disabled by smoke-only Startup gate: true\nFixture credential/provider/storage capability: ZERO\nActual Root + GeneralReadController Jobs admission/completion/apply dispatch count: {jobs_dispatches}\nActual Root + GeneralReadController Log admission/completion/apply dispatch count: {log_dispatches}\nJobs capture: {}\nFinal displayed row materializations: {final_materializations}\nMaximum rows in one native render request: {maximum_rendered} (bound {MAX_RENDERED_LOG_ROWS})\nEnclosing inspector bottom reached: {inspector_bottom_reached}\nHorizontal maximum: {horizontal_maximum:.1}px\nFinal row left-edge capture: {}\nFinal row far-right capture: {}\nFar-right offset reached: {right_offset_reached}\nAll identities, jobs, and log text: explicitly synthetic; no live transport or storage compatibility claim\nCredential resolution, /user, API, storage, mutation, OS notification, foreground/focus request, settings, preview, and physical input calls from scene: 0\n",
                     if jobs_capture { &jobs_name } else { "failed" },
                     if left_capture { &left_name } else { "failed" },
                     if right_capture { &right_name } else { "failed" },
