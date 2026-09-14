@@ -632,6 +632,36 @@ print(json.dumps(step['response']))
         }
 
         #[test]
+        fn displayed_capability_false_rejects_before_targeted_read() {
+            let content = ReactionContent::ThumbsDown;
+            let variables = json!({"id":"PR_node","content":"THUMBS_DOWN","after":null});
+            let (dir, provider) = reaction_fixture(vec![reaction_step(
+                "query ReactionTarget(",
+                variables,
+                target_response(
+                    ReactableKind::PullRequest,
+                    content,
+                    false,
+                    "unused",
+                ),
+            )]);
+            let mut denied = displayed_subject(ReactableKind::PullRequest, content, false);
+            denied.fresh_capability.as_mut().unwrap().viewer_can_react = false;
+            assert!(provider
+                .prepare_reaction(
+                    &reaction_repo("alice"),
+                    7,
+                    &denied,
+                    content,
+                    ReactionIntent::Add,
+                    "displayed-denied".into(),
+                    "displayed-denied-attempt".into(),
+                )
+                .is_err());
+            assert_eq!(reaction_count(&dir), 0);
+        }
+
+        #[test]
         fn targeted_identity_partial_and_pagination_evidence_fail_closed() {
             let content = ReactionContent::Hooray;
             let variables = json!({"id":"ISSUE_COMMENT_node","content":"HOORAY","after":null});

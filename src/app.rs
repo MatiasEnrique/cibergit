@@ -58,7 +58,7 @@ use comparison_picker::{
 use file_tree::{FileTree, TreeRowKind};
 use gpui::{prelude::*, *};
 use gpui_base::{
-    Scrollbar, TextView, TextViewStyle,
+    Button, Scrollbar, TextView, TextViewStyle,
     input::{Input, InputEditorStyle, InputEvent, InputState, Textarea, TextareaState},
 };
 use pr_lifecycle::{ChoiceKind, FrozenMutation, PrLifecycleController, reviewer};
@@ -4718,6 +4718,7 @@ impl ReviewWorkspace {
                                 let Some(index) = this.active_tab else { return false };
                                 this.tabs[index].details.is_some()
                                     && !this.tabs[index].details_refresh.active
+                                    && this.tabs[index].submitted_summary_editor.is_ready()
                                     && matches!(
                                         this.tabs[index].interactions,
                                         InteractionState::Ready(_)
@@ -4821,9 +4822,9 @@ impl ReviewWorkspace {
                                 coordinates("SYNTHETIC_REACTION_FILE_COMMENT_C"),
                             ];
                             let comment_bodies = [
-                                "Synthetic file comment A — first comment must have controls.",
-                                "Synthetic file comment B — middle comment must have controls.",
-                                "Synthetic file comment C — last comment must have controls.",
+                                "Synthetic FILE A — first reaction row.",
+                                "Synthetic FILE B — middle reaction row.",
+                                "Synthetic FILE C — last reaction row.",
                             ];
                             details.issue_comments.push(cibergit::domain::IssueComment {
                                 coordinates: issue.clone(),
@@ -4834,7 +4835,7 @@ impl ReviewWorkspace {
                                 updated_at: "2026-09-13T12:00:00Z".into(),
                                 url: "https://example.invalid/synthetic-discussion".into(),
                             });
-                            details.reviews.push(cibergit::domain::PullRequestReview {
+                            let synthetic_review = cibergit::domain::PullRequestReview {
                                 coordinates: review.clone(),
                                 author: Some("different-review-author".into()),
                                 body: "Clearly labelled synthetic review reaction authority."
@@ -4844,7 +4845,8 @@ impl ReviewWorkspace {
                                 commit_sha: None,
                                 edit_summary_capability: None,
                                 url: "https://example.invalid/synthetic-review".into(),
-                            });
+                            };
+                            details.reviews.push(synthetic_review.clone());
                             let comments = comment_ids
                                 .iter()
                                 .zip(comment_bodies)
@@ -4933,24 +4935,181 @@ impl ReviewWorkspace {
                                 })
                                 .cloned()
                                 .ok_or_else(|| "synthetic click target is absent".to_owned())?;
-                            let canonical = this.tabs[index].canonical_full_revision.clone();
-                            let selected = this.tabs[index]
+                            let displayed_session = this.tabs[index]
                                 .session
-                                .as_ref()
-                                .map(|session| session.revision().clone());
-                            let local_drafts = match &this.tabs[index].interactions {
-                                InteractionState::Ready(controller) => {
-                                    let body = active_review_composer_body(controller)
-                                        .unwrap_or_default()
-                                        .to_owned();
-                                    this.composer_input.update(cx, |input, cx| {
-                                        input.set_value(body, window, cx)
-                                    });
-                                    controller.composition.drafts.len()
-                                        + controller.composition.file_drafts.len()
-                                }
-                                _ => 0,
+                                .clone()
+                                .ok_or_else(|| "reaction smoke has no displayed session".to_owned())?;
+                            let canonical_session = this.tabs[index]
+                                .canonical_session
+                                .clone()
+                                .ok_or_else(|| "reaction smoke has no canonical session".to_owned())?;
+                            let selected_file = displayed_session
+                                .selected_file()
+                                .ok_or_else(|| "reaction smoke has no selected file".to_owned())?;
+                            let line_selection = build_rows(parse_file(selected_file), DiffMode::Unified)
+                                .into_iter()
+                                .find_map(|row| match row {
+                                    DiffRow::Unified(line) => line
+                                        .new_line
+                                        .map(|line| LineSelection::single(DiffSide::New, line))
+                                        .or_else(|| {
+                                            line.old_line.map(|line| {
+                                                LineSelection::single(DiffSide::Old, line)
+                                            })
+                                        }),
+                                    _ => None,
+                                })
+                                .ok_or_else(|| {
+                                    "reaction smoke selected file has no provider-safe line"
+                                        .to_owned()
+                                })?;
+                            let line_body = "Synthetic retained line draft for reaction preservation";
+                            let file_body = "Synthetic retained FILE draft for reaction preservation";
+                            {
+                                let InteractionState::Ready(controller) =
+                                    &mut this.tabs[index].interactions
+                                else {
+                                    return Err(
+                                        "reaction smoke interaction controller disappeared".into(),
+                                    );
+                                };
+                                controller.select_line_with_canonical(
+                                    &displayed_session,
+                                    &canonical_session,
+                                    line_selection,
+                                )?;
+                                let staged = controller.stage_composer_text(line_body.into())?;
+                                let draft_id = controller
+                                    .composer
+                                    .as_ref()
+                                    .and_then(|composer| composer.draft_id.clone())
+                                    .ok_or_else(|| {
+                                        "reaction smoke line draft has no exact identity".to_owned()
+                                    })?;
+                                controller.finish_composer_save(
+                                    &staged,
+                                    &draft_id,
+                                    line_body,
+                                    Ok(()),
+                                );
+                                controller.select_file_with_canonical(
+                                    &displayed_session,
+                                    &canonical_session,
+                                )?;
+                                let staged = controller.stage_composer_text(file_body.into())?;
+                                let draft_id = controller
+                                    .file_composer
+                                    .as_ref()
+                                    .and_then(|composer| composer.draft_id.clone())
+                                    .ok_or_else(|| {
+                                        "reaction smoke FILE draft has no exact identity".to_owned()
+                                    })?;
+                                controller.finish_composer_save(
+                                    &staged,
+                                    &draft_id,
+                                    file_body,
+                                    Ok(()),
+                                );
+                            }
+                            this.composer_input.update(cx, |input, cx| {
+                                input.set_value(file_body, window, cx)
+                            });
+                            let submitted_body =
+                                "Synthetic retained submitted-summary draft for reaction preservation";
+                            {
+                                let editor = &mut this.tabs[index].submitted_summary_editor;
+                                editor.begin(synthetic_review);
+                                editor.store_active_body(submitted_body.into());
+                                editor.active_review = None;
+                                editor.durable = editor.current_snapshot();
+                            }
+                            let journal_request = JournalRequest::Reaction(Box::new(
+                                cibergit::domain::ReactionRequest {
+                                    operation_id: "synthetic-retained-reaction-journal".into(),
+                                    attempt_id:
+                                        "synthetic-retained-reaction-journal-attempt".into(),
+                                    target: cibergit::domain::ReactionTarget {
+                                        kind: click.kind,
+                                        repository: repository.clone(),
+                                        pull_request: click.pull_request.clone(),
+                                        subject: click.subject.clone(),
+                                        parent_review: click.parent_review.clone(),
+                                        content: click.content.clone(),
+                                    },
+                                    viewer: click
+                                        .fresh_capability
+                                        .as_ref()
+                                        .expect("synthetic capability")
+                                        .viewer
+                                        .clone(),
+                                    content: ReactionContent::Eyes,
+                                    action: ReactionAction::Add,
+                                },
+                            ));
+                            let key = ReviewKey::for_repository("github", &repository, number)
+                                .map_err(|error| error.to_string())?;
+                            let journal = ActionJournal::open(&this.interaction_root, key)?;
+                            let seeded = journal.dispatch(
+                                journal_request,
+                                || ProviderMutationOutcome::<()>::Acknowledged(()),
+                                |_| {
+                                    (
+                                        true,
+                                        true,
+                                        "Synthetic local journal witness; zero provider transport"
+                                            .into(),
+                                    )
+                                },
+                            );
+                            if !matches!(seeded, ProviderMutationOutcome::Acknowledged(())) {
+                                return Err("reaction smoke could not seed its local journal witness"
+                                    .into());
+                            }
+                            this.tabs[index].journal_operations = journal.operations()?;
+                            let preservation = {
+                                let tab = &this.tabs[index];
+                                let composition = match &tab.interactions {
+                                    InteractionState::Ready(controller) => Some((
+                                        controller.composition.drafts.clone(),
+                                        controller.composition.file_drafts.clone(),
+                                        controller.composition.operations.clone(),
+                                    )),
+                                    _ => None,
+                                };
+                                let session = |session: Option<&ReviewSession>| {
+                                    session.map(|session| {
+                                        (
+                                            session.revision().clone(),
+                                            session.selected_file().map(file_key),
+                                            session.diff_mode(),
+                                        )
+                                    })
+                                };
+                                (
+                                    composition,
+                                    tab.submitted_summary_editor.current_snapshot(),
+                                    tab.journal_operations.clone(),
+                                    tab.canonical_full_revision.clone(),
+                                    session(tab.canonical_session.as_ref()),
+                                    session(tab.session.as_ref()),
+                                )
                             };
+                            let nonvacuous_witnesses = preservation.0.as_ref().is_some_and(
+                                |(line_drafts, file_drafts, _)| {
+                                    line_drafts.iter().any(|draft| draft.body == line_body)
+                                        && file_drafts
+                                            .iter()
+                                            .any(|draft| draft.body == file_body)
+                                },
+                            ) && preservation
+                                .1
+                                .drafts
+                                .iter()
+                                .any(|draft| draft.body == submitted_body)
+                                && preservation.2.iter().any(|operation| {
+                                    journal_identity(&operation.request).0
+                                        == "synthetic-retained-reaction-journal"
+                                });
                             this.tabs[index].details = Some(details);
                             this.tabs[index].inspector_section = InspectorSection::Overview;
                             this.inspector_open = true;
@@ -4959,12 +5118,11 @@ impl ReviewWorkspace {
                             Ok((
                                 index,
                                 click,
-                                canonical,
-                                selected,
-                                local_drafts,
                                 real_reaction_subjects,
                                 repository,
                                 real_pr_snapshot,
+                                preservation,
+                                nonvacuous_witnesses,
                             ))
                         })
                         .unwrap_or_else(|error| Err(format!("reaction entity unavailable: {error:#}")))
@@ -4973,8 +5131,8 @@ impl ReviewWorkspace {
                     .unwrap_or_else(|error| panic!("reaction smoke setup failed: {error}"));
 
                 let real_preparation = {
-                    let repository = setup.6.clone();
-                    let displayed = setup.7.clone();
+                    let repository = setup.3.clone();
+                    let displayed = setup.4.clone();
                     let choice = displayed.fresh_capability.as_ref().and_then(|capability| {
                         displayed
                             .reactions
@@ -5216,24 +5374,39 @@ impl ReviewWorkspace {
                         weak.read_with(cx, |root, _| {
                             let Root::Review(this) = root else { return false };
                             let tab = &this.tabs[setup.0];
-                            let draft_count = match &tab.interactions {
-                                InteractionState::Ready(controller) => {
-                                    controller.composition.drafts.len()
-                                        + controller.composition.file_drafts.len()
-                                }
-                                _ => usize::MAX,
+                            let composition = match &tab.interactions {
+                                InteractionState::Ready(controller) => Some((
+                                    controller.composition.drafts.clone(),
+                                    controller.composition.file_drafts.clone(),
+                                    controller.composition.operations.clone(),
+                                )),
+                                _ => None,
                             };
-                            tab.canonical_full_revision == setup.2
-                                && tab.session.as_ref().map(|session| session.revision().clone())
-                                    == setup.3
-                                && draft_count == setup.4
+                            let session = |session: Option<&ReviewSession>| {
+                                session.map(|session| {
+                                    (
+                                        session.revision().clone(),
+                                        session.selected_file().map(file_key),
+                                        session.diff_mode(),
+                                    )
+                                })
+                            };
+                            let current = (
+                                composition,
+                                tab.submitted_summary_editor.current_snapshot(),
+                                tab.journal_operations.clone(),
+                                tab.canonical_full_revision.clone(),
+                                session(tab.canonical_session.as_ref()),
+                                session(tab.session.as_ref()),
+                            );
+                            setup.6 && current == setup.5
                         })
                         .unwrap_or(false)
                     })
                     .unwrap_or(false);
                 let report = format!(
-                    "Native reaction smoke ({appearance})\nReal read-only provider details: true; provider-supplied PR node present; reaction subjects={}\nReal targeted reaction preparation completed without dispatch: {}\nSynthetic reaction authority: clearly labelled, isolated, selected viewer node/login explicit; subject authors differ\nOverview reaction-row capture: {}\nActivity top capture (discussion/review rows): {}\nActivity bottom capture (all three FILE-thread comment rows): {}\nActual reaction handler entered background targeted preparation: {}\nHandler settled with zero-write preflight refusal: {}\nFull stale success and stale error apply paths preserved newer identical-action busy token/status: {}\nCanonical/selected comparison and local drafts preserved: {}\nMutation transport: HARD ZERO under CIBERGIT_SMOKE_REACTIONS; GraphQL mutation dispatch is suppressed before credentials/transport\nProvider activity from the handler: read-only targeted preparation only\nFocus/physical input/OS calls: none; no focus request and no physical input is implied\n",
-                    setup.5,
+                    "Native reaction smoke ({appearance})\nReal read-only provider details: true; provider-supplied PR node present; reaction subjects={}\nReal targeted reaction preparation completed without dispatch: {}\nSynthetic reaction authority: clearly labelled, isolated, selected viewer node/login explicit; subject authors differ\nOverview reaction-row capture: {}\nActivity top capture (discussion/review rows): {}\nActivity bottom capture (FILE-thread continuation): {}\nActual reaction handler entered background targeted preparation: {}\nHandler settled with zero-write preflight refusal: {}\nFull stale success and stale error apply paths preserved newer identical-action busy token/status: {}\nExact seeded line+FILE draft identities/bodies, submitted-summary identity/body, local journal operation, canonical/displayed revisions, selected files, and diff modes preserved: {}\nSynthetic local journal witness: terminal and isolated; provider transport zero\nMutation transport: HARD ZERO under CIBERGIT_SMOKE_REACTIONS; GraphQL mutation dispatch is suppressed before credentials/transport\nProvider activity from the handler: read-only targeted preparation only\nFocus/physical input/OS calls: none; no focus request and no physical input is implied\n",
+                    setup.2,
                     real_preparation,
                     if overview { &overview_name } else { "failed" },
                     if activity_top { &activity_top_name } else { "failed" },
@@ -21921,8 +22094,19 @@ fn render_reaction_row(
             snapshot.subject.remote_id,
             content.graphql_name()
         );
-        let mut chip = div()
-            .id(SharedString::from(id))
+        let action_label = match intent {
+            ReactionIntent::Add => "Add",
+            ReactionIntent::Remove => "Remove",
+        };
+        let accessibility_label = format!(
+            "{action_label} {} reaction on {} {}",
+            content.graphql_name(),
+            snapshot.kind.graphql_name(),
+            snapshot.subject.remote_id
+        );
+        let root = root.clone();
+        let snapshot = snapshot.clone();
+        let chip = Button::new(id)
             .px_2()
             .py_1()
             .rounded_md()
@@ -21938,18 +22122,18 @@ fn render_reaction_row(
                 colors.canvas
             })
             .text_color(if allowed { colors.accent } else { colors.faint })
-            .child(format!("{} {count}", content.compact_label()));
-        if allowed {
-            let root = root.clone();
-            let snapshot = snapshot.clone();
-            chip = chip.cursor_pointer().on_click(move |_, _, cx| {
+            .selected(selected)
+            .disabled(!allowed)
+            .accessibility_label(accessibility_label)
+            .when(allowed, |chip| chip.cursor_pointer())
+            .child(format!("{} {count}", content.compact_label()))
+            .on_click(move |_, _, cx| {
                 root.update(cx, |root, cx| {
                     if let Root::Review(this) = root {
                         this.dispatch_reaction(snapshot.clone(), content, intent, cx);
                     }
                 });
             });
-        }
         row = row.child(chip);
     }
     row.child(
@@ -24568,6 +24752,71 @@ mod layout_tests {
         assert!(!activity_thread_visible(false, ReviewSubject::Line, true));
         assert!(activity_thread_visible(false, ReviewSubject::Line, false));
         assert!(activity_thread_visible(false, ReviewSubject::File, true));
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn reaction_button_uses_pointer_enter_space_and_blocks_disabled_activation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{
+            Context, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, Render, div, point,
+            prelude::*, px,
+        };
+        use gpui_base::Button;
+        use std::{cell::Cell, rc::Rc};
+
+        struct Harness {
+            disabled: bool,
+            activations: Rc<Cell<usize>>,
+        }
+
+        impl Render for Harness {
+            fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+                let activations = self.activations.clone();
+                div().size(px(100.)).child(
+                    Button::new("reaction-button-witness")
+                        .size_full()
+                        .disabled(self.disabled)
+                        .accessibility_label("Add HEART reaction on IssueComment COMMENT")
+                        .on_click(move |_, _, _| {
+                            activations.set(activations.get() + 1);
+                        }),
+                )
+            }
+        }
+
+        cx.update(gpui_base::init);
+        let activations = Rc::new(Cell::new(0));
+        let (harness, cx) = cx.add_window_view({
+            let activations = activations.clone();
+            move |_, _| Harness {
+                disabled: false,
+                activations,
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_click(point(px(10.), px(10.)), Modifiers::default());
+        assert_eq!(activations.get(), 1);
+        for key in ["enter", "space"] {
+            let keystroke = Keystroke::parse(key).unwrap();
+            cx.simulate_event(KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(KeyUpEvent { keystroke });
+        }
+        assert_eq!(activations.get(), 3);
+
+        harness.update(cx, |harness, cx| {
+            harness.disabled = true;
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_click(point(px(10.), px(10.)), Modifiers::default());
+        cx.simulate_keystrokes("enter space");
+        assert_eq!(activations.get(), 3);
     }
 
     #[test]

@@ -611,6 +611,25 @@ fn validate_details(identity: &CacheIdentity, details: &PullRequestDetails) -> R
             bail!("refuse collaboration cache payload with mismatched provider coordinates");
         }
     }
+    for reaction in &details.reactions {
+        if !identity.matches_coordinates(&reaction.pull_request)
+            || !identity.matches_coordinates(&reaction.subject)
+            || reaction
+                .parent_review
+                .as_ref()
+                .is_some_and(|parent| !identity.matches_coordinates(parent))
+        {
+            bail!("refuse collaboration cache payload with mismatched reaction coordinates");
+        }
+        match (reaction.kind, &reaction.parent_review) {
+            (cibergit::domain::ReactableKind::PullRequest, None)
+                if reaction.subject == reaction.pull_request => {}
+            (cibergit::domain::ReactableKind::PullRequestReviewComment, Some(_)) => {}
+            (cibergit::domain::ReactableKind::IssueComment, None)
+            | (cibergit::domain::ReactableKind::PullRequestReview, None) => {}
+            _ => bail!("refuse collaboration cache payload with invalid reaction parent shape"),
+        }
+    }
     Ok(())
 }
 
@@ -850,7 +869,7 @@ mod tests {
     use super::*;
     use cibergit::domain::{
         Account, CheckKind, IssueComment, MergeEligibility, PullRequestCheck, PullRequestReview,
-        ReviewComment, ReviewThread,
+        ReactableKind, ReactionSnapshot, ReactionSubjectSnapshot, ReviewComment, ReviewThread,
     };
     use std::{env, os::unix::fs::symlink, process::Command, time::Instant};
 
@@ -1039,6 +1058,38 @@ mod tests {
         let prepared = cache.prepare_write(&repo, 7).unwrap();
         assert!(cache.save(prepared, wrong, now_unix_ms().unwrap()).is_err());
         assert!(cache.load(&repo, 7).unwrap().is_none());
+    }
+
+    #[test]
+    fn foreign_cached_pr_reaction_is_rejected_and_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = CollaborationCache::new(root.path().to_owned());
+        let repo = repository("octo", "one", "alice");
+        let mut value = details(&repo, 7, "foreign-reaction");
+        let pr = coordinates(&repo, 7, "PR_7");
+        value.reactions.push(ReactionSubjectSnapshot {
+            kind: ReactableKind::PullRequest,
+            pull_request: pr.clone(),
+            subject: pr,
+            parent_review: None,
+            content: "cached PR body".into(),
+            reactions: ReactionSnapshot {
+                groups: Vec::new(),
+                complete: false,
+            },
+            fresh_capability: None,
+        });
+        save(&cache, &repo, 7, &value);
+        let record_path = cache.root.join(CacheIdentity::new(&repo, 7).filename());
+        let mut record: CacheRecord =
+            serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record.details.reactions[0].pull_request.pull_request = 8;
+        record.details.reactions[0].subject.pull_request = 8;
+        let foreign = serde_json::to_vec(&record).unwrap();
+        private_write(&record_path, &foreign);
+
+        assert!(cache.load(&repo, 7).is_err());
+        assert_eq!(fs::read(record_path).unwrap(), foreign);
     }
 
     #[test]
