@@ -675,6 +675,10 @@ pub struct TipChoice {
 /// single candidate is chosen only when nothing was requested; once an explicit
 /// choice has been made and then removed, a replacement is never substituted
 /// for it.
+///
+/// Callers must keep passing an invalidated identity here rather than dropping
+/// it back to `None`. A dropped identity reads as an unmade choice, which would
+/// let a later refresh adopt a sole surviving tip automatically.
 pub fn choose_tip(
     candidates: &StackTipCandidates,
     requested: Option<&StackPullRequestId>,

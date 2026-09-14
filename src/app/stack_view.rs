@@ -270,13 +270,14 @@ impl StackViewController {
                     .as_ref()
                     .and_then(|selection| selection.comparison.clone())
                     .map(ReviewSession::new);
-                // Remember exactly what this load proved. An outstanding or
-                // invalidated choice clears the request so the next refresh
-                // asks again instead of repeating a stale identity.
-                self.requested_tip = loaded
-                    .selection
-                    .as_ref()
-                    .map(|selection| selection.selected_tip.clone());
+                // Remember exactly what this load proved. When a load proves
+                // nothing, the requested identity is retained rather than
+                // cleared: clearing it would let the next ordinary refresh
+                // treat a sole surviving tip as an unmade choice and adopt it.
+                // Only explicit activation replaces a requested tip.
+                if let Some(selection) = loaded.selection.as_ref() {
+                    self.requested_tip = Some(selection.selected_tip.clone());
+                }
                 self.tip_notice = loaded.tip_notice.clone();
                 self.loaded = Some(loaded);
                 self.state = StackLoadState::Ready;
@@ -1723,7 +1724,9 @@ mod tests {
             true
         ));
         assert!(controller.session.is_none());
-        assert!(controller.requested_tip().is_none());
+        // The invalidated identity is retained, not cleared. Clearing it would
+        // read as an unmade choice on the next refresh.
+        assert_eq!(controller.requested_tip().as_ref(), Some(&chosen));
         assert!(
             controller
                 .tip_notice
@@ -1737,6 +1740,101 @@ mod tests {
             Some(2),
             "the remaining candidate stays explicitly activatable"
         );
+    }
+
+    #[test]
+    fn repeated_refresh_after_removal_never_adopts_the_sole_surviving_tip() {
+        let root = tempdir().unwrap();
+        let repo = repository(None, "alice");
+        let mut controller = StackViewController::new(root.path().to_owned(), &repo, 1);
+        let store = controller.store();
+        let open = controller.begin_refresh(&repo);
+        assert!(controller.accept(
+            &open,
+            Ok(forked_load(&repo, &store, &[1, 2, 3], None)),
+            true
+        ));
+
+        let chosen = StackPullRequestId {
+            repository: StackRepository::from_repository(&repo),
+            number: 3,
+        };
+        let sole = StackPullRequestId {
+            repository: StackRepository::from_repository(&repo),
+            number: 2,
+        };
+        let token = controller.begin_tip_selection(&repo, chosen.clone());
+        assert!(controller.accept(
+            &token,
+            Ok(forked_load(&repo, &store, &[1, 2, 3], Some(&chosen))),
+            true
+        ));
+        assert!(controller.session.is_some());
+
+        // #3 disappears, leaving #2 as the only candidate. Every subsequent
+        // ordinary refresh must keep refusing to adopt it.
+        for round in 0..3 {
+            let refresh = controller.begin_refresh(&repo);
+            assert!(controller.accept(
+                &refresh,
+                Ok(forked_load(
+                    &repo,
+                    &store,
+                    &[1, 2],
+                    controller.requested_tip().as_ref()
+                )),
+                true
+            ));
+            assert!(
+                controller.session.is_none(),
+                "refresh {round} adopted a substitute tip"
+            );
+            assert!(
+                controller.loaded.as_ref().unwrap().selection.is_none(),
+                "refresh {round} compared a tip nobody chose"
+            );
+            assert_eq!(
+                controller.requested_tip().as_ref(),
+                Some(&chosen),
+                "refresh {round} dropped the invalidated identity"
+            );
+            assert!(
+                controller
+                    .tip_notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("Selected tip #3 is no longer a candidate"),
+                "refresh {round} stopped explaining why nothing is shown"
+            );
+        }
+
+        // Explicit activation clears the block and compares #2.
+        let activate = controller.begin_tip_selection(&repo, sole.clone());
+        assert!(controller.accept(
+            &activate,
+            Ok(forked_load(&repo, &store, &[1, 2], Some(&sole))),
+            true
+        ));
+        assert_eq!(controller.requested_tip().as_ref(), Some(&sole));
+        assert_eq!(
+            controller.session.as_ref().unwrap().revision().head_sha,
+            "c".repeat(40)
+        );
+        assert!(controller.tip_notice.is_none());
+
+        // And the unblocked choice survives a later ordinary refresh.
+        let after = controller.begin_refresh(&repo);
+        assert!(controller.accept(
+            &after,
+            Ok(forked_load(
+                &repo,
+                &store,
+                &[1, 2],
+                controller.requested_tip().as_ref()
+            )),
+            true
+        ));
+        assert!(controller.session.is_some());
     }
 
     #[test]
