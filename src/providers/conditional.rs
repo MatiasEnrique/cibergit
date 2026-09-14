@@ -117,7 +117,19 @@ pub(crate) fn record_general_poll_from_included_prefix(prefix: &[u8]) {
 }
 
 pub(crate) fn general_poll_from_included_prefix(prefix: &[u8]) -> RestPollDirective {
-    rejected_header_poll(&prefix[..prefix.len().min(MAX_HEADER_BYTES)], false)
+    let bounded = &prefix[..prefix.len().min(MAX_HEADER_BYTES)];
+    if let Some((header_end, _)) = find_header_end(bounded) {
+        let Ok(collected) = collect_header_fields(&bounded[..header_end]) else {
+            return RestPollDirective::default();
+        };
+        let (poll, _, graphql_rate_limit) = parse_poll_directive(
+            collected.status,
+            &collected.fields,
+            collected.error.is_some(),
+        );
+        return promote_graphql_rate_on_error(poll, false, graphql_rate_limit);
+    }
+    rejected_header_poll(bounded, false)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,11 +233,25 @@ pub(crate) enum ConditionalGet<T> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RestReadErrorKind {
     Credential,
+    Cancelled,
+    TimedOut,
     Transport,
     OperationLimit,
     InvalidFraming,
     InvalidHeaders,
     InvalidBody,
+    HttpFailure,
+    RateDeferred,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestReadErrorClass {
+    Credential,
+    Cancelled,
+    TimedOut,
+    OperationLimit,
+    InvalidResponse,
+    Transport,
     HttpFailure,
     RateDeferred,
 }
@@ -248,6 +274,12 @@ impl RestReadError {
     pub(crate) fn credential() -> Self {
         Self::new(RestReadErrorKind::Credential, RestPollDirective::default())
     }
+    pub(crate) fn cancelled() -> Self {
+        Self::new(RestReadErrorKind::Cancelled, RestPollDirective::default())
+    }
+    pub(crate) fn timed_out() -> Self {
+        Self::new(RestReadErrorKind::TimedOut, RestPollDirective::default())
+    }
     pub(crate) fn transport() -> Self {
         Self::new(RestReadErrorKind::Transport, RestPollDirective::default())
     }
@@ -266,6 +298,20 @@ impl RestReadError {
     pub(crate) fn http_status(&self) -> Option<u16> {
         self.status
     }
+    pub(crate) fn class(&self) -> RestReadErrorClass {
+        match self.kind {
+            RestReadErrorKind::Credential => RestReadErrorClass::Credential,
+            RestReadErrorKind::Cancelled => RestReadErrorClass::Cancelled,
+            RestReadErrorKind::TimedOut => RestReadErrorClass::TimedOut,
+            RestReadErrorKind::OperationLimit => RestReadErrorClass::OperationLimit,
+            RestReadErrorKind::InvalidFraming
+            | RestReadErrorKind::InvalidHeaders
+            | RestReadErrorKind::InvalidBody => RestReadErrorClass::InvalidResponse,
+            RestReadErrorKind::Transport => RestReadErrorClass::Transport,
+            RestReadErrorKind::HttpFailure => RestReadErrorClass::HttpFailure,
+            RestReadErrorKind::RateDeferred => RestReadErrorClass::RateDeferred,
+        }
+    }
     pub(crate) fn invalidates_cached_body(&self) -> bool {
         matches!(self.kind, RestReadErrorKind::InvalidBody)
     }
@@ -274,7 +320,10 @@ impl RestReadError {
             GeneralReadFailureKind::RateLimited
         } else if matches!(
             self.kind,
-            RestReadErrorKind::Credential | RestReadErrorKind::Transport
+            RestReadErrorKind::Credential
+                | RestReadErrorKind::Cancelled
+                | RestReadErrorKind::TimedOut
+                | RestReadErrorKind::Transport
         ) {
             GeneralReadFailureKind::Unavailable
         } else {
@@ -295,6 +344,8 @@ impl fmt::Display for RestReadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self.kind {
             RestReadErrorKind::Credential => "Selected GitHub credential is unavailable",
+            RestReadErrorKind::Cancelled => "GitHub conditional read was cancelled",
+            RestReadErrorKind::TimedOut => "GitHub conditional read timed out",
             RestReadErrorKind::Transport => "GitHub conditional read transport failed",
             RestReadErrorKind::OperationLimit => "GitHub conditional read operation limit reached",
             RestReadErrorKind::InvalidFraming => "Invalid GitHub included-response framing",
@@ -975,6 +1026,14 @@ mod tests {
             Some(BoundedDelay::Seconds(90))
         );
         assert_eq!(error.poll().rate_limit, None);
+    }
+
+    #[test]
+    fn scheduling_recovery_never_reads_body_lookalikes() {
+        let poll = general_poll_from_included_prefix(
+            b"HTTP/2 200 OK\r\nETag: \"safe\"\r\n\r\nbody\nx-poll-interval: 999999999999999999999",
+        );
+        assert_eq!(poll, RestPollDirective::default());
     }
 
     #[test]

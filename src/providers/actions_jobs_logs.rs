@@ -16,7 +16,7 @@ use std::{
     fmt,
     io::{Read, Write},
     os::unix::process::CommandExt,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -41,6 +41,7 @@ const MAX_LOG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOG_LINES: usize = 200_000;
 const MAX_LOG_LINE_BYTES: usize = 256 * 1024;
 const MAX_STORAGE_REDIRECTS: usize = 2;
+const JOBS_OPERATION_TIMEOUT: Duration = Duration::from_secs(180);
 const LOG_OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
 const CURL_API_BODY_LIMIT: usize = 65_536;
@@ -163,11 +164,11 @@ impl GithubProvider {
         let ActionsLinkage::Linked(workflow_run) = &check.actions_linkage else {
             return Err(invalid("admission"));
         };
-        validate_workflow(workflow_run)?;
         let base_repository = required_repository(details.base_repository.as_ref())?;
         if base_repository.name_with_owner != repo.full_name() {
             return Err(moved("admission"));
         }
+        validate_workflow(workflow_run, &base_repository)?;
         let pull_request_node_id = required_node(details.pull_request_node_id.as_deref())?;
         let observed_head_sha = required_sha(details.observed_head_sha.as_deref())?;
         let head_repository = required_repository(details.head_repository.as_ref())?;
@@ -223,8 +224,11 @@ impl GithubProvider {
         if locator.account != self.account || locator.account != repo.account {
             return Err(moved("jobs"));
         }
-        check_cancel(cancellation, "jobs")?;
-        let mut session = Session::new_actions(self, cancellation.shared());
+        let deadline = Instant::now()
+            .checked_add(JOBS_OPERATION_TIMEOUT)
+            .ok_or_else(|| timed_out("jobs"))?;
+        check_operation(cancellation, deadline, "jobs")?;
+        let mut session = Session::new_actions_until(self, cancellation.shared(), deadline);
         let viewer: ApiViewer = modified(session.get_conditional("user", None), "viewer identity")?;
         if !viewer.login.eq_ignore_ascii_case(&self.account.login)
             || viewer.login != self.account.login
@@ -247,6 +251,7 @@ impl GithubProvider {
             first_run,
             observed_at,
         )?;
+        check_operation(cancellation, deadline, "run attempt")?;
         let initial_run_fingerprint = run_fingerprint(&attempt);
 
         let mut page_records = Vec::new();
@@ -287,6 +292,7 @@ impl GithubProvider {
                 }
                 page_jobs.push(job);
             }
+            check_operation(cancellation, deadline, "jobs page")?;
             let expected_total = total_count.unwrap_or_default();
             let more = jobs.len() + page_jobs.len() < expected_total;
             validate_link(metadata.link.as_deref(), repo, locator, page, more)?;
@@ -350,6 +356,7 @@ impl GithubProvider {
                 }
             }
             offset += record.identities.len();
+            check_operation(cancellation, deadline, "jobs revalidation")?;
         }
         let final_run: ApiRunAttempt = modified(
             session.get_conditional(&run_endpoint, None),
@@ -365,6 +372,7 @@ impl GithubProvider {
         if run_fingerprint(&final_attempt) != initial_run_fingerprint {
             return Err(moved("run revalidation"));
         }
+        check_operation(cancellation, deadline, "run revalidation")?;
         let matches = jobs
             .iter()
             .filter(|job| job.check_run_database_id == locator.check_database_id)
@@ -380,6 +388,7 @@ impl GithubProvider {
                 .cmp(&right.name.to_ascii_lowercase())
                 .then(left.id.cmp(&right.id))
         });
+        check_operation(cancellation, deadline, "jobs install")?;
         Ok(ActionsJobsSnapshot {
             attempt: final_attempt,
             provider_ordered_job_ids,
@@ -494,6 +503,7 @@ impl GithubProvider {
                 started,
             )?;
             let response = parse_http_response(output, MAX_LOG_BYTES, "log storage")?;
+            check_operation(cancellation, deadline, "log storage")?;
             match response.status {
                 200 => {
                     validate_content_type(response.single_header("content-type")?)?;
@@ -522,6 +532,7 @@ impl GithubProvider {
             }
         };
         let (sanitized_text, line_count) = sanitize_log(&raw_body)?;
+        check_operation(cancellation, deadline, "job log install")?;
         Ok(ActionsJobLog {
             key: snapshot.attempt.key.clone(),
             job: refreshed,
@@ -581,7 +592,10 @@ fn positive_graphql_id(value: Option<u64>) -> ActionsResult<u64> {
     Ok(value)
 }
 
-fn validate_workflow(value: &crate::domain::WorkflowRunIdentity) -> ActionsResult<()> {
+fn validate_workflow(
+    value: &crate::domain::WorkflowRunIdentity,
+    repository: &CheckRepositoryIdentity,
+) -> ActionsResult<()> {
     required_node(Some(&value.node_id))?;
     required_node(Some(&value.workflow_node_id))?;
     positive_graphql_id(Some(value.database_id))?;
@@ -591,8 +605,12 @@ fn validate_workflow(value: &crate::domain::WorkflowRunIdentity) -> ActionsResul
     }
     bounded_text(&value.event, "admission")?;
     bounded_text(&value.workflow_name, "admission")?;
-    if !value.github_url.starts_with("https://github.com/") {
-        return Err(invalid("admission"));
+    let expected = format!(
+        "https://github.com/{}/actions/runs/{}",
+        repository.name_with_owner, value.database_id
+    );
+    if value.github_url != expected {
+        return Err(moved("admission"));
     }
     Ok(())
 }
@@ -758,13 +776,7 @@ fn validate_run(
         return Err(moved("run attempt"));
     }
     let mut returned = Vec::with_capacity(value.pull_requests.len());
-    let selected_relation = if current_head.is_empty() {
-        ActionsHeadRelation::Unknown
-    } else if current_head.eq_ignore_ascii_case(&locator.observed_head_sha) {
-        ActionsHeadRelation::CurrentHead
-    } else {
-        ActionsHeadRelation::HistoricalHead
-    };
+    let mut selected_relation = ActionsHeadRelation::Unknown;
     for pull in value.pull_requests {
         let identity = ActionsPullRequestIdentity {
             number: pull.number,
@@ -780,6 +792,13 @@ fn validate_run(
             {
                 return Err(moved("run pull request"));
             }
+            selected_relation = if current_head.is_empty() {
+                ActionsHeadRelation::Unknown
+            } else if current_head.eq_ignore_ascii_case(&locator.observed_head_sha) {
+                ActionsHeadRelation::CurrentHead
+            } else {
+                ActionsHeadRelation::HistoricalHead
+            };
         }
         returned.push(identity);
     }
@@ -1000,7 +1019,25 @@ fn map_rest(error: conditional::RestReadError, stage: &'static str) -> ActionsRe
     match error.http_status() {
         Some(status) => status_error(status, rate, stage),
         None if rate => ActionsReadError::new(ActionsReadErrorCategory::RateLimited, stage),
-        None => ActionsReadError::new(ActionsReadErrorCategory::Transport, stage),
+        None => ActionsReadError::new(
+            match error.class() {
+                conditional::RestReadErrorClass::Credential => ActionsReadErrorCategory::Credential,
+                conditional::RestReadErrorClass::Cancelled => ActionsReadErrorCategory::Cancelled,
+                conditional::RestReadErrorClass::TimedOut => ActionsReadErrorCategory::TimedOut,
+                conditional::RestReadErrorClass::OperationLimit => {
+                    ActionsReadErrorCategory::TooLarge
+                }
+                conditional::RestReadErrorClass::InvalidResponse => {
+                    ActionsReadErrorCategory::InvalidResponse
+                }
+                conditional::RestReadErrorClass::Transport
+                | conditional::RestReadErrorClass::HttpFailure
+                | conditional::RestReadErrorClass::RateDeferred => {
+                    ActionsReadErrorCategory::Transport
+                }
+            },
+            stage,
+        ),
     }
 }
 
@@ -1252,27 +1289,8 @@ fn run_curl(
             command.arg(MAX_LOG_BYTES.to_string());
         }
     }
-    for name in [
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GH_ENTERPRISE_TOKEN",
-        "GITHUB_ENTERPRISE_TOKEN",
-        "GH_HOST",
-        "GH_REPO",
-        "GH_DEBUG",
-        "DEBUG",
-        "http_proxy",
-        "https_proxy",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "all_proxy",
-        "NO_PROXY",
-        "no_proxy",
-    ] {
-        command.env_remove(name);
-    }
     command
+        .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1346,16 +1364,16 @@ fn run_curl(
                             let remaining =
                                 output_limit.saturating_add(1).saturating_sub(bytes.len());
                             bytes.extend_from_slice(&chunk[..read.min(remaining)]);
-                            if is_stdout
-                                && matches!(kind, CurlKind::Api)
-                                && !prefix_sent
-                                && (find_header_end(&bytes).is_some()
-                                    || bytes.len() >= MAX_HEADER_BYTES)
-                            {
-                                prefix_sent = true;
-                                let _ = output_tx.send(CurlPipeEvent::ApiPrefix(
-                                    bytes[..bytes.len().min(MAX_HEADER_BYTES)].to_vec(),
-                                ));
+                            if is_stdout && matches!(kind, CurlKind::Api) && !prefix_sent {
+                                let prefix = bytes[..bytes.len().min(MAX_HEADER_BYTES)].to_vec();
+                                if find_header_end(&bytes).is_some()
+                                    || bytes.len() >= MAX_HEADER_BYTES
+                                {
+                                    prefix_sent = true;
+                                    let _ = output_tx.send(CurlPipeEvent::ApiPrefix(prefix));
+                                } else {
+                                    let _ = output_tx.send(CurlPipeEvent::ApiProgress(prefix));
+                                }
                             }
                             if bytes.len() > output_limit {
                                 break Ok(bytes);
@@ -1388,12 +1406,13 @@ fn run_curl(
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut status = None;
+    let mut api_prefix = Vec::new();
     loop {
         while let Ok(event) = rx.try_recv() {
             match event {
                 CurlPipeEvent::Input(result) => {
                     if result.is_err() {
-                        terminate_process_group(&mut child);
+                        terminate_curl_with_poll(&mut child, &rx, kind, &mut api_prefix);
                         return Err(ActionsReadError::new(
                             ActionsReadErrorCategory::Transport,
                             "curl transport",
@@ -1405,7 +1424,7 @@ fn run_curl(
                     let bytes = match result {
                         Ok(bytes) => bytes,
                         Err(_) => {
-                            terminate_process_group(&mut child);
+                            terminate_curl_with_poll(&mut child, &rx, kind, &mut api_prefix);
                             return Err(ActionsReadError::new(
                                 ActionsReadErrorCategory::Transport,
                                 "curl transport",
@@ -1413,10 +1432,10 @@ fn run_curl(
                         }
                     };
                     if bytes.len() > output_limit {
-                        if matches!(kind, CurlKind::Api) {
-                            conditional::record_general_poll_from_included_prefix(&bytes);
+                        if is_stdout && matches!(kind, CurlKind::Api) {
+                            api_prefix = bytes[..bytes.len().min(MAX_HEADER_BYTES)].to_vec();
                         }
-                        terminate_process_group(&mut child);
+                        terminate_curl_with_poll(&mut child, &rx, kind, &mut api_prefix);
                         return Err(too_large("curl transport"));
                     }
                     if is_stdout {
@@ -1427,16 +1446,18 @@ fn run_curl(
                     }
                 }
                 CurlPipeEvent::ApiPrefix(prefix) => {
+                    api_prefix = prefix.clone();
                     conditional::record_general_poll_from_included_prefix(&prefix);
                 }
+                CurlPipeEvent::ApiProgress(prefix) => api_prefix = prefix,
             }
         }
         if cancellation.is_cancelled() {
-            terminate_process_group(&mut child);
+            terminate_curl_with_poll(&mut child, &rx, kind, &mut api_prefix);
             return Err(cancelled("curl transport"));
         }
         if operation_started.elapsed() >= LOG_OPERATION_TIMEOUT {
-            terminate_process_group(&mut child);
+            terminate_curl_with_poll(&mut child, &rx, kind, &mut api_prefix);
             return Err(timed_out("curl transport"));
         }
         if status.is_none() {
@@ -1444,7 +1465,7 @@ fn run_curl(
                 Ok(Some(current)) => status = Some(current),
                 Ok(None) => {}
                 Err(_) => {
-                    terminate_process_group(&mut child);
+                    terminate_curl_with_poll(&mut child, &rx, kind, &mut api_prefix);
                     return Err(ActionsReadError::new(
                         ActionsReadErrorCategory::Transport,
                         "curl transport",
@@ -1467,7 +1488,7 @@ fn run_curl(
             return Ok(stdout.unwrap_or_default());
         }
         if child_started.elapsed() >= CHILD_TIMEOUT {
-            terminate_process_group(&mut child);
+            terminate_curl_with_poll(&mut child, &rx, kind, &mut api_prefix);
             return Err(timed_out("curl transport"));
         }
         thread::sleep(Duration::from_millis(5));
@@ -1478,6 +1499,39 @@ enum CurlPipeEvent {
     Input(std::io::Result<()>),
     Output(bool, std::io::Result<Vec<u8>>),
     ApiPrefix(Vec<u8>),
+    ApiProgress(Vec<u8>),
+}
+
+fn terminate_curl_with_poll(
+    child: &mut Child,
+    receiver: &mpsc::Receiver<CurlPipeEvent>,
+    kind: CurlKind,
+    prefix: &mut Vec<u8>,
+) {
+    terminate_process_group(child);
+    if !matches!(kind, CurlKind::Api) {
+        return;
+    }
+    let drain_until = Instant::now().checked_add(Duration::from_millis(50));
+    loop {
+        match receiver.try_recv() {
+            Ok(CurlPipeEvent::ApiPrefix(value) | CurlPipeEvent::ApiProgress(value)) => {
+                *prefix = value;
+            }
+            Ok(CurlPipeEvent::Output(true, Ok(value))) => {
+                *prefix = value[..value.len().min(MAX_HEADER_BYTES)].to_vec();
+            }
+            Ok(_) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty)
+                if drain_until.is_some_and(|deadline| Instant::now() < deadline) =>
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(mpsc::TryRecvError::Empty) => break,
+        }
+    }
+    conditional::record_general_poll_from_included_prefix(prefix);
 }
 
 struct ParsedHttp {
@@ -1591,7 +1645,7 @@ fn sanitize_log(raw: &[u8]) -> ActionsResult<(String, usize)> {
     let decoded = String::from_utf8_lossy(raw);
     let mut output = String::with_capacity(decoded.len().min(MAX_LOG_BYTES));
     let mut line_bytes = 0usize;
-    let mut line_count: usize = if decoded.is_empty() { 0 } else { 1 };
+    let mut line_count: usize = 0;
     let mut chars = decoded.chars().peekable();
     while let Some(character) = chars.next() {
         let character = if character == '\r' {
@@ -1604,10 +1658,8 @@ fn sanitize_log(raw: &[u8]) -> ActionsResult<(String, usize)> {
         };
         if character == '\n' {
             line_bytes = 0;
-            if !output.is_empty() {
-                line_count = line_count.saturating_add(1);
-            }
-            if line_count > MAX_LOG_LINES + 1 {
+            line_count = line_count.saturating_add(1);
+            if line_count > MAX_LOG_LINES {
                 return Err(too_large("job log lines"));
             }
             output.push('\n');
@@ -1629,8 +1681,8 @@ fn sanitize_log(raw: &[u8]) -> ActionsResult<(String, usize)> {
         }
         output.push(visible);
     }
-    if output.ends_with('\n') {
-        line_count = line_count.saturating_sub(1);
+    if !output.is_empty() && !output.ends_with('\n') {
+        line_count = line_count.saturating_add(1);
     }
     if line_count > MAX_LOG_LINES {
         return Err(too_large("job log lines"));
@@ -1641,6 +1693,19 @@ fn sanitize_log(raw: &[u8]) -> ActionsResult<(String, usize)> {
 fn check_cancel(cancellation: &ActionsCancellation, stage: &'static str) -> ActionsResult<()> {
     if cancellation.is_cancelled() {
         Err(cancelled(stage))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_operation(
+    cancellation: &ActionsCancellation,
+    deadline: Instant,
+    stage: &'static str,
+) -> ActionsResult<()> {
+    check_cancel(cancellation, stage)?;
+    if Instant::now() >= deadline {
+        Err(timed_out(stage))
     } else {
         Ok(())
     }
@@ -1892,10 +1957,7 @@ mod tests {
         assert_eq!(snapshot.jobs.len(), 101);
         assert_eq!(snapshot.selected_check_job_id, 1_040);
         assert_ne!(snapshot.selected_check_job_id, locator.check_database_id);
-        assert_eq!(
-            snapshot.attempt.relation,
-            ActionsHeadRelation::HistoricalHead
-        );
+        assert_eq!(snapshot.attempt.relation, ActionsHeadRelation::Unknown);
         assert!(snapshot.attempt.returned_pull_requests.is_empty());
         assert_eq!(snapshot.provider_ordered_job_ids[40], 1_040);
         let ledger = fs::read_to_string(ledger).unwrap();
@@ -1951,7 +2013,7 @@ mod tests {
         let curl = fake_curl(
             &temp,
             &format!(
-                "#!/bin/sh\n/bin/cat >/dev/null\nprintf 'HTTP/1.1 429 Too Many Requests\\r\\nRetry-After: 19\\r\\n\\r\\n'\nprintf ready > '{}'\n/bin/sleep 30\n",
+                "#!/bin/sh\n/bin/cat >/dev/null\nprintf 'HTTP/1.1 429 Too Many Requests\\r\\nRetry-After: 19\\r\\n'\nprintf ready > '{}'\n/bin/sleep 30\n",
                 ready.display()
             ),
         );
@@ -2011,18 +2073,41 @@ mod tests {
     }
 
     #[test]
+    fn fake_child_stderr_never_steers_api_scheduling() {
+        let temp = TempDir::new().unwrap();
+        let curl = fake_curl(
+            &temp,
+            "#!/bin/sh\n/bin/cat >/dev/null\nprintf 'HTTP/1.1 200 OK\\r\\n\\r\\n{}'\nprintf 'HTTP/1.1 429 Too Many Requests\\r\\nRetry-After: 777\\r\\n\\r\\n' >&2\n",
+        );
+        let mut config = curl_config(b"https://api.github.com/x", Some(b"fixture-token")).unwrap();
+        let (result, poll, _) = conditional::with_general_read_tracker(|| {
+            run_curl(
+                &curl,
+                CurlKind::Api,
+                &mut config,
+                32,
+                &ActionsCancellation::new(),
+                Instant::now(),
+            )
+        });
+        assert!(result.is_err());
+        assert_eq!(poll.rate_limit, None);
+        assert_eq!(poll.x_poll_interval, None);
+    }
+
+    #[test]
     fn fake_storage_child_receives_credential_free_stdin_and_fixed_headers() {
         let temp = TempDir::new().unwrap();
         let argv = temp.path().join("argv");
         let input = temp.path().join("input");
         let environment = temp.path().join("environment");
+        let ssl_key_log = temp.path().join("must-not-exist-ssl-key-log");
         let curl = fake_curl(
             &temp,
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n/bin/cat > '{}'\nif [ -n \"${{GH_TOKEN+x}}\" ]; then printf GH_TOKEN >> '{}'; fi\nif [ -n \"${{GITHUB_TOKEN+x}}\" ]; then printf GITHUB_TOKEN >> '{}'; fi\nprintf 'HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: 2\\r\\n\\r\\nok'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n/bin/cat > '{}'\n/usr/bin/env > '{}'\nprintf 'HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: 2\\r\\n\\r\\nok'\n",
                 argv.display(),
                 input.display(),
-                environment.display(),
                 environment.display()
             ),
         );
@@ -2031,6 +2116,9 @@ mod tests {
             None,
         )
         .unwrap();
+        // SAFETY: this non-secret sentinel only discriminates the child
+        // environment boundary and is removed immediately after the call.
+        unsafe { std::env::set_var("SSLKEYLOGFILE", &ssl_key_log) };
         let output = run_curl(
             &curl,
             CurlKind::Storage,
@@ -2040,6 +2128,7 @@ mod tests {
             Instant::now(),
         )
         .unwrap();
+        unsafe { std::env::remove_var("SSLKEYLOGFILE") };
         assert!(config.is_empty());
         assert!(parse_http_response(output, 2, "test").is_ok());
         let argv = fs::read_to_string(argv).unwrap();
@@ -2054,7 +2143,10 @@ mod tests {
             assert!(!argv.contains(forbidden), "argv leaked {forbidden}");
         }
         assert!(argv.starts_with("-q --config -"));
-        assert!(!environment.exists() || fs::read(environment).unwrap().is_empty());
+        let environment = fs::read_to_string(environment).unwrap();
+        assert!(!environment.contains("SSLKEYLOGFILE"));
+        assert!(!environment.contains("GH_TOKEN="));
+        assert!(!ssl_key_log.exists());
         let input = fs::read_to_string(input).unwrap();
         assert!(input.starts_with("url = \"https://account.blob.core.windows.net/"));
         assert!(!input.contains("Authorization"));
@@ -2075,6 +2167,130 @@ mod tests {
                 .unwrap_err()
                 .category(),
             ActionsReadErrorCategory::InvalidResponse
+        );
+    }
+
+    #[test]
+    fn workflow_url_is_canonical_to_the_frozen_repository_and_run() {
+        let repo = repository();
+        let provider = GithubProvider::new(repo.account.clone());
+        for url in [
+            "https://github.com/other/repo/actions/runs/6",
+            "https://github.com/owner/repo/actions/runs/7",
+            "https://github.com/owner/repo/actions/runs/6/attempts/2",
+            "https://github.com/owner/repo/actions/runs/6?check_suite_focus=true",
+        ] {
+            let (details, mut check) = details_and_check();
+            let ActionsLinkage::Linked(workflow) = &mut check.actions_linkage else {
+                panic!()
+            };
+            workflow.github_url = url.into();
+            assert_eq!(
+                provider
+                    .actions_attempt_locator(&repo, &details, &check)
+                    .unwrap_err()
+                    .category(),
+                ActionsReadErrorCategory::MovedIdentity,
+                "accepted {url}"
+            );
+        }
+        let (details, check) = details_and_check();
+        assert!(
+            provider
+                .actions_attempt_locator(&repo, &details, &check)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn selected_pr_relation_requires_an_exact_returned_association() {
+        let repo = repository();
+        let provider = GithubProvider::new(repo.account.clone());
+        let (details, check) = details_and_check();
+        let locator = provider
+            .actions_attempt_locator(&repo, &details, &check)
+            .unwrap();
+        let key = ActionsAttemptKey {
+            locator: locator.clone(),
+            viewer_node_id: "VIEWER_node".into(),
+            viewer_login: "alice".into(),
+        };
+        let run = |pull_requests| ApiRunAttempt {
+            id: 6,
+            node_id: "RUN_node".into(),
+            run_attempt: 2,
+            run_number: 5,
+            event: "pull_request".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            workflow_id: 4,
+            check_suite_id: 8,
+            check_suite_node_id: "SUITE_node".into(),
+            head_sha: "a".repeat(40),
+            url: "https://api.github.com/repos/owner/repo/actions/runs/6/attempts/2".into(),
+            html_url: "https://github.com/owner/repo/actions/runs/6/attempts/2".into(),
+            workflow_url: "https://api.github.com/repos/owner/repo/actions/workflows/4".into(),
+            repository: ApiRepositoryIdentity {
+                node_id: "REPO_node".into(),
+                full_name: "owner/repo".into(),
+            },
+            head_repository: Some(ApiRepositoryIdentity {
+                node_id: "REPO_node".into(),
+                full_name: "owner/repo".into(),
+            }),
+            pull_requests,
+        };
+        assert_eq!(
+            validate_run(&repo, &key, &"a".repeat(40), run(vec![]), 1)
+                .unwrap()
+                .relation,
+            ActionsHeadRelation::Unknown
+        );
+        let omitted = ApiRunPullRequest {
+            number: 8,
+            base: ApiPullBranch {
+                sha: "b".repeat(40),
+                repo: ApiRepositoryIdentity {
+                    node_id: "OTHER_BASE".into(),
+                    full_name: "owner/repo".into(),
+                },
+            },
+            head: ApiPullBranch {
+                sha: "c".repeat(40),
+                repo: ApiRepositoryIdentity {
+                    node_id: "OTHER_HEAD".into(),
+                    full_name: "fork/repo".into(),
+                },
+            },
+        };
+        assert_eq!(
+            validate_run(&repo, &key, &"a".repeat(40), run(vec![omitted]), 1)
+                .unwrap()
+                .relation,
+            ActionsHeadRelation::Unknown
+        );
+        let selected = ApiRunPullRequest {
+            number: 7,
+            base: ApiPullBranch {
+                sha: "b".repeat(40),
+                repo: ApiRepositoryIdentity {
+                    node_id: "REPO_node".into(),
+                    full_name: "owner/repo".into(),
+                },
+            },
+            head: ApiPullBranch {
+                sha: "a".repeat(40),
+                repo: ApiRepositoryIdentity {
+                    node_id: "REPO_node".into(),
+                    full_name: "owner/repo".into(),
+                },
+            },
+        };
+        assert_eq!(
+            validate_run(&repo, &key, &"c".repeat(40), run(vec![selected]), 1)
+                .unwrap()
+                .relation,
+            ActionsHeadRelation::HistoricalHead
         );
     }
 
@@ -2165,6 +2381,80 @@ mod tests {
         assert_eq!(text, "one\ntwo\nthree\u{fffd}[31m\tend\n");
         assert_eq!(lines, 3);
         assert!(sanitize_log(b"bad\0body").is_err());
+        assert_eq!(sanitize_log(b"").unwrap().1, 0);
+        assert_eq!(sanitize_log(b"\n").unwrap().1, 1);
+        assert_eq!(sanitize_log(b"\nA").unwrap().1, 2);
+        assert_eq!(sanitize_log(b"A\n").unwrap().1, 1);
+        assert_eq!(sanitize_log(b"\r\nA\r").unwrap().1, 2);
+        assert_eq!(
+            sanitize_log(&vec![b'\n'; MAX_LOG_LINES]).unwrap().1,
+            MAX_LOG_LINES
+        );
+        assert_eq!(
+            sanitize_log(&vec![b'\n'; MAX_LOG_LINES + 1])
+                .unwrap_err()
+                .category(),
+            ActionsReadErrorCategory::TooLarge
+        );
+    }
+
+    #[test]
+    fn actions_error_adapter_preserves_closed_non_http_categories() {
+        let cases = [
+            (
+                conditional::RestReadError::credential(),
+                ActionsReadErrorCategory::Credential,
+            ),
+            (
+                conditional::RestReadError::cancelled(),
+                ActionsReadErrorCategory::Cancelled,
+            ),
+            (
+                conditional::RestReadError::timed_out(),
+                ActionsReadErrorCategory::TimedOut,
+            ),
+            (
+                conditional::RestReadError::operation_limit(),
+                ActionsReadErrorCategory::TooLarge,
+            ),
+            (
+                conditional::RestReadError::invalid_body(Default::default()),
+                ActionsReadErrorCategory::InvalidResponse,
+            ),
+            (
+                conditional::RestReadError::transport(),
+                ActionsReadErrorCategory::Transport,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(map_rest(error, "test").category(), expected);
+        }
+    }
+
+    #[test]
+    fn expired_deadline_and_cancellation_block_install() {
+        assert_eq!(
+            check_operation(
+                &ActionsCancellation::new(),
+                Instant::now() - Duration::from_millis(1),
+                "install",
+            )
+            .unwrap_err()
+            .category(),
+            ActionsReadErrorCategory::TimedOut
+        );
+        let cancellation = ActionsCancellation::new();
+        cancellation.cancel();
+        assert_eq!(
+            check_operation(
+                &cancellation,
+                Instant::now() + Duration::from_secs(1),
+                "install",
+            )
+            .unwrap_err()
+            .category(),
+            ActionsReadErrorCategory::Cancelled
+        );
     }
 
     #[test]

@@ -1442,18 +1442,6 @@ impl<'a> Session<'a> {
             byte_limit: MAX_OPERATION_BYTES,
         }
     }
-    fn new_actions(provider: &'a GithubProvider, cancellation: Arc<AtomicBool>) -> Self {
-        let started = Instant::now();
-        Self {
-            provider,
-            started,
-            deadline: started.checked_add(Duration::from_secs(180)),
-            bytes: 0,
-            general_read: conditional::active_general_read_tracker(),
-            cancellation: Some(cancellation),
-            byte_limit: actions_jobs_logs::MAX_ACTIONS_JSON_BYTES,
-        }
-    }
     fn new_actions_until(
         provider: &'a GithubProvider,
         cancellation: Arc<AtomicBool>,
@@ -1536,13 +1524,7 @@ impl<'a> Session<'a> {
         if let Some(tracker) = &self.general_read {
             tracker.check_not_halted()?;
         }
-        if self
-            .deadline
-            .is_none_or(|deadline| Instant::now() >= deadline)
-        {
-            self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
-            return Err(RestReadError::operation_limit());
-        }
+        self.check_actions_active()?;
         let mut token_command = self.provider.runner.gh_command();
         token_command.args([
             "auth",
@@ -1552,20 +1534,25 @@ impl<'a> Session<'a> {
             "--user",
             &self.provider.account.login,
         ]);
-        let token = self
+        let token_output = self
             .provider
             .runner
-            .run_maybe_cancelled(
+            .run_with_status_maybe_cancelled(
                 token_command,
                 "resolve selected GitHub credential",
                 self.cancellation.as_deref(),
                 self.deadline,
             )
-            .map_err(|_| {
-                self.record_general_failure(conditional::GeneralReadFailureKind::Unavailable);
-                RestReadError::credential()
+            .map_err(|error| {
+                let error = rest_from_runner(error, true);
+                self.record_general_error(&error);
+                error
             })?;
-        let token = std::str::from_utf8(&token)
+        if !token_output.status.success() {
+            self.record_general_failure(conditional::GeneralReadFailureKind::Unavailable);
+            return Err(RestReadError::credential());
+        }
+        let token = std::str::from_utf8(&token_output.stdout)
             .map_err(|_| {
                 self.record_general_failure(conditional::GeneralReadFailureKind::Unavailable);
                 RestReadError::credential()
@@ -1603,9 +1590,10 @@ impl<'a> Session<'a> {
                 self.cancellation.as_deref(),
                 self.deadline,
             )
-            .map_err(|_| {
-                self.record_general_failure(conditional::GeneralReadFailureKind::Unavailable);
-                RestReadError::transport()
+            .map_err(|error| {
+                let error = rest_from_runner(error, false);
+                self.record_general_error(&error);
+                error
             })?;
         let parsed = conditional::parse_included_response(&output.stdout, output.status.success())
             .inspect_err(|error| {
@@ -1631,12 +1619,35 @@ impl<'a> Session<'a> {
                     self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
                     RestReadError::invalid_body(metadata.poll.clone())
                 })?;
+                self.check_actions_active()?;
                 Ok(ConditionalGet::Modified { value, metadata })
             }
             ConditionalGet::NotModified { metadata } => {
+                self.check_actions_active()?;
                 Ok(ConditionalGet::NotModified { metadata })
             }
         }
+    }
+
+    fn check_actions_active(&mut self) -> std::result::Result<(), conditional::RestReadError> {
+        if self
+            .cancellation
+            .as_deref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+        {
+            let error = conditional::RestReadError::cancelled();
+            self.record_general_error(&error);
+            return Err(error);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            let error = conditional::RestReadError::timed_out();
+            self.record_general_error(&error);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn graphql<T: serde::de::DeserializeOwned>(
@@ -2678,6 +2689,7 @@ impl Runner {
         input: Option<&[u8]>,
     ) -> Result<RunnerOutput> {
         self.run_inner_maybe_cancelled(command, action, input, None, None)
+            .map_err(anyhow::Error::new)
     }
     fn run_with_status_maybe_cancelled(
         &self,
@@ -2685,7 +2697,7 @@ impl Runner {
         action: &'static str,
         cancellation: Option<&AtomicBool>,
         deadline: Option<Instant>,
-    ) -> Result<RunnerOutput> {
+    ) -> std::result::Result<RunnerOutput, RunnerFailure> {
         self.run_inner_maybe_cancelled(&mut command, action, None, cancellation, deadline)
     }
     fn run_inner_maybe_cancelled(
@@ -2695,7 +2707,7 @@ impl Runner {
         input: Option<&[u8]>,
         cancellation: Option<&AtomicBool>,
         deadline: Option<Instant>,
-    ) -> Result<RunnerOutput> {
+    ) -> std::result::Result<RunnerOutput, RunnerFailure> {
         let input = input.map(<[u8]>::to_vec);
         command
             .stdin(if input.is_some() {
@@ -2707,15 +2719,15 @@ impl Runner {
             .stderr(Stdio::piped())
             .process_group(0);
         let started = Instant::now();
-        let mut child = command.spawn().map_err(|_| {
-            anyhow::anyhow!("Cannot start subprocess to {action}; check installed gh/Git")
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|_| RunnerFailure::new(RunnerFailureKind::Start, action))?;
         let (tx, rx) = mpsc::channel();
         let mut input_done = input.is_none();
         if let Some(input) = input {
             let Some(mut stdin) = child.stdin.take() else {
                 terminate_process_group(&mut child);
-                bail!("Cannot open bounded input pipe to {action}");
+                return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
             };
             let tx = tx.clone();
             if thread::Builder::new()
@@ -2726,19 +2738,20 @@ impl Runner {
                 .is_err()
             {
                 terminate_process_group(&mut child);
-                bail!("Cannot start bounded input writer for {action}");
+                return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
             }
         }
         let limit = self.output_limit;
         let Some(stdout) = child.stdout.take() else {
             terminate_process_group(&mut child);
-            bail!("Cannot open subprocess output pipe while attempting to {action}");
+            return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
         };
         let Some(stderr) = child.stderr.take() else {
             terminate_process_group(&mut child);
-            bail!("Cannot open subprocess output pipe while attempting to {action}");
+            return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
         };
-        for (is_stdout, pipe) in [
+        let capture_conditional_prefix = action == "GitHub conditional read request";
+        for (is_stdout, mut pipe) in [
             (true, Box::new(stdout) as Box<dyn Read + Send>),
             (false, Box::new(stderr) as Box<dyn Read + Send>),
         ] {
@@ -2747,16 +2760,52 @@ impl Runner {
                 .name("provider-output".into())
                 .spawn(move || {
                     let mut bytes = Vec::new();
-                    let result = pipe
-                        .take(limit as u64 + 1)
-                        .read_to_end(&mut bytes)
-                        .map(|_| bytes);
+                    let mut prefix_complete = false;
+                    let result = loop {
+                        let mut chunk = [0u8; 8 * 1024];
+                        match pipe.read(&mut chunk) {
+                            Ok(0) => {
+                                if is_stdout && capture_conditional_prefix && !prefix_complete {
+                                    let _ = tx.send(PipeEvent::ConditionalPrefix(
+                                        bytes[..bytes.len().min(64 * 1024)].to_vec(),
+                                    ));
+                                }
+                                break Ok(bytes);
+                            }
+                            Ok(read) => {
+                                let remaining = limit.saturating_add(1).saturating_sub(bytes.len());
+                                bytes.extend_from_slice(&chunk[..read.min(remaining)]);
+                                if is_stdout && capture_conditional_prefix && !prefix_complete {
+                                    let prefix = bytes[..bytes.len().min(64 * 1024)].to_vec();
+                                    if conditional_prefix_complete(&prefix)
+                                        || prefix.len() == 64 * 1024
+                                    {
+                                        prefix_complete = true;
+                                        let _ = tx.send(PipeEvent::ConditionalPrefix(prefix));
+                                    } else {
+                                        let _ = tx.send(PipeEvent::ConditionalProgress(prefix));
+                                    }
+                                }
+                                if bytes.len() > limit {
+                                    break Ok(bytes);
+                                }
+                            }
+                            Err(error) => {
+                                if is_stdout && capture_conditional_prefix && !prefix_complete {
+                                    let _ = tx.send(PipeEvent::ConditionalPrefix(
+                                        bytes[..bytes.len().min(64 * 1024)].to_vec(),
+                                    ));
+                                }
+                                break Err(error);
+                            }
+                        }
+                    };
                     let _ = tx.send(PipeEvent::Output(is_stdout, result));
                 })
                 .is_err()
             {
                 terminate_process_group(&mut child);
-                bail!("Cannot start bounded output reader while attempting to {action}");
+                return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
             }
         }
         drop(tx);
@@ -2764,21 +2813,19 @@ impl Runner {
         let mut stdout_done = false;
         let mut stderr_done = false;
         let mut status = None;
+        let mut conditional_prefix = Vec::new();
         loop {
-            if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-                terminate_process_group(&mut child);
-                bail!("Cancelled while attempting to {action}");
-            }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                terminate_process_group(&mut child);
-                bail!("Timed out attempting to {action}");
-            }
             loop {
                 match rx.try_recv() {
                     Ok(PipeEvent::Input(result)) => {
                         if result.is_err() {
-                            terminate_process_group(&mut child);
-                            bail!("Cannot send bounded input to {action}");
+                            terminate_runner_with_poll(
+                                &mut child,
+                                &rx,
+                                capture_conditional_prefix,
+                                &mut conditional_prefix,
+                            );
+                            return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
                         }
                         input_done = true;
                     }
@@ -2786,19 +2833,29 @@ impl Runner {
                         let bytes = match result {
                             Ok(bytes) if bytes.len() <= limit => bytes,
                             Ok(bytes) => {
-                                if is_stdout && action == "GitHub conditional read request" {
-                                    conditional::record_general_poll_from_included_prefix(&bytes);
+                                if is_stdout && capture_conditional_prefix {
+                                    conditional_prefix =
+                                        bytes[..bytes.len().min(64 * 1024)].to_vec();
                                 }
-                                terminate_process_group(&mut child);
-                                bail!(
-                                    "Subprocess output failed or exceeded limit while attempting to {action}"
+                                terminate_runner_with_poll(
+                                    &mut child,
+                                    &rx,
+                                    capture_conditional_prefix,
+                                    &mut conditional_prefix,
                                 );
+                                return Err(RunnerFailure::new(
+                                    RunnerFailureKind::OutputLimit,
+                                    action,
+                                ));
                             }
                             Err(_) => {
-                                terminate_process_group(&mut child);
-                                bail!(
-                                    "Subprocess output failed or exceeded limit while attempting to {action}"
+                                terminate_runner_with_poll(
+                                    &mut child,
+                                    &rx,
+                                    capture_conditional_prefix,
+                                    &mut conditional_prefix,
                                 );
+                                return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
                             }
                         };
                         if is_stdout {
@@ -2808,23 +2865,56 @@ impl Runner {
                             stderr_done = true;
                         }
                     }
+                    Ok(PipeEvent::ConditionalPrefix(prefix)) => {
+                        conditional_prefix = prefix.clone();
+                        conditional::record_general_poll_from_included_prefix(&prefix);
+                    }
+                    Ok(PipeEvent::ConditionalProgress(prefix)) => conditional_prefix = prefix,
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         if !input_done || !stdout_done || !stderr_done {
-                            terminate_process_group(&mut child);
-                            bail!("Subprocess I/O stopped while attempting to {action}");
+                            terminate_runner_with_poll(
+                                &mut child,
+                                &rx,
+                                capture_conditional_prefix,
+                                &mut conditional_prefix,
+                            );
+                            return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
                         }
                         break;
                     }
                 }
+            }
+            if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                terminate_runner_with_poll(
+                    &mut child,
+                    &rx,
+                    capture_conditional_prefix,
+                    &mut conditional_prefix,
+                );
+                return Err(RunnerFailure::new(RunnerFailureKind::Cancelled, action));
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                terminate_runner_with_poll(
+                    &mut child,
+                    &rx,
+                    capture_conditional_prefix,
+                    &mut conditional_prefix,
+                );
+                return Err(RunnerFailure::new(RunnerFailureKind::TimedOut, action));
             }
             if status.is_none() {
                 match child.try_wait() {
                     Ok(Some(current)) => status = Some(current),
                     Ok(None) => {}
                     Err(_) => {
-                        terminate_process_group(&mut child);
-                        bail!("Cannot wait for subprocess to {action}");
+                        terminate_runner_with_poll(
+                            &mut child,
+                            &rx,
+                            capture_conditional_prefix,
+                            &mut conditional_prefix,
+                        );
+                        return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
                     }
                 }
             }
@@ -2839,12 +2929,22 @@ impl Runner {
                 });
             }
             if !input_done && started.elapsed() >= self.input_timeout.unwrap_or(self.timeout) {
-                terminate_process_group(&mut child);
-                bail!("Timed out sending bounded input to {action}");
+                terminate_runner_with_poll(
+                    &mut child,
+                    &rx,
+                    capture_conditional_prefix,
+                    &mut conditional_prefix,
+                );
+                return Err(RunnerFailure::new(RunnerFailureKind::TimedOut, action));
             }
             if started.elapsed() >= self.timeout {
-                terminate_process_group(&mut child);
-                bail!("Timed out attempting to {action}");
+                terminate_runner_with_poll(
+                    &mut child,
+                    &rx,
+                    capture_conditional_prefix,
+                    &mut conditional_prefix,
+                );
+                return Err(RunnerFailure::new(RunnerFailureKind::TimedOut, action));
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -2854,6 +2954,54 @@ impl Runner {
 struct RunnerOutput {
     stdout: Vec<u8>,
     status: std::process::ExitStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunnerFailureKind {
+    Start,
+    Io,
+    OutputLimit,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Debug)]
+struct RunnerFailure {
+    kind: RunnerFailureKind,
+    action: &'static str,
+}
+
+impl RunnerFailure {
+    fn new(kind: RunnerFailureKind, action: &'static str) -> Self {
+        Self { kind, action }
+    }
+}
+
+impl std::fmt::Display for RunnerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self.kind {
+            RunnerFailureKind::Start => "Cannot start subprocess",
+            RunnerFailureKind::Io => "Subprocess I/O failed",
+            RunnerFailureKind::OutputLimit => "Subprocess output exceeded limit",
+            RunnerFailureKind::TimedOut => "Timed out",
+            RunnerFailureKind::Cancelled => "Cancelled",
+        };
+        write!(formatter, "{message} while attempting to {}", self.action)
+    }
+}
+
+impl std::error::Error for RunnerFailure {}
+
+fn rest_from_runner(error: RunnerFailure, credential_phase: bool) -> conditional::RestReadError {
+    match error.kind {
+        RunnerFailureKind::Cancelled => conditional::RestReadError::cancelled(),
+        RunnerFailureKind::TimedOut => conditional::RestReadError::timed_out(),
+        RunnerFailureKind::OutputLimit => conditional::RestReadError::operation_limit(),
+        RunnerFailureKind::Start | RunnerFailureKind::Io if credential_phase => {
+            conditional::RestReadError::credential()
+        }
+        RunnerFailureKind::Start | RunnerFailureKind::Io => conditional::RestReadError::transport(),
+    }
 }
 
 fn ensure_success(output: RunnerOutput, action: &'static str) -> Result<Vec<u8>> {
@@ -2873,6 +3021,45 @@ fn ensure_success(output: RunnerOutput, action: &'static str) -> Result<Vec<u8>>
 enum PipeEvent {
     Input(std::io::Result<()>),
     Output(bool, std::io::Result<Vec<u8>>),
+    ConditionalPrefix(Vec<u8>),
+    ConditionalProgress(Vec<u8>),
+}
+
+fn conditional_prefix_complete(prefix: &[u8]) -> bool {
+    prefix.windows(4).any(|window| window == b"\r\n\r\n")
+        || prefix.windows(2).any(|window| window == b"\n\n")
+}
+
+fn terminate_runner_with_poll(
+    child: &mut Child,
+    receiver: &mpsc::Receiver<PipeEvent>,
+    capture_conditional_prefix: bool,
+    prefix: &mut Vec<u8>,
+) {
+    terminate_process_group(child);
+    if !capture_conditional_prefix {
+        return;
+    }
+    let drain_until = Instant::now().checked_add(Duration::from_millis(50));
+    loop {
+        match receiver.try_recv() {
+            Ok(PipeEvent::ConditionalPrefix(value) | PipeEvent::ConditionalProgress(value)) => {
+                *prefix = value;
+            }
+            Ok(PipeEvent::Output(true, Ok(value))) => {
+                *prefix = value[..value.len().min(64 * 1024)].to_vec();
+            }
+            Ok(_) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty)
+                if drain_until.is_some_and(|deadline| Instant::now() < deadline) =>
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(mpsc::TryRecvError::Empty) => break,
+        }
+    }
+    conditional::record_general_poll_from_included_prefix(prefix);
 }
 
 unsafe extern "C" {
@@ -9002,6 +9189,63 @@ else:
                 .to_string();
             assert!(err.contains("limit"));
             assert!(!err.contains("sensitive"));
+        }
+    }
+
+    #[test]
+    fn conditional_child_termination_preserves_stdout_rate_floor() {
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        for mode in ["cancel", "deadline", "child-timeout"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let ready = fixture.path().join("ready");
+            let runner = Runner {
+                timeout: if mode == "child-timeout" {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_secs(2)
+                },
+                output_limit: 1024,
+                ..Runner::default()
+            };
+            let mut command = Command::new("/usr/bin/python3");
+            command.args([
+                "-c",
+                "import pathlib,sys,time; sys.stdout.write('HTTP/1.1 429 Too Many Requests\\r\\nRetry-After: 23\\r\\n'); sys.stdout.flush(); pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(5)",
+                ready.to_str().unwrap(),
+            ]);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let setter = (mode == "cancel").then(|| {
+                let cancelled = cancelled.clone();
+                let ready = ready.clone();
+                thread::spawn(move || {
+                    let started = Instant::now();
+                    while !ready.exists() && started.elapsed() < Duration::from_secs(2) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(ready.exists());
+                    cancelled.store(true, Ordering::Release);
+                })
+            });
+            let deadline =
+                (mode == "deadline").then(|| Instant::now() + Duration::from_millis(500));
+            let (result, poll, _) = conditional::with_general_read_tracker(|| {
+                runner.run_with_status_maybe_cancelled(
+                    command,
+                    "GitHub conditional read request",
+                    (mode == "cancel").then_some(cancelled.as_ref()),
+                    deadline,
+                )
+            });
+            if let Some(setter) = setter {
+                setter.join().unwrap();
+            }
+            assert!(result.is_err(), "{mode} unexpectedly succeeded");
+            assert_eq!(
+                poll.rate_limit,
+                Some(conditional::BoundedDelay::Seconds(23)),
+                "lost floor on {mode}"
+            );
         }
     }
 
