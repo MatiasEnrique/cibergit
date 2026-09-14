@@ -5122,8 +5122,10 @@ struct DetailsReviewComment {
     commit: Option<GraphqlOid>,
     original_commit: Option<GraphqlOid>,
     pull_request_review: Option<GraphqlNodeId>,
-    viewer_can_react: bool,
-    reaction_groups: Vec<DetailsReactionGroup>,
+    // PendingReview shares this comment shape but does not request reactions.
+    // Missing fields cannot establish a complete reaction snapshot.
+    viewer_can_react: Option<bool>,
+    reaction_groups: Option<Vec<DetailsReactionGroup>>,
 }
 
 #[derive(Deserialize)]
@@ -5512,10 +5514,13 @@ impl DetailsBuilder {
                         coordinates(repo, number, comment.id.clone()),
                         parent_review,
                         comment.body.clone(),
-                        &comment.reaction_groups,
-                        comment.viewer_can_react,
+                        comment.reaction_groups.as_deref().unwrap_or_default(),
+                        comment.viewer_can_react.unwrap_or(false),
                         &selected_viewer,
-                        !partial && comments_complete,
+                        !partial
+                            && comments_complete
+                            && comment.viewer_can_react.is_some()
+                            && comment.reaction_groups.is_some(),
                     ));
                 }
                 self.review_threads
@@ -6577,6 +6582,61 @@ else:
                 "repository": {"nameWithOwner": "owner/repo", "pullRequest": pull}
             }
         })
+    }
+
+    #[test]
+    fn missing_review_comment_reactions_preserve_text_without_fresh_authority() {
+        for field in ["viewerCanReact", "reactionGroups"] {
+            for explicit_null in [false, true] {
+                let mut comment = json!({
+                    "id": "RC1", "author": {"login": "bob"}, "body": "retained comment",
+                    "createdAt": "a", "updatedAt": "b", "url": "u", "path": "src/lib.rs",
+                    "subjectType": "FILE", "line": null, "originalLine": null,
+                    "startLine": null, "originalStartLine": null, "diffHunk": "",
+                    "outdated": false, "commit": null, "originalCommit": null,
+                    "pullRequestReview": {"id": "R1"},
+                    "viewerCanReact": true, "reactionGroups": []
+                });
+                if explicit_null {
+                    comment[field] = Value::Null;
+                } else {
+                    comment.as_object_mut().unwrap().remove(field);
+                }
+                let mut pull = details_overview();
+                pull["reviewThreads"] = json!({
+                    "nodes": [{
+                        "id": "T1", "path": "src/lib.rs", "subjectType": "FILE",
+                        "line": null, "originalLine": null, "startLine": null,
+                        "originalStartLine": null, "diffSide": null, "startDiffSide": null,
+                        "isResolved": false, "isOutdated": false,
+                        "comments": {"nodes": [comment],
+                            "pageInfo": {"hasNextPage": false, "endCursor": null}}
+                    }],
+                    "pageInfo": {"hasNextPage": false, "endCursor": null}
+                });
+                let (dir, provider) = fixture(
+                    "alice",
+                    vec![details_step(details_response(pull), json!({"number": 1}))],
+                );
+                let details = provider.details(&repo("alice"), 1).unwrap();
+                assert_eq!(
+                    details.review_threads[0].comments[0].body,
+                    "retained comment"
+                );
+                let reaction = details
+                    .reactions
+                    .iter()
+                    .find(|snapshot| snapshot.kind == ReactableKind::PullRequestReviewComment)
+                    .unwrap();
+                assert!(
+                    !reaction.reactions.complete,
+                    "{field}, null={explicit_null}"
+                );
+                assert!(reaction.reactions.groups.is_empty());
+                assert!(reaction.fresh_capability.is_none());
+                exhausted(&dir, 1);
+            }
+        }
     }
 
     #[test]
