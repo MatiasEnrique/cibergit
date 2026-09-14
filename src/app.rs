@@ -94,7 +94,7 @@ use comparison_picker::{
 use file_tree::{FileTree, TreeRowKind};
 use gpui::{prelude::*, *};
 use gpui_base::{
-    Button, Scrollbar, TextView, TextViewStyle,
+    Button, HoverCard, Scrollbar, TextView, TextViewStyle,
     input::{Input, InputEditorStyle, InputEvent, InputState, Textarea, TextareaState},
 };
 use pr_lifecycle::{ChoiceKind, FrozenMutation, PrLifecycleController, reviewer};
@@ -22367,6 +22367,11 @@ impl ReviewWorkspace {
         let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
             let active = self.active_tab == Some(index);
             let id = SharedString::from(format!("tab-{index}"));
+            let close_id = SharedString::from(format!("close-tab-{index}"));
+            let close_label = format!(
+                "Close {} #{}",
+                tab.repository.name, tab.pull_request.number
+            );
             // Open PRs read as rounded chips on the canvas. Dividers between
             // them and a rule under the strip would repeat what the active
             // chip's own fill already says. The chip is painted at control
@@ -22383,10 +22388,13 @@ impl ReviewWorkspace {
                 .child(
                     div()
                         .h(px(ui::CONTROL_HEIGHT))
-                        .px(px(ui::CONTROL_INSET))
+                        .pl(px(ui::CONTROL_INSET))
+                        // The close target carries its own inset, so the chip
+                        // keeps an optical right edge without doubling it.
+                        .pr(px(ui::GAP_ICON))
                         .flex()
                         .items_center()
-                        .gap(px(ui::GAP_GROUP))
+                        .gap(px(ui::GAP_ICON))
                         .rounded(px(ui::CONTROL_RADIUS))
                         .text_color(if active { colors.text } else { colors.muted })
                         .when(active, |tab| tab.bg(colors.surface))
@@ -22402,6 +22410,47 @@ impl ReviewWorkspace {
                                     "{}  #{}",
                                     tab.repository.name, tab.pull_request.number
                                 )),
+                        )
+                        .child(
+                            // The close affordance stays painted rather than
+                            // hover-revealed: a hidden target still answers the
+                            // pointer, and a tab has to be closable by pointer
+                            // without first being read.
+                            Button::new(close_id.clone())
+                                .debug_selector({
+                                    let close_id = close_id.clone();
+                                    move || close_id.clone()
+                                })
+                                .group(close_id.clone())
+                                .size(px(ui::BADGE_HEIGHT))
+                                .flex_none()
+                                .p_0()
+                                .rounded(px(ui::BADGE_RADIUS))
+                                .border_1()
+                                .border_color(rgba(0x00000000))
+                                .focus_ring(colors.accent, colors.selected)
+                                .cursor_pointer()
+                                .hover(|close| close.bg(colors.elevated))
+                                .accessibility_label(close_label)
+                                .child(
+                                    sidebar_icon(
+                                        "close",
+                                        if active { colors.muted } else { colors.faint },
+                                    )
+                                    .size(px(ui::ICON_SIZE - 2.))
+                                    .group_hover(close_id, |icon| icon.text_color(colors.text)),
+                                )
+                                // The chip behind this target activates the tab.
+                                // Without stopping the press, closing a tab would
+                                // also select it on the way out.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(move |root, _, window, cx| {
+                                    if let Root::Review(this) = root {
+                                        this.close_tab_at(index, window, cx);
+                                    }
+                                })),
                         ),
                 )
                 .on_click(cx.listener(move |root, _, window, cx| {
@@ -22636,6 +22685,105 @@ impl ReviewWorkspace {
         )
     }
 
+    /// Everything this tab has to say about the freshness or completeness of
+    /// what it is showing. These used to be stacked bands of amber text above
+    /// the section, which spent real estate on a sentence most readers skip.
+    fn tab_notices(&self, index: usize) -> Vec<(String, bool)> {
+        let tab = &self.tabs[index];
+        let mut notices = Vec::new();
+        if tab.details.is_none()
+            && let Some(observation) = tab.cached_collaboration.as_ref()
+        {
+            let details = &observation.details;
+            notices.push((
+                format!(
+                    "Cached · saved {} · read-only.{}{}",
+                    collaboration_age_label(observation.observed_at_unix_ms),
+                    if details.activity_complete {
+                        ""
+                    } else {
+                        " Activity was incomplete when observed."
+                    },
+                    if details.checks_complete {
+                        ""
+                    } else {
+                        " Checks were incomplete when observed."
+                    },
+                ),
+                true,
+            ));
+            if let Some(value) = details.notice.clone() {
+                notices.push((format!("Original provider notice: {value}"), true));
+            }
+        }
+        if let Some(notice) = tab.details_state.notice() {
+            notices.push((notice, matches!(tab.details_state, LoadState::Error(_))));
+        }
+        if let Some(notice) = tab.collaboration_cache_notice.clone() {
+            notices.push((notice, true));
+        }
+        notices
+    }
+
+    /// The notices ride in the tab row as one icon with a hover card, so a
+    /// stale or partial read still announces itself without taking a line of
+    /// the diff. The icon's label carries the same text for assistive tech,
+    /// which never sees a hover.
+    fn render_tab_notices(&self, index: usize, colors: Palette) -> Option<impl IntoElement> {
+        let notices = self.tab_notices(index);
+        if notices.is_empty() {
+            return None;
+        }
+        let warning = notices.iter().any(|(_, warning)| *warning);
+        let spoken = notices
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let tint = if warning { colors.amber } else { colors.muted };
+        Some(
+            HoverCard::new("pr-notices")
+                .anchor(Anchor::TopRight)
+                .trigger(
+                    div()
+                        .id("pr-notices-trigger")
+                        .debug_selector(|| "pr-notices-trigger".to_owned())
+                        .size(px(ui::CONTROL_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(ui::CONTROL_RADIUS))
+                        .cursor_pointer()
+                        .hover(|trigger| trigger.bg(colors.selected))
+                        .aria_label(format!(
+                            "{} about this pull request: {spoken}",
+                            if warning { "Warning" } else { "Notice" }
+                        ))
+                        .child(sidebar_icon("alert", tint)),
+                )
+                .content(move |_, _, _| {
+                    div()
+                        .id("pr-notices-card")
+                        .debug_selector(|| "pr-notices-card".to_owned())
+                        .w(px(360.))
+                        .p(px(ui::CONTROL_INSET))
+                        .flex()
+                        .flex_col()
+                        .gap(px(ui::GAP_FIELD))
+                        .rounded(px(ui::POPOVER_RADIUS))
+                        .bg(colors.surface)
+                        .border_1()
+                        .border_color(colors.border)
+                        .ui_text(TextRole::Caption)
+                        .children(notices.into_iter().map(|(text, warning)| {
+                            div()
+                                .text_color(if warning { colors.amber } else { colors.muted })
+                                .child(text)
+                        }))
+                }),
+        )
+    }
+
     fn render_pr_tabs(&self, index: usize, colors: Palette, cx: &mut Context<Root>) -> Div {
         let tab = &self.tabs[index];
         let selected = if self.inspector_open {
@@ -22758,6 +22906,9 @@ impl ReviewWorkspace {
                         }
                     }))
             }))
+            .when_some(self.render_tab_notices(index, colors), |row, notices| {
+                row.child(div().flex_1()).child(notices)
+            })
     }
 
     fn render_review(
@@ -27989,11 +28140,6 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) -> impl IntoElement {
         let tab = &self.tabs[index];
-        let cached_observation = if tab.details.is_none() {
-            tab.cached_collaboration.as_ref()
-        } else {
-            None
-        };
         let confirmation_open = tab.confirmation.is_some();
         let current = tab.inspector_section;
         let content = if matches!(
@@ -28031,53 +28177,8 @@ impl ReviewWorkspace {
             .flex()
             .flex_col()
             .bg(colors.canvas)
-            .when_some(cached_observation, |panel, observation| {
-                let details = &observation.details;
-                panel.child(
-                    div()
-                        .px(px(ui::PANEL_GUTTER))
-                        .py_2()
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.amber)
-                        .child(format!(
-                            "Cached · saved {} · read-only.{}{}",
-                            collaboration_age_label(observation.observed_at_unix_ms),
-                            if details.activity_complete {
-                                ""
-                            } else {
-                                " Activity was incomplete when observed."
-                            },
-                            if details.checks_complete {
-                                ""
-                            } else {
-                                " Checks were incomplete when observed."
-                            },
-                        ))
-                        .when_some(details.notice.clone(), |notice, value| {
-                            notice.child(format!(" Original provider notice: {value}"))
-                        }),
-                )
-            })
-            .when_some(tab.details_state.notice(), |panel, notice| {
-                panel.child(
-                    div()
-                        .px(px(ui::PANEL_GUTTER))
-                        .py_2()
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.muted)
-                        .child(notice),
-                )
-            })
-            .when_some(tab.collaboration_cache_notice.clone(), |panel, notice| {
-                panel.child(
-                    div()
-                        .px(px(ui::PANEL_GUTTER))
-                        .py_2()
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.amber)
-                        .child(notice),
-                )
-            })
+            // Freshness and completeness now ride in the tab row's notice
+            // icon; see `render_tab_notices`.
             .child(
                 div()
                     .id("inspector-scroll")
@@ -29657,6 +29758,10 @@ fn sidebar_icon(name: &str, color: Rgba) -> Svg {
             "<path d='M3 7V5a2 2 0 0 1 2-2h5l3 3h6a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7h18'/>"
         }
         "plus" => "<path d='M12 5v14M5 12h14'/>",
+        "close" => "<path d='m7 7 10 10M17 7 7 17'/>",
+        "alert" => {
+            "<path d='M10.3 3.9 1.8 18.5A2 2 0 0 0 3.5 21.5h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z'/><path d='M12 9v4.5M12 17.2h.01'/>"
+        }
         "more" => {
             "<circle cx='5' cy='12' r='.7'/><circle cx='12' cy='12' r='.7'/><circle cx='19' cy='12' r='.7'/>"
         }
@@ -32629,6 +32734,85 @@ mod layout_tests {
             "the pane-level Enter shortcut must still work when the pane itself \
              holds focus"
         );
+    }
+
+    /// The freshness notices no longer occupy the page, so the affordance that
+    /// replaced them has to actually appear and actually open. A silent icon
+    /// would hide a stale read instead of reporting it.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn a_tab_notice_becomes_an_icon_whose_hover_card_carries_the_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.install_pr_layout_fixture(window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("pr-notices-trigger").is_none(),
+            "a tab with nothing to report must not show a notice icon"
+        );
+
+        let notice = "Cached · saved 50 minutes ago · read-only.".to_owned();
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.tabs[0].collaboration_cache_notice = Some(notice.clone());
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let trigger = cx
+            .debug_bounds("pr-notices-trigger")
+            .expect("a tab notice must reach the tab row as an icon");
+        assert!(
+            cx.debug_bounds("pr-notices-card").is_none(),
+            "the card must stay closed until the pointer arrives"
+        );
+
+        // Hovering is the whole affordance. Drive it the way a pointer does,
+        // then let the component's own open delay elapse.
+        cx.simulate_mouse_move(trigger.center(), None, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            cx.debug_bounds("pr-notices-card").is_some(),
+            "hovering the notice icon must open its card"
+        );
+
+        // The text itself is what has to survive, not only the icon.
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert_eq!(
+                this.tab_notices(0),
+                vec![(notice.clone(), true)],
+                "the card is built from the tab's own notices"
+            );
+        });
     }
 
     #[cfg(feature = "ui-smoke")]

@@ -2,8 +2,10 @@
 
 cibergit keeps the last successfully fetched pull-request collaboration snapshot so Overview,
 Activity, and Checks remain readable after an application restart when GitHub cannot be reached.
-The inspector labels this content `Cached`, shows its age, identifies it as read-only, and retains
-the provider's original completeness state and notice. If the inspector displays only the first
+A warning icon at the right of the tab row carries that state: its hover card names the content
+`Cached`, shows its age, identifies it as read-only, and retains the provider's original completeness
+state and notice. The icon's accessibility label repeats the same text, because a hover card is not
+reachable from the keyboard. The icon appears only while the tab has something to report. If the inspector displays only the first
 20 reviews, 30 mapped threads, or 40 checks from a larger cached payload, it discloses that display
 limit. Top-level issue comments keep their existing paging.
 

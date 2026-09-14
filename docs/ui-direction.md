@@ -14,6 +14,11 @@ The open-PR strip, the PR title block, the PR tab row, the sidebar account foote
 
 The chrome above a diff is three rows: title with its actions, branches with the local-edit and diff-mode controls, and the tab row, with the Compare bar as a fourth only where it applies. Information that a neighbouring row already carries does not get a row of its own: the published-revision label, the comparison line where the Compare bar is on screen, and a settled commit count are all dropped, and exact SHAs sit behind the revision summary. A warning about the comparison keeps its own line, always.
 
+Freshness and completeness notices are the exception: a stale or partial read reports itself through
+one warning icon at the right of the tab row, whose hover card holds the full text and whose
+accessibility label repeats it. Those notices were three stacked bands of amber prose above the
+content, and they cost a reader two lines of diff on every screen that carried them.
+
 User instruction, 2026-09-14: match GitHub's colours and diff highlighting so the workspace reads the way the pull request page it came from does.
 
 Surfaces keep this app's own neutrals; every colour that carries meaning comes from GitHub's Primer functional tokens, light and dark. The mapping is:
