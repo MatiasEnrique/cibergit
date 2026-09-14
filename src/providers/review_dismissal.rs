@@ -12,6 +12,7 @@ use crate::domain::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const MAX_DISMISSAL_REASON_BYTES: usize = 64 * 1024;
 const MAX_DISMISSAL_SOURCE_BYTES: usize = 1024 * 1024;
@@ -89,6 +90,7 @@ impl GithubProvider {
             || receipt.durable_record_id.chars().any(char::is_control)
         {
             return dismissal_not_started(
+                &context,
                 &mut *attempt,
                 "durable admission receipt does not match the frozen dismissal attempt".into(),
             );
@@ -101,6 +103,7 @@ impl GithubProvider {
             Ok(fresh) => fresh,
             Err(error) => {
                 return dismissal_not_started(
+                    &context,
                     &mut *attempt,
                     format!("post-admission dismissal preflight failed: {error}"),
                 );
@@ -112,6 +115,7 @@ impl GithubProvider {
             || !fresh.authority.permits_attempt()
         {
             return dismissal_not_started(
+                &context,
                 &mut *attempt,
                 "post-admission dismissal target, viewer, or authority changed; zero writes sent"
                     .into(),
@@ -119,7 +123,7 @@ impl GithubProvider {
         }
         let data = match mutation.dispatch(self) {
             MutationTransport::Rejected(reason) => {
-                return dismissal_not_started(&mut *attempt, reason);
+                return dismissal_not_started(&context, &mut *attempt, reason);
             }
             MutationTransport::Uncertain(reason) => {
                 return dismissal_uncertain(&context, &mut *attempt, reason);
@@ -130,7 +134,7 @@ impl GithubProvider {
             Ok(acknowledgement) => acknowledgement,
             Err(reason) => return dismissal_uncertain(&context, &mut *attempt, reason),
         };
-        let encoded = match serde_json::to_value(&acknowledgement) {
+        let encoded = match compact_terminal_acknowledgement(request, &acknowledgement) {
             Ok(encoded) => encoded,
             Err(error) => {
                 return dismissal_uncertain(
@@ -175,6 +179,23 @@ impl GithubProvider {
             },
         }
     }
+}
+
+fn compact_terminal_acknowledgement(
+    request: &SubmittedReviewDismissalRequest,
+    acknowledgement: &SubmittedReviewDismissalAcknowledgement,
+) -> std::result::Result<Value, serde_json::Error> {
+    let request_bytes = serde_json::to_vec(request)?;
+    let request_sha256 = format!("{:x}", Sha256::digest(request_bytes));
+    Ok(json!({
+        "operation_id": acknowledgement.operation_id.as_str(),
+        "review_id": acknowledgement.target.review.remote_id.as_str(),
+        "pull_request_id": acknowledgement.target.pull_request.remote_id.as_str(),
+        "repository": acknowledgement.target.repository.full_name(),
+        "viewer_node_id": acknowledgement.viewer.node_id.as_str(),
+        "final_state": acknowledgement.final_state.as_str(),
+        "frozen_request_sha256": request_sha256,
+    }))
 }
 
 fn validate_displayed(
@@ -311,6 +332,7 @@ fn validate_authority(authority: &DismissalAuthority) -> std::result::Result<(),
 }
 
 fn dismissal_not_started<A>(
+    context: &MutationContext,
     attempt: &mut dyn super::AdmittedMutationAttempt,
     reason: String,
 ) -> ProviderMutationOutcome<A> {
@@ -319,13 +341,16 @@ fn dismissal_not_started<A>(
             reason: reason.clone(),
         })
         .err();
-    rejected(if let Some(error) = record_error {
-        format!(
-            "{reason}; dispatched zero writes; durable InFlight retained because NotStarted recording failed: {error}"
-        )
+    if let Some(error) = record_error {
+        ProviderMutationOutcome::Uncertain {
+            context: context.clone(),
+            reason: format!(
+                "{reason}; dispatched zero writes, but durable NotStarted recording failed and InFlight authority was retained against replay: {error}"
+            ),
+        }
     } else {
-        format!("{reason}; dispatched zero writes")
-    })
+        rejected(format!("{reason}; dispatched zero writes"))
+    }
 }
 
 fn dismissal_uncertain<A>(

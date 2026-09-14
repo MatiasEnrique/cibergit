@@ -82,6 +82,19 @@ impl GithubProvider {
         }
     }
 
+    #[cfg(any(test, feature = "ui-smoke"))]
+    #[doc(hidden)]
+    pub fn synthetic_with_gh(account: Account, gh: PathBuf, timeout: Duration) -> Self {
+        Self {
+            account,
+            runner: Runner {
+                gh,
+                timeout,
+                ..Runner::default()
+            },
+        }
+    }
+
     /// Discover all stored GitHub.com identities, including inactive identities.
     /// Broken credentials are omitted; an entirely unusable configuration errors.
     pub fn accounts() -> Result<Vec<Account>> {

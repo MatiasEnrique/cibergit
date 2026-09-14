@@ -1847,7 +1847,7 @@ impl JournalRequest {
                 cibergit::domain::ReactionAction::Add => "add-reaction",
                 cibergit::domain::ReactionAction::Remove { .. } => "remove-reaction",
             },
-            Self::Dismissal(_) => "dismiss submitted review",
+            Self::Dismissal(_) => "dismiss-submitted-review",
         };
         let payload = match self {
             Self::Lifecycle(request) => serde_json::json!({
@@ -2582,6 +2582,8 @@ fn short_sha(sha: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "ui-smoke")]
+    use cibergit::domain::FreshReviewDismissalCapability;
     use cibergit::domain::{
         Account, ChangedFile, Comparison, DismissalAuthority, LinkedReviewComment,
         MergeEligibility, PendingFileCommentSource, ProviderCoordinates,
@@ -2592,6 +2594,8 @@ mod tests {
     use cibergit::participation::{
         DiffSide, RemoteDraftIds, ReviewCommentTarget, ReviewOperationStatus,
     };
+    #[cfg(feature = "ui-smoke")]
+    use std::{fs, os::unix::fs::PermissionsExt};
     use std::{
         process::Command,
         sync::{
@@ -2887,6 +2891,176 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ui-smoke")]
+    fn real_dismissal_fixture(
+        body: &str,
+        operation_id: &str,
+        complete_write: bool,
+    ) -> (tempfile::TempDir, cibergit::providers::GithubProvider) {
+        let directory = tempdir().unwrap();
+        let target = serde_json::json!({"data":{
+            "viewer":{"id":"USER_reader","login":"reader"},
+            "repository":{
+                "nameWithOwner":"octo/repo","viewerCanAdminister":true,
+                "pullRequest":{"id":"PR_7","number":7}
+            },
+            "node":{
+                "__typename":"PullRequestReview","id":"REVIEW_7",
+                "body":body,"state":"APPROVED","submittedAt":"2026-09-12T09:00:00Z",
+                "author":null,"commit":{"oid":"1111111111111111111111111111111111111111"},
+                "pullRequest":{"id":"PR_7","number":7,"repository":{"nameWithOwner":"octo/repo"}}
+            }
+        }});
+        let mut steps = vec![serde_json::json!({
+            "marker":"query SubmittedReviewDismissalTarget(",
+            "variables":{"owner":"octo","name":"repo","number":7,"reviewId":"REVIEW_7"},
+            "response":target
+        })];
+        if complete_write {
+            steps.push(steps[0].clone());
+            steps.push(serde_json::json!({
+                "marker":"mutation DismissSubmittedReview(",
+                "variables":{"reviewId":"REVIEW_7","message":"exact required reason","clientMutationId":operation_id},
+                "response":{"data":{"dismissPullRequestReview":{
+                    "clientMutationId":operation_id,
+                    "pullRequestReview":{
+                        "__typename":"PullRequestReview","id":"REVIEW_7",
+                        "body":body,"state":"DISMISSED","submittedAt":"2026-09-12T09:00:00Z",
+                        "author":null,"commit":{"oid":"1111111111111111111111111111111111111111"},
+                        "pullRequest":{"id":"PR_7","number":7,"repository":{"nameWithOwner":"octo/repo"}}
+                    }
+                }}}
+            }));
+        }
+        fs::write(
+            directory.path().join("steps.json"),
+            serde_json::to_vec(&steps).unwrap(),
+        )
+        .unwrap();
+        let executable = directory.path().join("gh");
+        fs::write(
+            &executable,
+            r#"#!/usr/bin/python3
+import json, os, pathlib, sys
+root = pathlib.Path(__file__).parent
+steps = json.loads((root / 'steps.json').read_text())
+args = sys.argv[1:]
+if args[:2] == ['auth','token']:
+    assert args == ['auth','token','--hostname','github.com','--user','reader']
+    assert 'GH_TOKEN' not in os.environ
+    print('private-reader')
+    sys.exit(0)
+assert os.environ.get('GH_TOKEN') == 'private-reader'
+assert args == ['api','--hostname','github.com','--method','POST','--header','Accept: application/vnd.github+json','--header','X-GitHub-Api-Version: 2026-03-10','graphql','--input','-']
+count_path = root / 'count'
+index = int(count_path.read_text()) if count_path.exists() else 0
+assert index < len(steps), 'unexpected extra request'
+payload = json.load(sys.stdin)
+step = steps[index]
+query = ' '.join(payload['query'].split())
+assert step['marker'] in query
+assert payload['variables'] == step['variables']
+if 'mutation DismissSubmittedReview(' in query:
+    assert query.count('dismissPullRequestReview(') == 1
+    assert 'pullRequestReview { __typename id body state submittedAt author { login } commit { oid } pullRequest { id number repository { nameWithOwner } } }' in query
+count_path.write_text(str(index + 1))
+print(json.dumps(step['response']))
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let provider = cibergit::providers::GithubProvider::synthetic_with_gh(
+            repository().account,
+            executable,
+            Duration::from_secs(30),
+        );
+        (directory, provider)
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[test]
+    fn real_journal_admission_executes_once_with_compact_terminal_and_rejects_oversize() {
+        let large_body = "b".repeat(70 * 1024);
+        let (transport, provider) =
+            real_dismissal_fixture(&large_body, "dismiss-real-journal", true);
+        let mut displayed = PullRequestReview {
+            coordinates: coordinates("REVIEW_7"),
+            author: None,
+            body: large_body.clone(),
+            state: "APPROVED".into(),
+            submitted_at: Some("2026-09-12T09:00:00Z".into()),
+            commit_sha: Some("1".repeat(40)),
+            edit_summary_capability: None,
+            dismissal_capability: Some(FreshReviewDismissalCapability {
+                viewer: SelectedViewer {
+                    node_id: "USER_reader".into(),
+                    login: "reader".into(),
+                },
+                pull_request: coordinates("PR_7"),
+                authority: DismissalAuthority::Available,
+            }),
+            url: String::new(),
+        };
+        let request = provider
+            .prepare_review_dismissal(
+                &repository(),
+                7,
+                &displayed,
+                "exact required reason".into(),
+                "dismiss-real-journal".into(),
+                "attempt-real-journal".into(),
+            )
+            .unwrap();
+        let journal_root = tempdir().unwrap();
+        let mut journal = ActionJournal::open(journal_root.path(), review_key()).unwrap();
+        let mut admission = journal.admission(JournalRequest::Dismissal(Box::new(request.clone())));
+        let outcome = provider.execute_review_dismissal(&repository(), &request, &mut admission);
+        assert!(matches!(outcome, ProviderMutationOutcome::Acknowledged(_)));
+        drop(admission);
+        assert_eq!(
+            fs::read_to_string(transport.path().join("count")).unwrap(),
+            "3"
+        );
+        let operations = journal.operations().unwrap();
+        assert!(matches!(
+            operations[0].status,
+            JournalStatus::Acknowledged { .. }
+        ));
+        let JournalStatus::Acknowledged { summary, .. } = &operations[0].status else {
+            unreachable!()
+        };
+        assert!(summary.contains("frozen_request_sha256"));
+        assert!(!summary.contains(&large_body));
+
+        let oversize_body = "z".repeat(520 * 1024);
+        let (transport, provider) =
+            real_dismissal_fixture(&oversize_body, "dismiss-oversize", false);
+        displayed.body = oversize_body;
+        let request = provider
+            .prepare_review_dismissal(
+                &repository(),
+                7,
+                &displayed,
+                "exact required reason".into(),
+                "dismiss-oversize".into(),
+                "attempt-oversize".into(),
+            )
+            .unwrap();
+        let journal_root = tempdir().unwrap();
+        let mut journal = ActionJournal::open(journal_root.path(), review_key()).unwrap();
+        let mut admission = journal.admission(JournalRequest::Dismissal(Box::new(request.clone())));
+        let outcome = provider.execute_review_dismissal(&repository(), &request, &mut admission);
+        assert!(matches!(
+            outcome,
+            ProviderMutationOutcome::PreflightRejected { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(transport.path().join("count")).unwrap(),
+            "1",
+            "oversize durable intent must reject before the second read or mutation"
+        );
+    }
+
     #[test]
     fn dismissal_journal_freezes_reason_and_restart_never_replays() {
         let directory = tempdir().unwrap();
@@ -2894,7 +3068,7 @@ mod tests {
         let request = dismissal_request("dismiss-1", "dismiss-attempt-1");
         let frozen = JournalRequest::Dismissal(Box::new(request.clone()));
         let context = frozen.mutation_context();
-        assert_eq!(context.action, "dismiss submitted review");
+        assert_eq!(context.action, "dismiss-submitted-review");
         assert_eq!(
             context.payload["request"],
             serde_json::to_value(&request).unwrap()

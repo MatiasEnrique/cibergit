@@ -320,6 +320,23 @@ fn new_textarea(
     })
 }
 
+fn new_textarea_in_app(
+    value: impl Into<String>,
+    placeholder: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<TextareaState> {
+    let value = value.into();
+    let colors = palette(is_dark(window));
+    cx.new(|cx| {
+        let mut editor = TextareaState::new(window, cx).auto_grow(3, 8);
+        editor.set_editor_style(input_style(colors));
+        editor.set_value(value, window, cx);
+        editor.set_placeholder(placeholder, window, cx);
+        editor
+    })
+}
+
 struct ViewEditorInputs {
     name: Entity<InputState>,
     search: Entity<InputState>,
@@ -864,12 +881,6 @@ struct DismissalReasonInputOwner {
     repository_key: String,
     pull_request: u64,
     review: Option<ProviderCoordinates>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DismissalReasonChangeGuard {
-    owner: DismissalReasonInputOwner,
-    stale_value: String,
 }
 
 impl DismissalReasonInputOwner {
@@ -1834,7 +1845,7 @@ pub struct ReviewWorkspace {
     active_tab: Option<usize>,
     active_tab_input_restore: Option<ActiveTabInputRestoreToken>,
     dismissal_reason_input_owner: Option<DismissalReasonInputOwner>,
-    dismissal_reason_change_guard: Option<DismissalReasonChangeGuard>,
+    dismissal_reason_subscription: Option<Subscription>,
     setup_open: bool,
     command_palette: bool,
     creation_dialog: Option<Entity<pr_creation::PrCreationDialog>>,
@@ -2120,7 +2131,7 @@ impl ReviewWorkspace {
             active_tab: None,
             active_tab_input_restore: None,
             dismissal_reason_input_owner: None,
-            dismissal_reason_change_guard: None,
+            dismissal_reason_subscription: None,
             setup_open: startup.repository.is_none() && !startup_restore_pending,
             command_palette: false,
             creation_dialog: None,
@@ -2335,66 +2346,15 @@ impl ReviewWorkspace {
         );
         let dismissal_reason_changes = cx.subscribe(
             &this.dismissal_reason_input,
-            |root, _, event: &InputEvent, cx| {
+            |root, input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change)
                     && let Root::Review(this) = root
-                    && let Some(index) = this.active_tab
-                    && this.active_tab_input_restore.is_none()
-                    && this.dismissal_reason_input_owner.as_ref().is_some_and(|owner| {
-                        this.tabs
-                            .get(index)
-                            .is_some_and(|tab| owner.matches(this.workspace_instance, tab))
-                    })
                 {
-                    let reason = this.dismissal_reason_input.read(cx).value().to_string();
-                    let guarded_owner = this
-                        .dismissal_reason_change_guard
-                        .as_ref()
-                        .is_some_and(|guard| {
-                            this.dismissal_reason_input_owner.as_ref() == Some(&guard.owner)
-                        });
-                    if guarded_owner {
-                        let stale_value = this
-                            .dismissal_reason_change_guard
-                            .take()
-                            .map(|guard| guard.stale_value)
-                            .unwrap_or_default();
-                        let expected = this.tabs[index]
-                            .dismissal_editor
-                            .active_reason()
-                            .to_owned();
-                        if reason == stale_value && reason != expected {
-                            let owner = DismissalReasonInputOwner::for_tab(
-                                this.workspace_instance,
-                                &this.tabs[index],
-                            );
-                            let root_entity = cx.entity_id();
-                            let input = this.dismissal_reason_input.clone();
-                            let _ = cx.with_window(root_entity, |window, cx| {
-                                input.update(cx, |input, cx| {
-                                    input.set_value(expected, window, cx)
-                                });
-                            });
-                            this.dismissal_reason_input_owner = Some(owner);
-                            this.status = "Ignored a queued dismissal-reason event from the previous tab; the active tab text was restored."
-                                .into();
-                            cx.notify();
-                            return;
-                        }
-                    }
-                    let changed = this.tabs[index]
-                        .dismissal_editor
-                        .store_active_reason(reason);
-                    if changed {
-                        this.invalidate_dismissal_confirmation(
-                            index,
-                            "Dismissal reason changed; review the newly frozen reason before confirming.",
-                        );
-                        cx.notify();
-                    }
+                    this.stage_dismissal_reason_change(&input, cx);
                 }
             },
         );
+        this.dismissal_reason_subscription = Some(dismissal_reason_changes);
         this._subscriptions.extend([
             activation,
             appearance,
@@ -2405,7 +2365,6 @@ impl ReviewWorkspace {
             lifecycle_base_changes,
             discussion_changes,
             submitted_summary_changes,
-            dismissal_reason_changes,
         ]);
         this.start_workspace_restore(cx);
         this.start_notifications(cx);
@@ -10414,7 +10373,8 @@ impl ReviewWorkspace {
     ) {
         if self.begin_active_tab_transition(index, record_navigation, cx) {
             self.active_tab_input_restore = None;
-            self.restore_active_tab_shared_inputs(index, window, cx);
+            let root = cx.weak_entity();
+            self.restore_active_tab_shared_inputs(index, root, window, cx);
         }
     }
 
@@ -10424,7 +10384,6 @@ impl ReviewWorkspace {
         record_navigation: bool,
         cx: &mut Context<Root>,
     ) {
-        let stale_dismissal_value = self.dismissal_reason_input.read(cx).value().to_string();
         if self.begin_active_tab_transition(index, record_navigation, cx) {
             let tab = &self.tabs[index];
             let token = ActiveTabInputRestoreToken {
@@ -10433,13 +10392,8 @@ impl ReviewWorkspace {
                 repository_key: tab.repository.cache_key(),
                 pull_request: tab.pull_request.number,
             };
-            let dismissal_owner = DismissalReasonInputOwner::for_tab(self.workspace_instance, tab);
             self.active_tab_input_restore = Some(token.clone());
             self.dismissal_reason_input_owner = None;
-            self.dismissal_reason_change_guard = Some(DismissalReasonChangeGuard {
-                owner: dismissal_owner,
-                stale_value: stale_dismissal_value,
-            });
             self.composer_input
                 .update(cx, |input, cx| input.set_disabled(true, cx));
             self.submitted_summary_input
@@ -10524,6 +10478,7 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) {
         let weak = cx.weak_entity();
+        let restoration_root = weak.clone();
         cx.defer(move |cx| {
             let _ = weak.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
@@ -10541,9 +10496,10 @@ impl ReviewWorkspace {
                     return;
                 }
                 let root_entity = cx.entity_id();
+                let input_root = restoration_root.clone();
                 let restored = cx
                     .with_window(root_entity, |window, cx| {
-                        this.restore_active_tab_shared_inputs(index, window, cx);
+                        this.restore_active_tab_shared_inputs(index, input_root, window, cx);
                     })
                     .is_some();
                 if restored {
@@ -10561,6 +10517,7 @@ impl ReviewWorkspace {
     fn restore_active_tab_shared_inputs(
         &mut self,
         index: usize,
+        root: WeakEntity<Root>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -10607,11 +10564,14 @@ impl ReviewWorkspace {
             window,
             cx,
         );
-        self.dismissal_reason_input.update(cx, |input, cx| {
-            input.set_value(dismissal_reason, window, cx);
-            input.set_disabled(mutation_disabled, cx);
-        });
-        self.dismissal_reason_input_owner = Some(dismissal_owner);
+        self.replace_dismissal_reason_input(
+            dismissal_reason,
+            mutation_disabled,
+            dismissal_owner,
+            root,
+            window,
+            cx,
+        );
         if let Some(form) = metadata_form {
             self.metadata_title_input
                 .update(cx, |input, cx| input.set_value(form.title, window, cx));
@@ -10648,7 +10608,8 @@ impl ReviewWorkspace {
         {
             return false;
         }
-        self.restore_active_tab_shared_inputs(index, window, cx);
+        let root = cx.weak_entity();
+        self.restore_active_tab_shared_inputs(index, root, window, cx);
         self.active_tab_input_restore = None;
         true
     }
@@ -10958,6 +10919,68 @@ impl ReviewWorkspace {
             && self.tabs.get(index).is_some_and(|tab| {
                 !tab.write_in_flight && !tab.submitted_summary_editor.close_after_save
             })
+    }
+
+    fn stage_dismissal_reason_change(
+        &mut self,
+        source: &Entity<TextareaState>,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.active_tab else { return };
+        if self.active_tab_input_restore.is_some()
+            || source.entity_id() != self.dismissal_reason_input.entity_id()
+            || !self
+                .dismissal_reason_input_owner
+                .as_ref()
+                .is_some_and(|owner| {
+                    self.tabs
+                        .get(index)
+                        .is_some_and(|tab| owner.matches(self.workspace_instance, tab))
+                })
+        {
+            return;
+        }
+        let reason = source.read(cx).value().to_string();
+        let changed = self.tabs[index]
+            .dismissal_editor
+            .store_active_reason(reason);
+        if changed {
+            self.invalidate_dismissal_confirmation(
+                index,
+                "Dismissal reason changed; review the newly frozen reason before confirming.",
+            );
+            cx.notify();
+        }
+    }
+
+    fn replace_dismissal_reason_input(
+        &mut self,
+        reason: String,
+        disabled: bool,
+        owner: DismissalReasonInputOwner,
+        root: WeakEntity<Root>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let input = new_textarea_in_app(
+            &reason,
+            "Required reason for dismissing this review…",
+            window,
+            cx,
+        );
+        input.update(cx, |input, cx| input.set_disabled(disabled, cx));
+        let subscription = cx.subscribe(&input, move |input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let _ = root.update(cx, |root, cx| {
+                    if let Root::Review(this) = root {
+                        this.stage_dismissal_reason_change(&input, cx);
+                    }
+                });
+            }
+        });
+        self.dismissal_reason_input = input;
+        self.dismissal_reason_input_owner = Some(owner);
+        self.dismissal_reason_subscription = Some(subscription);
     }
 
     fn update_shared_composer_disabled(&self, cx: &mut Context<Root>) {
@@ -12574,12 +12597,10 @@ impl ReviewWorkspace {
             .begin(current.coordinates.clone());
         let dismissal_owner =
             DismissalReasonInputOwner::for_tab(self.workspace_instance, &self.tabs[index]);
-        self.dismissal_reason_input.update(cx, |input, cx| {
-            input.set_value(reason, window, cx);
-            input.set_disabled(false, cx);
-            input.focus(window, cx);
-        });
-        self.dismissal_reason_input_owner = Some(dismissal_owner);
+        let root = cx.weak_entity();
+        self.replace_dismissal_reason_input(reason, false, dismissal_owner, root, window, cx);
+        self.dismissal_reason_input
+            .update(cx, |input, cx| input.focus(window, cx));
         self.status = match &capability.authority {
             DismissalAuthority::Available => {
                 "Fresh direct repository-admin evidence is available. Enter a required dismissal reason."
@@ -25292,6 +25313,29 @@ mod layout_tests {
                 this.dismissal_reason_input_owner
                     .as_ref()
                     .is_some_and(|owner| { owner.review.as_ref() == Some(&review_b.coordinates) })
+            );
+        });
+        cx.update(|window, cx| {
+            let input = {
+                let Root::Review(this) = root.read(cx) else {
+                    unreachable!()
+                };
+                this.dismissal_reason_input.clone()
+            };
+            input.update(cx, |input, cx| {
+                input.set_value("late queued A text", window, cx);
+                cx.emit(gpui_base::input::InputEvent::Change);
+            });
+        });
+        cx.update(|_, _| {});
+        cx.read(|cx| {
+            let Root::Review(this) = root.read(cx) else {
+                unreachable!()
+            };
+            assert_eq!(
+                this.tabs[1].dismissal_editor.active_reason(),
+                "late queued A text",
+                "the current B entity must accept a legitimate first edit equal to old A text"
             );
         });
     }

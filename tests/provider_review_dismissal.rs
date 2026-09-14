@@ -217,6 +217,7 @@ print(json.dumps(step['response']))
             state: Arc<Mutex<DismissalAdmissionState>>,
             fail_admit: bool,
             fail_terminal: bool,
+            reject_replay: bool,
         }
 
         struct DismissalAttempt {
@@ -232,6 +233,9 @@ print(json.dumps(step['response']))
             ) -> Result<Box<dyn AdmittedMutationAttempt + 'a>> {
                 if self.fail_admit {
                     anyhow::bail!("synthetic durable intent failure");
+                }
+                if self.reject_replay && self.state.lock().unwrap().admitted > 0 {
+                    anyhow::bail!("synthetic durable InFlight replay barrier");
                 }
                 self.state.lock().unwrap().admitted += 1;
                 Ok(Box::new(DismissalAttempt {
@@ -265,6 +269,7 @@ print(json.dumps(step['response']))
                 state: Arc::new(Mutex::new(DismissalAdmissionState::default())),
                 fail_admit: false,
                 fail_terminal: false,
+                reject_replay: false,
             }
         }
 
@@ -447,6 +452,79 @@ print(json.dumps(step['response']))
                     [MutationTerminalRecord::NotStarted { .. }]
                 ));
             }
+        }
+
+        #[test]
+        fn failed_not_started_terminal_is_uncertain_and_retained_against_replay() {
+            let initial = dismissal_target_response(
+                "APPROVED",
+                "Original submitted review body.",
+                "alice",
+                Some("bob"),
+                Some(DISMISS_OLD_COMMIT),
+                true,
+            );
+            let changed = dismissal_target_response(
+                "APPROVED",
+                "changed after confirmation",
+                "alice",
+                Some("bob"),
+                Some(DISMISS_OLD_COMMIT),
+                true,
+            );
+            let variables = json!({
+                "owner":"owner","name":"repo","number":7,"reviewId":"REVIEW_target"
+            });
+            let (directory, provider) = dismissal_fixture(vec![
+                dismissal_step(
+                    "query SubmittedReviewDismissalTarget(",
+                    variables.clone(),
+                    initial,
+                ),
+                dismissal_step(
+                    "query SubmittedReviewDismissalTarget(",
+                    variables,
+                    changed,
+                ),
+            ]);
+            let review = displayed_dismissal_review(
+                "APPROVED",
+                Some("bob"),
+                Some(DISMISS_OLD_COMMIT),
+                DismissalAuthority::Available,
+            );
+            let request = provider
+                .prepare_review_dismissal(
+                    &dismissal_repo("alice"),
+                    7,
+                    &review,
+                    DISMISS_REASON.into(),
+                    "dismiss-not-started-save".into(),
+                    "attempt-not-started-save".into(),
+                )
+                .unwrap();
+            let mut admission = dismissal_admission();
+            admission.fail_terminal = true;
+            admission.reject_replay = true;
+            let ProviderMutationOutcome::Uncertain { context, reason } = provider
+                .execute_review_dismissal(&dismissal_repo("alice"), &request, &mut admission)
+            else {
+                panic!("failed NotStarted persistence must retain uncertainty")
+            };
+            assert_eq!(context.operation_id, request.operation_id);
+            assert!(reason.contains("dispatched zero writes"));
+            assert!(reason.contains("InFlight"));
+            assert_eq!(dismissal_count(&directory), 2);
+
+            assert!(matches!(
+                provider.execute_review_dismissal(
+                    &dismissal_repo("alice"),
+                    &request,
+                    &mut admission,
+                ),
+                ProviderMutationOutcome::PreflightRejected { .. }
+            ));
+            assert_eq!(dismissal_count(&directory), 2);
         }
 
         #[test]
