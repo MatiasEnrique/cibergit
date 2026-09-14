@@ -559,11 +559,11 @@ impl SubmittedReviewDraftStore {
         let result = (|| {
             let mut file = create_private_file_at(root, &temporary)?;
             directory_mutated = true;
+            after_create(root, &temporary)?;
             let metadata = file
                 .metadata()
                 .context("capture submitted-review draft temp identity")?;
             created_identity = Some((metadata.dev(), metadata.ino()));
-            after_create(root, &temporary)?;
             validate_open_file_at(root, &temporary, &file, None, MAX_RECORD_BYTES)?;
             file.write_all(bytes)
                 .context("write submitted-review draft temp")?;
@@ -851,7 +851,6 @@ fn create_private_file_at(root: &File, name: &str) -> Result<File> {
             .context("create private submitted-review draft temp relative to root");
     }
     let file = unsafe { File::from_raw_fd(descriptor) };
-    validate_metadata(&file.metadata()?, MAX_RECORD_BYTES)?;
     Ok(file)
 }
 
@@ -1707,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn submitted_post_create_and_cleanup_failure_still_syncs_retained_temp() {
+    fn submitted_post_open_pre_metadata_failure_syncs_retained_temp() {
         let directory = tempdir().unwrap();
         let repository = repository("alice");
         let store = SubmittedReviewDraftStore::new(directory.path().to_owned());
@@ -1724,13 +1723,9 @@ mod tests {
                 b"forced candidate",
                 |_, temporary| {
                     retained_name.replace(Some(temporary.to_owned()));
-                    fs::set_permissions(
-                        store.root.join(temporary),
-                        fs::Permissions::from_mode(0o644),
-                    )?;
-                    bail!("forced post-create failure")
+                    bail!("forced post-open metadata failure")
                 },
-                || unreachable!("post-create failure stops before install"),
+                || unreachable!("post-open failure stops before install"),
                 || {
                     let temporary = retained_name
                         .borrow()
@@ -1738,15 +1733,17 @@ mod tests {
                         .expect("post-create hook captured candidate name");
                     let metadata = fs::symlink_metadata(store.root.join(temporary))?;
                     assert!(metadata.is_file());
-                    assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+                    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
                     recovery_was_durably_observed.set(true);
                     Ok(())
                 },
             )
         });
         let error = format!("{:#}", result.unwrap_err());
-        assert!(error.contains("forced post-create failure"), "{error}");
-        assert!(error.contains("exact temporary cleanup failed"));
+        assert!(
+            error.contains("forced post-open metadata failure"),
+            "{error}"
+        );
         assert!(recovery_was_durably_observed.get());
     }
 }
