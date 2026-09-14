@@ -3065,6 +3065,10 @@ impl ReviewWorkspace {
             self.start_pending_file_comment_smoke(window, cx, output);
             return;
         }
+        if std::env::var_os("CIBERGIT_SMOKE_DISMISSAL").is_some() {
+            self.start_dismissal_smoke(window, cx, output);
+            return;
+        }
         if std::env::var_os("CIBERGIT_SMOKE_REACTIONS").is_some() {
             self.start_reaction_smoke(window, cx, output);
             return;
@@ -5314,6 +5318,631 @@ impl ReviewWorkspace {
                 if !passed {
                     panic!("native pending file-comment smoke assertions failed");
                 }
+                let _ = window.update(|_, cx| cx.quit());
+            })
+            .detach();
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn start_dismissal_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+        output: PathBuf,
+    ) {
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                let appearance = std::env::var("CIBERGIT_SMOKE_APPEARANCE")
+                    .unwrap_or_else(|_| "system".into());
+                let started = std::time::Instant::now();
+                let ready = loop {
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                let Root::Review(this) = root else { return false };
+                                let Some(index) = this.active_tab else { return false };
+                                this.tabs[index].details.is_some()
+                                    && !this.tabs[index].details_refresh.active
+                                    && this.tabs[index].submitted_summary_editor.is_ready()
+                                    && matches!(
+                                        this.tabs[index].interactions,
+                                        InteractionState::Ready(_)
+                                    )
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready || started.elapsed() > Duration::from_secs(90) {
+                        break ready;
+                    }
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                };
+                assert!(ready, "dismissal native smoke did not receive read-only details");
+                fs::create_dir_all(&output).expect("create dismissal smoke output");
+                let (repository, number, real_review) = window
+                    .update(|_, cx| {
+                        weak.read_with(cx, |root, _| {
+                            let Root::Review(this) = root else {
+                                return Err("dismissal smoke left review workspace".to_owned());
+                            };
+                            let index = this
+                                .active_tab
+                                .ok_or_else(|| "dismissal smoke has no active tab".to_owned())?;
+                            let real_review = this.tabs[index]
+                                .details
+                                .as_ref()
+                                .and_then(|details| {
+                                    details.reviews.iter().find(|review| {
+                                        matches!(
+                                            review.state.as_str(),
+                                            "APPROVED" | "CHANGES_REQUESTED"
+                                        ) && review
+                                            .dismissal_capability
+                                            .as_ref()
+                                            .is_some_and(|capability| {
+                                                capability.authority.permits_attempt()
+                                            })
+                                    })
+                                })
+                                .cloned()
+                                .ok_or_else(|| {
+                                    "selected read-only PR has no exact eligible submitted review"
+                                        .to_owned()
+                                })?;
+                            Ok((
+                                this.tabs[index].repository.clone(),
+                                this.tabs[index].pull_request.number,
+                                real_review,
+                            ))
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke entity unavailable: {error:#}")))
+                    })
+                    .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")))
+                    .expect("read dismissal smoke target");
+                let real_request = GithubProvider::new(repository.account.clone())
+                    .prepare_review_dismissal(
+                        &repository,
+                        number,
+                        &real_review,
+                        "Read-only native dismissal preparation; this request is never dispatched."
+                            .into(),
+                        "read-only-native-dismissal-preparation".into(),
+                        "read-only-native-dismissal-preparation-attempt".into(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("real read-only dismissal preparation failed: {error}")
+                    });
+                let transport_journal = output.join(format!(
+                    ".dismissal-transport-journal-{}-{appearance}",
+                    std::process::id()
+                ));
+                fs::create_dir(&transport_journal)
+                    .expect("create disposable dismissal transport journal");
+                let key = ReviewKey::for_repository("github", &repository, number)
+                    .expect("construct dismissal smoke review key");
+                let mut journal = ActionJournal::open(&transport_journal, key)
+                    .expect("open disposable dismissal transport journal");
+                let mut admission = journal.admission(JournalRequest::Dismissal(Box::new(
+                    real_request.clone(),
+                )));
+                let provider = GithubProvider::new(repository.account.clone());
+                let transport_outcome = provider.execute_review_dismissal(
+                    &repository,
+                    &real_request,
+                    &mut admission,
+                );
+                drop(admission);
+                let hard_zero = matches!(
+                    &transport_outcome,
+                    ProviderMutationOutcome::PreflightRejected { reason }
+                        if reason.contains("hard-suppressed mutation transport before credential resolution")
+                );
+                let terminal = journal
+                    .operations()
+                    .expect("read disposable dismissal transport journal")
+                    .into_iter()
+                    .any(|operation| matches!(operation.status, JournalStatus::NotStarted { .. }));
+                assert!(
+                    hard_zero && terminal,
+                    "dismissal transport was not hard-zero and durably terminal: {transport_outcome:?}"
+                );
+                fs::remove_dir_all(&transport_journal)
+                    .expect("remove disposable dismissal transport journal");
+
+                let coordinates = |remote_id: &str| cibergit::domain::ProviderCoordinates {
+                    provider: "github".into(),
+                    host: repository.host.clone(),
+                    owner: repository.owner.clone(),
+                    repository: repository.name.clone(),
+                    pull_request: number,
+                    remote_id: remote_id.into(),
+                };
+                let review = cibergit::domain::PullRequestReview {
+                    coordinates: coordinates("SYNTHETIC_DISMISSAL_REVIEW_NO_LIVE_WRITE"),
+                    author: None,
+                    body: "Synthetic submitted review on an older commit; native dismissal authority is not real."
+                        .into(),
+                    state: "APPROVED".into(),
+                    submitted_at: Some("2026-09-12T09:00:00Z".into()),
+                    commit_sha: Some("1111111111111111111111111111111111111111".into()),
+                    edit_summary_capability: None,
+                    dismissal_capability: Some(
+                        cibergit::domain::FreshReviewDismissalCapability {
+                            viewer: cibergit::domain::SelectedViewer {
+                                node_id: "SYNTHETIC_DISMISSAL_VIEWER".into(),
+                                login: repository.account.login.clone(),
+                            },
+                            pull_request: coordinates("SYNTHETIC_DISMISSAL_PARENT"),
+                            authority: DismissalAuthority::Unknown {
+                                reason: "Synthetic native scene: GitHub decides authorization for the selected account."
+                                    .into(),
+                            },
+                        },
+                    ),
+                    url: "https://example.invalid/synthetic-dismissal-review".into(),
+                };
+                let request = SubmittedReviewDismissalRequest {
+                    operation_id: "synthetic-dismissal-operation".into(),
+                    attempt_id: "synthetic-dismissal-attempt".into(),
+                    target: cibergit::domain::SubmittedReviewDismissalTarget {
+                        repository: repository.clone(),
+                        pull_request: coordinates("SYNTHETIC_DISMISSAL_PARENT"),
+                        review: review.coordinates.clone(),
+                        review_state: review.state.clone(),
+                        review_body: review.body.clone(),
+                        submitted_at: review.submitted_at.clone().expect("synthetic timestamp"),
+                        review_author: review.author.clone(),
+                        review_commit_sha: review.commit_sha.clone(),
+                    },
+                    viewer: review
+                        .dismissal_capability
+                        .as_ref()
+                        .expect("synthetic dismissal capability")
+                        .viewer
+                        .clone(),
+                    authority: review
+                        .dismissal_capability
+                        .as_ref()
+                        .expect("synthetic dismissal capability")
+                        .authority
+                        .clone(),
+                    reason: "Synthetic bounded reason: obsolete approval; no live write.".into(),
+                };
+                let setup = window
+                    .update(|window, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err("dismissal smoke left review workspace".to_owned());
+                            };
+                            let index = this
+                                .active_tab
+                                .ok_or_else(|| "dismissal smoke has no active tab".to_owned())?;
+                            let displayed_session = this.tabs[index]
+                                .session
+                                .clone()
+                                .ok_or_else(|| "dismissal smoke has no displayed session".to_owned())?;
+                            let canonical_session = this.tabs[index]
+                                .canonical_session
+                                .clone()
+                                .ok_or_else(|| "dismissal smoke has no canonical session".to_owned())?;
+                            let selected_file = displayed_session
+                                .selected_file()
+                                .ok_or_else(|| "dismissal smoke has no selected file".to_owned())?;
+                            let line_selection = build_rows(parse_file(selected_file), DiffMode::Unified)
+                                .into_iter()
+                                .find_map(|row| match row {
+                                    DiffRow::Unified(line) => line
+                                        .new_line
+                                        .map(|line| LineSelection::single(DiffSide::New, line))
+                                        .or_else(|| {
+                                            line.old_line.map(|line| {
+                                                LineSelection::single(DiffSide::Old, line)
+                                            })
+                                        }),
+                                    _ => None,
+                                })
+                                .ok_or_else(|| {
+                                    "dismissal smoke selected file has no provider-safe line"
+                                        .to_owned()
+                                })?;
+                            let line_body =
+                                "Synthetic retained LINE draft for dismissal preservation";
+                            let file_body =
+                                "Synthetic retained FILE draft for dismissal preservation";
+                            {
+                                let InteractionState::Ready(controller) =
+                                    &mut this.tabs[index].interactions
+                                else {
+                                    return Err(
+                                        "dismissal smoke interaction controller disappeared"
+                                            .into(),
+                                    );
+                                };
+                                controller.select_line_with_canonical(
+                                    &displayed_session,
+                                    &canonical_session,
+                                    line_selection,
+                                )?;
+                                let staged = controller.stage_composer_text(line_body.into())?;
+                                let draft_id = controller
+                                    .composer
+                                    .as_ref()
+                                    .and_then(|composer| composer.draft_id.clone())
+                                    .ok_or_else(|| {
+                                        "dismissal smoke LINE draft has no exact identity".to_owned()
+                                    })?;
+                                controller.finish_composer_save(
+                                    &staged,
+                                    &draft_id,
+                                    line_body,
+                                    Ok(()),
+                                );
+                                controller.select_file_with_canonical(
+                                    &displayed_session,
+                                    &canonical_session,
+                                )?;
+                                let staged = controller.stage_composer_text(file_body.into())?;
+                                let draft_id = controller
+                                    .file_composer
+                                    .as_ref()
+                                    .and_then(|composer| composer.draft_id.clone())
+                                    .ok_or_else(|| {
+                                        "dismissal smoke FILE draft has no exact identity".to_owned()
+                                    })?;
+                                controller.finish_composer_save(
+                                    &staged,
+                                    &draft_id,
+                                    file_body,
+                                    Ok(()),
+                                );
+                            }
+                            this.composer_input.update(cx, |input, cx| {
+                                input.set_value(file_body, window, cx)
+                            });
+                            let submitted_body =
+                                "Synthetic retained submitted-summary draft for dismissal preservation";
+                            {
+                                let editor = &mut this.tabs[index].submitted_summary_editor;
+                                editor.begin(review.clone());
+                                editor.store_active_body(submitted_body.into());
+                                editor.active_review = None;
+                                editor.durable = editor.current_snapshot();
+                            }
+                            let key = ReviewKey::for_repository("github", &repository, number)
+                                .map_err(|error| error.to_string())?;
+                            let journal = ActionJournal::open(&this.interaction_root, key)?;
+                            let seeded = journal.dispatch(
+                                JournalRequest::Dismissal(Box::new(request.clone())),
+                                || ProviderMutationOutcome::<()>::Acknowledged(()),
+                                |_| {
+                                    (
+                                        true,
+                                        true,
+                                        "Synthetic local dismissal journal witness; zero provider transport"
+                                            .into(),
+                                    )
+                                },
+                            );
+                            if !matches!(seeded, ProviderMutationOutcome::Acknowledged(())) {
+                                return Err(
+                                    "dismissal smoke could not seed its local journal witness"
+                                        .into(),
+                                );
+                            }
+                            this.tabs[index].journal_operations = journal.operations()?;
+                            let before = (
+                                match &this.tabs[index].interactions {
+                                    InteractionState::Ready(controller) => Some((
+                                        controller.composition.drafts.clone(),
+                                        controller.composition.file_drafts.clone(),
+                                        controller.composition.operations.clone(),
+                                    )),
+                                    _ => None,
+                                },
+                                this.tabs[index]
+                                    .submitted_summary_editor
+                                    .current_snapshot(),
+                                this.tabs[index].journal_operations.clone(),
+                                this.tabs[index].canonical_full_revision.clone(),
+                                this.tabs[index].canonical_session.as_ref().map(|session| {
+                                    (
+                                        session.revision().clone(),
+                                        session.selected_file().map(file_key),
+                                        session.diff_mode(),
+                                    )
+                                }),
+                                this.tabs[index]
+                                    .session
+                                    .as_ref()
+                                    .map(|session| {
+                                        (
+                                            session.revision().clone(),
+                                            session.selected_file().map(file_key),
+                                            session.diff_mode(),
+                                        )
+                                    }),
+                            );
+                            let nonempty_preservation = before.0.as_ref().is_some_and(
+                                |(line_drafts, file_drafts, _)| {
+                                    line_drafts.iter().any(|draft| draft.body == line_body)
+                                        && file_drafts
+                                            .iter()
+                                            .any(|draft| draft.body == file_body)
+                                },
+                            ) && before
+                                .1
+                                .drafts
+                                .iter()
+                                .any(|draft| draft.body == submitted_body)
+                                && before.2.iter().any(|operation| {
+                                    journal_identity(&operation.request).0
+                                        == request.operation_id
+                                })
+                                && before.4.is_some()
+                                && before.5.is_some();
+                            this.tabs[index]
+                                .details
+                                .as_mut()
+                                .ok_or_else(|| "dismissal smoke details disappeared".to_owned())?
+                                .reviews
+                                .insert(0, review.clone());
+                            this.tabs[index].inspector_section = InspectorSection::Activity;
+                            this.tabs[index].review_page = 0;
+                            this.tabs[index]
+                                .dismissal_editor
+                                .begin(review.coordinates.clone());
+                            this.tabs[index]
+                                .dismissal_editor
+                                .store_active_reason(request.reason.clone());
+                            let owner = DismissalReasonInputOwner::for_tab(
+                                this.workspace_instance,
+                                &this.tabs[index],
+                            );
+                            let root_entity = cx.weak_entity();
+                            this.replace_dismissal_reason_input(
+                                request.reason.clone(),
+                                false,
+                                owner,
+                                root_entity,
+                                window,
+                                cx,
+                            );
+                            this.tabs[index].dismissal_confirmation_generation = this.tabs[index]
+                                .dismissal_confirmation_generation
+                                .checked_add(1)
+                                .expect("dismissal smoke generation overflow");
+                            let first_generation =
+                                this.tabs[index].dismissal_confirmation_generation;
+                            let preparation = DismissalPreparationToken {
+                                workspace_instance: this.workspace_instance,
+                                tab_instance: this.tabs[index].instance_generation,
+                                repository_key: repository.cache_key(),
+                                pull_request: number,
+                                review: review.coordinates.clone(),
+                                reason: request.reason.clone(),
+                                editor_generation: this.tabs[index].dismissal_editor.generation,
+                                operation_id: request.operation_id.clone(),
+                                attempt_id: request.attempt_id.clone(),
+                                action_generation: first_generation,
+                            };
+                            this.tabs[index].write_in_flight = true;
+                            if this.apply_dismissal_preparation(&preparation, Ok(request.clone()))
+                                != Some(index)
+                            {
+                                return Err(
+                                    "exact prepared dismissal did not apply to its native lane"
+                                        .to_owned(),
+                                );
+                            }
+                            let first_confirmation = DismissalConfirmationToken {
+                                workspace_instance: this.workspace_instance,
+                                tab_instance: this.tabs[index].instance_generation,
+                                repository_key: repository.cache_key(),
+                                pull_request: number,
+                                generation: first_generation,
+                                request: request.clone(),
+                            };
+                            this.cancel_review_dismissal_confirmation(&first_confirmation, cx);
+                            let cancellation_retained = this.tabs[index].confirmation.is_none()
+                                && this.tabs[index].dismissal_editor.active_reason()
+                                    == request.reason
+                                && this.dismissal_reason_input.read(cx).value() == request.reason;
+
+                            this.tabs[index].dismissal_confirmation_generation = this.tabs[index]
+                                .dismissal_confirmation_generation
+                                .checked_add(1)
+                                .expect("dismissal smoke reprepare generation overflow");
+                            let second_generation =
+                                this.tabs[index].dismissal_confirmation_generation;
+                            let mut second_preparation = preparation.clone();
+                            second_preparation.action_generation = second_generation;
+                            this.tabs[index].write_in_flight = true;
+                            if this.apply_dismissal_preparation(
+                                &second_preparation,
+                                Ok(request.clone()),
+                            ) != Some(index)
+                            {
+                                return Err("dismissal smoke reprepare failed".to_owned());
+                            }
+                            let second_confirmation = DismissalConfirmationToken {
+                                workspace_instance: this.workspace_instance,
+                                tab_instance: this.tabs[index].instance_generation,
+                                repository_key: repository.cache_key(),
+                                pull_request: number,
+                                generation: second_generation,
+                                request: request.clone(),
+                            };
+                            let edited_reason = format!("{} edited after preparation", request.reason);
+                            this.dismissal_reason_input.update(cx, |input, cx| {
+                                input.set_value(edited_reason.clone(), window, cx)
+                            });
+                            this.confirm_review_dismissal(
+                                second_confirmation.clone(),
+                                window,
+                                cx,
+                            );
+                            let edited_reason_rejected = !this.tabs[index].write_in_flight
+                                && this.tabs[index].confirmation.is_none()
+                                && this.tabs[index].dismissal_editor.active_reason()
+                                    == edited_reason;
+                            this.dismissal_reason_input.update(cx, |input, cx| {
+                                input.set_value(request.reason.clone(), window, cx)
+                            });
+                            this.tabs[index]
+                                .dismissal_editor
+                                .store_active_reason(request.reason.clone());
+                            this.tabs[index].dismissal_confirmation_generation = this.tabs[index]
+                                .dismissal_confirmation_generation
+                                .checked_add(1)
+                                .expect("dismissal smoke final reprepare generation overflow");
+                            let third_generation =
+                                this.tabs[index].dismissal_confirmation_generation;
+                            let mut third_preparation = preparation.clone();
+                            third_preparation.editor_generation =
+                                this.tabs[index].dismissal_editor.generation;
+                            third_preparation.action_generation = third_generation;
+                            this.tabs[index].write_in_flight = true;
+                            if this.apply_dismissal_preparation(
+                                &third_preparation,
+                                Ok(request.clone()),
+                            ) != Some(index)
+                            {
+                                return Err("dismissal smoke final reprepare failed".to_owned());
+                            }
+                            this.tabs[index].write_in_flight = true;
+                            let sentinel = "Newer exact dismissal confirmation preserved";
+                            this.status = sentinel.into();
+                            let stale_rejected = this
+                                .apply_dismissal_completion(
+                                    &second_confirmation,
+                                    ProviderMutationOutcome::PreflightRejected {
+                                        reason: "synthetic stale completion".into(),
+                                    },
+                                )
+                                .is_none()
+                                && this.status == sentinel
+                                && matches!(
+                                    this.tabs[index].confirmation.as_ref(),
+                                    Some(NativeConfirmation::DismissSubmittedReview {
+                                        generation,
+                                        ..
+                                    }) if *generation == third_generation
+                                );
+                            this.tabs[index].write_in_flight = false;
+                            this.inspector_open = true;
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                            this.status = "Synthetic dismissal authority; exact native confirmation only. Mutation transport is hard-suppressed before credentials.".into();
+                            let after = (
+                                match &this.tabs[index].interactions {
+                                    InteractionState::Ready(controller) => Some((
+                                        controller.composition.drafts.clone(),
+                                        controller.composition.file_drafts.clone(),
+                                        controller.composition.operations.clone(),
+                                    )),
+                                    _ => None,
+                                },
+                                this.tabs[index]
+                                    .submitted_summary_editor
+                                    .current_snapshot(),
+                                this.tabs[index].journal_operations.clone(),
+                                this.tabs[index].canonical_full_revision.clone(),
+                                this.tabs[index].canonical_session.as_ref().map(|session| {
+                                    (
+                                        session.revision().clone(),
+                                        session.selected_file().map(file_key),
+                                        session.diff_mode(),
+                                    )
+                                }),
+                                this.tabs[index]
+                                    .session
+                                    .as_ref()
+                                    .map(|session| {
+                                        (
+                                            session.revision().clone(),
+                                            session.selected_file().map(file_key),
+                                            session.diff_mode(),
+                                        )
+                                    }),
+                            );
+                            cx.notify();
+                            Ok((
+                                cancellation_retained,
+                                edited_reason_rejected,
+                                stale_rejected,
+                                nonempty_preservation && before == after,
+                            ))
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke entity unavailable: {error:#}")))
+                    })
+                    .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")))
+                    .expect("install dismissal native scene");
+                let _ = window.update(|window, _| window.resize(size(px(1180.), px(820.))));
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
+                let top_name = format!("native-dismissal-confirmation-top-{appearance}.png");
+                let top = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| image.save(output.join(&top_name)).map_err(Into::into))
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.inspector_scroll.set_offset(point(px(0.), px(720.)));
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let bottom_name =
+                    format!("native-dismissal-confirmation-bottom-{appearance}.png");
+                let bottom = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image.save(output.join(&bottom_name)).map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let report = format!(
+                    "Native submitted-review dismissal smoke ({appearance})\nReal GitHub read-only preparation: review {} on {} #{} frozen successfully; durable admission and second exact read completed\nSynthetic dismissal authority: explicit Unknown; GitHub decides authorization\nExact frozen target: {} #{} review {} with nullable author and older commit\nExact nonempty reason: {:?}\nPost-preflight race and state-alone reason uncertainty: rendered in native confirmation\nActual cancellation handler retained reason: {}\nActual confirm handler rejected edited visible reason with zero dispatch and retained it: {}\nCancelled/reprepared stale completion apply preserved newer confirmation: {}\nNonempty exact LINE/FILE/submitted drafts, local journal operation, canonical and selected comparison identities preserved: {}\nTop capture: {}\nBottom capture: {}\nMutation transport: HARD ZERO under CIBERGIT_SMOKE_DISMISSAL before mutation credential resolution; durable NotStarted recorded\nLive GitHub writes, OS notifications, global settings, focus requests, and physical input: none\n",
+                    real_request.target.review.remote_id,
+                    real_request.target.repository.full_name(),
+                    real_request.target.pull_request.pull_request,
+                    request.target.repository.full_name(),
+                    request.target.pull_request.pull_request,
+                    request.target.review.remote_id,
+                    request.reason,
+                    setup.0,
+                    setup.1,
+                    setup.2,
+                    setup.3,
+                    if top { &top_name } else { "failed" },
+                    if bottom { &bottom_name } else { "failed" },
+                );
+                fs::write(
+                    output.join(format!("native-dismissal-{appearance}.txt")),
+                    report,
+                )
+                .expect("write dismissal smoke report");
+                assert!(
+                    setup.0 && setup.1 && setup.2 && setup.3 && top && bottom,
+                    "dismissal native smoke assertions failed"
+                );
                 let _ = window.update(|_, cx| cx.quit());
             })
             .detach();
@@ -26273,6 +26902,139 @@ mod layout_tests {
                 "late queued A text",
                 "the current B entity must accept a legitimate first edit equal to old A text"
             );
+        });
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn dismissal_deferred_restore_mounts_current_entity_in_native_confirmation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let appearance =
+            std::env::var("CIBERGIT_SMOKE_APPEARANCE").unwrap_or_else(|_| "light".into());
+        cx.update(|cx| {
+            cx.set_window_appearance(Some(if appearance == "dark" {
+                WindowAppearance::Dark
+            } else {
+                WindowAppearance::Light
+            }));
+        });
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    ..Default::default()
+                },
+            )
+        });
+        let (repository, review_a) = dismissal_review_fixture(7, "REVIEW_A");
+        let (_, mut review_b) = dismissal_review_fixture(8, "REVIEW_B");
+        review_b.author = None;
+        review_b.body =
+            "Synthetic older-commit review; dismissal authority is explicitly not real.".into();
+        review_b.dismissal_capability.as_mut().unwrap().authority = DismissalAuthority::Unknown {
+            reason: "Synthetic authority: GitHub decides authorization for the selected account."
+                .into(),
+        };
+        let old_entity = cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                for (pull, review, reason) in [
+                    (transition_pull_request(7), review_a.clone(), "old A reason"),
+                    (
+                        transition_pull_request(8),
+                        review_b.clone(),
+                        "Synthetic bounded reason: obsolete approval; zero transport.",
+                    ),
+                ] {
+                    this.install_tab_with_restore(
+                        repository.clone(),
+                        pull,
+                        None,
+                        InstallTabOptions {
+                            activate: false,
+                            window: None,
+                            start_background_work: false,
+                        },
+                        cx,
+                    );
+                    let index = this.tabs.len() - 1;
+                    this.tabs[index].details = Some(details_with_reviews(vec![review.clone()]));
+                    this.tabs[index]
+                        .dismissal_editor
+                        .begin(review.coordinates.clone());
+                    this.tabs[index]
+                        .dismissal_editor
+                        .store_active_reason(reason.into());
+                }
+                this.activate_tab_in_window(0, false, window, cx);
+                let old_entity = this.dismissal_reason_input.entity_id();
+                this.activate_tab_context(1, false, cx);
+                old_entity
+            })
+        });
+        cx.update(|_, _| {});
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let index = this.active_tab.unwrap();
+                assert_eq!(this.tabs[index].pull_request.number, 8);
+                assert!(this.active_tab_input_restore.is_none());
+                assert_ne!(this.dismissal_reason_input.entity_id(), old_entity);
+                assert_eq!(
+                    this.dismissal_reason_input.read(cx).value(),
+                    "Synthetic bounded reason: obsolete approval; zero transport."
+                );
+                assert!(
+                    this.dismissal_reason_input_owner
+                        .as_ref()
+                        .is_some_and(|owner| owner.review.as_ref() == Some(&review_b.coordinates))
+                );
+                this.tabs[index].dismissal_confirmation_generation = 41;
+                let request = dismissal_request(
+                    &repository,
+                    &review_b,
+                    "Synthetic bounded reason: obsolete approval; zero transport.",
+                    "synthetic-native-dismissal",
+                    "synthetic-native-dismissal-attempt",
+                );
+                this.tabs[index].confirmation =
+                    Some(NativeConfirmation::DismissSubmittedReview {
+                        generation: 41,
+                        request: Box::new(request),
+                    });
+                this.tabs[index].inspector_section = InspectorSection::Activity;
+                this.tabs[index].review_page = 0;
+                this.inspector_open = true;
+                this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                this.status = "Synthetic dismissal authority; hard-zero mutation transport before credentials."
+                    .into();
+                window.resize(size(px(1180.), px(820.)));
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let capture_dir = std::env::var_os("CIBERGIT_DISMISSAL_CAPTURE_DIR")
+            .map(PathBuf::from)
+            .expect("CIBERGIT_DISMISSAL_CAPTURE_DIR is required for this focused native witness");
+        fs::create_dir_all(&capture_dir).unwrap();
+        cx.update(|window, _| {
+            window
+                .render_to_image()
+                .unwrap()
+                .save(capture_dir.join(format!(
+                    "native-dismissal-mounted-confirmation-{appearance}.png"
+                )))
+                .unwrap();
         });
     }
 
