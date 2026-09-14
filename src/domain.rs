@@ -103,6 +103,193 @@ pub struct ProviderCoordinates {
     pub remote_id: String,
 }
 
+/// The four GitHub pull-request objects that implement GraphQL `Reactable`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReactableKind {
+    PullRequest,
+    PullRequestReview,
+    IssueComment,
+    PullRequestReviewComment,
+}
+
+impl ReactableKind {
+    pub fn graphql_name(self) -> &'static str {
+        match self {
+            Self::PullRequest => "PullRequest",
+            Self::PullRequestReview => "PullRequestReview",
+            Self::IssueComment => "IssueComment",
+            Self::PullRequestReviewComment => "PullRequestReviewComment",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReactionContent {
+    ThumbsUp,
+    ThumbsDown,
+    Laugh,
+    Confused,
+    Heart,
+    Hooray,
+    Rocket,
+    Eyes,
+}
+
+impl ReactionContent {
+    pub const ALL: [Self; 8] = [
+        Self::ThumbsUp,
+        Self::ThumbsDown,
+        Self::Laugh,
+        Self::Confused,
+        Self::Heart,
+        Self::Hooray,
+        Self::Rocket,
+        Self::Eyes,
+    ];
+
+    pub fn graphql_name(self) -> &'static str {
+        match self {
+            Self::ThumbsUp => "THUMBS_UP",
+            Self::ThumbsDown => "THUMBS_DOWN",
+            Self::Laugh => "LAUGH",
+            Self::Confused => "CONFUSED",
+            Self::Heart => "HEART",
+            Self::Hooray => "HOORAY",
+            Self::Rocket => "ROCKET",
+            Self::Eyes => "EYES",
+        }
+    }
+
+    pub fn compact_label(self) -> &'static str {
+        match self {
+            Self::ThumbsUp => "+1",
+            Self::ThumbsDown => "-1",
+            Self::Laugh => "Laugh",
+            Self::Confused => "Confused",
+            Self::Heart => "Heart",
+            Self::Hooray => "Hooray",
+            Self::Rocket => "Rocket",
+            Self::Eyes => "Eyes",
+        }
+    }
+
+    pub fn from_graphql(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|content| content.graphql_name() == value)
+    }
+}
+
+/// Historical presentation data. Cached selected-viewer state may be shown,
+/// but it never authorizes a mutation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionGroupSnapshot {
+    pub content: ReactionContent,
+    pub count: u64,
+    pub viewer_has_reacted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionSnapshot {
+    pub groups: Vec<ReactionGroupSnapshot>,
+    /// False means missing, duplicate, partial, or otherwise unusable groups
+    /// were preserved as Unknown rather than filled with zeroes.
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectedViewer {
+    pub node_id: String,
+    pub login: String,
+}
+
+/// Fresh selected-account evidence from the current details generation. This
+/// field is deliberately dropped by every cache round-trip.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshReactionCapability {
+    pub viewer: SelectedViewer,
+    pub viewer_can_react: bool,
+}
+
+/// One exact reactable object and its historical/fresh reaction state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionSubjectSnapshot {
+    pub kind: ReactableKind,
+    pub pull_request: ProviderCoordinates,
+    pub subject: ProviderCoordinates,
+    /// Required only for PullRequestReviewComment and exact when present.
+    pub parent_review: Option<ProviderCoordinates>,
+    pub content: String,
+    pub reactions: ReactionSnapshot,
+    #[serde(skip)]
+    pub fresh_capability: Option<FreshReactionCapability>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReactionIntent {
+    Add,
+    Remove,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReactionAction {
+    Add,
+    Remove { existing_reaction_id: String },
+}
+
+impl ReactionAction {
+    pub fn intent(&self) -> ReactionIntent {
+        match self {
+            Self::Add => ReactionIntent::Add,
+            Self::Remove { .. } => ReactionIntent::Remove,
+        }
+    }
+}
+
+/// Exact immutable target frozen after the first bounded provider preflight.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionTarget {
+    pub kind: ReactableKind,
+    pub repository: Repository,
+    pub pull_request: ProviderCoordinates,
+    pub subject: ProviderCoordinates,
+    pub parent_review: Option<ProviderCoordinates>,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionRequest {
+    pub operation_id: String,
+    pub attempt_id: String,
+    pub target: ReactionTarget,
+    pub viewer: SelectedViewer,
+    pub content: ReactionContent,
+    pub action: ReactionAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionAcknowledgement {
+    pub operation_id: String,
+    pub target: ReactionTarget,
+    pub viewer: SelectedViewer,
+    pub content: ReactionContent,
+    pub reaction_id: String,
+    pub present: bool,
+}
+
+/// Complete targeted read used only for preparation or read-only recovery.
+/// It records current convergence and never attributes causation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionObservation {
+    pub target: ReactionTarget,
+    pub viewer: SelectedViewer,
+    pub content: ReactionContent,
+    pub viewer_can_react: bool,
+    pub viewer_has_reacted: bool,
+    pub own_reaction_id: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueComment {
     pub coordinates: ProviderCoordinates,
@@ -712,6 +899,11 @@ pub struct PullRequestDetails {
     pub issue_comments: Vec<IssueComment>,
     pub reviews: Vec<PullRequestReview>,
     pub review_threads: Vec<ReviewThread>,
+    /// Historical snapshots for every reactable object returned by the
+    /// bounded details read. Fresh capabilities inside each entry are never
+    /// serialized, so a cached round-trip cannot arm a write.
+    #[serde(default)]
+    pub reactions: Vec<ReactionSubjectSnapshot>,
     pub checks: Vec<PullRequestCheck>,
     /// False when any activity connection was partial or hit an explicit cap.
     pub activity_complete: bool,
@@ -743,4 +935,85 @@ pub struct Comparison {
     pub files: Vec<ChangedFile>,
     pub complete: bool,
     pub notice: Option<String>,
+}
+
+#[cfg(test)]
+mod reaction_serialization_tests {
+    use super::*;
+
+    fn coordinates(id: &str) -> ProviderCoordinates {
+        ProviderCoordinates {
+            provider: "github".into(),
+            host: "github.com".into(),
+            owner: "owner".into(),
+            repository: "repo".into(),
+            pull_request: 7,
+            remote_id: id.into(),
+        }
+    }
+
+    #[test]
+    fn cache_serialization_preserves_history_and_drops_fresh_reaction_capability() {
+        let snapshot = ReactionSubjectSnapshot {
+            kind: ReactableKind::PullRequestReviewComment,
+            pull_request: coordinates("PR-node"),
+            subject: coordinates("COMMENT-node"),
+            parent_review: Some(coordinates("REVIEW-node")),
+            content: "Exact historical body".into(),
+            reactions: ReactionSnapshot {
+                groups: vec![ReactionGroupSnapshot {
+                    content: ReactionContent::Heart,
+                    count: 3,
+                    viewer_has_reacted: true,
+                }],
+                complete: true,
+            },
+            fresh_capability: Some(FreshReactionCapability {
+                viewer: SelectedViewer {
+                    node_id: "USER-node".into(),
+                    login: "alice".into(),
+                },
+                viewer_can_react: true,
+            }),
+        };
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert!(encoded.get("fresh_capability").is_none());
+        let mut injected = encoded.clone();
+        injected["fresh_capability"] = serde_json::json!({
+            "viewer": {"node_id": "FORGED", "login": "alice"},
+            "viewer_can_react": true
+        });
+        let cached: ReactionSubjectSnapshot = serde_json::from_value(injected).unwrap();
+        assert_eq!(cached.reactions, snapshot.reactions);
+        assert_eq!(cached.content, snapshot.content);
+        assert!(cached.fresh_capability.is_none());
+    }
+
+    #[test]
+    fn old_details_without_reaction_field_loads_as_unknown_empty_history() {
+        let old = serde_json::json!({
+            "number": 7,
+            "body": "old cached details",
+            "requested_reviewers": [],
+            "labels": [],
+            "assignees": [],
+            "merge_eligibility": {
+                "state": "OPEN", "draft": false, "mergeable": "UNKNOWN",
+                "merge_state_status": "UNKNOWN", "review_status": "UNKNOWN",
+                "check_status": "UNKNOWN", "maintainer_can_modify": false,
+                "can_rebase": false, "can_update_branch": false,
+                "auto_merge_enabled": false, "in_merge_queue": false
+            },
+            "issue_comments": [],
+            "reviews": [],
+            "review_threads": [],
+            "checks": [],
+            "activity_complete": false,
+            "checks_complete": false,
+            "notice": "legacy v1 cache"
+        });
+        let details: PullRequestDetails = serde_json::from_value(old).unwrap();
+        assert!(details.reactions.is_empty());
+        assert!(!details.activity_complete);
+    }
 }

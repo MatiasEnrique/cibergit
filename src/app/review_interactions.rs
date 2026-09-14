@@ -3,7 +3,7 @@ use cibergit::{
         MergeAcknowledgement, MergeExecutionRequest, MergeMethod, MergePreparation,
         MutationAdmissionReceipt, MutationContext, MutationTerminalRecord, PendingReviewSnapshot,
         ProviderCoordinates, ProviderMutationOutcome, PullRequestDetails,
-        PullRequestDiscussionRequest, PullRequestLifecycleRequest, Repository,
+        PullRequestDiscussionRequest, PullRequestLifecycleRequest, ReactionRequest, Repository,
         ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryRequest, ReviewComment, ReviewThread,
     },
     participation::{
@@ -1757,6 +1757,7 @@ pub enum JournalRequest {
     },
     Lifecycle(Box<PullRequestLifecycleRequest>),
     Discussion(Box<PullRequestDiscussionRequest>),
+    Reaction(Box<ReactionRequest>),
 }
 
 impl JournalRequest {
@@ -1766,6 +1767,7 @@ impl JournalRequest {
             Self::Merge { request, .. } => (&request.operation_id, &request.attempt_id),
             Self::Lifecycle(request) => (&request.operation_id, &request.attempt_id),
             Self::Discussion(request) => (&request.operation_id, &request.attempt_id),
+            Self::Reaction(request) => (&request.operation_id, &request.attempt_id),
         }
     }
 
@@ -1838,6 +1840,10 @@ impl JournalRequest {
                     "delete-pr-discussion-comment"
                 }
             },
+            Self::Reaction(request) => match request.action {
+                cibergit::domain::ReactionAction::Add => "add-reaction",
+                cibergit::domain::ReactionAction::Remove { .. } => "remove-reaction",
+            },
         };
         let payload = match self {
             Self::Lifecycle(request) => serde_json::json!({
@@ -1845,6 +1851,10 @@ impl JournalRequest {
                 "dispatch": {"transport": "journal-context"},
             }),
             Self::Discussion(request) => serde_json::json!({
+                "request": request,
+                "dispatch": {"transport": "journal-context"},
+            }),
+            Self::Reaction(request) => serde_json::json!({
                 "request": request,
                 "dispatch": {"transport": "journal-context"},
             }),
@@ -2567,7 +2577,8 @@ mod tests {
     use cibergit::domain::{
         Account, ChangedFile, Comparison, LinkedReviewComment, MergeEligibility,
         PendingFileCommentSource, ProviderCoordinates, PullRequestLifecycleAction,
-        PullRequestMutationTarget, PullRequestReview, ReviewComment, Revision,
+        PullRequestMutationTarget, PullRequestReview, ReactableKind, ReactionAction,
+        ReactionContent, ReactionRequest, ReactionTarget, ReviewComment, Revision, SelectedViewer,
     };
     use cibergit::participation::{
         DiffSide, RemoteDraftIds, ReviewCommentTarget, ReviewOperationStatus,
@@ -2819,6 +2830,102 @@ mod tests {
         }
     }
 
+    fn reaction_request(operation_id: &str, attempt_id: &str) -> ReactionRequest {
+        ReactionRequest {
+            operation_id: operation_id.into(),
+            attempt_id: attempt_id.into(),
+            target: ReactionTarget {
+                kind: ReactableKind::PullRequestReviewComment,
+                repository: repository(),
+                pull_request: coordinates("PR_7"),
+                subject: coordinates("COMMENT_7"),
+                parent_review: Some(coordinates("REVIEW_7")),
+                content: "Exact comment body".into(),
+            },
+            viewer: SelectedViewer {
+                node_id: "USER_reader".into(),
+                login: "reader".into(),
+            },
+            content: ReactionContent::Heart,
+            action: ReactionAction::Remove {
+                existing_reaction_id: "REACTION_7".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn reaction_journal_freezes_exact_request_and_preserves_v1_shared_barrier() {
+        let directory = tempdir().unwrap();
+        let mut journal = ActionJournal::open(directory.path(), review_key()).unwrap();
+        let reaction = reaction_request("reaction-1", "reaction-attempt-1");
+        let frozen = JournalRequest::Reaction(Box::new(reaction.clone()));
+        let context = frozen.mutation_context();
+        assert_eq!(context.action, "remove-reaction");
+        assert_eq!(
+            context.payload["request"],
+            serde_json::to_value(&reaction).unwrap()
+        );
+        assert!(context.payload.get("dispatch").is_some());
+
+        {
+            let mut admission = journal.admission(frozen.clone());
+            let mut held = admission.admit(&context).unwrap();
+            held.record_terminal(&MutationTerminalRecord::Uncertain {
+                reason: "synthetic lost transport".into(),
+            })
+            .unwrap();
+        }
+        let path = journal.path().unwrap();
+        let before = fs::read(&path).unwrap();
+        let restored = ActionJournal::open(directory.path(), review_key()).unwrap();
+        assert_eq!(restored.operations().unwrap()[0].request, frozen);
+
+        let calls = AtomicUsize::new(0);
+        let blocked = restored.dispatch(
+            JournalRequest::Auxiliary(Box::new(auxiliary_request())),
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ProviderMutationOutcome::Acknowledged(())
+            },
+            |_| (true, true, "unexpected".into()),
+        );
+        assert!(matches!(
+            blocked,
+            ProviderMutationOutcome::PreflightRejected { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_v1_nonreaction_unresolved_record_remains_readable_and_preserved() {
+        let directory = tempdir().unwrap();
+        let journal = ActionJournal::open(directory.path(), review_key()).unwrap();
+        let request = JournalRequest::Auxiliary(Box::new(auxiliary_request()));
+        let record = JournalRecord {
+            version: 1,
+            key: review_key(),
+            operations: vec![JournalOperation {
+                request: request.clone(),
+                status: JournalStatus::Uncertain {
+                    reason: "legacy unresolved outcome".into(),
+                },
+            }],
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let path = journal.path().unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let operations = journal.operations().unwrap();
+        assert_eq!(operations[0].request, request);
+        assert!(matches!(
+            operations[0].status,
+            JournalStatus::Uncertain { .. }
+        ));
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
     #[test]
     fn submitted_edit_journal_freezes_distinct_historical_request() {
         let directory = tempdir().unwrap();
@@ -2905,6 +3012,7 @@ mod tests {
             issue_comments: Vec::new(),
             reviews,
             review_threads: Vec::new(),
+            reactions: Vec::new(),
             checks: Vec::new(),
             activity_complete: complete,
             checks_complete: true,
@@ -4413,6 +4521,7 @@ mod tests {
                 url: String::new(),
             }],
             review_threads: Vec::new(),
+            reactions: Vec::new(),
             checks: Vec::new(),
             activity_complete: true,
             checks_complete: true,

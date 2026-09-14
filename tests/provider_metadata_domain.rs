@@ -63,6 +63,7 @@ fn details_types_are_provider_independent_and_revision_free() {
         issue_comments: vec![],
         reviews: vec![],
         review_threads: vec![],
+        reactions: vec![],
         checks: vec![PullRequestCheck {
             coordinates,
             kind: CheckKind::CheckRun,

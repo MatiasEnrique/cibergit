@@ -12,13 +12,14 @@ use crate::comparisons::{
 };
 use crate::domain::{
     Account, BranchDeletionAcknowledgement, BranchDeletionRequest, ChangedFile, CheckKind,
-    Comparison, IssueComment, LinkedReviewComment, MergeAcknowledgement, MergeAction,
-    MergeEligibility, MergeExecutionRequest, MergeMethod, MergePreparation, MutationContext,
-    PendingFileCommentSource, PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome,
-    PullRequest, PullRequestCheck, PullRequestCheckoutSource, PullRequestDetails,
-    PullRequestReview, Repository, ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryAction,
-    ReviewAuxiliaryRequest, ReviewComment, ReviewSubject, ReviewThread, ReviewWriteAcknowledgement,
-    Revision, SubmittedReviewEditCapability,
+    Comparison, FreshReactionCapability, IssueComment, LinkedReviewComment, MergeAcknowledgement,
+    MergeAction, MergeEligibility, MergeExecutionRequest, MergeMethod, MergePreparation,
+    MutationContext, PendingFileCommentSource, PendingReviewSnapshot, ProviderCoordinates,
+    ProviderMutationOutcome, PullRequest, PullRequestCheck, PullRequestCheckoutSource,
+    PullRequestDetails, PullRequestReview, ReactableKind, ReactionContent, ReactionGroupSnapshot,
+    ReactionSnapshot, ReactionSubjectSnapshot, Repository, ReviewAuxiliaryAcknowledgement,
+    ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewComment, ReviewSubject, ReviewThread,
+    ReviewWriteAcknowledgement, Revision, SelectedViewer, SubmittedReviewEditCapability,
 };
 use crate::participation::{
     DraftStore, PendingCommentIntent, PendingFileCommentIntent, ReviewCommentTarget,
@@ -43,6 +44,7 @@ mod conditional;
 mod general_sync;
 pub mod notifications;
 mod pr_lifecycle;
+mod reactions;
 mod stacks;
 #[cfg(feature = "ui-smoke")]
 pub use general_sync::synthetic_exact_304_smoke_fixture;
@@ -2289,10 +2291,8 @@ impl<'a> Session<'a> {
         for page in 0..MAX_DETAILS_PAGES {
             let response: GraphqlResult<DetailsData> =
                 self.graphql(DETAILS_QUERY, details_variables(repo, number, &cursors))?;
-            let repository = response
-                .data
-                .repository
-                .context("GitHub details repository is unavailable")?;
+            let DetailsData { viewer, repository } = response.data;
+            let repository = repository.context("GitHub details repository is unavailable")?;
             ensure!(
                 repository
                     .name_with_owner
@@ -2303,7 +2303,7 @@ impl<'a> Session<'a> {
                 .pull_request
                 .context("PR details are unavailable or inaccessible")?;
             pull.validate(repo, number)?;
-            let next = builder.absorb(repo, pull, response.partial, page == 0)?;
+            let next = builder.absorb(repo, pull, viewer, response.partial, page == 0)?;
             if next.done() {
                 return builder.finish(number);
             }
@@ -4828,10 +4828,12 @@ const DETAILS_QUERY: &str = r#"query PullRequestDetails(
     $checksCursor: String, $includeComments: Boolean!, $includeReviews: Boolean!,
     $includeThreads: Boolean!, $includeChecks: Boolean!
 ) {
+  viewer { id login }
   repository(owner: $owner, name: $name) {
     nameWithOwner
     pullRequest(number: $number) {
-      number url headRefOid body state isDraft maintainerCanModify canBeRebased
+      id number url headRefOid body state isDraft maintainerCanModify canBeRebased viewerCanReact
+      reactionGroups { content viewerHasReacted users { totalCount } }
       viewerCanUpdateBranch mergeable mergeStateStatus reviewDecision
       autoMergeRequest { enabledAt }
       isInMergeQueue
@@ -4842,13 +4844,17 @@ const DETAILS_QUERY: &str = r#"query PullRequestDetails(
       assignees(first: 100) { nodes { login } pageInfo { hasNextPage endCursor } }
       labels(first: 100) { nodes { name } pageInfo { hasNextPage endCursor } }
       comments(first: 50, after: $commentsCursor) @include(if: $includeComments) {
-        nodes { id author { login } body createdAt updatedAt url }
+        nodes {
+          id author { login } body createdAt updatedAt url viewerCanReact
+          reactionGroups { content viewerHasReacted users { totalCount } }
+        }
         pageInfo { hasNextPage endCursor }
       }
       reviews(first: 50, after: $reviewsCursor) @include(if: $includeReviews) {
         nodes {
           id author { login } body state submittedAt commit { oid } url
           viewerDidAuthor viewerCanUpdate viewerCannotUpdateReasons
+          viewerCanReact reactionGroups { content viewerHasReacted users { totalCount } }
         }
         pageInfo { hasNextPage endCursor }
       }
@@ -4860,6 +4866,8 @@ const DETAILS_QUERY: &str = r#"query PullRequestDetails(
             nodes {
               id author { login } body createdAt updatedAt url path subjectType line originalLine
               startLine originalStartLine diffHunk outdated commit { oid } originalCommit { oid }
+              pullRequestReview { id }
+              viewerCanReact reactionGroups { content viewerHasReacted users { totalCount } }
             }
             pageInfo { hasNextPage endCursor }
           }
@@ -4949,7 +4957,14 @@ fn details_variables(repo: &Repository, number: u64, cursors: &DetailsCursors) -
 
 #[derive(Deserialize)]
 struct DetailsData {
+    viewer: DetailsViewer,
     repository: Option<DetailsRepository>,
+}
+
+#[derive(Clone, Deserialize)]
+struct DetailsViewer {
+    id: String,
+    login: String,
 }
 
 #[derive(Deserialize)]
@@ -4962,6 +4977,7 @@ struct DetailsRepository {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DetailsPull {
+    id: String,
     number: u64,
     url: String,
     head_ref_oid: String,
@@ -4976,6 +4992,8 @@ struct DetailsPull {
     review_decision: Option<String>,
     auto_merge_request: Option<Value>,
     is_in_merge_queue: bool,
+    viewer_can_react: bool,
+    reaction_groups: Vec<DetailsReactionGroup>,
     review_requests: GraphqlConnection<DetailsReviewRequest>,
     assignees: GraphqlConnection<GraphqlActor>,
     labels: GraphqlConnection<DetailsLabel>,
@@ -5022,6 +5040,8 @@ struct DetailsIssueComment {
     created_at: String,
     updated_at: String,
     url: String,
+    viewer_can_react: bool,
+    reaction_groups: Vec<DetailsReactionGroup>,
 }
 
 #[derive(Deserialize)]
@@ -5036,7 +5056,23 @@ struct DetailsReview {
     viewer_did_author: bool,
     viewer_can_update: bool,
     viewer_cannot_update_reasons: Vec<String>,
+    viewer_can_react: bool,
+    reaction_groups: Vec<DetailsReactionGroup>,
     url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsReactionGroup {
+    content: String,
+    viewer_has_reacted: bool,
+    users: DetailsReactionUsers,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsReactionUsers {
+    total_count: u64,
 }
 
 #[derive(Deserialize)]
@@ -5086,6 +5122,8 @@ struct DetailsReviewComment {
     commit: Option<GraphqlOid>,
     original_commit: Option<GraphqlOid>,
     pull_request_review: Option<GraphqlNodeId>,
+    viewer_can_react: bool,
+    reaction_groups: Vec<DetailsReactionGroup>,
 }
 
 #[derive(Deserialize)]
@@ -5135,18 +5173,94 @@ struct DetailsOverview {
     merge_eligibility: MergeEligibility,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn reaction_subject_snapshot(
+    repo: &Repository,
+    pull_request: &ProviderCoordinates,
+    kind: ReactableKind,
+    subject: ProviderCoordinates,
+    parent_review: Option<ProviderCoordinates>,
+    content: String,
+    provider_groups: &[DetailsReactionGroup],
+    viewer_can_react: bool,
+    viewer: &SelectedViewer,
+    provider_complete: bool,
+) -> ReactionSubjectSnapshot {
+    let mut groups = Vec::new();
+    let mut complete = provider_complete;
+    let mut seen = HashSet::new();
+    for group in provider_groups {
+        let Some(content) = ReactionContent::from_graphql(&group.content) else {
+            complete = false;
+            continue;
+        };
+        if !seen.insert(content) {
+            complete = false;
+            continue;
+        }
+        groups.push(ReactionGroupSnapshot {
+            content,
+            count: group.users.total_count,
+            viewer_has_reacted: group.viewer_has_reacted,
+        });
+    }
+    if complete {
+        // GitHub omits zero-count entries from a complete reactionGroups
+        // result. Materialize those documented empty groups for presentation;
+        // the click still performs an exact targeted absence preflight.
+        for content in ReactionContent::ALL {
+            if seen.insert(content) {
+                groups.push(ReactionGroupSnapshot {
+                    content,
+                    count: 0,
+                    viewer_has_reacted: false,
+                });
+            }
+        }
+    }
+    groups.sort_by_key(|group| {
+        ReactionContent::ALL
+            .iter()
+            .position(|content| content == &group.content)
+            .unwrap_or(usize::MAX)
+    });
+    let exact_parent = match kind {
+        ReactableKind::PullRequestReviewComment => parent_review.is_some(),
+        _ => parent_review.is_none(),
+    };
+    let fresh_capability =
+        (complete && exact_parent && coordinates_match(repo, pull_request.pull_request, &subject))
+            .then(|| FreshReactionCapability {
+                viewer: viewer.clone(),
+                viewer_can_react,
+            });
+    ReactionSubjectSnapshot {
+        kind,
+        pull_request: pull_request.clone(),
+        subject,
+        parent_review,
+        content,
+        reactions: ReactionSnapshot { groups, complete },
+        fresh_capability,
+    }
+}
+
 struct DetailsBuilder {
     head_oid: Option<String>,
+    viewer: Option<SelectedViewer>,
+    pull_request: Option<ProviderCoordinates>,
     overview: Option<DetailsOverview>,
     issue_comments: Vec<IssueComment>,
     reviews: Vec<PullRequestReview>,
     review_threads: Vec<ReviewThread>,
+    reactions: Vec<ReactionSubjectSnapshot>,
     checks: Vec<PullRequestCheck>,
     activity_ids: HashSet<String>,
     thread_ids: HashSet<String>,
     check_ids: HashSet<String>,
     activity_complete: bool,
     checks_complete: bool,
+    reaction_authority_complete: bool,
     notices: Vec<String>,
 }
 
@@ -5154,16 +5268,20 @@ impl Default for DetailsBuilder {
     fn default() -> Self {
         Self {
             head_oid: None,
+            viewer: None,
+            pull_request: None,
             overview: None,
             issue_comments: Vec::new(),
             reviews: Vec::new(),
             review_threads: Vec::new(),
+            reactions: Vec::new(),
             checks: Vec::new(),
             activity_ids: HashSet::new(),
             thread_ids: HashSet::new(),
             check_ids: HashSet::new(),
             activity_complete: true,
             checks_complete: true,
+            reaction_authority_complete: true,
             notices: Vec::new(),
         }
     }
@@ -5174,10 +5292,38 @@ impl DetailsBuilder {
         &mut self,
         repo: &Repository,
         pull: DetailsPull,
+        viewer: DetailsViewer,
         partial: bool,
         first: bool,
     ) -> Result<DetailsCursors> {
         let number = pull.number;
+        validate_node_id(&viewer.id)?;
+        ensure!(
+            viewer.login.eq_ignore_ascii_case(&repo.account.login),
+            "selected GitHub credential resolved to another account"
+        );
+        let selected_viewer = SelectedViewer {
+            node_id: viewer.id,
+            login: viewer.login,
+        };
+        if let Some(prior) = &self.viewer {
+            ensure!(
+                prior == &selected_viewer,
+                "selected viewer changed during collaboration pagination"
+            );
+        } else {
+            self.viewer = Some(selected_viewer.clone());
+        }
+        validate_node_id(&pull.id)?;
+        let pull_request = coordinates(repo, number, pull.id.clone());
+        if let Some(prior) = &self.pull_request {
+            ensure!(
+                prior == &pull_request,
+                "PR node ID changed during collaboration pagination"
+            );
+        } else {
+            self.pull_request = Some(pull_request.clone());
+        }
         validate_sha(&pull.head_ref_oid)?;
         if let Some(head) = &self.head_oid {
             ensure!(
@@ -5191,8 +5337,21 @@ impl DetailsBuilder {
             self.activity_complete = false;
             self.checks_complete = false;
             self.notice("GitHub returned partial collaboration data; unavailable fields were not treated as complete.");
+            self.reaction_authority_complete = false;
         }
         if first {
+            self.reactions.push(reaction_subject_snapshot(
+                repo,
+                &pull_request,
+                ReactableKind::PullRequest,
+                pull_request.clone(),
+                None,
+                pull.body.clone(),
+                &pull.reaction_groups,
+                pull.viewer_can_react,
+                &selected_viewer,
+                !partial,
+            ));
             let requested_reviewers = pull
                 .review_requests
                 .nodes
@@ -5275,6 +5434,18 @@ impl DetailsBuilder {
                     self.activity_ids.insert(comment.id.clone()),
                     "PR activity changed during pagination; refresh to retry"
                 );
+                self.reactions.push(reaction_subject_snapshot(
+                    repo,
+                    &pull_request,
+                    ReactableKind::IssueComment,
+                    coordinates(repo, number, comment.id.clone()),
+                    None,
+                    comment.body.clone(),
+                    &comment.reaction_groups,
+                    comment.viewer_can_react,
+                    &selected_viewer,
+                    !partial,
+                ));
                 self.issue_comments.push(comment.into_domain(repo, number));
             }
         }
@@ -5291,6 +5462,18 @@ impl DetailsBuilder {
                     self.activity_ids.insert(review.id.clone()),
                     "PR activity changed during pagination; refresh to retry"
                 );
+                self.reactions.push(reaction_subject_snapshot(
+                    repo,
+                    &pull_request,
+                    ReactableKind::PullRequestReview,
+                    coordinates(repo, number, review.id.clone()),
+                    None,
+                    review.body.clone(),
+                    &review.reaction_groups,
+                    review.viewer_can_react,
+                    &selected_viewer,
+                    !partial,
+                ));
                 self.reviews
                     .push(review.into_domain(repo, number, !partial));
             }
@@ -5316,6 +5499,24 @@ impl DetailsBuilder {
                 if thread.comments.nodes.iter().any(Option::is_none) {
                     self.activity_complete = false;
                     self.notice("Review thread comments contained unavailable entries; the activity snapshot is partial.");
+                }
+                for comment in thread.comments.nodes.iter().flatten() {
+                    let parent_review = comment
+                        .pull_request_review
+                        .as_ref()
+                        .map(|parent| coordinates(repo, number, parent.id.clone()));
+                    self.reactions.push(reaction_subject_snapshot(
+                        repo,
+                        &pull_request,
+                        ReactableKind::PullRequestReviewComment,
+                        coordinates(repo, number, comment.id.clone()),
+                        parent_review,
+                        comment.body.clone(),
+                        &comment.reaction_groups,
+                        comment.viewer_can_react,
+                        &selected_viewer,
+                        !partial && comments_complete,
+                    ));
                 }
                 self.review_threads
                     .push(thread.into_domain(repo, number, comments_complete));
@@ -5349,10 +5550,15 @@ impl DetailsBuilder {
         }
     }
 
-    fn finish(self, number: u64) -> Result<PullRequestDetails> {
+    fn finish(mut self, number: u64) -> Result<PullRequestDetails> {
         let overview = self
             .overview
             .context("GitHub PR overview was unavailable")?;
+        if !self.reaction_authority_complete {
+            for reaction in &mut self.reactions {
+                reaction.fresh_capability = None;
+            }
+        }
         Ok(PullRequestDetails {
             number,
             body: overview.body,
@@ -5363,6 +5569,7 @@ impl DetailsBuilder {
             issue_comments: self.issue_comments,
             reviews: self.reviews,
             review_threads: self.review_threads,
+            reactions: self.reactions,
             checks: self.checks,
             activity_complete: self.activity_complete,
             checks_complete: self.checks_complete,
@@ -6340,6 +6547,7 @@ else:
 
     fn details_overview() -> Value {
         json!({
+            "id": "PR1",
             "number": 1,
             "headRefOid": "b".repeat(40),
             "url": "https://github.com/owner/repo/pull/1",
@@ -6354,9 +6562,20 @@ else:
             "reviewDecision": "APPROVED",
             "autoMergeRequest": null,
             "isInMergeQueue": false,
+            "viewerCanReact": true,
+            "reactionGroups": [],
             "reviewRequests": {"nodes": [{"requestedReviewer": {"login": "reviewer"}}, {"requestedReviewer": {"slug": "maintainers"}}], "pageInfo": {"hasNextPage": false, "endCursor": null}},
             "assignees": {"nodes": [{"login": "assignee"}], "pageInfo": {"hasNextPage": false, "endCursor": null}},
             "labels": {"nodes": [{"name": "bug"}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+        })
+    }
+
+    fn details_response(pull: Value) -> Value {
+        json!({
+            "data": {
+                "viewer": {"id": "U-alice", "login": "alice"},
+                "repository": {"nameWithOwner": "owner/repo", "pullRequest": pull}
+            }
         })
     }
 
@@ -6373,16 +6592,14 @@ else:
             "state": "FAILURE", "contexts": { "nodes": [],
                 "pageInfo": { "hasNextPage": false, "endCursor": null } }
         });
-        let response = |pull| {
-            json!({"data": {"repository": {
-                "nameWithOwner": "owner/repo", "pullRequest": pull
-            }}})
-        };
         let (dir, provider) = fixture(
             "alice",
             vec![
-                details_step(response(first), json!({"checksCursor": null})),
-                details_step(response(second), json!({"checksCursor": "old-head-checks"})),
+                details_step(details_response(first), json!({"checksCursor": null})),
+                details_step(
+                    details_response(second),
+                    json!({"checksCursor": "old-head-checks"}),
+                ),
             ],
         );
         let error = provider.details(&repo("alice"), 1).unwrap_err();
@@ -6400,12 +6617,12 @@ else:
                 "commit": {"oid": "a".repeat(40)},
                 "viewerDidAuthor": true, "viewerCanUpdate": true,
                 "viewerCannotUpdateReasons": [],
+                "viewerCanReact": true, "reactionGroups": [],
                 "url": "https://github.com/owner/repo/pull/1#pullrequestreview-owned"
             }],
             "pageInfo": {"hasNextPage": false, "endCursor": null}
         });
-        let response =
-            json!({"data":{"repository":{"nameWithOwner":"owner/repo","pullRequest":pull}}});
+        let response = details_response(pull);
         let (dir, provider) = fixture("alice", vec![details_step(response, json!({"number": 1}))]);
         let details = provider.details(&repo("alice"), 1).unwrap();
         let capability = details.reviews[0]
@@ -6415,6 +6632,109 @@ else:
         assert!(capability.viewer_did_author);
         assert!(capability.viewer_can_update);
         assert!(capability.viewer_cannot_update_reasons.is_empty());
+        assert_eq!(details.reactions.len(), 2);
+        assert!(details.reactions.iter().all(|reaction| {
+            reaction.reactions.complete
+                && reaction.reactions.groups.len() == ReactionContent::ALL.len()
+                && reaction
+                    .fresh_capability
+                    .as_ref()
+                    .is_some_and(|fresh| fresh.viewer.node_id == "U-alice")
+        }));
+        exhausted(&dir, 1);
+    }
+
+    #[test]
+    fn complete_details_materializes_all_four_reactables_with_fresh_viewer_not_author() {
+        let group = json!([{
+            "content": "HEART",
+            "viewerHasReacted": true,
+            "users": {"totalCount": 4}
+        }]);
+        let mut pull = details_overview();
+        pull["reactionGroups"] = group.clone();
+        pull["comments"] = json!({
+            "nodes": [{
+                "id": "IC-bob", "author": {"login": "bob"}, "body": "discussion",
+                "createdAt": "2026-09-12T10:00:00Z", "updatedAt": "2026-09-12T10:00:00Z",
+                "url": "https://github.com/owner/repo/pull/1#issuecomment-bob",
+                "viewerCanReact": true, "reactionGroups": group.clone()
+            }],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        });
+        pull["reviews"] = json!({
+            "nodes": [{
+                "id": "R-bob", "author": {"login": "bob"}, "body": "review",
+                "state": "APPROVED", "submittedAt": "2026-09-12T11:00:00Z", "commit": null,
+                "viewerDidAuthor": false, "viewerCanUpdate": false,
+                "viewerCannotUpdateReasons": ["NOT_AUTHOR"],
+                "viewerCanReact": true, "reactionGroups": group.clone(),
+                "url": "https://github.com/owner/repo/pull/1#pullrequestreview-bob"
+            }],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        });
+        pull["reviewThreads"] = json!({
+            "nodes": [{
+                "id": "T-bob", "path": "src/lib.rs", "subjectType": "FILE",
+                "line": null, "originalLine": null, "startLine": null,
+                "originalStartLine": null, "diffSide": null, "startDiffSide": null,
+                "isResolved": false, "isOutdated": false,
+                "comments": {
+                    "nodes": [{
+                        "id": "RC-bob", "author": {"login": "bob"}, "body": "file note",
+                        "createdAt": "2026-09-12T12:00:00Z", "updatedAt": "2026-09-12T12:00:00Z",
+                        "url": "https://github.com/owner/repo/pull/1#discussion-bob",
+                        "path": "src/lib.rs", "subjectType": "FILE", "line": null,
+                        "originalLine": null, "startLine": null, "originalStartLine": null,
+                        "diffHunk": "", "outdated": false, "commit": null,
+                        "originalCommit": null, "pullRequestReview": {"id": "R-bob"},
+                        "viewerCanReact": true, "reactionGroups": group.clone()
+                    }],
+                    "pageInfo": {"hasNextPage": false, "endCursor": null}
+                }
+            }],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        });
+        let (dir, provider) = fixture(
+            "alice",
+            vec![details_step(details_response(pull), json!({"number": 1}))],
+        );
+        let details = provider.details(&repo("alice"), 1).unwrap();
+        assert_eq!(details.reactions.len(), 4);
+        assert_eq!(
+            details
+                .reactions
+                .iter()
+                .map(|reaction| reaction.kind)
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                ReactableKind::PullRequest,
+                ReactableKind::PullRequestReview,
+                ReactableKind::IssueComment,
+                ReactableKind::PullRequestReviewComment,
+            ])
+        );
+        for reaction in &details.reactions {
+            assert_eq!(reaction.reactions.groups.len(), ReactionContent::ALL.len());
+            let heart = reaction
+                .reactions
+                .groups
+                .iter()
+                .find(|entry| entry.content == ReactionContent::Heart)
+                .unwrap();
+            assert_eq!((heart.count, heart.viewer_has_reacted), (4, true));
+            let fresh = reaction.fresh_capability.as_ref().unwrap();
+            assert_eq!(fresh.viewer.node_id, "U-alice");
+            assert_eq!(fresh.viewer.login, "alice");
+        }
+        let comment = details
+            .reactions
+            .iter()
+            .find(|reaction| reaction.kind == ReactableKind::PullRequestReviewComment)
+            .unwrap();
+        assert_eq!(comment.parent_review.as_ref().unwrap().remote_id, "R-bob");
+        assert_eq!(details.issue_comments[0].author.as_deref(), Some("bob"));
+        assert_eq!(details.reviews[0].author.as_deref(), Some("bob"));
         exhausted(&dir, 1);
     }
 
@@ -6423,11 +6743,11 @@ else:
         let overview = details_overview();
         let mut first = overview.clone();
         first["comments"] = json!({
-            "nodes": [{"id": "IC1", "author": {"login": "one"}, "body": "first", "createdAt": "2026-09-12T10:00:00Z", "updatedAt": "2026-09-12T10:00:00Z", "url": "https://github.com/owner/repo/pull/1#issuecomment-1"}],
+            "nodes": [{"id": "IC1", "author": {"login": "one"}, "body": "first", "createdAt": "2026-09-12T10:00:00Z", "updatedAt": "2026-09-12T10:00:00Z", "url": "https://github.com/owner/repo/pull/1#issuecomment-1", "viewerCanReact": true, "reactionGroups": []}],
             "pageInfo": {"hasNextPage": true, "endCursor": "comments-1"}
         });
         first["reviews"] = json!({
-            "nodes": [{"id": "R1", "author": {"login": "reviewer"}, "body": "approved", "state": "APPROVED", "submittedAt": "2026-09-12T11:00:00Z", "commit": null, "viewerDidAuthor": false, "viewerCanUpdate": false, "viewerCannotUpdateReasons": ["NOT_AUTHOR"], "url": "https://github.com/owner/repo/pull/1#pullrequestreview-1"}],
+            "nodes": [{"id": "R1", "author": {"login": "reviewer"}, "body": "approved", "state": "APPROVED", "submittedAt": "2026-09-12T11:00:00Z", "commit": null, "viewerDidAuthor": false, "viewerCanUpdate": false, "viewerCannotUpdateReasons": ["NOT_AUTHOR"], "viewerCanReact": true, "reactionGroups": [], "url": "https://github.com/owner/repo/pull/1#pullrequestreview-1"}],
             "pageInfo": {"hasNextPage": false, "endCursor": null}
         });
         first["reviewThreads"] = json!({
@@ -6440,7 +6760,8 @@ else:
                     "createdAt": "2026-09-12T11:00:00Z", "updatedAt": "2026-09-12T11:01:00Z",
                     "url": "https://github.com/owner/repo/pull/1#discussion_r1", "path": "src/lib.rs",
                     "line": null, "originalLine": 7, "startLine": null, "originalStartLine": null,
-                    "diffHunk": "@@ -7 +8 @@", "outdated": true, "commit": null, "originalCommit": null
+                    "diffHunk": "@@ -7 +8 @@", "outdated": true, "commit": null, "originalCommit": null,
+                    "pullRequestReview": {"id": "R1"}, "viewerCanReact": true, "reactionGroups": []
                 }], "pageInfo": {"hasNextPage": true, "endCursor": "nested-more"}}
             }],
             "pageInfo": {"hasNextPage": false, "endCursor": null}
@@ -6456,7 +6777,7 @@ else:
 
         let mut second = overview;
         second["comments"] = json!({
-            "nodes": [{"id": "IC2", "author": null, "body": "second", "createdAt": "2026-09-12T12:00:00Z", "updatedAt": "2026-09-12T12:00:00Z", "url": "https://github.com/owner/repo/pull/1#issuecomment-2"}],
+            "nodes": [{"id": "IC2", "author": null, "body": "second", "createdAt": "2026-09-12T12:00:00Z", "updatedAt": "2026-09-12T12:00:00Z", "url": "https://github.com/owner/repo/pull/1#issuecomment-2", "viewerCanReact": true, "reactionGroups": []}],
             "pageInfo": {"hasNextPage": false, "endCursor": null}
         });
         second["statusCheckRollup"] = json!({
@@ -6468,12 +6789,9 @@ else:
             }], "pageInfo": {"hasNextPage": false, "endCursor": null}}
         });
 
-        let first_response = json!({
-            "data": {"repository": {"nameWithOwner": "owner/repo", "pullRequest": first}},
-            "errors": [{"message": "one field was inaccessible"}]
-        });
-        let second_response =
-            json!({"data": {"repository": {"nameWithOwner": "owner/repo", "pullRequest": second}}});
+        let mut first_response = details_response(first);
+        first_response["errors"] = json!([{"message": "one field was inaccessible"}]);
+        let second_response = details_response(second);
         let (dir, provider) = fixture(
             "alice",
             vec![
@@ -6507,6 +6825,13 @@ else:
         assert_eq!(details.merge_eligibility.check_status, "Passing");
         assert!(!details.activity_complete);
         assert!(!details.checks_complete);
+        assert_eq!(details.reactions.len(), 5);
+        assert!(
+            details
+                .reactions
+                .iter()
+                .all(|reaction| reaction.fresh_capability.is_none())
+        );
         let notice = details.notice.unwrap();
         assert!(notice.contains("partial collaboration data"));
         assert!(notice.contains("100-comment per-thread limit"));
@@ -7314,4 +7639,13 @@ mod provider_lifecycle_fixture;
 #[cfg(test)]
 mod provider_lifecycle_tests {
     crate::provider_lifecycle_tests!();
+}
+
+#[cfg(test)]
+#[path = "../tests/provider_reactions.rs"]
+mod provider_reactions_fixture;
+
+#[cfg(test)]
+mod provider_reaction_tests {
+    crate::provider_reaction_tests!();
 }

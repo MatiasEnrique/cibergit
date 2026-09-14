@@ -173,6 +173,7 @@ fn details(
         issue_comments: vec![],
         reviews,
         review_threads,
+        reactions: vec![],
         checks: vec![],
         activity_complete: true,
         checks_complete: true,

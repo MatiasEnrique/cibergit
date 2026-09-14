@@ -36,8 +36,9 @@ use cibergit::{
     domain::{
         MergeAction, MergeExecutionRequest, MergeMethod, MergePreparation, PendingReviewSnapshot,
         ProviderMutationOutcome, ProviderReadEvidence, PullRequest, PullRequestDetails,
-        PullRequestDiscussionAction, PullRequestLifecycleAction, Repository, ReviewAuxiliaryAction,
-        ReviewAuxiliaryRequest, Revision,
+        PullRequestDiscussionAction, PullRequestLifecycleAction, ReactableKind, ReactionAction,
+        ReactionContent, ReactionIntent, ReactionSubjectSnapshot, Repository,
+        ReviewAuxiliaryAction, ReviewAuxiliaryRequest, Revision,
     },
     participation::{DiffSide, LineSelection, ReviewEvent, ReviewKey},
     providers::{GeneralReadFailureKind, GithubProvider},
@@ -834,6 +835,48 @@ struct ActionJournalCompletionToken {
     pull_request: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReactionCompletionToken {
+    workspace_instance: u64,
+    tab_instance: u64,
+    repository_key: String,
+    pull_request: u64,
+    subject: cibergit::domain::ProviderCoordinates,
+    parent_review: Option<cibergit::domain::ProviderCoordinates>,
+    content: ReactionContent,
+    intent: ReactionIntent,
+    operation_id: String,
+    attempt_id: String,
+    generation: u64,
+}
+
+impl ReactionCompletionToken {
+    fn matches_values(&self, workspace_instance: u64, tab: &ReviewTab) -> bool {
+        self.matches_fence(
+            workspace_instance,
+            tab.instance_generation,
+            &tab.repository.cache_key(),
+            tab.pull_request.number,
+            tab.reaction_in_flight.as_ref(),
+        )
+    }
+
+    fn matches_fence(
+        &self,
+        workspace_instance: u64,
+        tab_instance: u64,
+        repository_key: &str,
+        pull_request: u64,
+        current: Option<&Self>,
+    ) -> bool {
+        self.workspace_instance == workspace_instance
+            && self.tab_instance == tab_instance
+            && self.repository_key == repository_key
+            && self.pull_request == pull_request
+            && current == Some(self)
+    }
+}
+
 impl ActionJournalCompletionToken {
     fn matches_values(
         &self,
@@ -1040,6 +1083,7 @@ struct ReviewTab {
     interaction_generation: u64,
     confirmation: Option<NativeConfirmation>,
     write_in_flight: bool,
+    reaction_in_flight: Option<ReactionCompletionToken>,
     reply_thread: Option<cibergit::domain::ProviderCoordinates>,
     editing_pending_summary: bool,
     submitted_summary_editor: SubmittedSummaryEditor,
@@ -2685,6 +2729,10 @@ impl ReviewWorkspace {
         }
         if std::env::var_os("CIBERGIT_SMOKE_PENDING_FILE").is_some() {
             self.start_pending_file_comment_smoke(window, cx, output);
+            return;
+        }
+        if std::env::var_os("CIBERGIT_SMOKE_REACTIONS").is_some() {
+            self.start_reaction_smoke(window, cx, output);
             return;
         }
         let second_pr = std::env::var("CIBERGIT_SMOKE_SECOND_PR")
@@ -4644,6 +4692,574 @@ impl ReviewWorkspace {
                 if !passed {
                     panic!("native pending file-comment smoke assertions failed");
                 }
+                let _ = window.update(|_, cx| cx.quit());
+            })
+            .detach();
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn start_reaction_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+        output: PathBuf,
+    ) {
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                let appearance = std::env::var("CIBERGIT_SMOKE_APPEARANCE")
+                    .unwrap_or_else(|_| "system".into());
+                let started = std::time::Instant::now();
+                let ready = loop {
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                let Root::Review(this) = root else { return false };
+                                let Some(index) = this.active_tab else { return false };
+                                this.tabs[index].details.is_some()
+                                    && !this.tabs[index].details_refresh.active
+                                    && matches!(
+                                        this.tabs[index].interactions,
+                                        InteractionState::Ready(_)
+                                    )
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready || started.elapsed() > Duration::from_secs(90) {
+                        break ready;
+                    }
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                };
+                assert!(ready, "reaction native smoke did not receive real read-only details");
+
+                let setup = window
+                    .update(|window, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err("reaction smoke left review workspace".to_owned());
+                            };
+                            let index = this
+                                .active_tab
+                                .ok_or_else(|| "reaction smoke has no active tab".to_owned())?;
+                            let repository = this.tabs[index].repository.clone();
+                            let number = this.tabs[index].pull_request.number;
+                            let mut details = this.tabs[index]
+                                .details
+                                .clone()
+                                .ok_or_else(|| "real provider details disappeared".to_owned())?;
+                            let real_reaction_subjects = details.reactions.len();
+                            let real_pr_snapshot = details
+                                .reactions
+                                .iter()
+                                .find(|reaction| reaction.kind == ReactableKind::PullRequest)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    "real details omitted the provider-supplied PR node ID".to_owned()
+                                })?;
+                            let pull_request = real_pr_snapshot.pull_request.clone();
+                            let viewer = cibergit::domain::SelectedViewer {
+                                node_id: "SYNTHETIC_REACTION_VIEWER_NODE".into(),
+                                login: repository.account.login.clone(),
+                            };
+                            let coordinates = |remote_id: &str| {
+                                cibergit::domain::ProviderCoordinates {
+                                    provider: "github".into(),
+                                    host: repository.host.clone(),
+                                    owner: repository.owner.clone(),
+                                    repository: repository.name.clone(),
+                                    pull_request: number,
+                                    remote_id: remote_id.into(),
+                                }
+                            };
+                            let groups = |selected: Option<ReactionContent>| {
+                                ReactionContent::ALL
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(position, content)| {
+                                        cibergit::domain::ReactionGroupSnapshot {
+                                            content,
+                                            count: (position as u64) + 1,
+                                            viewer_has_reacted: selected == Some(content),
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                            };
+                            let snapshot = |
+                                kind,
+                                subject: cibergit::domain::ProviderCoordinates,
+                                parent_review,
+                                body: &str,
+                                selected,
+                            | ReactionSubjectSnapshot {
+                                kind,
+                                pull_request: pull_request.clone(),
+                                subject,
+                                parent_review,
+                                content: body.into(),
+                                reactions: cibergit::domain::ReactionSnapshot {
+                                    groups: groups(selected),
+                                    complete: true,
+                                },
+                                fresh_capability: Some(
+                                    cibergit::domain::FreshReactionCapability {
+                                        viewer: viewer.clone(),
+                                        viewer_can_react: true,
+                                    },
+                                ),
+                            };
+
+                            let issue = coordinates("SYNTHETIC_REACTION_ISSUE_COMMENT");
+                            let review = coordinates("SYNTHETIC_REACTION_REVIEW");
+                            let thread = coordinates("SYNTHETIC_REACTION_FILE_THREAD");
+                            let comment_ids = [
+                                coordinates("SYNTHETIC_REACTION_FILE_COMMENT_A"),
+                                coordinates("SYNTHETIC_REACTION_FILE_COMMENT_B"),
+                                coordinates("SYNTHETIC_REACTION_FILE_COMMENT_C"),
+                            ];
+                            let comment_bodies = [
+                                "Synthetic file comment A — first comment must have controls.",
+                                "Synthetic file comment B — middle comment must have controls.",
+                                "Synthetic file comment C — last comment must have controls.",
+                            ];
+                            details.issue_comments.push(cibergit::domain::IssueComment {
+                                coordinates: issue.clone(),
+                                author: Some("different-discussion-author".into()),
+                                body: "Clearly labelled synthetic discussion reaction authority."
+                                    .into(),
+                                created_at: "2026-09-13T12:00:00Z".into(),
+                                updated_at: "2026-09-13T12:00:00Z".into(),
+                                url: "https://example.invalid/synthetic-discussion".into(),
+                            });
+                            details.reviews.push(cibergit::domain::PullRequestReview {
+                                coordinates: review.clone(),
+                                author: Some("different-review-author".into()),
+                                body: "Clearly labelled synthetic review reaction authority."
+                                    .into(),
+                                state: "COMMENTED".into(),
+                                submitted_at: Some("2026-09-13T12:01:00Z".into()),
+                                commit_sha: None,
+                                edit_summary_capability: None,
+                                url: "https://example.invalid/synthetic-review".into(),
+                            });
+                            let comments = comment_ids
+                                .iter()
+                                .zip(comment_bodies)
+                                .map(|(coordinates, body)| cibergit::domain::ReviewComment {
+                                    coordinates: coordinates.clone(),
+                                    author: Some("different-inline-author".into()),
+                                    body: body.into(),
+                                    created_at: "2026-09-13T12:02:00Z".into(),
+                                    updated_at: "2026-09-13T12:02:00Z".into(),
+                                    url: "https://example.invalid/synthetic-inline".into(),
+                                    path: "synthetic/reactions.txt".into(),
+                                    subject: cibergit::domain::ReviewSubject::File,
+                                    line: None,
+                                    original_line: None,
+                                    start_line: None,
+                                    original_start_line: None,
+                                    side: None,
+                                    diff_hunk: String::new(),
+                                    commit_sha: None,
+                                    original_commit_sha: None,
+                                    outdated: false,
+                                })
+                                .collect::<Vec<_>>();
+                            details.review_threads.push(cibergit::domain::ReviewThread {
+                                coordinates: thread,
+                                path: "synthetic/reactions.txt".into(),
+                                subject: cibergit::domain::ReviewSubject::File,
+                                line: None,
+                                original_line: None,
+                                start_line: None,
+                                original_start_line: None,
+                                side: None,
+                                start_side: None,
+                                resolved: false,
+                                outdated: false,
+                                comments,
+                                comments_complete: true,
+                            });
+
+                            if let Some(pr) = details
+                                .reactions
+                                .iter_mut()
+                                .find(|reaction| reaction.kind == ReactableKind::PullRequest)
+                            {
+                                pr.reactions = cibergit::domain::ReactionSnapshot {
+                                    groups: groups(Some(ReactionContent::Heart)),
+                                    complete: true,
+                                };
+                                pr.fresh_capability = Some(
+                                    cibergit::domain::FreshReactionCapability {
+                                        viewer: viewer.clone(),
+                                        viewer_can_react: true,
+                                    },
+                                );
+                            }
+                            details.reactions.push(snapshot(
+                                ReactableKind::IssueComment,
+                                issue,
+                                None,
+                                "Clearly labelled synthetic discussion reaction authority.",
+                                Some(ReactionContent::ThumbsUp),
+                            ));
+                            details.reactions.push(snapshot(
+                                ReactableKind::PullRequestReview,
+                                review.clone(),
+                                None,
+                                "Clearly labelled synthetic review reaction authority.",
+                                Some(ReactionContent::Laugh),
+                            ));
+                            for (coordinates, body) in comment_ids.iter().zip(comment_bodies) {
+                                details.reactions.push(snapshot(
+                                    ReactableKind::PullRequestReviewComment,
+                                    coordinates.clone(),
+                                    Some(review.clone()),
+                                    body,
+                                    None,
+                                ));
+                            }
+                            details.activity_complete = true;
+                            let click = details
+                                .reactions
+                                .iter()
+                                .find(|reaction| {
+                                    reaction.subject.remote_id
+                                        == "SYNTHETIC_REACTION_FILE_COMMENT_B"
+                                })
+                                .cloned()
+                                .ok_or_else(|| "synthetic click target is absent".to_owned())?;
+                            let canonical = this.tabs[index].canonical_full_revision.clone();
+                            let selected = this.tabs[index]
+                                .session
+                                .as_ref()
+                                .map(|session| session.revision().clone());
+                            let local_drafts = match &this.tabs[index].interactions {
+                                InteractionState::Ready(controller) => {
+                                    let body = active_review_composer_body(controller)
+                                        .unwrap_or_default()
+                                        .to_owned();
+                                    this.composer_input.update(cx, |input, cx| {
+                                        input.set_value(body, window, cx)
+                                    });
+                                    controller.composition.drafts.len()
+                                        + controller.composition.file_drafts.len()
+                                }
+                                _ => 0,
+                            };
+                            this.tabs[index].details = Some(details);
+                            this.tabs[index].inspector_section = InspectorSection::Overview;
+                            this.inspector_open = true;
+                            this.refresh_auto_layout(window);
+                            cx.notify();
+                            Ok((
+                                index,
+                                click,
+                                canonical,
+                                selected,
+                                local_drafts,
+                                real_reaction_subjects,
+                                repository,
+                                real_pr_snapshot,
+                            ))
+                        })
+                        .unwrap_or_else(|error| Err(format!("reaction entity unavailable: {error:#}")))
+                    })
+                    .unwrap_or_else(|error| Err(format!("reaction window unavailable: {error:#}")))
+                    .unwrap_or_else(|error| panic!("reaction smoke setup failed: {error}"));
+
+                let real_preparation = {
+                    let repository = setup.6.clone();
+                    let displayed = setup.7.clone();
+                    let choice = displayed.fresh_capability.as_ref().and_then(|capability| {
+                        displayed
+                            .reactions
+                            .groups
+                            .iter()
+                            .find(|group| group.viewer_has_reacted)
+                            .map(|group| (group.content, ReactionIntent::Remove))
+                            .or_else(|| {
+                                capability.viewer_can_react.then(|| {
+                                    displayed
+                                        .reactions
+                                        .groups
+                                        .iter()
+                                        .find(|group| !group.viewer_has_reacted)
+                                        .map(|group| (group.content, ReactionIntent::Add))
+                                })?
+                            })
+                    });
+                    if let Some((content, intent)) = choice {
+                        window
+                            .background_executor()
+                            .spawn(async move {
+                                GithubProvider::new(repository.account.clone()).prepare_reaction(
+                                    &repository,
+                                    displayed.pull_request.pull_request,
+                                    &displayed,
+                                    content,
+                                    intent,
+                                    "native-read-only-reaction-preparation".into(),
+                                    "native-read-only-reaction-preparation-attempt".into(),
+                                )
+                            })
+                            .await
+                            .is_ok()
+                    } else {
+                        false
+                    }
+                };
+
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let overview_name = format!("native-reactions-{appearance}-overview.png");
+                let overview = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image.save(output.join(&overview_name)).map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let _ = window.update(|window, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.tabs[setup.0].inspector_section = InspectorSection::Activity;
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                            this.refresh_auto_layout(window);
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let activity_top_name =
+                    format!("native-reactions-{appearance}-activity-top.png");
+                let activity_top = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join(&activity_top_name))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let _ = window.update(|_, cx| {
+                    let _ = weak.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.inspector_scroll.scroll_to_bottom();
+                            cx.notify();
+                        }
+                    });
+                });
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let activity_bottom_name =
+                    format!("native-reactions-{appearance}-activity-bottom.png");
+                let activity_bottom = window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .and_then(|image| {
+                                image
+                                    .save(output.join(&activity_bottom_name))
+                                    .map_err(Into::into)
+                            })
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+
+                let stale_paths = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return false };
+                            let index = setup.0;
+                            let repository_key = this.tabs[index].repository.cache_key();
+                            let current = ReactionCompletionToken {
+                                workspace_instance: this.workspace_instance,
+                                tab_instance: this.tabs[index].instance_generation,
+                                repository_key,
+                                pull_request: this.tabs[index].pull_request.number,
+                                subject: setup.1.subject.clone(),
+                                parent_review: setup.1.parent_review.clone(),
+                                content: ReactionContent::Rocket,
+                                intent: ReactionIntent::Add,
+                                operation_id: "synthetic-current-reaction".into(),
+                                attempt_id: "synthetic-current-reaction-attempt".into(),
+                                generation: 900,
+                            };
+                            this.tabs[index].reaction_in_flight = Some(current.clone());
+                            this.tabs[index].write_in_flight = true;
+                            let sentinel = "synthetic newer reaction remains busy".to_owned();
+                            this.status = sentinel.clone();
+                            let mut stale_success = current.clone();
+                            stale_success.generation = 899;
+                            let ack = cibergit::domain::ReactionAcknowledgement {
+                                operation_id: stale_success.operation_id.clone(),
+                                target: cibergit::domain::ReactionTarget {
+                                    kind: setup.1.kind,
+                                    repository: this.tabs[index].repository.clone(),
+                                    pull_request: setup.1.pull_request.clone(),
+                                    subject: setup.1.subject.clone(),
+                                    parent_review: setup.1.parent_review.clone(),
+                                    content: setup.1.content.clone(),
+                                },
+                                viewer: setup
+                                    .1
+                                    .fresh_capability
+                                    .as_ref()
+                                    .unwrap()
+                                    .viewer
+                                    .clone(),
+                                content: ReactionContent::Rocket,
+                                reaction_id: "SYNTHETIC_REACTION_ACK".into(),
+                                present: true,
+                            };
+                            let success_rejected = this
+                                .apply_reaction_completion(
+                                    &stale_success,
+                                    ProviderMutationOutcome::Acknowledged(ack),
+                                    cx,
+                                )
+                                .is_none()
+                                && this.tabs[index].write_in_flight
+                                && this.tabs[index].reaction_in_flight.as_ref() == Some(&current)
+                                && this.status == sentinel;
+                            let mut stale_error = current.clone();
+                            stale_error.workspace_instance =
+                                stale_error.workspace_instance.wrapping_add(1);
+                            let error_rejected = this
+                                .apply_reaction_completion(
+                                    &stale_error,
+                                    ProviderMutationOutcome::Uncertain {
+                                        context: cibergit::domain::MutationContext {
+                                            operation_id: stale_error.operation_id.clone(),
+                                            attempt_id: stale_error.attempt_id.clone(),
+                                            action: "add-reaction".into(),
+                                            payload: serde_json::json!({"synthetic": true}),
+                                        },
+                                        reason: "synthetic stale error".into(),
+                                    },
+                                    cx,
+                                )
+                                .is_none()
+                                && this.tabs[index].write_in_flight
+                                && this.tabs[index].reaction_in_flight.as_ref() == Some(&current)
+                                && this.status == sentinel;
+                            this.tabs[index].reaction_in_flight = None;
+                            this.tabs[index].write_in_flight = false;
+                            this.update_shared_composer_disabled(cx);
+                            success_rejected && error_rejected
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+
+                let handler_started = window
+                    .update(|_, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else { return false };
+                            this.dispatch_reaction(
+                                setup.1.clone(),
+                                ReactionContent::Rocket,
+                                ReactionIntent::Add,
+                                cx,
+                            );
+                            this.tabs[setup.0].write_in_flight
+                                && this.tabs[setup.0].reaction_in_flight.is_some()
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                let handler_settled = if handler_started {
+                    let started = std::time::Instant::now();
+                    loop {
+                        let settled = window
+                            .update(|_, cx| {
+                                weak.read_with(cx, |root, _| {
+                                    matches!(root, Root::Review(this)
+                                        if !this.tabs[setup.0].write_in_flight
+                                            && this.tabs[setup.0].reaction_in_flight.is_none()
+                                            && this.status.contains("Reaction was not sent"))
+                                })
+                                .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if settled || started.elapsed() > Duration::from_secs(30) {
+                            break settled;
+                        }
+                        window
+                            .background_executor()
+                            .timer(Duration::from_millis(100))
+                            .await;
+                    }
+                } else {
+                    false
+                };
+                let preserved = window
+                    .update(|_, cx| {
+                        weak.read_with(cx, |root, _| {
+                            let Root::Review(this) = root else { return false };
+                            let tab = &this.tabs[setup.0];
+                            let draft_count = match &tab.interactions {
+                                InteractionState::Ready(controller) => {
+                                    controller.composition.drafts.len()
+                                        + controller.composition.file_drafts.len()
+                                }
+                                _ => usize::MAX,
+                            };
+                            tab.canonical_full_revision == setup.2
+                                && tab.session.as_ref().map(|session| session.revision().clone())
+                                    == setup.3
+                                && draft_count == setup.4
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                let report = format!(
+                    "Native reaction smoke ({appearance})\nReal read-only provider details: true; provider-supplied PR node present; reaction subjects={}\nReal targeted reaction preparation completed without dispatch: {}\nSynthetic reaction authority: clearly labelled, isolated, selected viewer node/login explicit; subject authors differ\nOverview reaction-row capture: {}\nActivity top capture (discussion/review rows): {}\nActivity bottom capture (all three FILE-thread comment rows): {}\nActual reaction handler entered background targeted preparation: {}\nHandler settled with zero-write preflight refusal: {}\nFull stale success and stale error apply paths preserved newer identical-action busy token/status: {}\nCanonical/selected comparison and local drafts preserved: {}\nMutation transport: HARD ZERO under CIBERGIT_SMOKE_REACTIONS; GraphQL mutation dispatch is suppressed before credentials/transport\nProvider activity from the handler: read-only targeted preparation only\nFocus/physical input/OS calls: none; no focus request and no physical input is implied\n",
+                    setup.5,
+                    real_preparation,
+                    if overview { &overview_name } else { "failed" },
+                    if activity_top { &activity_top_name } else { "failed" },
+                    if activity_bottom { &activity_bottom_name } else { "failed" },
+                    handler_started,
+                    handler_settled,
+                    stale_paths,
+                    preserved,
+                );
+                fs::create_dir_all(&output).expect("create reaction smoke output");
+                fs::write(
+                    output.join(format!("native-reactions-{appearance}.txt")),
+                    report,
+                )
+                .expect("write reaction smoke report");
+                assert!(
+                    overview
+                        && activity_top
+                        && activity_bottom
+                        && real_preparation
+                        && handler_started
+                        && handler_settled
+                        && stale_paths
+                        && preserved,
+                    "reaction native smoke assertions failed"
+                );
                 let _ = window.update(|_, cx| cx.quit());
             })
             .detach();
@@ -9748,6 +10364,7 @@ impl ReviewWorkspace {
             interaction_generation: 0,
             confirmation: None,
             write_in_flight: false,
+            reaction_in_flight: None,
             reply_thread: None,
             editing_pending_summary: false,
             submitted_summary_editor: SubmittedSummaryEditor::default(),
@@ -12011,6 +12628,169 @@ impl ReviewWorkspace {
         .detach();
     }
 
+    fn dispatch_reaction(
+        &mut self,
+        displayed: ReactionSubjectSnapshot,
+        content: ReactionContent,
+        intent: ReactionIntent,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].submitted_summary_editor.close_after_save {
+            self.status = "Wait for the submitted-review draft close barrier to finish.".into();
+            cx.notify();
+            return;
+        }
+        if !self.shared_composer_admitted(index) {
+            self.status =
+                "Wait for the active editor restoration or target mutation to finish.".into();
+            cx.notify();
+            return;
+        }
+        if self.persist_active_composer_before_transition(
+            index,
+            "Saved the current local review draft first. Click the reaction again after the save finishes.",
+            cx,
+        ) {
+            return;
+        }
+        let current = self.tabs[index].details.as_ref().and_then(|details| {
+            details.reactions.iter().find(|candidate| {
+                candidate.kind == displayed.kind
+                    && candidate.subject == displayed.subject
+                    && candidate.parent_review == displayed.parent_review
+            })
+        });
+        if current != Some(&displayed) || displayed.fresh_capability.is_none() {
+            self.status = "Reaction state is stale, cached, partial, or no longer belongs to this exact subject. Refresh before reacting.".into();
+            cx.notify();
+            return;
+        }
+        let repository = self.tabs[index].repository.clone();
+        let number = self.tabs[index].pull_request.number;
+        let operation_id = next_attempt_id("reaction");
+        let attempt_id = next_attempt_id(&operation_id);
+        let generation = self.issue_request_generation();
+        let token = ReactionCompletionToken {
+            workspace_instance: self.workspace_instance,
+            tab_instance: self.tabs[index].instance_generation,
+            repository_key: repository.cache_key(),
+            pull_request: number,
+            subject: displayed.subject.clone(),
+            parent_review: displayed.parent_review.clone(),
+            content,
+            intent,
+            operation_id: operation_id.clone(),
+            attempt_id: attempt_id.clone(),
+            generation,
+        };
+        self.tabs[index].details_generation = self.tabs[index].details_generation.saturating_add(1);
+        if let Some(details) = &mut self.tabs[index].details {
+            for reaction in &mut details.reactions {
+                reaction.fresh_capability = None;
+            }
+        }
+        self.tabs[index].write_in_flight = true;
+        self.tabs[index].reaction_in_flight = Some(token.clone());
+        self.update_shared_composer_disabled(cx);
+        self.submitted_summary_input
+            .update(cx, |input, cx| input.set_disabled(true, cx));
+        self.status = format!(
+            "Preparing one exact {} reaction on the background executor…",
+            match intent {
+                ReactionIntent::Add => "Add",
+                ReactionIntent::Remove => "Remove",
+            }
+        );
+        let journal_root = self.interaction_root.clone();
+        let task = cx.background_spawn(async move {
+            let provider = GithubProvider::new(repository.account.clone());
+            let request = provider
+                .prepare_reaction(
+                    &repository,
+                    number,
+                    &displayed,
+                    content,
+                    intent,
+                    operation_id,
+                    attempt_id,
+                )
+                .map_err(|reason| ProviderMutationOutcome::<
+                    cibergit::domain::ReactionAcknowledgement,
+                >::PreflightRejected { reason })?;
+            let key = ReviewKey::for_repository("github", &repository, number).map_err(|error| {
+                ProviderMutationOutcome::<cibergit::domain::ReactionAcknowledgement>::PreflightRejected {
+                    reason: error.to_string(),
+                }
+            })?;
+            let mut journal = ActionJournal::open(&journal_root, key).map_err(|reason| {
+                ProviderMutationOutcome::<cibergit::domain::ReactionAcknowledgement>::PreflightRejected {
+                    reason: format!("Cannot open caller journal; zero writes sent: {reason}"),
+                }
+            })?;
+            let mut admission =
+                journal.admission(JournalRequest::Reaction(Box::new(request.clone())));
+            Ok::<_, ProviderMutationOutcome<cibergit::domain::ReactionAcknowledgement>>(
+                provider.execute_reaction(&repository, &request, &mut admission),
+            )
+        });
+        cx.spawn(async move |root, cx| {
+            let outcome = match task.await {
+                Ok(outcome) | Err(outcome) => outcome,
+            };
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(index) = this.apply_reaction_completion(&token, outcome, cx) else {
+                    return;
+                };
+                this.refresh_details(index, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_reaction_completion(
+        &mut self,
+        token: &ReactionCompletionToken,
+        outcome: ProviderMutationOutcome<cibergit::domain::ReactionAcknowledgement>,
+        cx: &mut Context<Root>,
+    ) -> Option<usize> {
+        let index = self
+            .tabs
+            .iter()
+            .position(|tab| token.matches_values(self.workspace_instance, tab))?;
+        self.tabs[index].reaction_in_flight = None;
+        self.tabs[index].write_in_flight = false;
+        self.update_shared_composer_disabled(cx);
+        if self.active_tab == Some(index) {
+            let disabled = self.tabs[index].submitted_summary_editor.clear_in_flight
+                || self.tabs[index]
+                    .submitted_summary_editor
+                    .pending_clear
+                    .is_some()
+                || self.tabs[index].submitted_summary_editor.close_after_save;
+            self.submitted_summary_input
+                .update(cx, |input, cx| input.set_disabled(disabled, cx));
+        }
+        self.status = match outcome {
+            ProviderMutationOutcome::Acknowledged(ack) => format!(
+                "Reaction {} acknowledged exactly for {} as {}. Refreshing current state.",
+                ack.content.graphql_name(),
+                ack.target.subject.remote_id,
+                if ack.present { "present" } else { "absent" }
+            ),
+            ProviderMutationOutcome::PreflightRejected { reason } => {
+                format!("Reaction was not sent: {reason}")
+            }
+            ProviderMutationOutcome::Uncertain { reason, .. } => format!(
+                "Reaction outcome is uncertain and frozen against automatic replay: {reason}"
+            ),
+        };
+        Some(index)
+    }
+
     fn reconcile_action_journal(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         if self.tabs[index].submitted_summary_editor.close_after_save {
@@ -12093,6 +12873,29 @@ impl ReviewWorkspace {
                         PullRequestDiscussionAction::Create { .. }
                         | PullRequestDiscussionAction::Delete { .. } => None,
                     },
+                    JournalRequest::Reaction(request) => match provider
+                        .reconcile_reaction(&repository, request)
+                    {
+                        ProviderReadEvidence::Observed(observed) => match &request.action {
+                            // The new reaction ID was unknown at dispatch. A
+                            // later present state proves convergence only, not
+                            // that this attempt created that exact reaction.
+                            ReactionAction::Add => None,
+                            ReactionAction::Remove { .. }
+                                if !observed.viewer_has_reacted
+                                    && observed.own_reaction_id.is_none() =>
+                            {
+                                Some((
+                                    true,
+                                    true,
+                                    "Fresh exact subject/viewer/content state is absent. This records final-state convergence only, not which actor caused it."
+                                        .into(),
+                                ))
+                            }
+                            ReactionAction::Remove { .. } => None,
+                        },
+                        ProviderReadEvidence::Inconclusive { .. } => None,
+                    },
                 };
                 match observation {
                     Some((true, completed, evidence)) => {
@@ -12113,6 +12916,16 @@ impl ReviewWorkspace {
                                 if matches!(request.action, ReviewAuxiliaryAction::Reply { .. }) =>
                             {
                                 "No safe exact-ID reply observation route exists: the frozen request contains the target thread/review/body but no provider reply ID, and GitHub does not preserve the local attempt ID."
+                            }
+                            JournalRequest::Reaction(request)
+                                if matches!(request.action, ReactionAction::Add) =>
+                            {
+                                "The add acknowledgement was lost before its new reaction ID became known. Current presence can show convergence but cannot identify this attempt."
+                            }
+                            JournalRequest::Reaction(request)
+                                if matches!(request.action, ReactionAction::Remove { .. }) =>
+                            {
+                                "The fresh exact state did not show bounded absence. A different current reaction ID is never removed or adopted automatically."
                             }
                             _ => {
                                 "The fresh read did not provide complete exact identity and payload evidence for this request."
@@ -17279,6 +18092,18 @@ impl ReviewWorkspace {
         let composer = self.composer_input.clone();
         let reply_input = self.reply_input.clone();
         let reply_thread = tab.reply_thread.clone();
+        let inline_reactions = tab
+            .details
+            .as_ref()
+            .or_else(|| {
+                tab.cached_collaboration
+                    .as_ref()
+                    .map(|cached| &cached.details)
+            })
+            .map(|details| details.reactions.clone())
+            .unwrap_or_default();
+        let inline_reactions_cached = tab.details.is_none();
+        let mutation_busy = tab.write_in_flight;
         let pending_review = match &tab.interactions {
             InteractionState::Ready(controller) => controller
                 .pending_review
@@ -17394,6 +18219,9 @@ impl ReviewWorkspace {
                                 &reply_input,
                                 reply_thread.as_ref(),
                                 pending_review.as_ref(),
+                                &inline_reactions,
+                                inline_reactions_cached,
+                                mutation_busy,
                             )
                         })
                         .w_full()
@@ -17416,6 +18244,9 @@ impl ReviewWorkspace {
                                 &reply_input,
                                 reply_thread.as_ref(),
                                 pending_review.as_ref(),
+                                &inline_reactions,
+                                inline_reactions_cached,
+                                mutation_busy,
                             )
                         })
                         .w_full()
@@ -18052,8 +18883,9 @@ impl ReviewWorkspace {
         let confirmation_open = tab.confirmation.is_some();
         let current = tab.inspector_section;
         let root = cx.entity();
+        let section_root = root.clone();
         let section = move |name: &'static str, value: InspectorSection| {
-            let root = root.clone();
+            let root = section_root.clone();
             side_control(name, current == value, colors)
                 .id(SharedString::from(format!("inspector-{name}")))
                 .on_click(move |_, _, cx| {
@@ -18131,10 +18963,30 @@ impl ReviewWorkspace {
                     }
                 }
                 let lifecycle = self.render_lifecycle_overview(index, colors, cx);
+                let pr_reactions = render_reaction_row(
+                    displayed_details.and_then(|details| {
+                        details
+                            .reactions
+                            .iter()
+                            .find(|reaction| reaction.kind == ReactableKind::PullRequest)
+                    }),
+                    cached_observation.is_some(),
+                    tab.write_in_flight,
+                    colors,
+                    &root,
+                );
                 if cached_observation.is_some() {
-                    div().children(fields).child(lifecycle).into_any_element()
+                    div()
+                        .children(fields)
+                        .child(pr_reactions)
+                        .child(lifecycle)
+                        .into_any_element()
                 } else {
-                    div().child(lifecycle).children(fields).into_any_element()
+                    div()
+                        .child(lifecycle)
+                        .child(pr_reactions)
+                        .children(fields)
+                        .into_any_element()
                 }
             }
             InspectorSection::Activity => {
@@ -18759,6 +19611,17 @@ impl ReviewWorkspace {
                                     .text_color(colors.faint)
                                     .child(format!("Remote ID {}", comment.coordinates.remote_id)),
                             )
+                            .child(render_reaction_row(
+                                reaction_subject(
+                                    details,
+                                    ReactableKind::IssueComment,
+                                    &comment.coordinates,
+                                ),
+                                cached_observation.is_some(),
+                                tab.write_in_flight,
+                                colors,
+                                &root,
+                            ))
                             .when(editable, |card| {
                                 card.child(
                                     div()
@@ -19095,6 +19958,17 @@ impl ReviewWorkspace {
                                     review.state, review.coordinates.remote_id
                                 )),
                         );
+                        card = card.child(render_reaction_row(
+                            reaction_subject(
+                                details,
+                                ReactableKind::PullRequestReview,
+                                &review.coordinates,
+                            ),
+                            cached_observation.is_some(),
+                            tab.write_in_flight,
+                            colors,
+                            &root,
+                        ));
                         let selected_author = review.author.as_deref().is_some_and(|author| {
                             author.eq_ignore_ascii_case(&tab.repository.account.login)
                         });
@@ -19240,7 +20114,27 @@ impl ReviewWorkspace {
                             })
                         })
                         .unwrap_or_default();
-                    for thread in placed.iter().take(30) {
+                    let activity_thread_count = placed
+                        .iter()
+                        .filter(|thread| {
+                            activity_thread_visible(
+                                cached_observation.is_some(),
+                                thread.thread.subject,
+                                thread.anchor.is_some(),
+                            )
+                        })
+                        .count();
+                    for thread in placed
+                        .iter()
+                        .filter(|thread| {
+                            activity_thread_visible(
+                                cached_observation.is_some(),
+                                thread.thread.subject,
+                                thread.anchor.is_some(),
+                            )
+                        })
+                        .take(30)
+                    {
                         let location = match thread.thread.subject {
                             cibergit::domain::ReviewSubject::File => {
                                 format!("File-level · {}", thread.thread.path)
@@ -19281,8 +20175,7 @@ impl ReviewWorkspace {
                                 )
                             }
                         };
-                        activity.push(
-                            div()
+                        let mut thread_card = div()
                                 .mb_3()
                                 .child(format!(
                                     "Thread {} · {}{}",
@@ -19320,29 +20213,61 @@ impl ReviewWorkspace {
                                                     comment.original_commit_sha.as_deref()
                                                 }),
                                         )),
-                                )
-                                .when_some(thread.thread.comments.last(), |item, comment| {
-                                    item.child(
-                                        div().mt_1().child(
-                                            markdown_text(
-                                                format!(
-                                                    "activity-thread-{}",
-                                                    thread.thread.coordinates.remote_id
-                                                ),
-                                                &comment.body,
-                                                colors,
-                                            )
-                                            .text_size(px(12.)),
+                                );
+                        for (comment_position, comment) in thread.thread.comments.iter().enumerate()
+                        {
+                            thread_card = thread_card.child(
+                                div()
+                                    .mt_2()
+                                    .pl_2()
+                                    .border_l_2()
+                                    .border_color(colors.border)
+                                    .child(
+                                        div().text_xs().text_color(colors.muted).child(
+                                            comment
+                                                .author
+                                                .as_deref()
+                                                .unwrap_or("Unknown author")
+                                                .to_owned(),
                                         ),
                                     )
-                                }),
-                        );
+                                    .child(
+                                        markdown_text(
+                                            format!(
+                                                "activity-thread-{}-{comment_position}",
+                                                thread.thread.coordinates.remote_id
+                                            ),
+                                            &comment.body,
+                                            colors,
+                                        )
+                                        .text_size(px(12.)),
+                                    )
+                                    .child(render_reaction_row(
+                                        reaction_subject(
+                                            details,
+                                            ReactableKind::PullRequestReviewComment,
+                                            &comment.coordinates,
+                                        ),
+                                        cached_observation.is_some(),
+                                        tab.write_in_flight,
+                                        colors,
+                                        &root,
+                                    )),
+                            );
+                        }
+                        if !thread.thread.comments_complete {
+                            thread_card =
+                                thread_card
+                                    .child(div().mt_1().text_xs().text_color(colors.amber).child(
+                                    "Thread comments are partial at the explicit provider bound.",
+                                ));
+                        }
+                        activity.push(thread_card);
                     }
-                    if cached_observation.is_some() && placed.len() > 30 {
+                    if activity_thread_count > 30 {
                         activity.push(
                             div().text_color(colors.amber).child(format!(
-                                "Cached snapshot contains {} mapped discussion threads; this view displays the first 30.",
-                                placed.len()
+                                "The snapshot contains {activity_thread_count} Activity discussion threads; Activity displays the first 30."
                             )),
                         );
                     }
@@ -20475,6 +21400,7 @@ fn journal_identity(request: &JournalRequest) -> (&str, &str) {
         JournalRequest::Merge { request, .. } => (&request.operation_id, &request.attempt_id),
         JournalRequest::Lifecycle(request) => (&request.operation_id, &request.attempt_id),
         JournalRequest::Discussion(request) => (&request.operation_id, &request.attempt_id),
+        JournalRequest::Reaction(request) => (&request.operation_id, &request.attempt_id),
     }
 }
 
@@ -20568,6 +21494,10 @@ fn journal_operation_summary(operation: &JournalOperation) -> String {
             PullRequestDiscussionAction::Edit { .. } => "Edit top-level comment",
             PullRequestDiscussionAction::Delete { .. } => "Delete top-level comment",
         },
+        JournalRequest::Reaction(request) => match request.action {
+            ReactionAction::Add => "Add reaction",
+            ReactionAction::Remove { .. } => "Remove reaction",
+        },
     };
     let reason = match &operation.request {
         JournalRequest::Auxiliary(request)
@@ -20584,6 +21514,14 @@ fn journal_operation_summary(operation: &JournalOperation) -> String {
             if matches!(request.action, PullRequestDiscussionAction::Delete { .. }) =>
         {
             "Outcome unknown; absence of the exact comment is not proof this delete applied."
+        }
+        JournalRequest::Reaction(request) if matches!(request.action, ReactionAction::Add) => {
+            "Outcome unknown; a lost add acknowledgement contains no known new reaction ID."
+        }
+        JournalRequest::Reaction(request)
+            if matches!(request.action, ReactionAction::Remove { .. }) =>
+        {
+            "Outcome unknown; read-only reconciliation may record exact absence but never causation."
         }
         _ => "Outcome unknown; use read-only reconciliation before retry.",
     };
@@ -20665,6 +21603,22 @@ fn journal_operation_description(operation: &JournalOperation) -> String {
             request.target.observed_updated_at,
             request.target.observed_state,
             request.target.observed_head_sha
+        ),
+        JournalRequest::Reaction(request) => format!(
+            "reaction {:?} · kind {:?} · subject {} · parent {:?} · PR {} · viewer {} ({}) · content {} · subject content {:?}",
+            request.action,
+            request.target.kind,
+            request.target.subject.remote_id,
+            request
+                .target
+                .parent_review
+                .as_ref()
+                .map(|parent| parent.remote_id.as_str()),
+            request.target.pull_request.remote_id,
+            request.viewer.login,
+            request.viewer.node_id,
+            request.content.graphql_name(),
+            request.target.content,
         ),
     };
     let status = match &operation.status {
@@ -20901,6 +21855,126 @@ fn activity_item(id: String, author: &str, body: &str, timestamp: &str, colors: 
                 .mt_1()
                 .child(markdown_text(id, body, colors).text_size(px(12.))),
         )
+}
+
+fn reaction_subject<'a>(
+    details: &'a PullRequestDetails,
+    kind: ReactableKind,
+    subject: &cibergit::domain::ProviderCoordinates,
+) -> Option<&'a ReactionSubjectSnapshot> {
+    details
+        .reactions
+        .iter()
+        .find(|candidate| candidate.kind == kind && candidate.subject == *subject)
+}
+
+fn activity_thread_visible(
+    cached: bool,
+    subject: cibergit::domain::ReviewSubject,
+    has_inline_anchor: bool,
+) -> bool {
+    cached || subject == cibergit::domain::ReviewSubject::File || !has_inline_anchor
+}
+
+fn render_reaction_row(
+    snapshot: Option<&ReactionSubjectSnapshot>,
+    cached: bool,
+    mutation_busy: bool,
+    colors: Palette,
+    root: &Entity<Root>,
+) -> Div {
+    let Some(snapshot) = snapshot else {
+        return div()
+            .mt_2()
+            .text_xs()
+            .text_color(colors.faint)
+            .child("Reactions unavailable in this snapshot.");
+    };
+    let fresh = !cached && snapshot.fresh_capability.is_some();
+    let viewer_can_add = snapshot
+        .fresh_capability
+        .as_ref()
+        .is_some_and(|capability| capability.viewer_can_react);
+    let mut row = div().mt_2().flex().flex_wrap().gap_1().text_xs();
+    for content in ReactionContent::ALL {
+        let group = snapshot
+            .reactions
+            .groups
+            .iter()
+            .find(|group| group.content == content);
+        let selected = group.is_some_and(|group| group.viewer_has_reacted);
+        let count = group
+            .map(|group| group.count.to_string())
+            .unwrap_or_else(|| "?".into());
+        let allowed = fresh
+            && snapshot.reactions.complete
+            && !mutation_busy
+            && group.is_some()
+            && (selected || viewer_can_add);
+        let intent = if selected {
+            ReactionIntent::Remove
+        } else {
+            ReactionIntent::Add
+        };
+        let id = format!(
+            "reaction-{}-{}",
+            snapshot.subject.remote_id,
+            content.graphql_name()
+        );
+        let mut chip = div()
+            .id(SharedString::from(id))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(if selected {
+                colors.accent
+            } else {
+                colors.border
+            })
+            .bg(if selected {
+                colors.selected
+            } else {
+                colors.canvas
+            })
+            .text_color(if allowed { colors.accent } else { colors.faint })
+            .child(format!("{} {count}", content.compact_label()));
+        if allowed {
+            let root = root.clone();
+            let snapshot = snapshot.clone();
+            chip = chip.cursor_pointer().on_click(move |_, _, cx| {
+                root.update(cx, |root, cx| {
+                    if let Root::Review(this) = root {
+                        this.dispatch_reaction(snapshot.clone(), content, intent, cx);
+                    }
+                });
+            });
+        }
+        row = row.child(chip);
+    }
+    row.child(
+        div()
+            .w_full()
+            .mt_1()
+            .text_color(if fresh && snapshot.reactions.complete {
+                colors.faint
+            } else {
+                colors.amber
+            })
+            .child(if mutation_busy {
+                "Reaction action in progress."
+            } else if cached {
+                "Cached reaction state is read-only."
+            } else if !snapshot.reactions.complete {
+                "Reaction groups are partial; unknown values stay read-only."
+            } else if snapshot.fresh_capability.is_none() {
+                "Fresh selected-viewer reaction authority is unavailable."
+            } else if !viewer_can_add {
+                "GitHub does not allow this viewer to add reactions; an exact own reaction may still be removed."
+            } else {
+                "Selected outline is the current viewer. Click once to add or remove."
+            }),
+    )
 }
 
 fn markdown_text(id: String, source: &str, colors: Palette) -> TextView {
@@ -21433,6 +22507,9 @@ fn render_interactive_diff_row(
     reply_input: &Entity<TextareaState>,
     reply_target: Option<&cibergit::domain::ProviderCoordinates>,
     pending_review: Option<&cibergit::domain::ProviderCoordinates>,
+    reactions: &[ReactionSubjectSnapshot],
+    reactions_cached: bool,
+    mutation_busy: bool,
 ) -> AnyElement {
     match row {
         DiffRow::Hunk(header) => render_diff_row(&DiffRow::Hunk(header.clone()), colors),
@@ -21447,6 +22524,9 @@ fn render_interactive_diff_row(
             reply_input,
             reply_target,
             pending_review,
+            reactions,
+            reactions_cached,
+            mutation_busy,
         ),
         DiffRow::Composer {
             side,
@@ -21557,6 +22637,7 @@ fn render_split_interactive(
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_inline_thread(
     thread: &InlineThread,
     colors: Palette,
@@ -21564,6 +22645,9 @@ fn render_inline_thread(
     reply_input: &Entity<TextareaState>,
     reply_target: Option<&cibergit::domain::ProviderCoordinates>,
     pending_review: Option<&cibergit::domain::ProviderCoordinates>,
+    reactions: &[ReactionSubjectSnapshot],
+    reactions_cached: bool,
+    mutation_busy: bool,
 ) -> AnyElement {
     let state = if thread.thread.resolved {
         "Resolved"
@@ -21682,6 +22766,16 @@ fn render_inline_thread(
                     format!("inline-thread-{remote_id}-{position}"),
                     &comment.body,
                     colors,
+                ))
+                .child(render_reaction_row(
+                    reactions.iter().find(|candidate| {
+                        candidate.kind == ReactableKind::PullRequestReviewComment
+                            && candidate.subject == comment.coordinates
+                    }),
+                    reactions_cached,
+                    mutation_busy,
+                    colors,
+                    root,
                 )),
         );
     }
@@ -22178,14 +23272,14 @@ mod layout_tests {
         EXCEPTIONAL_LINE_CHUNK_BYTES, FileCommentConfirmationToken, JournalOperation,
         JournalRequest, JournalStatus, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
         MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
-        SubmittedConfirmationToken, SubmittedDraftCallbackToken, SubmittedDraftCloseDisposition,
-        SubmittedDraftLoadState, SubmittedSummaryEditor, active_review_composer_body,
-        active_review_composer_needs_save, apply_submitted_draft_save_if_current,
-        available_diff_width_for, bounded_page, collaboration_completion_matches,
-        diff_content_width, display_columns, file_confirmation_matches_visible_body,
-        journal_operation_description, journal_operation_summary, line_text_chunks,
-        media_free_markdown, observe_auxiliary, resolved_panel_widths_for,
-        review_subject_allows_actions, submitted_review_edit_action,
+        ReactionCompletionToken, SubmittedConfirmationToken, SubmittedDraftCallbackToken,
+        SubmittedDraftCloseDisposition, SubmittedDraftLoadState, SubmittedSummaryEditor,
+        active_review_composer_body, active_review_composer_needs_save, activity_thread_visible,
+        apply_submitted_draft_save_if_current, available_diff_width_for, bounded_page,
+        collaboration_completion_matches, diff_content_width, display_columns,
+        file_confirmation_matches_visible_body, journal_operation_description,
+        journal_operation_summary, line_text_chunks, media_free_markdown, observe_auxiliary,
+        resolved_panel_widths_for, review_subject_allows_actions, submitted_review_edit_action,
     };
     #[cfg(feature = "ui-smoke")]
     use super::{InstallTabOptions, LoadState, RepoRuntime, Root, Startup};
@@ -22193,8 +23287,9 @@ mod layout_tests {
     use cibergit::domain::PullRequest;
     use cibergit::domain::{
         Account, MergeEligibility, PendingFileCommentSource, ProviderCoordinates,
-        PullRequestDetails, PullRequestReview, Repository, ReviewAuxiliaryAction,
-        ReviewAuxiliaryRequest, ReviewSubject, SubmittedReviewEditCapability,
+        PullRequestDetails, PullRequestReview, ReactionContent, ReactionIntent, Repository,
+        ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewSubject,
+        SubmittedReviewEditCapability,
     };
     use cibergit::participation::PublishedFile;
     use cibergit::providers::{GeneralReadDelay, GeneralReadDirective};
@@ -22338,6 +23433,7 @@ mod layout_tests {
             issue_comments: Vec::new(),
             reviews,
             review_threads: Vec::new(),
+            reactions: Vec::new(),
             checks: Vec::new(),
             activity_complete: true,
             checks_complete: true,
@@ -23464,6 +24560,88 @@ mod layout_tests {
         assert!(!token.matches_values(10, 21, "selected-account/repository", 7));
         assert!(!token.matches_values(10, 20, "other-account/repository", 7));
         assert!(!token.matches_values(10, 20, "selected-account/repository", 8));
+    }
+
+    #[test]
+    fn cached_anchored_line_thread_remains_in_read_only_activity() {
+        assert!(activity_thread_visible(true, ReviewSubject::Line, true));
+        assert!(!activity_thread_visible(false, ReviewSubject::Line, true));
+        assert!(activity_thread_visible(false, ReviewSubject::Line, false));
+        assert!(activity_thread_visible(false, ReviewSubject::File, true));
+    }
+
+    #[test]
+    fn reaction_completion_fence_captures_every_identity_and_identical_action_aba() {
+        let coordinates = |id: &str| ProviderCoordinates {
+            provider: "github".into(),
+            host: "github.com".into(),
+            owner: "octo".into(),
+            repository: "repo".into(),
+            pull_request: 7,
+            remote_id: id.into(),
+        };
+        let token = ReactionCompletionToken {
+            workspace_instance: 10,
+            tab_instance: 20,
+            repository_key: "account/repository".into(),
+            pull_request: 7,
+            subject: coordinates("COMMENT"),
+            parent_review: Some(coordinates("REVIEW")),
+            content: ReactionContent::Heart,
+            intent: ReactionIntent::Remove,
+            operation_id: "reaction-operation".into(),
+            attempt_id: "reaction-attempt".into(),
+            generation: 30,
+        };
+        assert!(token.matches_fence(10, 20, "account/repository", 7, Some(&token)));
+        assert!(!token.matches_fence(11, 20, "account/repository", 7, Some(&token)));
+        assert!(!token.matches_fence(10, 21, "account/repository", 7, Some(&token)));
+        assert!(!token.matches_fence(10, 20, "other-account/repository", 7, Some(&token)));
+        assert!(!token.matches_fence(10, 20, "account/repository", 8, Some(&token)));
+        assert!(!token.matches_fence(10, 20, "account/repository", 7, None));
+
+        for changed in [
+            {
+                let mut value = token.clone();
+                value.subject = coordinates("OTHER_COMMENT");
+                value
+            },
+            {
+                let mut value = token.clone();
+                value.parent_review = Some(coordinates("OTHER_REVIEW"));
+                value
+            },
+            {
+                let mut value = token.clone();
+                value.content = ReactionContent::Eyes;
+                value
+            },
+            {
+                let mut value = token.clone();
+                value.intent = ReactionIntent::Add;
+                value
+            },
+            {
+                let mut value = token.clone();
+                value.operation_id = "other-operation".into();
+                value
+            },
+            {
+                let mut value = token.clone();
+                value.attempt_id = "other-attempt".into();
+                value
+            },
+            {
+                let mut value = token.clone();
+                value.generation = 31;
+                value
+            },
+        ] {
+            assert!(
+                !token.matches_fence(10, 20, "account/repository", 7, Some(&changed)),
+                "a newer full-fence action must not be cleared by a stale callback"
+            );
+        }
     }
 
     #[test]

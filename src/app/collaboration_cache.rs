@@ -949,6 +949,7 @@ mod tests {
                 }],
                 comments_complete: false,
             }],
+            reactions: Vec::new(),
             checks: vec![PullRequestCheck {
                 coordinates: coordinates(repository, number, "check-1"),
                 kind: CheckKind::CheckRun,
