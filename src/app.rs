@@ -22448,12 +22448,13 @@ impl ReviewWorkspace {
         let line_width = log
             .sanitized_text
             .split_terminator('\n')
-            .map(str::len)
+            .map(display_columns)
             .max()
             .unwrap_or_default()
-            .saturating_mul(8)
-            .saturating_add(80)
-            .max(320) as f32;
+            .max(1) as f32
+            * DIFF_CELL_WIDTH
+            + 80.;
+        let line_width = line_width.max(320.);
         let rows_log = log.clone();
         let rows_horizontal = horizontal.clone();
         #[cfg(feature = "ui-smoke")]
