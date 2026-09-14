@@ -3783,12 +3783,24 @@ impl ReviewWorkspace {
                         })
                     })
                     .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")));
+                let appearance = std::env::var("CIBERGIT_SMOKE_APPEARANCE")
+                    .unwrap_or_else(|_| "system".into());
+                if root_fixture.is_err() || conditional_fixture.is_err() {
+                    let failure = format!(
+                        "General-sync fixture failed before synthetic notice scenes.\nRoot: {root_fixture:?}\nConditional: {conditional_fixture:?}\nSynthetic notice scenes started: false\n"
+                    );
+                    let _ = std::fs::write(
+                        output.join(format!(
+                            "native-general-sync-fixture-failure-{appearance}.txt"
+                        )),
+                        &failure,
+                    );
+                    panic!("{failure}");
+                }
                 window
                     .background_executor()
                     .timer(Duration::from_millis(300))
                     .await;
-                let appearance = std::env::var("CIBERGIT_SMOKE_APPEARANCE")
-                    .unwrap_or_else(|_| "system".into());
                 let rate_name = format!("native-general-sync-rate-{appearance}.png");
                 let rate_capture = window
                     .update(|window, cx| {
