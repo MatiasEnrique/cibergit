@@ -9836,6 +9836,10 @@ impl ReviewWorkspace {
 
     fn open_submit_confirmation(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].submitted_summary_editor.close_after_save {
+            self.status = "Wait for the local draft close operation to finish.".into();
+            return;
+        }
         if !matches!(self.tabs[index].interactions, InteractionState::Ready(_)) {
             self.status = "Review recovery must load before submission.".into();
             return;
@@ -9850,6 +9854,10 @@ impl ReviewWorkspace {
 
     fn prepare_merge_confirmation(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].submitted_summary_editor.close_after_save {
+            self.status = "Wait for the local draft close operation to finish.".into();
+            return;
+        }
         let tab = &mut self.tabs[index];
         let Some(session) = tab.canonical_session.as_ref() else {
             return;
@@ -9945,6 +9953,10 @@ impl ReviewWorkspace {
 
     fn confirm_submission(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].submitted_summary_editor.close_after_save {
+            self.status = "Wait for the local draft close operation to finish.".into();
+            return;
+        }
         if self.tabs[index].write_in_flight {
             return;
         }
@@ -10067,6 +10079,10 @@ impl ReviewWorkspace {
 
     fn confirm_merge(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].submitted_summary_editor.close_after_save {
+            self.status = "Wait for the local draft close operation to finish.".into();
+            return;
+        }
         if self.tabs[index].write_in_flight {
             return;
         }
@@ -11355,6 +11371,10 @@ impl ReviewWorkspace {
 
     fn reconcile_action_journal(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].submitted_summary_editor.close_after_save {
+            self.status = "Wait for the local draft close operation to finish.".into();
+            return;
+        }
         if self.tabs[index].write_in_flight {
             self.status = "Wait for the active write before reconciling outcomes.".into();
             return;
@@ -12130,6 +12150,10 @@ impl ReviewWorkspace {
 
     fn confirm_lifecycle_mutation(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].submitted_summary_editor.close_after_save {
+            self.status = "Wait for the local draft close operation to finish.".into();
+            return;
+        }
         if self.tabs[index].write_in_flight {
             self.status = "Another mutation is still in progress.".into();
             return;
@@ -21757,6 +21781,16 @@ mod layout_tests {
                 this.close_inline_composer(cx);
                 this.prepare_file_comment_confirmation(cx);
                 this.start_comment_write(false, cx);
+                this.open_submit_confirmation(cx);
+                this.confirm_submission(cx);
+                this.prepare_merge_confirmation(cx);
+                this.confirm_merge(cx);
+                this.confirm_lifecycle_mutation(cx);
+                this.reconcile_action_journal(cx);
+                assert!(
+                    !this.tabs[0].write_in_flight,
+                    "no later operation can strand the close barrier"
+                );
                 // Even a queued Change carrying old widget text cannot cross the close barrier.
                 this.composer_input
                     .update(cx, |input, cx| input.set_value("late text", window, cx));
@@ -21766,6 +21800,13 @@ mod layout_tests {
                     _ => unreachable!(),
                 };
                 assert_eq!(before, after);
+                assert_eq!(
+                    match &this.tabs[0].interactions {
+                        super::InteractionState::Ready(c) => active_review_composer_body(c),
+                        _ => None,
+                    },
+                    Some("file A")
+                );
                 assert!(this.tabs[0].confirmation.is_none());
                 assert!(!this.tabs[0].write_in_flight);
                 this.composer_input
