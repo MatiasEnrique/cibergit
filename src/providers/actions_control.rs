@@ -800,6 +800,18 @@ fn target_from_run(
     let Some(head_repository) = run.head_repository.as_ref() else {
         return Err("the Actions run returned no head repository identity after admission".into());
     };
+    // The repository identity below is frozen from the permission response, so
+    // the run's own nested repository must be cross-checked against it. Without
+    // this the run could move to a foreign repository while the permission read
+    // stayed correct, and the whole-observation comparison would still pass.
+    if run.repository.node_id != repository.node_id
+        || run.repository.full_name != repository.full_name
+    {
+        return Err(
+            "the Actions run repository identity differs from the freshly observed repository"
+                .into(),
+        );
+    }
     if run.run_attempt != frozen.run_attempt {
         return Err(format!(
             "the run advanced to attempt {} after the frozen attempt {}",

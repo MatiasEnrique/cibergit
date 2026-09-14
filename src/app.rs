@@ -34968,13 +34968,15 @@ mod layout_tests {
 
         // Each control tracks a caller-owned focus handle and accepts focus.
         //
-        // Keyboard traversal and keyboard activation are deliberately NOT
-        // asserted here. In this app's GPUI test context neither a Tab
-        // keystroke, nor `focus_next`, nor Enter/Space on a focused
-        // `gpui_base::Button` reaches the button. That is app-wide rather than
-        // specific to these controls: the pre-existing `checks-source-details`
-        // button behaves identically, because this inspector declares no tab
-        // group. Claiming keyboard evidence here would be false.
+        // Keyboard traversal and activation are deliberately NOT asserted,
+        // because they do not work for controls in this Checks section: neither
+        // `focus_next` nor Enter/Space on a focused button reaches them here.
+        // That is a known open gap in this subtree, not in these controls.
+        // Elsewhere in this window both work, and the pre-existing
+        // `checks-source-details` button is likewise painted every frame yet
+        // never enters the tab ring. The mechanism is unidentified; an earlier
+        // guess that the inspector declares no tab group was tested and
+        // disproved. Claiming keyboard evidence here would be false.
         for (position, action) in RUN_CONTROLS.into_iter().enumerate() {
             cx.update(|window, cx| {
                 root.update(cx, |root, cx| {

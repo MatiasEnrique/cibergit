@@ -562,6 +562,18 @@ sys.exit(step.get('exit', 0))
                     Box::new(|run: &mut Value| run["head_repository"] = Value::Null),
                 ),
                 (
+                    "run repository node",
+                    Box::new(|run: &mut Value| {
+                        run["repository"]["node_id"] = json!("OTHER_REPO_node")
+                    }),
+                ),
+                (
+                    "run repository name",
+                    Box::new(|run: &mut Value| {
+                        run["repository"]["full_name"] = json!("other/repo")
+                    }),
+                ),
+                (
                     "workflow URL",
                     Box::new(|run: &mut Value| {
                         run["workflow_url"] =
