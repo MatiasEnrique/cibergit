@@ -310,7 +310,7 @@ fn palette(dark: bool) -> Palette {
         Palette {
             canvas: rgba(0x18191bff),
             surface: rgba(0x202124ff),
-            sidebar: rgba(0x1c1d20ff),
+            sidebar: rgba(0x484848e0),
             elevated: rgba(0x292b2fff),
             text: rgba(0xf1f2f3ff),
             muted: rgba(0xb8bbc1ff),
@@ -327,7 +327,7 @@ fn palette(dark: bool) -> Palette {
         Palette {
             canvas: rgba(0xfafaf9ff),
             surface: rgba(0xffffffff),
-            sidebar: rgba(0xf3f3f1ff),
+            sidebar: rgba(0xf6f6f5f0),
             elevated: rgba(0xf2f2f0ff),
             text: rgba(0x202124ff),
             muted: rgba(0x56595eff),
@@ -2092,6 +2092,7 @@ pub struct ReviewWorkspace {
     repository_setup_generation: u64,
     repository_picker_open: bool,
     sidebar_search_generation: u64,
+    sidebar_search_open: bool,
     command_palette: bool,
     creation_dialog: Option<Entity<pr_creation::PrCreationDialog>>,
     creation_subscription: Option<Subscription>,
@@ -2882,6 +2883,7 @@ impl ReviewWorkspace {
             repository_setup_generation: 0,
             repository_picker_open: false,
             sidebar_search_generation: 0,
+            sidebar_search_open: false,
             command_palette: false,
             creation_dialog: None,
             creation_subscription: None,
@@ -20253,26 +20255,24 @@ impl ReviewWorkspace {
             match row {
                 SidebarRow::Group { depth, label } => rows.push(
                     div()
-                        .pl(px(12. + depth as f32 * 14.))
+                        .h(px(34.))
+                        .pl(px(16. + depth as f32 * 14.))
                         .pr_3()
-                        .pt(if depth == 0 { px(10.) } else { px(4.) })
-                        .pb_1()
-                        .text_xs()
-                        .font_weight(if depth == 0 {
-                            FontWeight::MEDIUM
-                        } else {
-                            FontWeight::NORMAL
-                        })
-                        .text_color(if depth == 0 {
-                            colors.muted
-                        } else {
-                            colors.faint
-                        })
-                        .child(if depth == 0 {
-                            label
-                        } else {
-                            format!("↳ {label}")
-                        })
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_color(colors.muted)
+                        .child(sidebar_icon(
+                            if depth == 0 { "folder" } else { "branch" },
+                            colors.muted,
+                        ))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(label),
+                        )
                         .into_any_element(),
                 ),
                 SidebarRow::Pull {
@@ -20296,44 +20296,50 @@ impl ReviewWorkspace {
                         number,
                     );
                     rows.push(
-                        div()
-                            .id(SharedString::from(format!(
-                                "pr-{repository_index}-{number}"
-                            )))
+                        Button::new(format!("pr-{repository_index}-{number}"))
                             .mx_2()
                             .my_px()
-                            .px_3()
-                            .py_2()
+                            .h(px(32.))
+                            .pl(px(30.))
+                            .pr_2()
                             .rounded_md()
-                            .cursor_pointer()
-                            .when(selected, |row| row.bg(colors.selected))
-                            .hover(|row| row.bg(colors.selected))
-                            .child(
-                                div().flex().gap_2().child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .child(pull_request.title),
-                                ),
-                            )
-                            .when(unread > 0, |row| {
-                                row.child(div().mt_1().text_xs().text_color(colors.accent).child(
-                                    format!(
-                                        "{unread} unread event{}",
-                                        if unread == 1 { "" } else { "s" }
-                                    ),
-                                ))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .selected(selected)
+                            .text_color(colors.muted)
+                            .when(selected, |row| {
+                                row.bg(colors.selected).text_color(colors.text)
                             })
+                            .hover(|row| row.bg(colors.selected))
+                            .accessibility_label(format!(
+                                "{} · #{number} by {}{}",
+                                pull_request.title,
+                                pull_request.author,
+                                if unread > 0 {
+                                    ", unread notifications"
+                                } else {
+                                    ""
+                                }
+                            ))
                             .child(
                                 div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(colors.muted)
+                                    .flex_1()
+                                    .min_w_0()
                                     .overflow_hidden()
                                     .text_ellipsis()
-                                    .child(format!("#{number}  ·  {}", pull_request.author)),
+                                    .child(pull_request.title),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(if unread > 0 {
+                                        colors.accent
+                                    } else {
+                                        colors.faint
+                                    })
+                                    .child(format!("#{number}")),
                             )
                             .on_click(cx.listener(move |root, _, window, cx| {
                                 if let Root::Review(this) = root {
@@ -20370,7 +20376,7 @@ impl ReviewWorkspace {
             }
         }
         let filters = [
-            ("filter-all", "All pull requests", PersonalFilter::All),
+            ("filter-all", "Pull requests", PersonalFilter::All),
             (
                 "filter-review",
                 "Needs review",
@@ -20398,6 +20404,30 @@ impl ReviewWorkspace {
             }))
         });
         let unread = self.notifications.unread_count();
+        let account = self
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| &tab.repository.account)
+            .or_else(|| {
+                self.repositories
+                    .first()
+                    .map(|repo| &repo.repository.account)
+            })
+            .or_else(|| self.accounts.first());
+        let account_label = account
+            .map(|account| account.login.as_str())
+            .unwrap_or("No account connected");
+        let initial = account
+            .map(|account| {
+                account
+                    .login
+                    .chars()
+                    .next()
+                    .unwrap_or('?')
+                    .to_uppercase()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "?".into());
         div()
             .w(px(sidebar_width))
             .min_w(px(sidebar_width))
@@ -20405,8 +20435,6 @@ impl ReviewWorkspace {
             .flex()
             .flex_col()
             .bg(colors.sidebar)
-            .border_r_1()
-            .border_color(colors.border)
             .child(
                 div()
                     .id("sidebar-titlebar")
@@ -20416,144 +20444,174 @@ impl ReviewWorkspace {
                     .pr_3()
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .child(
+                        sidebar_icon_button(
+                            "collapse-sidebar",
+                            "Collapse sidebar",
+                            "panel",
+                            colors,
+                        )
+                        .on_click(cx.listener(|root, _, window, cx| {
+                            if let Root::Review(this) = root {
+                                this.panel_layout.sidebar_collapsed = true;
+                                this.refresh_auto_layout(window);
+                                cx.notify();
+                            }
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .pb_3()
+                    .h(px(42.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .flex_1()
+                            .pl_1()
+                            .text_size(px(17.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("cibergit"),
                     )
                     .child(
-                        Button::new("collapse-sidebar")
-                            .size(px(28.))
-                            .rounded_md()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(colors.muted)
-                            .hover(|button| button.bg(colors.selected))
-                            .accessibility_label("Collapse sidebar")
-                            .child("‹")
-                            .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.panel_layout.sidebar_collapsed = true;
-                                    this.refresh_auto_layout(window);
-                                    cx.notify();
+                        sidebar_icon_button(
+                            "sidebar-search",
+                            "Search pull requests",
+                            "search",
+                            colors,
+                        )
+                        .on_click(cx.listener(|root, _, window, cx| {
+                            if let Root::Review(this) = root {
+                                this.sidebar_search_open = !this.sidebar_search_open;
+                                if this.sidebar_search_open {
+                                    this.query.update(cx, |input, cx| input.focus(window, cx));
+                                } else {
+                                    window.focus(&this.focus, cx);
                                 }
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .pb_3()
-                    .flex_none()
-                    .child(
-                        Button::new("open-notifications")
-                            .h(px(34.))
-                            .w_full()
-                            .px_2()
-                            .mb_2()
-                            .rounded_md()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .text_color(colors.muted)
-                            .hover(|row| row.bg(colors.selected))
-                            .accessibility_label(format!("Inbox, {unread} unread notifications"))
-                            .child("Inbox")
-                            .when(unread > 0, |row| {
-                                row.child(
-                                    div()
-                                        .px_2()
-                                        .rounded_md()
-                                        .text_xs()
-                                        .bg(colors.selected)
-                                        .child(unread.to_string()),
-                                )
-                            })
-                            .on_click(cx.listener(|root, _, _, cx| {
-                                if let Root::Review(this) = root {
-                                    this.notifications.toggle_open();
-                                    cx.notify();
-                                }
-                            })),
+                                cx.notify();
+                            }
+                        })),
                     )
                     .child(
+                        sidebar_icon_button(
+                            "open-notifications",
+                            &format!("Inbox, {unread} unread notifications"),
+                            "bell",
+                            colors,
+                        )
+                        .relative()
+                        .when(unread > 0, |button| {
+                            button.child(
+                                div()
+                                    .absolute()
+                                    .top(px(3.))
+                                    .right(px(3.))
+                                    .size(px(5.))
+                                    .rounded_full()
+                                    .bg(colors.accent),
+                            )
+                        })
+                        .on_click(cx.listener(|root, _, _, cx| {
+                            if let Root::Review(this) = root {
+                                this.notifications.toggle_open();
+                                cx.notify();
+                            }
+                        })),
+                    ),
+            )
+            .when(
+                self.sidebar_search_open || !view.filter.search.is_empty(),
+                |sidebar| {
+                    sidebar.child(
                         div()
-                            .h(px(34.))
+                            .mx_3()
+                            .mb_2()
+                            .h(px(32.))
                             .px_2()
                             .rounded_md()
-                            .bg(if colors.dark {
-                                colors.elevated
-                            } else {
-                                colors.surface
-                            })
+                            .bg(colors.selected)
                             .border_1()
                             .border_color(colors.border)
-                            .font_family(UI_FONT)
                             .child(Input::new(&self.query)),
-                    ),
+                    )
+                },
             )
             .child(
                 div()
-                    .px_3()
-                    .pb_3()
+                    .px_2()
                     .flex_none()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .child(
+                        sidebar_nav_button(
+                            "open-pr-creation".into(),
+                            "New pull request",
+                            false,
+                            colors,
+                        )
+                        .on_click(cx.listener(|root, _, window, cx| {
+                            if let Root::Review(this) = root {
+                                this.open_creation_dialog(window, cx);
+                            }
+                        })),
+                    )
                     .children(filters),
             )
             .when(self.workspace.views.len() > 1, |sidebar| {
                 sidebar.child(
                     div()
-                        .px_3()
-                        .pb_3()
+                        .px_2()
+                        .pt_4()
                         .flex()
                         .flex_col()
-                        .gap_1()
                         .child(
                             div()
                                 .px_2()
-                                .py_1()
-                                .text_xs()
-                                .text_color(colors.muted)
+                                .pb_2()
+                                .text_color(colors.faint)
                                 .child("Saved views"),
                         )
                         .children(saved_views),
                 )
             })
-            .child(div().mx_4().h(px(1.)).flex_none().bg(colors.border))
             .child(
                 div()
-                    .px_4()
-                    .pt_4()
-                    .pb_2()
+                    .px_3()
+                    .pt_5()
+                    .pb_1()
                     .flex_none()
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .gap_1()
                     .child(
                         div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
+                            .pl_1()
+                            .flex_1()
                             .text_color(colors.muted)
-                            .child("Pull requests"),
+                            .child("Repositories"),
                     )
                     .child(
-                        Button::new("edit-view")
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .text_xs()
-                            .text_color(colors.muted)
-                            .hover(|button| button.bg(colors.selected))
-                            .accessibility_label("Edit filters and grouping")
-                            .child("View options")
+                        sidebar_icon_button(
+                            "edit-view",
+                            "Edit filters and grouping",
+                            "more",
+                            colors,
+                        )
+                        .on_click(cx.listener(|root, _, window, cx| {
+                            if let Root::Review(this) = root {
+                                this.open_view_editor(window, cx);
+                            }
+                        })),
+                    )
+                    .child(
+                        sidebar_icon_button("add-repository", "Add repository", "plus", colors)
                             .on_click(cx.listener(|root, _, window, cx| {
                                 if let Root::Review(this) = root {
-                                    this.open_view_editor(window, cx);
+                                    this.open_repository_picker(window, cx);
                                 }
                             })),
                     ),
@@ -20588,60 +20646,45 @@ impl ReviewWorkspace {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .pb_3()
                     .children(rows),
             )
             .child(
                 div()
-                    .p_3()
+                    .h(px(48.))
+                    .px_4()
                     .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .border_t_1()
-                    .border_color(colors.border)
+                    .border_color(if colors.dark {
+                        rgba(0xffffff12)
+                    } else {
+                        rgba(0x0000000d)
+                    })
                     .child(
-                        Button::new("open-pr-creation")
-                            .w_full()
-                            .h(px(34.))
-                            .px_2()
-                            .mb_1()
-                            .rounded_md()
+                        div()
+                            .size(px(22.))
+                            .flex_none()
+                            .rounded_full()
                             .flex()
                             .items_center()
-                            .justify_between()
-                            .text_color(colors.muted)
-                            .hover(|button| button.bg(colors.selected))
-                            .accessibility_label("Create pull request")
-                            .child("New pull request")
-                            .child(div().text_xs().text_color(colors.faint).child("⇧⌘N"))
-                            .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.open_creation_dialog(window, cx);
-                                }
-                            })),
+                            .justify_center()
+                            .bg(rgba(0x9165b5ff))
+                            .text_color(rgba(0xffffffff))
+                            .text_size(px(10.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(initial),
                     )
                     .child(
-                        Button::new("add-repository")
-                            .w_full()
-                            .h(px(36.))
-                            .px_2()
-                            .rounded_md()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .bg(if colors.dark {
-                                colors.elevated
-                            } else {
-                                colors.surface
-                            })
-                            .border_1()
-                            .border_color(colors.border)
-                            .hover(|button| button.bg(colors.selected))
-                            .accessibility_label("Add repository")
-                            .child("Add repository…")
-                            .child(div().text_xs().text_color(colors.faint).child("⌘O"))
-                            .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.open_repository_picker(window, cx);
-                                }
-                            })),
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_color(colors.muted)
+                            .child(account_label.to_owned()),
                     ),
             )
     }
@@ -27869,7 +27912,57 @@ fn file_status_badge(status: &str) -> &'static str {
     }
 }
 
+// SVG paint requires an explicit foreground; inherited text color is not enough.
+fn sidebar_icon(name: &str, color: Rgba) -> Svg {
+    let shape = match name {
+        "search" => "<circle cx='10.5' cy='10.5' r='6.5'/><path d='m16 16 4 4'/>",
+        "bell" => "<path d='M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4'/>",
+        "panel" => "<rect x='3' y='4' width='18' height='16' rx='3'/><path d='M9 4v16'/>",
+        "folder" => {
+            "<path d='M3 7V5a2 2 0 0 1 2-2h5l3 3h6a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7h18'/>"
+        }
+        "plus" => "<path d='M12 5v14M5 12h14'/>",
+        "more" => {
+            "<circle cx='5' cy='12' r='.7'/><circle cx='12' cy='12' r='.7'/><circle cx='19' cy='12' r='.7'/>"
+        }
+        "edit" => {
+            "<path d='M13 4H6a3 3 0 0 0-3 3v11a3 3 0 0 0 3 3h11a3 3 0 0 0 3-3v-7M10 14l1-4L19 2l3 3-8 8-4 1Z'/>"
+        }
+        "review" => "<rect x='5' y='3' width='14' height='18' rx='3'/><path d='m8 12 3 3 5-6'/>",
+        "person" => "<circle cx='12' cy='7' r='4'/><path d='M4 21v-2a8 8 0 0 1 16 0v2'/>",
+        "conversation" => {
+            "<path d='M21 11a8 8 0 0 1-8 8H8l-5 3V6a3 3 0 0 1 3-3h7a8 8 0 0 1 8 8Z'/>"
+        }
+        _ => {
+            "<circle cx='6' cy='5' r='2'/><circle cx='6' cy='19' r='2'/><circle cx='18' cy='19' r='2'/><path d='M6 7v10M18 17V9a4 4 0 0 0-4-4h-2m3-3-3 3 3 3'/>"
+        }
+    };
+    svg().data(format!("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'>{shape}</svg>").as_bytes())
+        .size(px(16.)).flex_none().text_color(color)
+}
+
+fn sidebar_icon_button(id: &'static str, label: &str, icon: &str, colors: Palette) -> Button {
+    Button::new(id)
+        .debug_selector(move || id.to_owned())
+        .size(px(28.))
+        .rounded_md()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(colors.muted)
+        .hover(|button| button.bg(colors.selected))
+        .accessibility_label(label.to_owned())
+        .child(sidebar_icon(icon, colors.muted))
+}
+
 fn sidebar_nav_button(id: String, label: &str, selected: bool, colors: Palette) -> Button {
+    let icon = match id.as_str() {
+        "open-pr-creation" => "edit",
+        "filter-review" => "review",
+        "filter-mine" => "person",
+        "filter-participating" => "conversation",
+        _ => "branch",
+    };
     let selector = id.clone();
     Button::new(id)
         .debug_selector(move || selector.clone())
@@ -27883,19 +27976,13 @@ fn sidebar_nav_button(id: String, label: &str, selected: bool, colors: Palette) 
         .selected(selected)
         .text_size(px(13.))
         .text_color(if selected { colors.text } else { colors.muted })
-        .when(selected, |row| {
-            row.bg(colors.selected).font_weight(FontWeight::MEDIUM)
-        })
+        .when(selected, |row| row.bg(colors.selected))
         .hover(|row| row.bg(colors.selected))
         .accessibility_label(format!(
             "{label}{}",
             if selected { ", selected" } else { "" }
         ))
-        .child(div().w(px(3.)).h(px(14.)).rounded_full().bg(if selected {
-            colors.accent
-        } else {
-            rgba(0x00000000)
-        }))
+        .child(sidebar_icon(icon, colors.muted))
         .child(
             div()
                 .flex_1()
@@ -30213,9 +30300,13 @@ mod layout_tests {
                     unreachable!()
                 };
                 this.setup_open = false;
-                this.query.update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
             });
+            window.draw(cx).clear(cx);
         });
+        let search = cx.debug_bounds("sidebar-search").unwrap();
+        cx.simulate_click(search.center(), Modifiers::default());
+        cx.run_until_parked();
         cx.simulate_input("sidebar");
         cx.run_until_parked();
         cx.executor().advance_clock(Duration::from_millis(250));
