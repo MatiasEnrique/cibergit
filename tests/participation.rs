@@ -812,6 +812,7 @@ fn pending_file_absence(base: &str, head: &str) -> PendingFileReviewAbsence {
         viewer_login: "alice".into(),
         repository: repository("alice"),
         pull_request: provider_coordinates("PR_42"),
+        pull_request_url: "https://github.com/acme/rocket/pull/42".into(),
         pull_request_state: "OPEN".into(),
         current_base_sha: base.into(),
         current_head_sha: head.into(),
@@ -1056,6 +1057,19 @@ fn pending_review_start_rejects_absence_identity_and_duplicate_stage_ids() {
                 "flow-1".into(),
                 "create-1".into(),
                 "thread-1".into(),
+            )
+            .is_err()
+    );
+    let mut wrong_url = pending_file_absence("base", "head");
+    wrong_url.pull_request_url = "https://github.com/acme/rocket/pull/43".into();
+    assert!(
+        state
+            .prepare_pending_file_review_start(
+                &draft_id,
+                &wrong_url,
+                "flow-url".into(),
+                "create-url".into(),
+                "thread-url".into(),
             )
             .is_err()
     );

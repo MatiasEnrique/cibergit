@@ -13,9 +13,9 @@ The confirmation shows the selected account, repository, pull request, file, bod
 
 ## Absence proof
 
-The create stage needs a fresh, complete, nonserialized absence witness. It binds the selected viewer and account to the host, repository, pull request node ID, open state, base, and head. The full selected-account pending set must be empty.
+The create stage needs a fresh, complete, nonserialized absence witness. It binds the selected viewer and account to the host, repository, pull request node ID, canonical pull-request URL, open state, base, and head. The full selected-account pending set must be empty.
 
-A missing, partial, or cached read is not absence. Neither is a response containing an unclassifiable pending row. A row with a missing author, invalid login, invalid review ID, or non-PENDING state prevents the new absence witness even though legacy pending-review import can still ignore rows owned by another account. The provider repeats this read while holding the existing per-target mutation authority and before saving `CreateInFlight`.
+A missing, partial, or cached read is not absence. Neither is a response containing a missing or wrong canonical PR URL or an unclassifiable pending row. A row with a missing author, invalid login, invalid review ID, or non-PENDING state prevents the new absence witness even though legacy pending-review import can still ignore rows owned by another account. Starting any replacement pending read immediately revokes the prior in-memory absence capability while preserving legacy known-review linkage. The provider repeats the complete read while holding the existing per-target mutation authority and before saving `CreateInFlight`, including an exact comparison with the frozen URL.
 
 ## Durable state
 
@@ -25,13 +25,13 @@ The journal reuses the review interaction directory checks, bounded reader, atom
 
 The create acknowledgement must echo the create operation ID and return a valid new review ID, selected author, `PENDING` state, null submission time, exact commit, pull request, and repository. The app saves `ReviewCreated` with that exact ID before it can prepare the file write. The file stage repeats the complete selected-account pending read and requires exactly that review at the frozen base and head.
 
-Receipts contain only bounded typed IDs and state needed for recovery. They do not copy the request body into acknowledgement summaries.
+Receipts contain only bounded typed IDs and state needed for recovery. They do not copy the request body into acknowledgement summaries. A post-dispatch uncertain result separately retains the exact bounded stage query and frozen variables—including the create commit or FILE review ID, path, and body—rather than substituting a flow-only summary.
 
 ## Stops, uncertainty, and restart
 
 Restart never dispatches either provider write. A recovered `PreparedCreate` record can only be cancelled locally, which proves zero transport and releases the target. `CreateInFlight`, `ThreadInFlight`, and `Uncertain` stay frozen. The app does not find a replacement review or comment by body, path, time, or list order.
 
-A durable `ReviewCreated` record is quiescent and closable. The user can continue only after a fresh read proves the same sole pending review and a new confirmation freezes the exact draft again. The user can also choose "Stop and keep pending review." That local action sends no cleanup write, preserves the review ID and draft history, revokes continuation for this attempt, and lets later ordinary actions start only from fresh existing-pending evidence.
+A durable `ReviewCreated` record is quiescent and closable. A FILE transport rejection that proves zero remote writes is likewise kept as a blocking quiescent state with the exact created review ID and rejection evidence; it never silently unlocks the target. In either state, the user can continue only after a fresh read proves the same sole pending review and a new confirmation freezes the exact draft again. The user can also choose "Stop and keep pending review." That local action sends no cleanup write, preserves the review ID and draft history, revokes continuation for this attempt, and lets later ordinary actions start only from fresh existing-pending evidence.
 
 If the provider's FILE acknowledgement IDs are durable but local draft reconciliation did not finish, restart offers a local-only finish. It never resends the FILE mutation.
 

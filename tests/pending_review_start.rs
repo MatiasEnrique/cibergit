@@ -49,6 +49,7 @@ fn intent(body: String) -> PendingFileReviewStartIntent {
             raw_previous_path: None,
         }),
         pull_request: coordinates("PR_42"),
+        pull_request_url: "https://github.com/acme/rocket/pull/42".into(),
         selected_author: "alice".into(),
         observed_base_sha: "base".into(),
         observed_head_sha: "head".into(),
@@ -127,6 +128,46 @@ fn explicit_stop_is_only_available_before_file_dispatch_and_keeps_created_id() {
     assert!(!record.blocks_target_mutations());
     assert!(!record.may_continue_file_thread());
     assert!(record.mark_thread_in_flight("late".into()).is_err());
+}
+
+#[test]
+fn proven_zero_transport_file_rejection_remains_blocking_until_continue_or_stop() {
+    let mut record = PendingReviewStartRecord::new(intent("exact body".into())).unwrap();
+    record
+        .mark_create_in_flight("create-attempt".into())
+        .unwrap();
+    record.mark_review_created(creation()).unwrap();
+    record
+        .mark_thread_in_flight("thread-attempt".into())
+        .unwrap();
+    record
+        .mark_thread_not_applied("credential lookup failed before transport".into())
+        .unwrap();
+    assert!(record.blocks_target_mutations());
+    assert!(record.may_continue_file_thread());
+    assert_eq!(
+        record.creation().unwrap().review.remote_id,
+        "REVIEW_created"
+    );
+
+    let mut continued = record.clone();
+    continued
+        .mark_thread_in_flight("new-confirmed-attempt".into())
+        .unwrap();
+    assert!(matches!(
+        continued.stage,
+        PendingReviewStartStage::ThreadInFlight { .. }
+    ));
+
+    record
+        .stop_and_keep_created_review("user kept review and revoked continuation".into())
+        .unwrap();
+    assert!(matches!(
+        record.stage,
+        PendingReviewStartStage::StoppedAfterReviewCreated { .. }
+    ));
+    assert!(!record.blocks_target_mutations());
+    assert!(!record.may_continue_file_thread());
 }
 
 #[test]

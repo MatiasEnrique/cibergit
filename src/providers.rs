@@ -2484,9 +2484,11 @@ impl<'a> Session<'a> {
             .pull_request
             .context("GitHub pending-review PR is unavailable")?;
         ensure!(pull.number == number, "GitHub pending-review PR mismatch");
+        let canonical_pull_url =
+            format!("https://{}/{}/pull/{number}", repo.host, repo.full_name());
         if let Some(url) = &pull.url {
             ensure!(
-                url == &format!("https://{}/{}/pull/{number}", repo.host, repo.full_name()),
+                url == &canonical_pull_url,
                 "GitHub pending-review PR mismatch"
             );
         }
@@ -2528,6 +2530,7 @@ impl<'a> Session<'a> {
                     .id
                     .as_ref()
                     .is_some_and(|id| validate_node_id(id).is_ok())
+                && pull.url.is_some()
                 && pull.base_ref_oid.is_some()
                 && pull.head_ref_oid.is_some()
                 && viewer_login.as_ref().is_some_and(|viewer| {
@@ -2540,6 +2543,7 @@ impl<'a> Session<'a> {
                     viewer_login: viewer_login.expect("checked"),
                     repository: repo.clone(),
                     pull_request: coordinates(repo, number, pull.id.expect("checked")),
+                    pull_request_url: pull.url.expect("checked"),
                     pull_request_state: pull.state.expect("checked"),
                     current_base_sha: pull.base_ref_oid.expect("checked"),
                     current_head_sha: pull.head_ref_oid.expect("checked"),

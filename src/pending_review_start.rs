@@ -172,12 +172,14 @@ impl PendingReviewStartRecord {
 
     pub fn mark_thread_in_flight(&mut self, attempt_id: String) -> Result<(), String> {
         validate_id("thread attempt", &attempt_id)?;
-        let PendingReviewStartStage::ReviewCreated { creation, .. } = &self.stage else {
-            return Err("FILE dispatch requires a durably created exact review".into());
+        let creation = match &self.stage {
+            PendingReviewStartStage::ReviewCreated { creation, .. }
+            | PendingReviewStartStage::ThreadNotApplied { creation, .. } => creation.clone(),
+            _ => return Err("FILE dispatch requires a durably created exact review".into()),
         };
         self.stage = PendingReviewStartStage::ThreadInFlight {
             attempt_id,
-            creation: creation.clone(),
+            creation,
         };
         self.validate()
     }
@@ -226,15 +228,17 @@ impl PendingReviewStartRecord {
 
     pub fn stop_and_keep_created_review(&mut self, reason: String) -> Result<(), String> {
         validate_reason("created-review stop disposition", &reason)?;
-        let PendingReviewStartStage::ReviewCreated { creation, .. } = &self.stage else {
-            return Err(
-                "only a quiescent created review with no FILE dispatch can be stopped".into(),
-            );
+        let creation = match &self.stage {
+            PendingReviewStartStage::ReviewCreated { creation, .. }
+            | PendingReviewStartStage::ThreadNotApplied { creation, .. } => creation.clone(),
+            _ => {
+                return Err(
+                    "only a quiescent created review with no unresolved FILE dispatch can be stopped"
+                        .into(),
+                );
+            }
         };
-        self.stage = PendingReviewStartStage::StoppedAfterReviewCreated {
-            creation: creation.clone(),
-            reason,
-        };
+        self.stage = PendingReviewStartStage::StoppedAfterReviewCreated { creation, reason };
         self.validate()
     }
 
@@ -317,7 +321,11 @@ impl PendingReviewStartRecord {
     }
 
     pub fn may_continue_file_thread(&self) -> bool {
-        matches!(&self.stage, PendingReviewStartStage::ReviewCreated { .. })
+        matches!(
+            &self.stage,
+            PendingReviewStartStage::ReviewCreated { .. }
+                | PendingReviewStartStage::ThreadNotApplied { .. }
+        )
     }
 
     pub fn blocks_target_mutations(&self) -> bool {
@@ -328,6 +336,7 @@ impl PendingReviewStartRecord {
                 | PendingReviewStartStage::ReviewCreated { .. }
                 | PendingReviewStartStage::ThreadInFlight { .. }
                 | PendingReviewStartStage::ThreadAcknowledged { .. }
+                | PendingReviewStartStage::ThreadNotApplied { .. }
                 | PendingReviewStartStage::Uncertain { .. }
         )
     }

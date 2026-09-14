@@ -488,6 +488,7 @@ pub struct PendingFileReviewAbsence {
     pub viewer_login: String,
     pub repository: Repository,
     pub pull_request: ProviderCoordinates,
+    pub pull_request_url: String,
     pub pull_request_state: String,
     pub current_base_sha: String,
     pub current_head_sha: String,

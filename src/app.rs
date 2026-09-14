@@ -171,6 +171,20 @@ const SPLIT_GUTTER_WIDTH: f32 = 66.;
 const UNIFIED_GUTTER_WIDTH: f32 = 114.;
 const EXCEPTIONAL_LINE_CHUNK_BYTES: usize = 2_048;
 static WORKSPACE_INSTANCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(test, feature = "ui-smoke"))]
+thread_local! {
+    static PENDING_START_RECOVERY_CONTROLS_RENDERED: Cell<u8> = const { Cell::new(0) };
+}
+
+#[cfg(all(test, feature = "ui-smoke"))]
+fn note_pending_start_recovery_controls_rendered(mask: u8) {
+    PENDING_START_RECOVERY_CONTROLS_RENDERED.with(|value| value.set(value.get() | mask));
+}
+
+#[cfg(all(test, feature = "ui-smoke"))]
+fn take_pending_start_recovery_controls_rendered() -> u8 {
+    PENDING_START_RECOVERY_CONTROLS_RENDERED.with(|value| value.replace(0))
+}
 #[cfg(feature = "ui-smoke")]
 const SMOKE_LONG_LINE_TOKEN: &str = "CIBERGIT_LONG_LINE_END_7F3A";
 #[cfg(feature = "ui-smoke")]
@@ -1880,6 +1894,7 @@ impl PendingReviewStartStopToken {
                                 &record.stage,
                                 PendingReviewStartStage::PreparedCreate
                                     | PendingReviewStartStage::ReviewCreated { .. }
+                                    | PendingReviewStartStage::ThreadNotApplied { .. }
                                     | PendingReviewStartStage::ThreadAcknowledged { .. }
                             ))
             )
@@ -15431,7 +15446,7 @@ impl ReviewWorkspace {
                         composer.target.clone(),
                         composer.durable,
                         composer.body.clone(),
-                        controller.pending_absence.clone(),
+                        controller.pending_absence_for_confirmation(),
                         controller.pending_review_start.clone(),
                     )
                 }
@@ -15779,7 +15794,7 @@ impl ReviewWorkspace {
             (
                 PendingReviewStartConfirmationMode::Create { absence },
                 InteractionState::Ready(controller),
-            ) => controller.pending_absence.as_ref() == Some(absence),
+            ) => controller.pending_absence_for_confirmation().as_ref() == Some(absence),
             (
                 PendingReviewStartConfirmationMode::Continue { source, creation },
                 InteractionState::Ready(controller),
@@ -16099,13 +16114,26 @@ impl ReviewWorkspace {
                         controller.file_composer = None;
                     }
                 }
+                let created_in_this_live_chain = matches!(
+                    &token.mode,
+                    PendingReviewStartConfirmationMode::Create { .. }
+                );
                 let status = match step.outcome {
-                    ProviderMutationOutcome::Acknowledged(ack) => format!(
-                        "Created pending review {} and added exact FILE thread {} / comment {}; the review remains unsubmitted.",
-                        ack.review_id.as_deref().unwrap_or("unknown"),
-                        ack.thread_id.as_deref().unwrap_or("unknown"),
-                        ack.comment_id.as_deref().unwrap_or("unknown")
-                    ),
+                    ProviderMutationOutcome::Acknowledged(ack) => if created_in_this_live_chain {
+                        format!(
+                            "Created pending review {} and added exact FILE thread {} / comment {}; the review remains unsubmitted.",
+                            ack.review_id.as_deref().unwrap_or("unknown"),
+                            ack.thread_id.as_deref().unwrap_or("unknown"),
+                            ack.comment_id.as_deref().unwrap_or("unknown")
+                        )
+                    } else {
+                        format!(
+                            "Added exact FILE thread {} / comment {} to known pending review {}; the review remains unsubmitted.",
+                            ack.thread_id.as_deref().unwrap_or("unknown"),
+                            ack.comment_id.as_deref().unwrap_or("unknown"),
+                            ack.review_id.as_deref().unwrap_or("unknown")
+                        )
+                    },
                     ProviderMutationOutcome::PreflightRejected { reason } => {
                         let review = step
                             .record
@@ -16151,6 +16179,7 @@ impl ReviewWorkspace {
                 .update(cx, |input, cx| input.set_disabled(false, cx));
         }
         self.status = status;
+        cx.notify();
     }
 
     fn continue_pending_review_start(
@@ -18219,6 +18248,13 @@ impl ReviewWorkspace {
         else {
             return;
         };
+        // A requested details/pending refresh immediately revokes the prior
+        // nonserialized absence capability. Busy/server deferral, a failed
+        // details read, or an incomplete pending subread must never leave the
+        // old observation available to arm a new two-write confirmation.
+        if let InteractionState::Ready(controller) = &mut self.tabs[index].interactions {
+            controller.mark_pending_observation_unavailable(None);
+        }
         let admission = match self.general_reads.begin(&repository.account) {
             Ok(admission) => admission,
             Err(read_sync::ReadDeferral::Busy) => {
@@ -18367,8 +18403,7 @@ impl ReviewWorkspace {
                                     Err(error) => tab.journal_error = Some(error),
                                 }
                                 if let InteractionState::Ready(controller) = &mut tab.interactions {
-                                    controller.pending_complete = false;
-                                    controller.notice = Some(notice);
+                                    controller.mark_pending_observation_unavailable(Some(notice));
                                 }
                                 this.reconcile_ci_details(tab_index);
                                 this.rebuild_diff(tab_index, this.wide);
@@ -18514,6 +18549,9 @@ impl ReviewWorkspace {
                         } else {
                             LoadState::Error(notice.into())
                         };
+                        if let InteractionState::Ready(controller) = &mut tab.interactions {
+                            controller.mark_pending_observation_unavailable(Some(notice.into()));
+                        }
                     }
                 }
                 this.resume_general_read_followups(cx);
@@ -23946,6 +23984,7 @@ impl ReviewWorkspace {
                                         | PendingReviewStartStage::ReviewCreated { .. }
                                         | PendingReviewStartStage::ThreadInFlight { .. }
                                         | PendingReviewStartStage::ThreadAcknowledged { .. }
+                                        | PendingReviewStartStage::ThreadNotApplied { .. }
                                         | PendingReviewStartStage::Uncertain { .. }
                                 )
                             });
@@ -24111,6 +24150,8 @@ impl ReviewWorkspace {
                                     .child(start_description),
                             );
                             if record.may_continue_file_thread() {
+                                #[cfg(all(test, feature = "ui-smoke"))]
+                                note_pending_start_recovery_controls_rendered(0b11);
                                 let continue_root = cx.entity();
                                 let stop_root = continue_root.clone();
                                 let continue_flow = record.intent.flow_id.clone();
@@ -26462,6 +26503,10 @@ impl ReviewWorkspace {
                                         .border_1()
                                         .border_color(colors.border)
                                         .text_color(colors.amber)
+                                        .disabled(
+                                            tab.write_in_flight
+                                                || self.active_tab_input_restore.is_some(),
+                                        )
                                         .accessibility_label(if review_id.is_some() {
                                             "Confirm exact one-write FILE continuation"
                                         } else {
@@ -26489,6 +26534,10 @@ impl ReviewWorkspace {
                                         .border_1()
                                         .border_color(colors.border)
                                         .text_color(colors.accent)
+                                        .disabled(
+                                            tab.write_in_flight
+                                                || self.active_tab_input_restore.is_some(),
+                                        )
                                         .accessibility_label(
                                             "Cancel pending review start and retain draft",
                                         )
@@ -29232,7 +29281,7 @@ mod layout_tests {
     use super::{
         ActionsReadError, ActionsReadErrorCategory, ActionsReadFixture, CiCompletionToken, CiPane,
         DismissalConfirmationToken, DismissalPreparationToken, InspectorSection, InstallTabOptions,
-        LoadState, NextCheck, NextCheckPage, OpenChecks, OpenSelectedCheckJobs, RepoRuntime, Root,
+        InteractionState, LoadState, NextCheck, NextCheckPage, OpenChecks, OpenSelectedCheckJobs, RepoRuntime, Root,
         Startup, ToggleCheckIdentity, check_identity_button, checks_page_button, palette,
     };
     use cibergit::domain::{
@@ -29246,7 +29295,7 @@ mod layout_tests {
         ActionsAttemptKey, ActionsAttemptLocator, ActionsHeadRelation, ActionsJob, ActionsJobLog,
         ActionsJobsSnapshot, ActionsLinkage, ActionsLogProvenance, ActionsRunAttemptObservation,
         CheckKind, CheckRepositoryIdentity, CheckShaClass, CheckSuiteIdentity, DismissalAuthority,
-        FreshReviewDismissalCapability, ProviderMutationOutcome, PullRequest, PullRequestCheck,
+        FreshReviewDismissalCapability, PendingReviewCreationAcknowledgement, ProviderMutationOutcome, PullRequest, PullRequestCheck,
         SelectedViewer, SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
         SubmittedReviewDismissalTarget, WorkflowRunIdentity,
     };
@@ -29476,6 +29525,7 @@ mod layout_tests {
             body: "Whole-file rationale".into(),
             target: ReviewCommentTarget::File(target.clone()),
             pull_request: pull_request.clone(),
+            pull_request_url: "https://github.com/octo/repo/pull/7".into(),
             selected_author: "alice".into(),
             observed_base_sha: "1".repeat(40),
             observed_head_sha: "2".repeat(40),
@@ -29485,6 +29535,7 @@ mod layout_tests {
                 viewer_login: "alice".into(),
                 repository: repository.clone(),
                 pull_request,
+                pull_request_url: "https://github.com/octo/repo/pull/7".into(),
                 pull_request_state: "OPEN".into(),
                 current_base_sha: "1".repeat(40),
                 current_head_sha: "2".repeat(40),
@@ -32188,6 +32239,419 @@ mod layout_tests {
             &token,
             "edited visible body"
         ));
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn pending_start_early_finish_notifies_active_and_inactive_exact_tabs(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::review_interactions::{ControllerLoad, ReviewInteractionController};
+        use cibergit::{
+            domain::{ChangedFile, Comparison, Revision},
+            review::ReviewSession,
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    ..Default::default()
+                },
+            )
+        });
+        let notifications = Rc::new(Cell::new(0usize));
+        let observed = notifications.clone();
+        let _subscription =
+            cx.update(|_, cx| cx.observe(&root, move |_, _| observed.set(observed.get() + 1)));
+        let (repository, _, _, fixture_token) = pending_review_start_confirmation_fixture();
+        let session = ReviewSession::new(Comparison {
+            revision: Revision {
+                base_sha: "1".repeat(40),
+                head_sha: "2".repeat(40),
+            },
+            files: vec![ChangedFile {
+                path: "assets/example.bin".into(),
+                previous_path: Some("assets/old.bin".into()),
+                raw_path: None,
+                raw_previous_path: None,
+                status: "renamed".into(),
+                additions: 0,
+                deletions: 0,
+                patch: None,
+                patch_complete: false,
+            }],
+            complete: true,
+            notice: None,
+        });
+        let active_token = cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let mut pull = transition_pull_request(7);
+                pull.base_sha = "1".repeat(40);
+                pull.head_sha = "2".repeat(40);
+                this.install_tab_with_restore(
+                    repository.clone(),
+                    pull,
+                    None,
+                    InstallTabOptions {
+                        activate: true,
+                        window: Some(window),
+                        start_background_work: false,
+                    },
+                    cx,
+                );
+                let controller = match ReviewInteractionController::load(
+                    &this.interaction_root,
+                    &repository,
+                    7,
+                    &session,
+                )
+                .unwrap()
+                {
+                    ControllerLoad::Ready(controller) => controller,
+                    ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+                };
+                this.tabs[0].interactions = InteractionState::Ready(controller);
+                let mut token = fixture_token.clone();
+                token.workspace_instance = this.workspace_instance;
+                token.tab_instance = this.tabs[0].instance_generation;
+                token.repository_key = repository.cache_key();
+                this.tabs[0].pending_review_start_live = Some(token.clone());
+                this.tabs[0].write_in_flight = true;
+                token
+            })
+        });
+        notifications.set(0);
+        cx.update(|_, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.start_pending_review_thread(active_token.clone(), cx);
+                assert!(!this.tabs[0].write_in_flight);
+                assert!(this.tabs[0].pending_review_start_live.is_none());
+                assert!(this.status.contains("disappeared"));
+            });
+        });
+        cx.update(|_, _| {});
+        assert!(
+            notifications.get() > 0,
+            "active early finish must invalidate Root"
+        );
+
+        let inactive_token = cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let mut pull = transition_pull_request(8);
+                pull.base_sha = "1".repeat(40);
+                pull.head_sha = "2".repeat(40);
+                this.install_tab_with_restore(
+                    repository.clone(),
+                    pull,
+                    None,
+                    InstallTabOptions {
+                        activate: true,
+                        window: Some(window),
+                        start_background_work: false,
+                    },
+                    cx,
+                );
+                let mut token = fixture_token.clone();
+                token.workspace_instance = this.workspace_instance;
+                token.tab_instance = this.tabs[0].instance_generation;
+                token.repository_key = repository.cache_key();
+                this.tabs[0].pending_review_start_live = Some(token.clone());
+                this.tabs[0].write_in_flight = true;
+                assert_eq!(this.active_tab, Some(1));
+                token
+            })
+        });
+        notifications.set(0);
+        cx.update(|_, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.start_pending_review_thread(inactive_token.clone(), cx);
+                assert!(!this.tabs[0].write_in_flight);
+                assert!(this.tabs[0].pending_review_start_live.is_none());
+                assert_eq!(this.active_tab, Some(1));
+            });
+        });
+        cx.update(|_, _| {});
+        assert!(
+            notifications.get() > 0,
+            "inactive early finish must invalidate Root"
+        );
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn failed_actual_refresh_revokes_successful_empty_observation_before_confirmation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::review_interactions::{ControllerLoad, ReviewInteractionController};
+        use cibergit::{
+            domain::{ChangedFile, Comparison, Revision},
+            review::ReviewSession,
+        };
+
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    ..Default::default()
+                },
+            )
+        });
+        let (repository, _) = submitted_review_fixture();
+        let session = ReviewSession::new(Comparison {
+            revision: Revision {
+                base_sha: "1".repeat(40),
+                head_sha: "2".repeat(40),
+            },
+            files: vec![ChangedFile {
+                path: "assets/example.bin".into(),
+                previous_path: Some("assets/old.bin".into()),
+                raw_path: None,
+                raw_previous_path: None,
+                status: "renamed".into(),
+                additions: 0,
+                deletions: 0,
+                patch: None,
+                patch_complete: false,
+            }],
+            complete: true,
+            notice: None,
+        });
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let mut pull = transition_pull_request(7);
+                pull.base_sha = "1".repeat(40);
+                pull.head_sha = "2".repeat(40);
+                this.install_tab_with_restore(
+                    repository.clone(),
+                    pull,
+                    None,
+                    InstallTabOptions {
+                        activate: false,
+                        window: None,
+                        start_background_work: false,
+                    },
+                    cx,
+                );
+                let mut controller = match ReviewInteractionController::load(
+                    &this.interaction_root,
+                    &repository,
+                    7,
+                    &session,
+                )
+                .unwrap()
+                {
+                    ControllerLoad::Ready(controller) => controller,
+                    ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+                };
+                controller
+                    .select_file_with_canonical(&session, &session)
+                    .unwrap();
+                let saved = controller
+                    .stage_composer_text("Whole-file rationale".into())
+                    .unwrap();
+                controller.store.save(&saved).unwrap();
+                let draft_id = controller
+                    .file_composer
+                    .as_ref()
+                    .and_then(|composer| composer.draft_id.clone())
+                    .unwrap();
+                controller.finish_composer_save(&saved, &draft_id, "Whole-file rationale", Ok(()));
+                controller.install_pending_observation(
+                    None,
+                    Some(PendingFileReviewAbsence {
+                        viewer_login: "alice".into(),
+                        repository: repository.clone(),
+                        pull_request: ProviderCoordinates {
+                            provider: "github".into(),
+                            host: "github.com".into(),
+                            owner: "octo".into(),
+                            repository: "repo".into(),
+                            pull_request: 7,
+                            remote_id: "PR_node".into(),
+                        },
+                        pull_request_url: "https://github.com/octo/repo/pull/7".into(),
+                        pull_request_state: "OPEN".into(),
+                        current_base_sha: "1".repeat(40),
+                        current_head_sha: "2".repeat(40),
+                    }),
+                );
+                this.tabs[0].session = Some(session.clone());
+                this.tabs[0].canonical_session = Some(session.clone());
+                this.tabs[0].interactions = InteractionState::Ready(controller);
+                this.activate_tab_in_window(0, false, window, cx);
+                this.collaboration_read_disabled = true;
+            });
+        });
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.composer_input.update(cx, |input, cx| {
+                    input.set_value("Whole-file rationale", window, cx)
+                });
+                this.prepare_file_comment_confirmation(cx);
+                assert!(matches!(
+                    this.tabs[0].confirmation,
+                    Some(NativeConfirmation::PendingFileReviewStart { .. })
+                ));
+                this.tabs[0].confirmation = None;
+
+                this.refresh_details_with_intent(0, true, cx);
+                this.prepare_file_comment_confirmation(cx);
+                assert!(this.tabs[0].confirmation.is_none());
+                assert!(matches!(
+                    &this.tabs[0].interactions,
+                    InteractionState::Ready(controller)
+                        if controller.pending_absence_for_confirmation().is_none()
+                            && !controller.pending_complete
+                ));
+                assert!(this.status.contains("No complete fresh"));
+            });
+        });
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn thread_not_applied_actual_root_renders_continue_and_stop_controls(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::review_interactions::{ControllerLoad, ReviewInteractionController};
+        use cibergit::{
+            domain::{ChangedFile, Comparison, Revision},
+            pending_review_start::PendingReviewStartRecord,
+            review::ReviewSession,
+        };
+
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    ..Default::default()
+                },
+            )
+        });
+        let (repository, _, _, token) = pending_review_start_confirmation_fixture();
+        let session = ReviewSession::new(Comparison {
+            revision: Revision {
+                base_sha: "1".repeat(40),
+                head_sha: "2".repeat(40),
+            },
+            files: vec![ChangedFile {
+                path: "assets/example.bin".into(),
+                previous_path: Some("assets/old.bin".into()),
+                raw_path: None,
+                raw_previous_path: None,
+                status: "renamed".into(),
+                additions: 0,
+                deletions: 0,
+                patch: None,
+                patch_complete: false,
+            }],
+            complete: true,
+            notice: None,
+        });
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let mut pull = transition_pull_request(7);
+                pull.base_sha = "1".repeat(40);
+                pull.head_sha = "2".repeat(40);
+                this.install_tab_with_restore(
+                    repository.clone(),
+                    pull,
+                    None,
+                    InstallTabOptions {
+                        activate: true,
+                        window: Some(window),
+                        start_background_work: false,
+                    },
+                    cx,
+                );
+                let mut controller = match ReviewInteractionController::load(
+                    &this.interaction_root,
+                    &repository,
+                    7,
+                    &session,
+                )
+                .unwrap()
+                {
+                    ControllerLoad::Ready(controller) => controller,
+                    ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+                };
+                let mut record = PendingReviewStartRecord::new(token.intent.clone()).unwrap();
+                record
+                    .mark_create_in_flight("create-attempt".into())
+                    .unwrap();
+                record
+                    .mark_review_created(PendingReviewCreationAcknowledgement {
+                        operation_id: token.intent.create_operation_id.clone(),
+                        review: ProviderCoordinates {
+                            remote_id: "REVIEW_created".into(),
+                            ..token.intent.pull_request.clone()
+                        },
+                        review_author: "alice".into(),
+                        review_commit_sha: "2".repeat(40),
+                        pull_request: token.intent.pull_request.clone(),
+                        repository_name_with_owner: "octo/repo".into(),
+                    })
+                    .unwrap();
+                record
+                    .mark_thread_in_flight("thread-attempt".into())
+                    .unwrap();
+                record
+                    .mark_thread_not_applied("controlled zero-transport refusal".into())
+                    .unwrap();
+                controller.pending_review_start = Some(record);
+                this.tabs[0].interactions = InteractionState::Ready(controller);
+                this.tabs[0].inspector_section = InspectorSection::Activity;
+                this.tabs[0].recovery_details_expanded = true;
+                this.inspector_open = true;
+                window.resize(size(px(1180.), px(820.)));
+                cx.notify();
+            });
+            let _ = super::take_pending_start_recovery_controls_rendered();
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            super::take_pending_start_recovery_controls_rendered(),
+            0b11,
+            "the actual Root recovery card must render both Continue and Stop"
+        );
     }
 
     #[test]

@@ -195,6 +195,7 @@ fn pending_start_intent() -> $crate::participation::PendingFileReviewStartIntent
                 viewer_login: "alice".into(),
                 repository: repo("alice"),
                 pull_request: coordinates("PR_node"),
+                pull_request_url: "https://github.com/owner/repo/pull/7".into(),
                 pull_request_state: "OPEN".into(),
                 current_base_sha: OLD.into(),
                 current_head_sha: HEAD.into(),
@@ -916,6 +917,45 @@ fn pending_review_absence_requires_every_pending_row_to_be_classifiable() {
         assert!(observation.absence.is_none(), "{name}");
         assert!(!fixture.path().join("mutations").exists(), "{name}");
     }
+
+    for name in ["missing-pr-url", "null-pr-url", "wrong-pr-url"] {
+        let mut response = pending_review_read(vec![]);
+        let pull = response["data"]["repository"]["pullRequest"]
+            .as_object_mut()
+            .unwrap();
+        match name {
+            "missing-pr-url" => {
+                pull.remove("url");
+            }
+            "null-pr-url" => {
+                pull.insert("url".into(), Value::Null);
+            }
+            "wrong-pr-url" => {
+                pull.insert(
+                    "url".into(),
+                    json!("https://github.com/owner/repo/pull/8"),
+                );
+            }
+            _ => unreachable!(),
+        }
+        let (fixture, provider) = fixture(
+            "alice",
+            vec![step(
+                "query PendingReview",
+                json!({"owner":"owner","name":"repo","number":7}),
+                response,
+            )],
+            Duration::from_secs(2),
+        );
+        match provider.pending_review_observation(&repo("alice"), 7) {
+            Ok(observation) => assert!(observation.absence.is_none(), "{name}"),
+            Err(error) => assert!(
+                name == "wrong-pr-url" && error.to_string().contains("PR mismatch"),
+                "{name}: {error:#}"
+            ),
+        }
+        assert!(!fixture.path().join("mutations").exists(), "{name}");
+    }
 }
 
 #[test]
@@ -933,6 +973,13 @@ fn pending_review_start_rejects_frozen_identity_and_body_before_transport() {
     assert!(
         provider
             .prepare_pending_review_start_create(&repo("alice"), &empty_body)
+            .is_err()
+    );
+    let mut wrong_url = pending_start_intent();
+    wrong_url.pull_request_url = "https://github.com/owner/repo/pull/8".into();
+    assert!(
+        provider
+            .prepare_pending_review_start_create(&repo("alice"), &wrong_url)
             .is_err()
     );
     assert!(!fixture.path().join("count").exists());

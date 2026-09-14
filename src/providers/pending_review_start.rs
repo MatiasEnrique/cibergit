@@ -14,9 +14,37 @@ pub struct PreparedPendingReviewCreate {
     intent: PendingFileReviewStartIntent,
 }
 
+impl PreparedPendingReviewCreate {
+    pub fn mutation_context(&self, attempt_id: &str) -> MutationContext {
+        MutationContext {
+            operation_id: self.intent.create_operation_id.clone(),
+            attempt_id: attempt_id.to_owned(),
+            action: "create-empty-pending-review".into(),
+            payload: json!({
+                "query": ADD_EMPTY_PENDING_REVIEW_MUTATION,
+                "variables": self.variables.clone(),
+            }),
+        }
+    }
+}
+
 pub struct PreparedPendingFileStartThread {
     mutation: PreparedReviewMutation,
     operation_id: String,
+}
+
+impl PreparedPendingFileStartThread {
+    pub fn mutation_context(&self, attempt_id: &str) -> MutationContext {
+        MutationContext {
+            operation_id: self.operation_id.clone(),
+            attempt_id: attempt_id.to_owned(),
+            action: self.mutation.action.into(),
+            payload: json!({
+                "query": self.mutation.query,
+                "variables": self.mutation.variables.clone(),
+            }),
+        }
+    }
 }
 
 impl GithubProvider {
@@ -56,6 +84,7 @@ impl GithubProvider {
             .eq_ignore_ascii_case(&intent.selected_author)
             || absence.repository.cache_key() != repo.cache_key()
             || absence.pull_request != intent.pull_request
+            || absence.pull_request_url != intent.pull_request_url
             || absence.pull_request_state != "OPEN"
             || absence.current_base_sha != intent.observed_base_sha
             || absence.current_head_sha != intent.observed_head_sha
@@ -84,15 +113,7 @@ impl GithubProvider {
         prepared: PreparedPendingReviewCreate,
         attempt_id: &str,
     ) -> ProviderMutationOutcome<PendingReviewCreationAcknowledgement> {
-        let context = MutationContext {
-            operation_id: prepared.intent.create_operation_id.clone(),
-            attempt_id: attempt_id.to_owned(),
-            action: "create-empty-pending-review".into(),
-            payload: json!({
-                "query": ADD_EMPTY_PENDING_REVIEW_MUTATION,
-                "variables": prepared.variables,
-            }),
-        };
+        let context = prepared.mutation_context(attempt_id);
         let variables = context.payload["variables"].clone();
         let transport = Session::new(self).graphql_mutation::<PendingReviewCreateData>(
             ADD_EMPTY_PENDING_REVIEW_MUTATION,
@@ -160,15 +181,7 @@ impl GithubProvider {
         prepared: PreparedPendingFileStartThread,
         attempt_id: &str,
     ) -> ProviderMutationOutcome<ReviewWriteAcknowledgement> {
-        let context = MutationContext {
-            operation_id: prepared.operation_id.clone(),
-            attempt_id: attempt_id.to_owned(),
-            action: prepared.mutation.action.into(),
-            payload: json!({
-                "query": prepared.mutation.query,
-                "variables": prepared.mutation.variables,
-            }),
-        };
+        let context = prepared.mutation_context(attempt_id);
         let variables = context.payload["variables"].clone();
         let transport = Session::new(self)
             .graphql_mutation::<ReviewMutationData>(prepared.mutation.query, variables);

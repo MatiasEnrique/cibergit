@@ -777,6 +777,7 @@ pub struct PendingFileReviewStartIntent {
     pub body: String,
     pub target: ReviewCommentTarget,
     pub pull_request: ProviderCoordinates,
+    pub pull_request_url: String,
     pub selected_author: String,
     pub observed_base_sha: String,
     pub observed_head_sha: String,
@@ -1103,6 +1104,7 @@ impl ReviewComposition {
             body: draft.body.clone(),
             target: ReviewCommentTarget::File(draft.target.clone()),
             pull_request: absence.pull_request.clone(),
+            pull_request_url: absence.pull_request_url.clone(),
             selected_author: absence.viewer_login.clone(),
             observed_base_sha: absence.current_base_sha.clone(),
             observed_head_sha: absence.current_head_sha.clone(),
@@ -2157,6 +2159,11 @@ fn validate_pending_file_absence(
             .viewer_login
             .eq_ignore_ascii_case(&key.account.login)
         || !key.matches(&absence.pull_request)
+        || absence.pull_request_url
+            != format!(
+                "https://{}/{}/{}/pull/{}",
+                key.host, key.owner, key.repository, key.pull_request
+            )
         || absence.current_base_sha != file.base_sha
         || absence.current_head_sha != file.commit_sha
     {
@@ -2199,6 +2206,10 @@ pub(crate) fn validate_pending_file_review_start_intent(
             "pending start pull request ID",
             intent.pull_request.remote_id.as_str(),
         ),
+        (
+            "pending start pull request URL",
+            intent.pull_request_url.as_str(),
+        ),
     ] {
         validate_nonempty_id(field, value)?;
     }
@@ -2220,6 +2231,11 @@ pub(crate) fn validate_pending_file_review_start_intent(
         .selected_author
         .eq_ignore_ascii_case(&intent.key.account.login)
         || !intent.key.matches(&intent.pull_request)
+        || intent.pull_request_url
+            != format!(
+                "https://{}/{}/{}/pull/{}",
+                intent.key.host, intent.key.owner, intent.key.repository, intent.key.pull_request
+            )
         || intent.observed_base_sha != file.base_sha
         || intent.observed_head_sha != file.commit_sha
     {

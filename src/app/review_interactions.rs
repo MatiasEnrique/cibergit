@@ -675,6 +675,23 @@ impl ReviewInteractionController {
         self.pending_absence = absence;
     }
 
+    /// Revoke only the nonserialized create capability. Existing pending
+    /// linkage remains available for legacy display/reconciliation, but an
+    /// unavailable or in-progress read cannot arm a new review creation.
+    pub fn mark_pending_observation_unavailable(&mut self, notice: Option<String>) {
+        self.pending_absence = None;
+        self.pending_complete = false;
+        if let Some(notice) = notice {
+            self.notice = Some(notice);
+        }
+    }
+
+    pub fn pending_absence_for_confirmation(&self) -> Option<PendingFileReviewAbsence> {
+        self.pending_complete
+            .then(|| self.pending_absence.clone())
+            .flatten()
+    }
+
     pub fn pending_count(&self) -> usize {
         self.composition
             .drafts
@@ -801,12 +818,13 @@ pub fn execute_pending_review_start_create(
 ) -> PendingReviewStartStep<cibergit::domain::PendingReviewCreationAcknowledgement> {
     let fallback_composition = expected_composition.cloned();
     let fallback_record = expected_start.cloned();
-    let context = pending_start_context(
+    let fallback_context = pending_start_context(
         &intent.create_operation_id,
         attempt_id,
         "create-empty-pending-review",
         &intent.flow_id,
     );
+    let mut exact_context = None;
     let execution = authority.execute_pending_review_start_if_current(
         store,
         expected_composition,
@@ -835,7 +853,7 @@ pub fn execute_pending_review_start_create(
                                 reason.clone(),
                             );
                             ProviderMutationOutcome::Uncertain {
-                                context: context.clone(),
+                                context: fallback_context.clone(),
                                 reason,
                             }
                         }
@@ -843,6 +861,8 @@ pub fn execute_pending_review_start_create(
                     return Ok(outcome);
                 }
             };
+            let stage_context = prepared.mutation_context(attempt_id);
+            exact_context = Some(stage_context.clone());
             let mut in_flight = prepared_record.clone();
             in_flight.mark_create_in_flight(attempt_id.to_owned())?;
             journal.save_if_current_unlocked(Some(&prepared_record), &in_flight)?;
@@ -860,7 +880,7 @@ pub fn execute_pending_review_start_create(
                         );
                         persist_pending_start_uncertain(journal, &in_flight, reason.clone());
                         return Ok(ProviderMutationOutcome::Uncertain {
-                            context: context.clone(),
+                            context: stage_context.clone(),
                             reason,
                         });
                     }
@@ -875,7 +895,7 @@ pub fn execute_pending_review_start_create(
                                 ),
                             );
                             ProviderMutationOutcome::Uncertain {
-                                context: context.clone(),
+                                context: stage_context.clone(),
                                 reason: format!(
                                     "Create transport sent zero writes, but its terminal durable save failed: {error}"
                                 ),
@@ -901,7 +921,7 @@ pub fn execute_pending_review_start_create(
                         );
                         persist_pending_start_uncertain(journal, &in_flight, reason.clone());
                         return Ok(ProviderMutationOutcome::Uncertain {
-                            context: context.clone(),
+                            context: stage_context.clone(),
                             reason,
                         });
                     }
@@ -913,7 +933,7 @@ pub fn execute_pending_review_start_create(
                             );
                             persist_pending_start_uncertain(journal, &in_flight, reason.clone());
                             ProviderMutationOutcome::Uncertain {
-                                context: context.clone(),
+                                context: stage_context.clone(),
                                 reason,
                             }
                         }
@@ -948,6 +968,7 @@ pub fn execute_pending_review_start_create(
             record: fallback_record,
         },
         PendingReviewStartAuthorityExecution::ReadbackUncertain { value, reason } => {
+            let context = exact_context.unwrap_or(fallback_context);
             let prior = value.err().unwrap_or_else(|| {
                 "stage execution completed before durable readback failed".into()
             });
@@ -977,12 +998,13 @@ pub fn execute_pending_review_start_thread(
     let fallback_composition = expected_composition.cloned();
     let fallback_record = Some(expected_start.clone());
     let intent = &expected_start.intent;
-    let context = pending_start_context(
+    let fallback_context = pending_start_context(
         &intent.thread_operation_id,
         attempt_id,
         "add-pending-file-comment",
         &intent.flow_id,
     );
+    let mut exact_context = None;
     let execution = authority.execute_pending_review_start_if_current(
         store,
         expected_composition,
@@ -1020,7 +1042,7 @@ pub fn execute_pending_review_start_thread(
                                 reason.clone(),
                             );
                             ProviderMutationOutcome::Uncertain {
-                                context: context.clone(),
+                                context: fallback_context.clone(),
                                 reason,
                             }
                         }
@@ -1028,6 +1050,8 @@ pub fn execute_pending_review_start_thread(
                     return Ok(outcome);
                 }
             };
+            let stage_context = prepared.mutation_context(attempt_id);
+            exact_context = Some(stage_context.clone());
             let mut in_flight = expected_start.clone();
             in_flight.mark_thread_in_flight(attempt_id.to_owned())?;
             journal.save_if_current_unlocked(Some(expected_start), &in_flight)?;
@@ -1042,7 +1066,7 @@ pub fn execute_pending_review_start_thread(
                         );
                         persist_pending_start_uncertain(journal, &in_flight, reason.clone());
                         return Ok(ProviderMutationOutcome::Uncertain {
-                            context: context.clone(),
+                            context: stage_context.clone(),
                             reason,
                         });
                     }
@@ -1054,7 +1078,7 @@ pub fn execute_pending_review_start_thread(
                             );
                             persist_pending_start_uncertain(journal, &in_flight, reason.clone());
                             ProviderMutationOutcome::Uncertain {
-                                context: context.clone(),
+                                context: stage_context.clone(),
                                 reason,
                             }
                         }
@@ -1080,7 +1104,7 @@ pub fn execute_pending_review_start_thread(
                             "Validated FILE acknowledgement omitted an exact remote ID".to_owned();
                         persist_pending_start_uncertain(journal, &in_flight, reason.clone());
                         return Ok(ProviderMutationOutcome::Uncertain {
-                            context: context.clone(),
+                            context: stage_context.clone(),
                             reason,
                         });
                     };
@@ -1098,7 +1122,7 @@ pub fn execute_pending_review_start_thread(
                         );
                         persist_pending_start_uncertain(journal, &in_flight, reason.clone());
                         return Ok(ProviderMutationOutcome::Uncertain {
-                            context: context.clone(),
+                            context: stage_context.clone(),
                             reason,
                         });
                     }
@@ -1110,7 +1134,7 @@ pub fn execute_pending_review_start_thread(
                         );
                         persist_pending_start_uncertain(journal, &in_flight, reason.clone());
                         return Ok(ProviderMutationOutcome::Uncertain {
-                            context: context.clone(),
+                            context: stage_context.clone(),
                             reason,
                         });
                     }
@@ -1124,7 +1148,7 @@ pub fn execute_pending_review_start_thread(
                             reason.clone(),
                         );
                         return Ok(ProviderMutationOutcome::Uncertain {
-                            context: context.clone(),
+                            context: stage_context.clone(),
                             reason,
                         });
                     };
@@ -1142,7 +1166,7 @@ pub fn execute_pending_review_start_thread(
                             reason.clone(),
                         );
                         return Ok(ProviderMutationOutcome::Uncertain {
-                            context: context.clone(),
+                            context: stage_context.clone(),
                             reason,
                         });
                     }
@@ -1156,7 +1180,7 @@ pub fn execute_pending_review_start_thread(
                             reason.clone(),
                         );
                         return Ok(ProviderMutationOutcome::Uncertain {
-                            context: context.clone(),
+                            context: stage_context.clone(),
                             reason,
                         });
                     }
@@ -1171,7 +1195,7 @@ pub fn execute_pending_review_start_thread(
                             reason.clone(),
                         );
                         return Ok(ProviderMutationOutcome::Uncertain {
-                            context: context.clone(),
+                            context: stage_context.clone(),
                             reason,
                         });
                     }
@@ -1187,7 +1211,7 @@ pub fn execute_pending_review_start_thread(
                             reason.clone(),
                         );
                         return Ok(ProviderMutationOutcome::Uncertain {
-                            context: context.clone(),
+                            context: stage_context.clone(),
                             reason,
                         });
                     }
@@ -1222,6 +1246,7 @@ pub fn execute_pending_review_start_thread(
             record: fallback_record,
         },
         PendingReviewStartAuthorityExecution::ReadbackUncertain { value, reason } => {
+            let context = exact_context.unwrap_or(fallback_context);
             let prior = value.err().unwrap_or_else(|| {
                 "stage execution completed before durable readback failed".into()
             });
@@ -3778,11 +3803,58 @@ mod tests {
                 pull_request: 7,
                 remote_id: "PR_node".into(),
             },
+            pull_request_url: "https://github.com/octo/repo/pull/7".into(),
             selected_author: "reader".into(),
             observed_base_sha: "1111111".into(),
             observed_head_sha: "2222222".into(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn unavailable_pending_observation_revokes_only_fresh_absence_authority() {
+        let root = tempdir().unwrap();
+        let mut controller =
+            match ReviewInteractionController::load(root.path(), &repository(), 7, &session())
+                .unwrap()
+            {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+        let legacy = pending_snapshot("REVIEW_existing", "COMMENT_existing", "linked", true);
+        let absence = PendingFileReviewAbsence {
+            viewer_login: "reader".into(),
+            repository: repository(),
+            pull_request: ProviderCoordinates {
+                provider: "github".into(),
+                host: "github.com".into(),
+                owner: "octo".into(),
+                repository: "repo".into(),
+                pull_request: 7,
+                remote_id: "PR_node".into(),
+            },
+            pull_request_url: "https://github.com/octo/repo/pull/7".into(),
+            pull_request_state: "OPEN".into(),
+            current_base_sha: "1111111".into(),
+            current_head_sha: "2222222".into(),
+        };
+        controller.install_pending_observation(Some(legacy), Some(absence.clone()));
+        assert_eq!(controller.pending_absence_for_confirmation(), Some(absence));
+        let retained = controller.pending_review.clone();
+
+        controller.mark_pending_observation_unavailable(Some(
+            "pending subread failed; prior linkage retained".into(),
+        ));
+        assert!(controller.pending_absence_for_confirmation().is_none());
+        assert!(!controller.pending_complete);
+        assert_eq!(controller.pending_review, retained);
+        assert!(
+            controller
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("prior linkage")
+        );
     }
 
     fn pending_start_creation() -> cibergit::domain::PendingReviewCreationAcknowledgement {
@@ -3943,7 +4015,6 @@ mod tests {
             .unwrap()
             .id
             .clone();
-        assert_eq!(draft_id, "file-draft-1");
         let mut other_target = target;
         other_target.path = "src/other.rs".into();
         other_target.file_key = "src/other.rs".into();
@@ -3953,6 +4024,7 @@ mod tests {
             .id
             .clone();
         let mut record = pending_start_record("exact".into());
+        record.intent.draft_id = draft_id.clone();
         record
             .mark_create_in_flight("create-attempt".into())
             .unwrap();
@@ -3994,6 +4066,14 @@ mod tests {
     }
 
     #[cfg(feature = "ui-smoke")]
+    fn pending_start_session() -> ReviewSession {
+        let mut comparison = session().comparison().clone();
+        comparison.revision.base_sha = "1".repeat(40);
+        comparison.revision.head_sha = "2".repeat(40);
+        ReviewSession::new(comparison)
+    }
+
+    #[cfg(feature = "ui-smoke")]
     fn pending_start_create_fixture(
         include_thread: bool,
         deny_absence: bool,
@@ -4006,7 +4086,11 @@ mod tests {
 import json, os, pathlib, sys
 root = pathlib.Path(__file__).parent
 args = sys.argv[1:]
-if args == ['auth', 'token', '--hostname', 'github.com']:
+if args == ['auth', 'token', '--hostname', 'github.com', '--user', 'reader']:
+    count_path = root / 'count'
+    if (root / 'reject-thread-token').exists() and count_path.exists() and int(count_path.read_text()) >= 3:
+        print('controlled credential failure before FILE transport', file=sys.stderr)
+        sys.exit(1)
     print('private-reader')
     sys.exit(0)
 assert os.environ.get('GH_TOKEN') == 'private-reader'
@@ -4019,28 +4103,28 @@ if index == 0:
     assert payload['variables'] == {'owner':'octo','name':'repo','number':7}
     rows = [] if not (root / 'deny-absence').exists() else [{
         'id':'REVIEW_existing', 'author': {'login':'reader'}, 'body':'', 'state':'PENDING',
-        'submittedAt':None, 'commit': {'oid':'2222222'},
+        'submittedAt':None, 'commit': {'oid':'2222222222222222222222222222222222222222'},
         'url':'https://github.com/octo/repo/pull/7#pullrequestreview-existing',
         'comments': {'nodes':[], 'pageInfo': {'hasNextPage':False, 'endCursor':None}}
     }]
     response = {'data': {'viewer': {'login':'reader'}, 'repository': {
         'nameWithOwner':'octo/repo', 'pullRequest': {
             'id':'PR_node', 'number':7, 'url':'https://github.com/octo/repo/pull/7',
-            'state':'OPEN', 'baseRefOid':'1111111', 'headRefOid':'2222222',
+            'state':'OPEN', 'baseRefOid':'1111111111111111111111111111111111111111', 'headRefOid':'2222222222222222222222222222222222222222',
             'reviews': {'nodes':rows, 'pageInfo': {'hasNextPage':False, 'endCursor':None}}
         }
     }}}
 elif index == 1:
     assert 'mutation CreateEmptyPendingReview' in query
     assert payload['variables'] == {
-        'pullRequestId':'PR_node', 'commitOID':'2222222', 'event':None,
+        'pullRequestId':'PR_node', 'commitOID':'2222222222222222222222222222222222222222', 'event':None,
         'body':None, 'threads':None, 'clientMutationId':'create-operation'
     }
     (root / 'mutations').write_text('1')
     response = {'data': {'createEmptyPendingReview': {
         'clientMutationId':'create-operation', 'pullRequestReview': {
             'id':'REVIEW_created', 'state':'PENDING', 'submittedAt':None,
-            'author': {'login':'reader'}, 'commit': {'oid':'2222222'},
+            'author': {'login':'reader'}, 'commit': {'oid':'2222222222222222222222222222222222222222'},
             'pullRequest': {'id':'PR_node', 'number':7,
                 'repository': {'nameWithOwner':'octo/repo'}}
         }
@@ -4051,10 +4135,10 @@ elif index == 2 and (root / 'include-thread').exists():
     response = {'data': {'viewer': {'login':'reader'}, 'repository': {
         'nameWithOwner':'octo/repo', 'pullRequest': {
             'id':'PR_node', 'number':7, 'url':'https://github.com/octo/repo/pull/7',
-            'state':'OPEN', 'baseRefOid':'1111111', 'headRefOid':'2222222',
+            'state':'OPEN', 'baseRefOid':'1111111111111111111111111111111111111111', 'headRefOid':'2222222222222222222222222222222222222222',
             'reviews': {'nodes':[{
                 'id':'REVIEW_created', 'state':'PENDING', 'submittedAt':None,
-                'author': {'login':'reader'}, 'commit': {'oid':'2222222'}
+                'author': {'login':'reader'}, 'commit': {'oid':'2222222222222222222222222222222222222222'}
             }], 'pageInfo': {'hasNextPage':False, 'endCursor':None}}
         }
     }}}
@@ -4072,7 +4156,7 @@ elif index == 3 and (root / 'include-thread').exists():
             'subjectType':'FILE', 'author': {'login':'reader'},
             'pullRequestReview': {'id':'REVIEW_created', 'state':'PENDING',
                 'submittedAt':None, 'author': {'login':'reader'},
-                'commit': {'oid':'2222222'}, 'pullRequest': {'id':'PR_node', 'number':7,
+                'commit': {'oid':'2222222222222222222222222222222222222222'}, 'pullRequest': {'id':'PR_node', 'number':7,
                     'repository': {'nameWithOwner':'octo/repo'}}}
         }]}}}}}
 else:
@@ -4104,7 +4188,7 @@ print(json.dumps(response))
         Box<ReviewInteractionController>,
         PendingFileReviewStartIntent,
     ) {
-        let session = session();
+        let session = pending_start_session();
         let mut controller =
             match ReviewInteractionController::load(root, &repository(), 7, &session).unwrap() {
                 ControllerLoad::Ready(controller) => controller,
@@ -4136,9 +4220,10 @@ print(json.dumps(response))
                         pull_request: 7,
                         remote_id: "PR_node".into(),
                     },
+                    pull_request_url: "https://github.com/octo/repo/pull/7".into(),
                     pull_request_state: "OPEN".into(),
-                    current_base_sha: "1111111".into(),
-                    current_head_sha: "2222222".into(),
+                    current_base_sha: "1111111111111111111111111111111111111111".into(),
+                    current_head_sha: "2222222222222222222222222222222222222222".into(),
                 },
                 "flow-operation".into(),
                 "create-operation".into(),
@@ -4152,7 +4237,7 @@ print(json.dumps(response))
     #[test]
     fn post_dispatch_readback_failure_is_uncertain_after_actual_create_write() {
         let root = tempdir().unwrap();
-        let session = session();
+        let session = pending_start_session();
         let mut controller =
             match ReviewInteractionController::load(root.path(), &repository(), 7, &session)
                 .unwrap()
@@ -4184,9 +4269,10 @@ print(json.dumps(response))
                 pull_request: 7,
                 remote_id: "PR_node".into(),
             },
+            pull_request_url: "https://github.com/octo/repo/pull/7".into(),
             pull_request_state: "OPEN".into(),
-            current_base_sha: "1111111".into(),
-            current_head_sha: "2222222".into(),
+            current_base_sha: "1111111111111111111111111111111111111111".into(),
+            current_head_sha: "2222222222222222222222222222222222222222".into(),
         };
         let intent = controller
             .prepare_pending_file_review_start(
@@ -4208,10 +4294,24 @@ print(json.dumps(response))
             &intent,
             "create-attempt",
         );
-        assert!(matches!(
-            step.outcome,
-            ProviderMutationOutcome::Uncertain { .. }
-        ));
+        let ProviderMutationOutcome::Uncertain { context, .. } = step.outcome else {
+            panic!("post-create readback failure must remain uncertain")
+        };
+        assert_eq!(context.operation_id, "create-operation");
+        assert_eq!(context.attempt_id, "create-attempt");
+        assert_eq!(context.action, "create-empty-pending-review");
+        assert!(
+            context.payload["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("mutation CreateEmptyPendingReview"))
+        );
+        assert_eq!(
+            context.payload["variables"],
+            serde_json::json!({
+                "pullRequestId":"PR_node", "commitOID":"2222222222222222222222222222222222222222", "event":null,
+                "body":null, "threads":null, "clientMutationId":"create-operation"
+            })
+        );
         assert_eq!(
             fs::read_to_string(transport.path().join("count")).unwrap(),
             "2"
@@ -4236,7 +4336,7 @@ print(json.dumps(response))
     fn actual_provider_and_durable_authority_save_both_stages_in_order() {
         let _ = take_pending_start_save_trace();
         let root = tempdir().unwrap();
-        let session = session();
+        let session = pending_start_session();
         let mut controller =
             match ReviewInteractionController::load(root.path(), &repository(), 7, &session)
                 .unwrap()
@@ -4270,9 +4370,10 @@ print(json.dumps(response))
                         pull_request: 7,
                         remote_id: "PR_node".into(),
                     },
+                    pull_request_url: "https://github.com/octo/repo/pull/7".into(),
                     pull_request_state: "OPEN".into(),
-                    current_base_sha: "1111111".into(),
-                    current_head_sha: "2222222".into(),
+                    current_base_sha: "1111111111111111111111111111111111111111".into(),
+                    current_head_sha: "2222222222222222222222222222222222222222".into(),
                 },
                 "flow-operation".into(),
                 "create-operation".into(),
@@ -4290,10 +4391,11 @@ print(json.dumps(response))
             &intent,
             "create-attempt",
         );
-        assert!(matches!(
-            &create.outcome,
-            ProviderMutationOutcome::Acknowledged(_)
-        ));
+        assert!(
+            matches!(&create.outcome, ProviderMutationOutcome::Acknowledged(_)),
+            "unexpected create result: {:?}",
+            create.outcome
+        );
         let created = create.record.unwrap();
         assert!(matches!(
             &created.stage,
@@ -4346,8 +4448,146 @@ print(json.dumps(response))
         assert_eq!(
             file.remote
                 .as_ref()
-                .and_then(|remote| remote.comment_id.as_deref()),
+                .map(|remote| remote.comment_id.as_str()),
             Some("COMMENT_created")
+        );
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[test]
+    fn actual_zero_transport_file_rejection_keeps_blocking_continue_stop_lane() {
+        let root = tempdir().unwrap();
+        let (controller, intent) = pending_start_controller_and_intent(root.path());
+        let (transport, provider) = pending_start_create_fixture(true, false);
+        fs::write(transport.path().join("reject-thread-token"), b"1").unwrap();
+        let create = execute_pending_review_start_create(
+            &controller.authority,
+            &controller.store,
+            controller.durable_composition.as_ref(),
+            None,
+            &provider,
+            &repository(),
+            &intent,
+            "create-attempt",
+        );
+        let created = create.record.unwrap();
+        let thread = execute_pending_review_start_thread(
+            &controller.authority,
+            &controller.store,
+            create.composition.as_ref(),
+            &created,
+            &provider,
+            &repository(),
+            "thread-attempt",
+        );
+        let ProviderMutationOutcome::PreflightRejected { reason } = thread.outcome else {
+            panic!("credential refusal must be a proven zero-transport FILE result")
+        };
+        assert!(
+            reason.contains("resolve selected GitHub credential"),
+            "{reason}"
+        );
+        let rejected = thread.record.unwrap();
+        assert!(matches!(
+            &rejected.stage,
+            PendingReviewStartStage::ThreadNotApplied {
+                creation,
+                evidence,
+                ..
+            } if creation.review.remote_id == "REVIEW_created"
+                && evidence == &reason
+        ));
+        assert!(rejected.blocks_target_mutations());
+        assert!(rejected.may_continue_file_thread());
+        assert!(
+            controller
+                .authority
+                .refuse_blocking_pending_review_start()
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(transport.path().join("count")).unwrap(),
+            "3"
+        );
+        assert_eq!(
+            fs::read_to_string(transport.path().join("mutations")).unwrap(),
+            "1"
+        );
+
+        let stopped = stop_pending_review_start_after_create(
+            &controller.authority,
+            &controller.store,
+            thread.composition.as_ref(),
+            &rejected,
+        )
+        .unwrap();
+        assert!(matches!(
+            stopped.stage,
+            PendingReviewStartStage::StoppedAfterReviewCreated { .. }
+        ));
+        assert!(
+            controller
+                .authority
+                .refuse_blocking_pending_review_start()
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[test]
+    fn post_file_ack_readback_failure_returns_exact_sent_mutation_context() {
+        let root = tempdir().unwrap();
+        let (controller, intent) = pending_start_controller_and_intent(root.path());
+        let (transport, provider) = pending_start_create_fixture(true, false);
+        let create = execute_pending_review_start_create(
+            &controller.authority,
+            &controller.store,
+            controller.durable_composition.as_ref(),
+            None,
+            &provider,
+            &repository(),
+            &intent,
+            "create-attempt",
+        );
+        let created = create.record.unwrap();
+        fail_next_pending_start_readback_after_execution();
+        let thread = execute_pending_review_start_thread(
+            &controller.authority,
+            &controller.store,
+            create.composition.as_ref(),
+            &created,
+            &provider,
+            &repository(),
+            "thread-attempt",
+        );
+        let ProviderMutationOutcome::Uncertain { context, .. } = thread.outcome else {
+            panic!("post-FILE readback failure must remain uncertain")
+        };
+        assert_eq!(context.operation_id, "thread-operation");
+        assert_eq!(context.attempt_id, "thread-attempt");
+        assert_eq!(context.action, "add-pending-file-comment");
+        assert!(
+            context.payload["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("mutation AddPendingFileReviewThread"))
+        );
+        assert_eq!(
+            context.payload["variables"],
+            serde_json::json!({
+                "pullRequestReviewId":"REVIEW_created",
+                "body":"exact whole-file comment",
+                "path":"src/lib.rs",
+                "subjectType":"FILE",
+                "clientMutationId":"thread-operation"
+            })
+        );
+        assert_eq!(
+            fs::read_to_string(transport.path().join("count")).unwrap(),
+            "4"
+        );
+        assert_eq!(
+            fs::read_to_string(transport.path().join("mutations")).unwrap(),
+            "2"
         );
     }
 
@@ -4368,10 +4608,19 @@ print(json.dumps(response))
             &intent,
             "create-attempt",
         );
-        assert!(matches!(
-            step.outcome,
-            ProviderMutationOutcome::Uncertain { .. }
-        ));
+        let ProviderMutationOutcome::Uncertain { context, .. } = step.outcome else {
+            panic!("acknowledged create with a terminal save failure must be uncertain")
+        };
+        assert_eq!(context.operation_id, "create-operation");
+        assert_eq!(context.attempt_id, "create-attempt");
+        assert_eq!(context.action, "create-empty-pending-review");
+        assert_eq!(
+            context.payload["variables"],
+            serde_json::json!({
+                "pullRequestId":"PR_node", "commitOID":"2222222222222222222222222222222222222222", "event":null,
+                "body":null, "threads":null, "clientMutationId":"create-operation"
+            })
+        );
         let durable = PendingReviewStartJournal::open(root.path(), review_key())
             .unwrap()
             .record()
