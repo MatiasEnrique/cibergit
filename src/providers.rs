@@ -47,6 +47,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod actions_control;
 mod actions_jobs_logs;
 mod conditional;
 mod general_sync;
@@ -56,6 +57,7 @@ mod pr_lifecycle;
 mod reactions;
 mod review_dismissal;
 mod stacks;
+pub use actions_control::ActionsRunControlDispatch;
 pub use actions_jobs_logs::{ActionsCancellation, ActionsReadError, ActionsReadErrorCategory};
 #[cfg(feature = "ui-smoke")]
 pub use general_sync::synthetic_exact_304_smoke_fixture;
@@ -9627,6 +9629,15 @@ else:
                 .all(|comment| comment.coordinates.pull_request == 14398)
         );
     }
+}
+
+#[cfg(test)]
+#[path = "../tests/provider_actions_control.rs"]
+mod provider_actions_control_fixture;
+
+#[cfg(test)]
+mod provider_actions_control {
+    crate::provider_actions_control_tests!();
 }
 
 #[cfg(test)]

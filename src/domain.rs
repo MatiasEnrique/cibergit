@@ -1178,6 +1178,161 @@ pub struct ActionsJobLog {
     pub provenance: ActionsLogProvenance,
 }
 
+/// One explicit GitHub Actions run control. Force-cancel and arbitrary
+/// workflow dispatch are deliberately absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActionsRunControlAction {
+    RerunAllJobs,
+    RerunFailedJobs,
+    CancelRun,
+}
+
+impl ActionsRunControlAction {
+    /// The final REST path segment documented for this control.
+    pub fn rest_segment(self) -> &'static str {
+        match self {
+            Self::RerunAllJobs => "rerun",
+            Self::RerunFailedJobs => "rerun-failed-jobs",
+            Self::CancelRun => "cancel",
+        }
+    }
+
+    /// The single documented accepted status. Every other status is treated as
+    /// an unresolved outcome, never as a proven no-op.
+    pub fn accepted_status(self) -> u16 {
+        match self {
+            Self::RerunAllJobs | Self::RerunFailedJobs => 201,
+            Self::CancelRun => 202,
+        }
+    }
+
+    pub fn journal_action(self) -> &'static str {
+        match self {
+            Self::RerunAllJobs => "rerun-actions-run-all-jobs",
+            Self::RerunFailedJobs => "rerun-actions-run-failed-jobs",
+            Self::CancelRun => "cancel-actions-run",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RerunAllJobs => "Re-run all jobs",
+            Self::RerunFailedJobs => "Re-run failed jobs",
+            Self::CancelRun => "Cancel run",
+        }
+    }
+
+    /// Stable element identity for this control's native button.
+    pub fn control_element_id(self) -> &'static str {
+        match self {
+            Self::RerunAllJobs => "actions-control-rerun-actions-run-all-jobs",
+            Self::RerunFailedJobs => "actions-control-rerun-actions-run-failed-jobs",
+            Self::CancelRun => "actions-control-cancel-actions-run",
+        }
+    }
+}
+
+/// A serialized projection of the exact Actions identity one control targets.
+/// It is a record of what was frozen, never fresh capability: every dispatch
+/// re-establishes identity, status, and authority from a new read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionsRunControlTarget {
+    pub account: Account,
+    pub repository_node_id: String,
+    pub repository_name_with_owner: String,
+    pub pull_request_number: u64,
+    pub pull_request_node_id: String,
+    pub check_node_id: String,
+    pub check_database_id: u64,
+    pub check_suite_node_id: String,
+    pub check_suite_database_id: u64,
+    pub workflow_node_id: String,
+    pub workflow_database_id: u64,
+    pub workflow_name: String,
+    pub run_node_id: String,
+    pub run_database_id: u64,
+    pub run_number: u64,
+    /// The attempt the Checks inspector displayed. A control refuses when
+    /// GitHub's current attempt differs; it never retargets silently.
+    pub run_attempt: u64,
+    pub run_event: String,
+    pub run_head_sha: String,
+    pub run_html_url: String,
+}
+
+/// Fresh explicit repository-permission evidence. Resolving `/user` proves
+/// which account is selected, never what that account may write.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActionsRunControlAuthority {
+    /// A fresh repository read returned write (push) permission.
+    Available,
+    /// GitHub returned no usable permission evidence. GitHub decides at
+    /// dispatch; this is never treated as permission.
+    Unknown { reason: String },
+    /// A fresh repository read showed no write permission.
+    Unavailable { reason: String },
+}
+
+impl ActionsRunControlAuthority {
+    pub fn permits_attempt(&self) -> bool {
+        !matches!(self, Self::Unavailable { .. })
+    }
+}
+
+/// One complete fresh observation of the exact run a control would target.
+/// Preparation and the post-admission preflight compare this value whole.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionsRunControlObservation {
+    pub target: ActionsRunControlTarget,
+    pub viewer: SelectedViewer,
+    pub run_status: String,
+    pub run_conclusion: Option<String>,
+    pub authority: ActionsRunControlAuthority,
+}
+
+/// The exact outgoing request, frozen once. The same method, path, body, and
+/// action name back the durable admission, the dispatch, and every post-send
+/// local failure record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionsRunControlPreparation {
+    pub action: ActionsRunControlAction,
+    pub observation: ActionsRunControlObservation,
+    pub method: String,
+    pub path: String,
+    pub body: serde_json::Value,
+    pub observed_at_unix_ms: u64,
+    pub notices: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionsRunControlRequest {
+    pub operation_id: String,
+    pub attempt_id: String,
+    pub preparation: ActionsRunControlPreparation,
+}
+
+/// What a later read observed about the run. It is disclosure, not proof that
+/// this request caused the change: GitHub offers no per-request correlation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionsRunControlProgress {
+    pub run_attempt: u64,
+    pub run_status: String,
+    pub run_conclusion: Option<String>,
+}
+
+/// GitHub returned the documented accepted status for the exact frozen
+/// request. That is acceptance of the request only. It does not prove a new
+/// attempt started, that any job re-ran, or that the run is cancelled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionsRunControlAcknowledgement {
+    pub operation_id: String,
+    pub action: ActionsRunControlAction,
+    pub target: ActionsRunControlTarget,
+    pub accepted_status: u16,
+    pub observed_after: ProviderReadEvidence<ActionsRunControlProgress>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeEligibility {
     /// OPEN, CLOSED, or MERGED.

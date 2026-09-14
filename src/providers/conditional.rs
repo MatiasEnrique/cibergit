@@ -880,6 +880,64 @@ fn is_token(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
+/// Bounded framing for one explicit `gh api --include` mutation response.
+///
+/// A mutation never reuses the conditional read entrypoint, but its rate and
+/// poll directives are still safely parsed so the caller can install the same
+/// account floor a read would have installed. Framing failure yields no status
+/// and no body, never a guessed success.
+pub(super) struct MutationResponseFraming {
+    pub(super) status: Option<u16>,
+    pub(super) poll: RestPollDirective,
+    pub(super) body: Vec<u8>,
+}
+
+pub(super) fn parse_mutation_response(output: &[u8]) -> MutationResponseFraming {
+    if output.len() > MAX_HEADER_BYTES.saturating_add(CURL_MUTATION_BODY_LIMIT) {
+        return MutationResponseFraming {
+            status: None,
+            poll: RestPollDirective::default(),
+            body: Vec::new(),
+        };
+    }
+    let Some((end, separator)) = find_header_end(output) else {
+        return MutationResponseFraming {
+            status: None,
+            poll: rejected_header_poll(&output[..output.len().min(MAX_HEADER_BYTES)], false),
+            body: Vec::new(),
+        };
+    };
+    if end > MAX_HEADER_BYTES {
+        return MutationResponseFraming {
+            status: None,
+            poll: RestPollDirective::default(),
+            body: Vec::new(),
+        };
+    }
+    let Ok(collected) = collect_header_fields(&output[..end]) else {
+        return MutationResponseFraming {
+            status: None,
+            poll: rejected_header_poll(&output[..end], false),
+            body: Vec::new(),
+        };
+    };
+    let (poll, _, _) = parse_poll_directive(collected.status, &collected.fields, false);
+    if collected.error.is_some() {
+        return MutationResponseFraming {
+            status: None,
+            poll,
+            body: Vec::new(),
+        };
+    }
+    MutationResponseFraming {
+        status: Some(collected.status),
+        poll,
+        body: output[end.saturating_add(separator)..].to_vec(),
+    }
+}
+
+const CURL_MUTATION_BODY_LIMIT: usize = 64 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;

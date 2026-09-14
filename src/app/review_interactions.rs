@@ -1,7 +1,7 @@
 use cibergit::{
     domain::{
-        MergeAcknowledgement, MergeExecutionRequest, MergeMethod, MergePreparation,
-        MutationAdmissionReceipt, MutationContext, MutationTerminalRecord,
+        ActionsRunControlRequest, MergeAcknowledgement, MergeExecutionRequest, MergeMethod,
+        MergePreparation, MutationAdmissionReceipt, MutationContext, MutationTerminalRecord,
         PendingFileReviewAbsence, PendingReviewSnapshot, ProviderCoordinates,
         ProviderMutationOutcome, PullRequestDetails, PullRequestDiscussionRequest,
         PullRequestLifecycleRequest, ReactionRequest, Repository, ReviewAuxiliaryAcknowledgement,
@@ -2708,6 +2708,10 @@ pub enum JournalRequest {
     Discussion(Box<PullRequestDiscussionRequest>),
     Reaction(Box<ReactionRequest>),
     Dismissal(Box<SubmittedReviewDismissalRequest>),
+    /// One explicit GitHub Actions run control for the exact run linked to a
+    /// selected check. It shares this target's durable authority with every
+    /// other mutation family.
+    ActionsRunControl(Box<ActionsRunControlRequest>),
 }
 
 impl JournalRequest {
@@ -2719,6 +2723,7 @@ impl JournalRequest {
             Self::Discussion(request) => (&request.operation_id, &request.attempt_id),
             Self::Reaction(request) => (&request.operation_id, &request.attempt_id),
             Self::Dismissal(request) => (&request.operation_id, &request.attempt_id),
+            Self::ActionsRunControl(request) => (&request.operation_id, &request.attempt_id),
         }
     }
 
@@ -2796,6 +2801,7 @@ impl JournalRequest {
                 cibergit::domain::ReactionAction::Remove { .. } => "remove-reaction",
             },
             Self::Dismissal(_) => "dismiss-submitted-review",
+            Self::ActionsRunControl(request) => request.preparation.action.journal_action(),
         };
         let payload = match self {
             Self::Lifecycle(request) => serde_json::json!({
@@ -2811,6 +2817,10 @@ impl JournalRequest {
                 "dispatch": {"transport": "journal-context"},
             }),
             Self::Dismissal(request) => serde_json::json!({
+                "request": request,
+                "dispatch": {"transport": "journal-context"},
+            }),
+            Self::ActionsRunControl(request) => serde_json::json!({
                 "request": request,
                 "dispatch": {"transport": "journal-context"},
             }),

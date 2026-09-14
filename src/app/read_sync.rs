@@ -175,6 +175,39 @@ impl GeneralReadController {
         })
     }
 
+    /// Install the same account floor a read would have installed, from server
+    /// pacing directives disclosed by an explicit mutation.
+    ///
+    /// It admits nothing and releases nothing: a mutation never uses this
+    /// scheduler as its authority, and a mutation never becomes a read.
+    pub(super) fn apply_server_directive(
+        &mut self,
+        account: &Account,
+        directive: &GeneralReadDirective,
+    ) {
+        self.apply_server_directive_at(account, directive, Instant::now(), SystemTime::now());
+    }
+
+    fn apply_server_directive_at(
+        &mut self,
+        account: &Account,
+        directive: &GeneralReadDirective,
+        now: Instant,
+        wall_now: SystemTime,
+    ) {
+        let state = self.accounts.entry(account_key(account)).or_default();
+        if let Some(delay) = &directive.rate_limit {
+            state
+                .floor
+                .apply(delay, FloorReason::RateLimit, now, wall_now);
+        }
+        if let Some(delay) = &directive.x_poll_interval {
+            state
+                .floor
+                .apply(delay, FloorReason::PollInterval, now, wall_now);
+        }
+    }
+
     pub(super) fn complete(
         &mut self,
         token: &ReadToken,
@@ -286,6 +319,93 @@ mod tests {
         let success = GeneralReadDirective::default();
         controller.complete_at(&token, &success, None, true, later, wall);
         assert!(controller.begin_at(&alice, later).is_ok());
+    }
+
+    #[test]
+    fn mutation_directive_installs_an_account_floor_without_admitting_a_read() {
+        let now = Instant::now();
+        let wall = UNIX_EPOCH + Duration::from_secs(10_000);
+        let alice = account("alice");
+        let bob = account("bob");
+        let mut controller = GeneralReadController::default();
+        let rate = GeneralReadDirective {
+            x_poll_interval: None,
+            rate_limit: Some(GeneralReadDelay::Seconds(90)),
+        };
+        controller.apply_server_directive_at(&alice, &rate, now, wall);
+        assert!(matches!(
+            controller.begin_at(&alice, now + Duration::from_secs(89)),
+            Err(ReadDeferral::Server(RATE_DEFERRED_NOTICE))
+        ));
+        let (other, _) = controller.begin_at(&bob, now).unwrap().into_parts();
+        let success = GeneralReadDirective::default();
+        assert!(
+            controller
+                .complete_at(&other, &success, None, true, now, wall)
+                .matching_operation_released
+        );
+
+        // The mutation never occupied the account, so the floor alone gates it.
+        let later = now + Duration::from_secs(90);
+        let (released, _) = controller.begin_at(&alice, later).unwrap().into_parts();
+        assert!(
+            controller
+                .complete_at(&released, &success, None, true, later, wall)
+                .matching_operation_released
+        );
+
+        // A shorter later directive can never shorten an installed floor.
+        let (token, _) = controller.begin_at(&bob, later).unwrap().into_parts();
+        let long = GeneralReadDirective {
+            x_poll_interval: None,
+            rate_limit: Some(GeneralReadDelay::Seconds(600)),
+        };
+        controller.complete_at(&token, &long, None, true, later, wall);
+        let short = GeneralReadDirective {
+            x_poll_interval: None,
+            rate_limit: Some(GeneralReadDelay::Seconds(5)),
+        };
+        controller.apply_server_directive_at(&bob, &short, later, wall);
+        assert!(matches!(
+            controller.begin_at(&bob, later + Duration::from_secs(599)),
+            Err(ReadDeferral::Server(RATE_DEFERRED_NOTICE))
+        ));
+    }
+
+    #[test]
+    fn a_stale_read_completion_cannot_erase_a_mutation_installed_floor() {
+        let now = Instant::now();
+        let wall = UNIX_EPOCH + Duration::from_secs(10_000);
+        let alice = account("alice");
+        let mut controller = GeneralReadController::default();
+        let (stale, _) = controller.begin_at(&alice, now).unwrap().into_parts();
+        let success = GeneralReadDirective::default();
+        controller.complete_at(&stale, &success, None, true, now, wall);
+
+        let rate = GeneralReadDirective {
+            x_poll_interval: None,
+            rate_limit: Some(GeneralReadDelay::Seconds(300)),
+        };
+        controller.apply_server_directive_at(&alice, &rate, now, wall);
+
+        // A completion from an already-released generation, and one from a
+        // foreign controller lifetime, both leave the floor intact.
+        controller.complete_at(&stale, &success, None, true, now, wall);
+        let foreign = ReadToken {
+            lifetime: stale.lifetime.wrapping_add(1),
+            account_key: stale.account_key.clone(),
+            generation: stale.generation,
+        };
+        controller.complete_at(&foreign, &success, None, true, now, wall);
+        assert!(matches!(
+            controller.begin_at(&alice, now + Duration::from_secs(299)),
+            Err(ReadDeferral::Server(RATE_DEFERRED_NOTICE))
+        ));
+        assert!(
+            controller
+                .begin_at(&alice, now + Duration::from_secs(300))
+                .is_ok()
+        );
     }
 
     #[test]

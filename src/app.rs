@@ -13,6 +13,7 @@ use crate::{
 };
 use cibergit::ui::{self, Density, TextRole};
 mod checks_view;
+mod ci_actions;
 mod ci_read;
 mod collaboration_cache;
 mod comparison_picker;
@@ -35,6 +36,11 @@ use checks_view::{
     PreviousJobPage, RefreshSelectedCheckJobs, ReturnToChecks, ReturnToJobs, ToggleCheckIdentity,
     checks_page, identity_fields, kind_label, linkage_label, required_label, sha_label,
 };
+use ci_actions::{
+    ActionsControlConfirmationToken, ActionsControlFence, ActionsControlPreparationToken,
+    CiActionsState, RUN_CONTROLS, authority_summary, completion_status,
+    dispatch_actions_run_control, reconciliation_summary,
+};
 #[cfg(feature = "ui-smoke")]
 use ci_read::MemoryRead;
 use ci_read::{CiOperation, CiPane, CiReadState, jobs_page};
@@ -54,7 +60,8 @@ use cibergit::{
         select_github_comparison, select_local_comparison,
     },
     domain::{
-        ActionsAttemptLocator, ActionsHeadRelation, DismissalAuthority, MergeAction,
+        ActionsAttemptLocator, ActionsHeadRelation, ActionsRunControlAcknowledgement,
+        ActionsRunControlAction, ActionsRunControlRequest, DismissalAuthority, MergeAction,
         MergeExecutionRequest, MergeMethod, MergePreparation, PendingFileReviewAbsence,
         PendingReviewCreationAcknowledgement, PendingReviewSnapshot, ProviderCoordinates,
         ProviderMutationOutcome, ProviderReadEvidence, PullRequest, PullRequestDetails,
@@ -840,6 +847,17 @@ enum OpenPrIntent {
     ExplicitStartup,
 }
 
+/// Caller-owned focus for the Actions run controls and their confirmation.
+///
+/// A control button inside the Checks pane cannot rely on press-to-focus for
+/// keyboard activation, so each one tracks a handle the workspace owns. This
+/// also makes Tab order between the controls directly observable.
+struct ActionsControlFocus {
+    controls: [FocusHandle; RUN_CONTROLS.len()],
+    confirm: FocusHandle,
+    cancel: FocusHandle,
+}
+
 struct InstallTabOptions<'a> {
     activate: bool,
     window: Option<&'a mut Window>,
@@ -1372,6 +1390,7 @@ struct ReviewTab {
     checks_selection: ChecksSelection,
     checks_source_expanded: bool,
     ci_read: CiReadState,
+    ci_actions: CiActionsState,
     local_inventory: bool,
     session_persistence_error: Option<String>,
     details: Option<PullRequestDetails>,
@@ -1480,6 +1499,10 @@ enum NativeConfirmation {
         preparation: Box<MergePreparation>,
         method: MergeMethod,
         action: MergeConfirmationAction,
+    },
+    ActionsRunControl {
+        generation: u64,
+        request: Box<ActionsRunControlRequest>,
     },
 }
 
@@ -2129,6 +2152,7 @@ pub struct ReviewWorkspace {
     view_editor_scroll: ScrollHandle,
     inspector_scroll: ScrollHandle,
     checks_focus: FocusHandle,
+    actions_control_focus: ActionsControlFocus,
     jobs_focus: FocusHandle,
     log_focus: FocusHandle,
     query: Entity<InputState>,
@@ -2438,6 +2462,7 @@ impl ReviewWorkspace {
         {
             self.tabs[index].ci_read.reconcile_locator(None);
         }
+        self.reconcile_actions_control_confirmation(index);
     }
 
     fn reconcile_ci_details(&mut self, index: usize) {
@@ -2446,6 +2471,48 @@ impl ReviewWorkspace {
             .ok()
             .map(|(_, locator, _, _)| locator);
         self.tabs[index].ci_read.reconcile_locator(locator.as_ref());
+        self.reconcile_actions_control_confirmation(index);
+    }
+
+    /// A moved check selection or a changed exact run must never leave a frozen
+    /// control confirmation on screen. Only the prepared request is discarded:
+    /// every text draft, pinned selection, and recovery record is untouched.
+    ///
+    /// An already dispatched control is never fenced here. Its outcome must
+    /// still reach the completion path so an unresolved attempt is reported
+    /// rather than silently dropped.
+    fn reconcile_actions_control_confirmation(&mut self, index: usize) {
+        if self.tabs[index].write_in_flight {
+            return;
+        }
+        let Some(target) = self.tabs[index]
+            .confirmation
+            .as_ref()
+            .and_then(|confirmation| match confirmation {
+                NativeConfirmation::ActionsRunControl { request, .. } => {
+                    Some(request.preparation.observation.target.clone())
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let still_current =
+            self.selected_actions_locator(index)
+                .ok()
+                .is_some_and(|(_, locator, _, _)| {
+                    locator.check_node_id == target.check_node_id
+                        && locator.check_database_id == target.check_database_id
+                        && locator.workflow_run.node_id == target.run_node_id
+                        && locator.workflow_run.database_id == target.run_database_id
+                        && locator.workflow_run.run_attempt == target.run_attempt
+                });
+        if !still_current {
+            self.invalidate_actions_control_confirmation(
+                index,
+                "The selected check or exact run attempt changed; the prepared Actions control was discarded. Zero writes sent.",
+            );
+        }
     }
 
     fn ci_completion_index(&self, token: &CiCompletionToken) -> Option<usize> {
@@ -2859,6 +2926,11 @@ impl ReviewWorkspace {
         let checks_focus = cx.focus_handle();
         let jobs_focus = cx.focus_handle();
         let log_focus = cx.focus_handle();
+        let actions_control_focus = ActionsControlFocus {
+            controls: RUN_CONTROLS.map(|_| cx.focus_handle()),
+            confirm: cx.focus_handle(),
+            cancel: cx.focus_handle(),
+        };
         window.focus(&focus, cx);
         let repositories = workspace
             .repositories
@@ -2926,6 +2998,7 @@ impl ReviewWorkspace {
             checks_focus,
             jobs_focus,
             log_focus,
+            actions_control_focus,
             query,
             composer_input,
             review_summary_input,
@@ -5387,6 +5460,151 @@ impl ReviewWorkspace {
         self.inspector_open = true;
         self.rebuild_diff(0, self.wide);
         cx.notify();
+    }
+
+    /// One synthetic PR whose selected check carries complete exact Actions
+    /// identity, so the Checks pane can render its run controls. It installs no
+    /// credential, transport, or provider capability.
+    #[cfg(all(test, feature = "ui-smoke"))]
+    fn install_actions_control_fixture(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) -> ActionsAttemptLocator {
+        self.install_pr_layout_fixture(window, cx);
+        let repository = self.tabs[0].repository.clone();
+        let identity = CheckRepositoryIdentity {
+            node_id: "SYNTHETIC_REPOSITORY_NODE".into(),
+            name_with_owner: repository.full_name(),
+        };
+        let details = self.tabs[0]
+            .details
+            .as_mut()
+            .expect("layout fixture details");
+        details.pull_request_node_id = Some("SYNTHETIC_PULL_REQUEST_NODE".into());
+        details.base_repository = Some(identity.clone());
+        details.head_repository = Some(identity.clone());
+        details.rollup_repository = Some(identity.clone());
+        details.observed_head_sha = Some("2".repeat(40));
+        details.rollup_commit_sha = Some("2".repeat(40));
+        details.checks_complete = true;
+        details.checks = vec![PullRequestCheck {
+            coordinates: ProviderCoordinates {
+                provider: "github".into(),
+                host: repository.host.clone(),
+                owner: repository.owner.clone(),
+                repository: repository.name.clone(),
+                pull_request: 203,
+                remote_id: "SYNTHETIC_ACTIONS_CHECK_NODE".into(),
+            },
+            kind: CheckKind::CheckRun,
+            name: "SYNTHETIC exact Actions check".into(),
+            status: "COMPLETED".into(),
+            conclusion: Some("FAILURE".into()),
+            description: None,
+            details_url: None,
+            github_permalink: None,
+            started_at: None,
+            completed_at: None,
+            required: Some(true),
+            database_id: Some(9),
+            suite: Some(CheckSuiteIdentity {
+                node_id: "SYNTHETIC_SUITE_NODE".into(),
+                database_id: Some(8),
+                repository: identity.clone(),
+                app: Some(CheckAppIdentity {
+                    node_id: "SYNTHETIC_APP_NODE".into(),
+                    name: "Synthetic Actions Renderer".into(),
+                    slug: "synthetic-actions-renderer".into(),
+                }),
+            }),
+            commit_sha: Some("2".repeat(40)),
+            commit_repository: Some(identity),
+            sha_class: CheckShaClass::Head,
+            actions_linkage: ActionsLinkage::Linked(WorkflowRunIdentity {
+                node_id: "SYNTHETIC_RUN_NODE".into(),
+                database_id: 6,
+                run_attempt: 2,
+                run_number: 5,
+                event: "pull_request".into(),
+                github_url: format!(
+                    "https://github.com/{}/actions/runs/6",
+                    repository.full_name()
+                ),
+                workflow_node_id: "SYNTHETIC_WORKFLOW_NODE".into(),
+                workflow_database_id: 4,
+                workflow_name: "SYNTHETIC CI".into(),
+            }),
+        }];
+        let checks = details.checks.clone();
+        self.tabs[0].checks_selection.reconcile(&checks);
+        self.tabs[0].checks_selection.selected_id = Some("SYNTHETIC_ACTIONS_CHECK_NODE".into());
+        self.tabs[0].inspector_section = InspectorSection::Checks;
+        self.inspector_open = true;
+        self.panel_layout.sidebar_collapsed = true;
+        self.panel_layout.file_tree_collapsed = true;
+        cx.notify();
+        let (_, locator, _, _) = self
+            .selected_actions_locator(0)
+            .expect("the synthetic check carries complete exact Actions identity");
+        locator
+    }
+
+    /// A frozen control request for the synthetic scene. It is presentation
+    /// input only: no credential, permission, or transport is involved.
+    #[cfg(all(test, feature = "ui-smoke"))]
+    fn synthetic_actions_control_request(
+        locator: &ActionsAttemptLocator,
+        action: ActionsRunControlAction,
+    ) -> ActionsRunControlRequest {
+        let run = &locator.workflow_run;
+        ActionsRunControlRequest {
+            operation_id: "synthetic-actions-control".into(),
+            attempt_id: "synthetic-actions-control-attempt".into(),
+            preparation: cibergit::domain::ActionsRunControlPreparation {
+                action,
+                observation: cibergit::domain::ActionsRunControlObservation {
+                    target: cibergit::domain::ActionsRunControlTarget {
+                        account: locator.account.clone(),
+                        repository_node_id: locator.base_repository.node_id.clone(),
+                        repository_name_with_owner: locator.base_repository.name_with_owner.clone(),
+                        pull_request_number: locator.pull_request_number,
+                        pull_request_node_id: locator.pull_request_node_id.clone(),
+                        check_node_id: locator.check_node_id.clone(),
+                        check_database_id: locator.check_database_id,
+                        check_suite_node_id: locator.suite.node_id.clone(),
+                        check_suite_database_id: locator.suite.database_id.unwrap_or_default(),
+                        workflow_node_id: run.workflow_node_id.clone(),
+                        workflow_database_id: run.workflow_database_id,
+                        workflow_name: run.workflow_name.clone(),
+                        run_node_id: run.node_id.clone(),
+                        run_database_id: run.database_id,
+                        run_number: run.run_number,
+                        run_attempt: run.run_attempt,
+                        run_event: run.event.clone(),
+                        run_head_sha: locator.check_commit_sha.clone(),
+                        run_html_url: run.github_url.clone(),
+                    },
+                    viewer: cibergit::domain::SelectedViewer {
+                        node_id: "SYNTHETIC_VIEWER_NODE".into(),
+                        login: locator.account.login.clone(),
+                    },
+                    run_status: "completed".into(),
+                    run_conclusion: Some("failure".into()),
+                    authority: cibergit::domain::ActionsRunControlAuthority::Available,
+                },
+                method: "POST".into(),
+                path: format!(
+                    "repos/{}/actions/runs/{}/{}",
+                    locator.base_repository.name_with_owner,
+                    run.database_id,
+                    action.rest_segment()
+                ),
+                body: serde_json::json!({}),
+                observed_at_unix_ms: 1,
+                notices: vec!["SYNTHETIC presentation fixture · zero transport capability".into()],
+            },
+        }
     }
 
     #[cfg(feature = "ui-smoke")]
@@ -13761,6 +13979,7 @@ impl ReviewWorkspace {
             checks_selection: ChecksSelection::default(),
             checks_source_expanded: false,
             ci_read: CiReadState::default(),
+            ci_actions: CiActionsState::default(),
             local_inventory,
             session_persistence_error,
             details: None,
@@ -15936,6 +16155,317 @@ impl ReviewWorkspace {
         Some(index)
     }
 
+    /// The exact tab identity every prepared or confirmed Actions control is
+    /// bound to. A moved check selection, a new details generation, or a
+    /// different exact run locator all fence a pending control.
+    fn actions_control_fence(&self, index: usize) -> Option<ActionsControlFence> {
+        let tab = self.tabs.get(index)?;
+        Some(ActionsControlFence {
+            workspace_instance: self.workspace_instance,
+            tab_instance: tab.instance_generation,
+            repository_key: tab.repository.cache_key(),
+            pull_request: tab.pull_request.number,
+            details_generation: tab.details_generation,
+            selected_check_id: tab.checks_selection.selected_id.clone(),
+            locator: self
+                .selected_actions_locator(index)
+                .ok()
+                .map(|(_, locator, _, _)| locator),
+            generation: tab.ci_actions.confirmation_generation,
+            write_in_flight: tab.write_in_flight,
+        })
+    }
+
+    fn invalidate_actions_control_confirmation(&mut self, index: usize, status: &str) -> bool {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return false;
+        };
+        if !matches!(
+            tab.confirmation.as_ref(),
+            Some(NativeConfirmation::ActionsRunControl { .. })
+        ) {
+            return false;
+        }
+        tab.confirmation = None;
+        tab.ci_actions.invalidate();
+        self.status = status.into();
+        true
+    }
+
+    /// Read the selected viewer, fresh repository permission, and the exact
+    /// current run, then freeze one control. Nothing is sent by preparation.
+    fn prepare_actions_run_control(
+        &mut self,
+        index: usize,
+        action: ActionsRunControlAction,
+        cx: &mut Context<Root>,
+    ) {
+        if self.tabs[index].write_in_flight {
+            self.status = "Another mutation is still in progress.".into();
+            cx.notify();
+            return;
+        }
+        if self.tabs[index].submitted_summary_editor.close_after_save {
+            self.status = "Wait for the local draft close operation to finish.".into();
+            cx.notify();
+            return;
+        }
+        if self.tabs[index].pending_review_start_live.is_some() {
+            self.status =
+                "A pending review start is still live; reconcile it before an Actions control."
+                    .into();
+            cx.notify();
+            return;
+        }
+        #[cfg(feature = "ui-smoke")]
+        if self.provider_reads_disabled {
+            self.status =
+                "Provider reads are disabled in this synthetic scene; no Actions control was prepared and zero writes were sent."
+                    .into();
+            cx.notify();
+            return;
+        }
+        let (repository, locator, _, _) = match self.selected_actions_locator(index) {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                cx.notify();
+                return;
+            }
+        };
+        self.invalidate_actions_control_confirmation(
+            index,
+            "Preparing a different Actions control; the prior confirmation was discarded.",
+        );
+        self.tabs[index].confirmation = None;
+        self.tabs[index].ci_actions.invalidate();
+        self.tabs[index].write_in_flight = true;
+        let operation_id = next_attempt_id(action.journal_action());
+        let attempt_id = next_attempt_id(&operation_id);
+        let Some(fence) = self.actions_control_fence(index) else {
+            return;
+        };
+        let token = ActionsControlPreparationToken {
+            fence,
+            action,
+            operation_id: operation_id.clone(),
+            attempt_id: attempt_id.clone(),
+        };
+        self.update_shared_composer_disabled(cx);
+        self.status = format!(
+            "Reading the exact run, current attempt, and write permission for {}…",
+            action.label().to_lowercase()
+        );
+        let task = cx.background_spawn(async move {
+            GithubProvider::new(repository.account.clone()).prepare_actions_run_control(
+                &repository,
+                &locator,
+                action,
+                operation_id,
+                attempt_id,
+            )
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                if this
+                    .apply_actions_control_preparation(&token, result)
+                    .is_some()
+                {
+                    this.update_shared_composer_disabled(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_actions_control_preparation(
+        &mut self,
+        token: &ActionsControlPreparationToken,
+        result: Result<ActionsRunControlRequest, String>,
+    ) -> Option<usize> {
+        let index = (0..self.tabs.len()).find(|index| {
+            self.actions_control_fence(*index)
+                .is_some_and(|fence| token.matches(&fence))
+        })?;
+        self.tabs[index].write_in_flight = false;
+        match result {
+            Ok(request)
+                if request.operation_id == token.operation_id
+                    && request.attempt_id == token.attempt_id
+                    && request.preparation.action == token.action =>
+            {
+                let unknown = matches!(
+                    request.preparation.observation.authority,
+                    cibergit::domain::ActionsRunControlAuthority::Unknown { .. }
+                );
+                self.tabs[index].confirmation = Some(NativeConfirmation::ActionsRunControl {
+                    generation: token.fence.generation,
+                    request: Box::new(request),
+                });
+                self.inspector_open = true;
+                self.status = if unknown {
+                    "Exact run and current attempt frozen. Write permission is unknown; GitHub decides when the request is sent."
+                        .into()
+                } else {
+                    "Exact run, current attempt, and fresh write permission frozen; explicit confirmation is required."
+                        .into()
+                };
+            }
+            Ok(_) => {
+                self.status =
+                    "Actions control preparation returned a different frozen request; zero writes sent."
+                        .into();
+            }
+            Err(reason) => {
+                self.status =
+                    format!("The Actions control was not prepared; zero writes sent: {reason}");
+            }
+        }
+        Some(index)
+    }
+
+    fn cancel_actions_control_confirmation(
+        &mut self,
+        token: &ActionsControlConfirmationToken,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = (0..self.tabs.len()).find(|index| {
+            self.actions_control_fence(*index)
+                .is_some_and(|fence| token.matches(&fence, false))
+        }) else {
+            return;
+        };
+        if self.tabs[index].write_in_flight {
+            return;
+        }
+        self.tabs[index].confirmation = None;
+        self.status = "Actions control cancelled; zero writes sent.".into();
+        cx.notify();
+    }
+
+    /// Durably admit the exact frozen request, repeat the preflight inside the
+    /// provider, and send one POST. There is no retry and no replay.
+    fn confirm_actions_run_control(
+        &mut self,
+        token: ActionsControlConfirmationToken,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = (0..self.tabs.len()).find(|index| {
+            self.actions_control_fence(*index)
+                .is_some_and(|fence| token.matches(&fence, false))
+        }) else {
+            return;
+        };
+        if self.tabs[index].write_in_flight {
+            self.status = "Another mutation is still in progress.".into();
+            cx.notify();
+            return;
+        }
+        if self.tabs[index].pending_review_start_live.is_some() {
+            self.status =
+                "A pending review start is still live; reconcile it before an Actions control."
+                    .into();
+            cx.notify();
+            return;
+        }
+        // The visible check and exact run attempt must still be the frozen
+        // ones. The provider repeats a complete preflight after admission; this
+        // refuses an obviously stale confirmation before taking any authority.
+        let target = &token.request.preparation.observation.target;
+        let visible_run_unchanged =
+            self.selected_actions_locator(index)
+                .ok()
+                .is_some_and(|(_, locator, _, _)| {
+                    locator.check_node_id == target.check_node_id
+                        && locator.check_database_id == target.check_database_id
+                        && locator.workflow_run.node_id == target.run_node_id
+                        && locator.workflow_run.database_id == target.run_database_id
+                        && locator.workflow_run.run_attempt == target.run_attempt
+                });
+        if !visible_run_unchanged {
+            self.invalidate_actions_control_confirmation(
+                index,
+                "The selected check or exact run attempt changed; prepare the control again. Zero writes sent.",
+            );
+            cx.notify();
+            return;
+        }
+        #[cfg(feature = "ui-smoke")]
+        if self.provider_reads_disabled {
+            self.status =
+                "Provider reads are disabled in this synthetic scene; the confirmed Actions control was not dispatched and zero writes were sent."
+                    .into();
+            cx.notify();
+            return;
+        }
+        let repository = self.tabs[index].repository.clone();
+        let number = self.tabs[index].pull_request.number;
+        let request = token.request.clone();
+        let journal_root = self.interaction_root.clone();
+        self.tabs[index].write_in_flight = true;
+        self.update_shared_composer_disabled(cx);
+        self.status = "Durably admitting one exact Actions control request…".into();
+        let account = repository.account.clone();
+        let task = cx.background_spawn(async move {
+            let key = ReviewKey::for_repository("github", &repository, number)
+                .map_err(|error| error.to_string())?;
+            let mut journal = ActionJournal::open(&journal_root, key).map_err(|reason| {
+                format!("Cannot open caller journal; zero writes sent: {reason}")
+            })?;
+            let provider = GithubProvider::new(repository.account.clone());
+            Ok::<_, String>(dispatch_actions_run_control(
+                &mut journal,
+                &provider,
+                &repository,
+                &request,
+            ))
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let outcome = match result {
+                    Ok(dispatch) => {
+                        // A mutation never admits a read, but the server's own
+                        // pacing directives still install this account's floor.
+                        this.general_reads
+                            .apply_server_directive(&account, &dispatch.directive);
+                        dispatch.outcome
+                    }
+                    Err(reason) => ProviderMutationOutcome::PreflightRejected { reason },
+                };
+                if this
+                    .apply_actions_control_completion(&token, outcome)
+                    .is_some()
+                {
+                    this.update_shared_composer_disabled(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_actions_control_completion(
+        &mut self,
+        token: &ActionsControlConfirmationToken,
+        outcome: ProviderMutationOutcome<ActionsRunControlAcknowledgement>,
+    ) -> Option<usize> {
+        let index = (0..self.tabs.len()).find(|index| {
+            self.actions_control_fence(*index)
+                .is_some_and(|fence| token.matches(&fence, true))
+        })?;
+        self.tabs[index].write_in_flight = false;
+        self.tabs[index].confirmation = None;
+        self.status = completion_status(token.request.preparation.action, &outcome);
+        Some(index)
+    }
+
     fn prepare_submitted_summary_confirmation(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         if self.active_tab_input_restore.is_some() {
@@ -17820,6 +18350,23 @@ impl ReviewWorkspace {
                         let _ = provider.reconcile_review_dismissal(&repository, request);
                         None
                     }
+                    JournalRequest::ActionsRunControl(request) => {
+                        let preparation = &request.preparation;
+                        let evidence = provider.reconcile_actions_run_control(
+                            &repository,
+                            &preparation.observation.target,
+                        );
+                        reconciliation_summary(
+                            preparation.action,
+                            preparation.observation.target.run_attempt,
+                            &preparation.observation.run_status,
+                            &evidence,
+                        )
+                        // An accepted control only ever schedules work, so
+                        // convergence is recorded as observed movement, never
+                        // as a completed effect attributed to this attempt.
+                        .map(|(resolved, evidence)| (resolved, false, evidence))
+                    }
                 };
                 match observation {
                     Some((true, completed, evidence)) => {
@@ -17853,6 +18400,9 @@ impl ReviewWorkspace {
                             }
                             JournalRequest::Dismissal(_) => {
                                 "A later exact DISMISSED review can show state convergence only. No exact dismissal event with the frozen review, parent, selected actor, previous state, and message was recorded, so reason and causation remain unresolved."
+                            }
+                            JournalRequest::ActionsRunControl(_) => {
+                                "The run showed no later attempt or matching cancelled conclusion. GitHub records no per-request Actions control event, so an unmoved run never proves this attempt was NotApplied."
                             }
                             _ => {
                                 "The fresh read did not provide complete exact identity and payload evidence for this request."
@@ -26720,346 +27270,389 @@ impl ReviewWorkspace {
                 }
                 vec![div().children(activity).into_any_element()]
             }
-            InspectorSection::Checks => {
-                match tab.ci_read.pane {
-                    CiPane::Jobs => self.render_actions_jobs(index, colors, cx),
-                    CiPane::Log => self.render_actions_log(index, colors, cx),
-                    CiPane::Checks => {
-                        let mut checks: Vec<AnyElement> = vec![
-                            detail(
-                                "Status",
-                                empty_unknown(&tab.pull_request.check_status),
-                                colors,
-                            )
-                            .into_any_element(),
-                        ];
-                        let source_identity = displayed_details
-                            .map(|details| {
-                                let repository = |repository: Option<
-                                    &cibergit::domain::CheckRepositoryIdentity,
-                                >| {
+            InspectorSection::Checks => match tab.ci_read.pane {
+                CiPane::Jobs => self.render_actions_jobs(index, colors, cx),
+                CiPane::Log => self.render_actions_log(index, colors, cx),
+                CiPane::Checks => {
+                    let mut checks: Vec<AnyElement> = vec![
+                        detail(
+                            "Status",
+                            empty_unknown(&tab.pull_request.check_status),
+                            colors,
+                        )
+                        .into_any_element(),
+                    ];
+                    let source_identity = displayed_details
+                        .map(|details| {
+                            let repository =
+                                |repository: Option<&cibergit::domain::CheckRepositoryIdentity>| {
                                     repository
                                         .map(|repository| repository.name_with_owner.clone())
                                         .unwrap_or_else(|| "Unknown".into())
                                 };
-                                div()
-                                    .mb_2()
-                                    .p_2()
-                                    .rounded(px(ui::CONTROL_RADIUS))
+                            div()
+                                .mb_2()
+                                .p_2()
+                                .rounded(px(ui::CONTROL_RADIUS))
+                                .border_1()
+                                .border_color(colors.border)
+                                .child(detail(
+                                    "Observed PR head",
+                                    details
+                                        .observed_head_sha
+                                        .clone()
+                                        .unwrap_or_else(|| "Unknown".into()),
+                                    colors,
+                                ))
+                                .child(detail(
+                                    "Checks rollup commit",
+                                    details
+                                        .rollup_commit_sha
+                                        .clone()
+                                        .unwrap_or_else(|| "No rollup observed".into()),
+                                    colors,
+                                ))
+                                .child(detail(
+                                    "Merge candidate",
+                                    details
+                                        .potential_merge_commit_sha
+                                        .clone()
+                                        .unwrap_or_else(|| "Not observed".into()),
+                                    colors,
+                                ))
+                                .child(detail(
+                                    "Base repository",
+                                    repository(details.base_repository.as_ref()),
+                                    colors,
+                                ))
+                                .child(detail(
+                                    "Head repository",
+                                    repository(details.head_repository.as_ref()),
+                                    colors,
+                                ))
+                                .child(detail(
+                                    "Rollup repository",
+                                    repository(details.rollup_repository.as_ref()),
+                                    colors,
+                                ))
+                        })
+                        .unwrap_or_else(|| {
+                            div()
+                                .mb_2()
+                                .ui_text(TextRole::Caption)
+                                .text_color(colors.muted)
+                                .child("Observed Checks source identity is unavailable.")
+                        });
+                    checks.push(
+                        div()
+                            .mb_3()
+                            .child(
+                                Button::new("checks-source-details")
+                                    .control()
                                     .border_1()
-                                    .border_color(colors.border)
-                                    .child(detail(
-                                        "Observed PR head",
-                                        details
-                                            .observed_head_sha
-                                            .clone()
-                                            .unwrap_or_else(|| "Unknown".into()),
-                                        colors,
-                                    ))
-                                    .child(detail(
-                                        "Checks rollup commit",
-                                        details
-                                            .rollup_commit_sha
-                                            .clone()
-                                            .unwrap_or_else(|| "No rollup observed".into()),
-                                        colors,
-                                    ))
-                                    .child(detail(
-                                        "Merge candidate",
-                                        details
-                                            .potential_merge_commit_sha
-                                            .clone()
-                                            .unwrap_or_else(|| "Not observed".into()),
-                                        colors,
-                                    ))
-                                    .child(detail(
-                                        "Base repository",
-                                        repository(details.base_repository.as_ref()),
-                                        colors,
-                                    ))
-                                    .child(detail(
-                                        "Head repository",
-                                        repository(details.head_repository.as_ref()),
-                                        colors,
-                                    ))
-                                    .child(detail(
-                                        "Rollup repository",
-                                        repository(details.rollup_repository.as_ref()),
-                                        colors,
-                                    ))
+                                    .border_color(rgba(0x00000000))
+                                    .focus_ring(colors.accent, colors.selected)
+                                    .child(if tab.checks_source_expanded {
+                                        "Hide revision details"
+                                    } else {
+                                        "Revision details"
+                                    })
+                                    .selected(tab.checks_source_expanded)
+                                    .accessibility_label(if tab.checks_source_expanded {
+                                        "Revision details, expanded"
+                                    } else {
+                                        "Revision details, collapsed"
+                                    })
+                                    .debug_selector(|| "checks-source-details".to_owned())
+                                    .on_click(cx.listener(move |root, _, _, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.tabs[index].checks_source_expanded =
+                                                !this.tabs[index].checks_source_expanded;
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .when(tab.checks_source_expanded, |section| {
+                                section.child(source_identity)
                             })
-                            .unwrap_or_else(|| {
-                                div()
-                                    .mb_2()
-                                    .ui_text(TextRole::Caption)
-                                    .text_color(colors.muted)
-                                    .child("Observed Checks source identity is unavailable.")
-                            });
+                            .into_any_element(),
+                    );
+                    if self.selected_actions_locator(index).is_ok() {
+                        let jobs_root = root.clone();
                         checks.push(
                             div()
                                 .mb_3()
                                 .child(
-                                    Button::new("checks-source-details")
-                                        .control()
-                                        .border_1()
-                                        .border_color(rgba(0x00000000))
-                                        .focus_ring(colors.accent, colors.selected)
-                                        .child(if tab.checks_source_expanded {
-                                            "Hide revision details"
-                                        } else {
-                                            "Revision details"
-                                        })
-                                        .selected(tab.checks_source_expanded)
-                                        .accessibility_label(if tab.checks_source_expanded {
-                                            "Revision details, expanded"
-                                        } else {
-                                            "Revision details, collapsed"
-                                        })
-                                        .debug_selector(|| "checks-source-details".to_owned())
-                                        .on_click(cx.listener(move |root, _, _, cx| {
-                                            if let Root::Review(this) = root {
-                                                this.tabs[index].checks_source_expanded =
-                                                    !this.tabs[index].checks_source_expanded;
-                                                cx.notify();
-                                            }
-                                        })),
-                                )
-                                .when(tab.checks_source_expanded, |section| {
-                                    section.child(source_identity)
-                                })
-                                .into_any_element(),
-                        );
-                        if self.selected_actions_locator(index).is_ok() {
-                            let jobs_root = root.clone();
-                            checks.push(
-                                div()
-                                    .mb_3()
-                                    .child(
-                                        action_link_with_id(
-                                            "checks-open-actions-jobs".into(),
-                                            "Load exact Actions jobs",
-                                            colors,
-                                        )
-                                        .on_click(
-                                            move |_, window, cx| {
-                                                jobs_root.update(cx, |root, cx| {
-                                                    if let Root::Review(this) = root
-                                                        && this.start_actions_jobs(index, cx)
-                                                    {
-                                                        this.focus_current_ci_pane(
-                                                            index, window, cx,
-                                                        );
-                                                    }
-                                                });
-                                            },
-                                        ),
+                                    action_link_with_id(
+                                        "checks-open-actions-jobs".into(),
+                                        "Load exact Actions jobs",
+                                        colors,
                                     )
-                                    .child(div().mt_1().ui_text(TextRole::Caption).text_color(colors.muted).child(
-                                        "Read-only · exact run attempt · memory-only result",
-                                    ))
-                                    .into_any_element(),
-                            );
-                        }
-                        if let Some(details) = displayed_details {
-                            let (page, pages, range) =
-                                checks_page(details.checks.len(), tab.checks_selection.page);
-                            for check in &details.checks[range.clone()] {
-                                let remote_id = check.coordinates.remote_id.clone();
-                                let selected = tab.checks_selection.selected_id.as_deref()
-                                    == Some(remote_id.as_str());
-                                let expanded = tab.checks_selection.expanded_id.as_deref()
-                                    == Some(remote_id.as_str());
-                                let row_root = root.clone();
-                                let accessibility_label = format!(
-                                    "{}; {}; {}; {}; {}; {}; {}",
-                                    check.name,
-                                    kind_label(check),
-                                    required_label(check),
-                                    sha_label(check),
-                                    linkage_label(check),
-                                    if selected { "selected" } else { "not selected" },
-                                    if expanded { "expanded" } else { "collapsed" },
-                                );
-                                let row = check_identity_button(
-                                    format!("check-row-{remote_id}"),
-                                    accessibility_label,
-                                    selected,
-                                    expanded,
-                                    colors,
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap(px(ui::GAP_GROUP))
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .flex_1()
-                                                .whitespace_normal()
-                                                .overflow_hidden()
-                                                .child(check.name.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .whitespace_nowrap()
-                                                .ui_text(TextRole::Caption)
-                                                .text_color(colors.muted)
-                                                .child(if expanded { "Hide" } else { "Details" }),
-                                        ),
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            jobs_root.update(cx, |root, cx| {
+                                                if let Root::Review(this) = root
+                                                    && this.start_actions_jobs(index, cx)
+                                                {
+                                                    this.focus_current_ci_pane(index, window, cx);
+                                                }
+                                            });
+                                        },
+                                    ),
                                 )
                                 .child(
                                     div()
                                         .mt_1()
                                         .ui_text(TextRole::Caption)
                                         .text_color(colors.muted)
-                                        .child(format!(
-                                            "{} · {}{}",
-                                            kind_label(check),
-                                            check.status,
-                                            check
-                                                .conclusion
-                                                .as_ref()
-                                                .map(|value| format!(" · {value}"))
-                                                .unwrap_or_default()
-                                        )),
+                                        .child(
+                                            "Read-only · exact run attempt · memory-only result",
+                                        ),
                                 )
-                                .child(
-                                    div()
-                                        .ui_text(TextRole::Caption)
-                                        .text_color(colors.faint)
-                                        .child(format!(
-                                            "{} · {} · {}",
-                                            required_label(check),
-                                            sha_label(check),
-                                            linkage_label(check)
-                                        )),
-                                )
-                                .when(expanded, |row| {
-                                    row.child(
+                                .into_any_element(),
+                        );
+                        let mut controls = div().mb_3().flex().flex_wrap().gap(px(ui::GAP_COLUMNS));
+                        for (position, action) in RUN_CONTROLS.into_iter().enumerate() {
+                            let control_root = root.clone();
+                            controls = controls.child(
+                                Button::new(action.control_element_id())
+                                    .control()
+                                    .track_focus(&self.actions_control_focus.controls[position])
+                                    .tab_index(position as isize)
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .disabled(tab.write_in_flight)
+                                    .accessibility_label(format!(
+                                        "Prepare {} for the exact selected Actions run",
+                                        action.label()
+                                    ))
+                                    .debug_selector(move || action.control_element_id().to_owned())
+                                    .on_click(move |_, _, cx| {
+                                        control_root.update(cx, |root, cx| {
+                                            if let Root::Review(this) = root {
+                                                this.prepare_actions_run_control(index, action, cx);
+                                            }
+                                        });
+                                    })
+                                    .child(action.label()),
+                            );
+                        }
+                        checks.push(
+                                div()
+                                    .child(controls)
+                                    .child(
                                         div()
-                                            .mt_2()
-                                            .pt_2()
-                                            .border_t_1()
-                                            .border_color(colors.border)
-                                            .children(identity_fields(check).into_iter().map(
-                                                |(label, value)| {
-                                                    div()
-                                                        .mb_1()
-                                                        .child(
-                                                            div()
-                                                                .ui_text(TextRole::Caption)
-                                                                .text_color(colors.muted)
-                                                                .child(label),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .ui_text(TextRole::Caption)
-                                                                .text_color(colors.text)
-                                                                .child(value),
-                                                        )
-                                                },
-                                            )),
+                                            .mb_3()
+                                            .ui_text(TextRole::Caption)
+                                            .text_color(colors.muted)
+                                            .child(
+                                                "Each control reads the exact run, its current attempt, and fresh write permission, then asks for explicit confirmation. GitHub has no expected-attempt condition on these endpoints.",
+                                            ),
                                     )
-                                })
-                                .on_click(move |_, _, cx| {
-                                    row_root.update(cx, |root, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.activate_check(&remote_id, cx);
-                                        }
-                                    });
-                                });
-                                checks.push(row.into_any_element());
-                            }
-                            if !details.checks.is_empty() {
-                                checks.push(
+                                    .into_any_element(),
+                            );
+                    }
+                    if let Some(details) = displayed_details {
+                        let (page, pages, range) =
+                            checks_page(details.checks.len(), tab.checks_selection.page);
+                        for check in &details.checks[range.clone()] {
+                            let remote_id = check.coordinates.remote_id.clone();
+                            let selected = tab.checks_selection.selected_id.as_deref()
+                                == Some(remote_id.as_str());
+                            let expanded = tab.checks_selection.expanded_id.as_deref()
+                                == Some(remote_id.as_str());
+                            let row_root = root.clone();
+                            let accessibility_label = format!(
+                                "{}; {}; {}; {}; {}; {}; {}",
+                                check.name,
+                                kind_label(check),
+                                required_label(check),
+                                sha_label(check),
+                                linkage_label(check),
+                                if selected { "selected" } else { "not selected" },
+                                if expanded { "expanded" } else { "collapsed" },
+                            );
+                            let row = check_identity_button(
+                                format!("check-row-{remote_id}"),
+                                accessibility_label,
+                                selected,
+                                expanded,
+                                colors,
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(ui::GAP_GROUP))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .whitespace_normal()
+                                            .overflow_hidden()
+                                            .child(check.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .whitespace_nowrap()
+                                            .ui_text(TextRole::Caption)
+                                            .text_color(colors.muted)
+                                            .child(if expanded { "Hide" } else { "Details" }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .ui_text(TextRole::Caption)
+                                    .text_color(colors.muted)
+                                    .child(format!(
+                                        "{} · {}{}",
+                                        kind_label(check),
+                                        check.status,
+                                        check
+                                            .conclusion
+                                            .as_ref()
+                                            .map(|value| format!(" · {value}"))
+                                            .unwrap_or_default()
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .ui_text(TextRole::Caption)
+                                    .text_color(colors.faint)
+                                    .child(format!(
+                                        "{} · {} · {}",
+                                        required_label(check),
+                                        sha_label(check),
+                                        linkage_label(check)
+                                    )),
+                            )
+                            .when(expanded, |row| {
+                                row.child(
                                     div()
                                         .mt_2()
-                                        .ui_text(TextRole::Caption)
-                                        .text_color(colors.muted)
-                                        .child(format!(
-                                            "Showing {}–{} of {} observed checks · page {} of {}.",
-                                            range.start + 1,
-                                            range.end,
-                                            details.checks.len(),
-                                            page + 1,
-                                            pages
-                                        ))
-                                        .into_any_element(),
-                                );
-                            }
-                            if pages > 1 {
-                                let previous_root = root.clone();
-                                let next_root = root.clone();
-                                let previous_disabled = page == 0;
-                                let next_disabled = page + 1 == pages;
-                                checks.push(
-                            div()
-                                .mt_2()
-                                .flex()
-                                .gap(px(ui::GAP_GROUP))
-                                .child(
-                                    checks_page_button(
-                                        "checks-previous-page",
-                                        "Previous 40",
-                                        previous_disabled,
-                                        if previous_disabled {
-                                            "Previous 40 checks, unavailable on the first page"
-                                        } else {
-                                            "Previous 40 checks"
-                                        },
-                                        colors,
-                                    )
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            previous_root.update(cx, |root, cx| {
-                                                if let Root::Review(this) = root {
-                                                    this.move_checks_page(-1, window, cx);
-                                                }
-                                            });
-                                        },
-                                    ),
+                                        .pt_2()
+                                        .border_t_1()
+                                        .border_color(colors.border)
+                                        .children(identity_fields(check).into_iter().map(
+                                            |(label, value)| {
+                                                div()
+                                                    .mb_1()
+                                                    .child(
+                                                        div()
+                                                            .ui_text(TextRole::Caption)
+                                                            .text_color(colors.muted)
+                                                            .child(label),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .ui_text(TextRole::Caption)
+                                                            .text_color(colors.text)
+                                                            .child(value),
+                                                    )
+                                            },
+                                        )),
                                 )
-                                .child(
-                                    checks_page_button(
-                                        "checks-next-page",
-                                        "Next 40",
-                                        next_disabled,
-                                        if next_disabled {
-                                            "Next 40 checks, unavailable on the last page"
-                                        } else {
-                                            "Next 40 checks"
-                                        },
-                                        colors,
-                                    )
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            next_root.update(cx, |root, cx| {
-                                                if let Root::Review(this) = root {
-                                                    this.move_checks_page(1, window, cx);
-                                                }
-                                            });
-                                        },
-                                    ),
-                                )
-                                .into_any_element(),
-                        );
-                            }
-                            if !details.checks_complete {
-                                checks.push(
-                            div()
-                                .text_color(colors.amber)
-                                .child("GitHub did not return complete check identity evidence.")
-                                .into_any_element(),
-                        );
-                            }
+                            })
+                            .on_click(move |_, _, cx| {
+                                row_root.update(cx, |root, cx| {
+                                    if let Root::Review(this) = root {
+                                        this.activate_check(&remote_id, cx);
+                                    }
+                                });
+                            });
+                            checks.push(row.into_any_element());
                         }
-                        checks
+                        if !details.checks.is_empty() {
+                            checks.push(
+                                div()
+                                    .mt_2()
+                                    .ui_text(TextRole::Caption)
+                                    .text_color(colors.muted)
+                                    .child(format!(
+                                        "Showing {}–{} of {} observed checks · page {} of {}.",
+                                        range.start + 1,
+                                        range.end,
+                                        details.checks.len(),
+                                        page + 1,
+                                        pages
+                                    ))
+                                    .into_any_element(),
+                            );
+                        }
+                        if pages > 1 {
+                            let previous_root = root.clone();
+                            let next_root = root.clone();
+                            let previous_disabled = page == 0;
+                            let next_disabled = page + 1 == pages;
+                            checks.push(
+                                div()
+                                    .mt_2()
+                                    .flex()
+                                    .gap(px(ui::GAP_GROUP))
+                                    .child(
+                                        checks_page_button(
+                                            "checks-previous-page",
+                                            "Previous 40",
+                                            previous_disabled,
+                                            if previous_disabled {
+                                                "Previous 40 checks, unavailable on the first page"
+                                            } else {
+                                                "Previous 40 checks"
+                                            },
+                                            colors,
+                                        )
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                previous_root.update(cx, |root, cx| {
+                                                    if let Root::Review(this) = root {
+                                                        this.move_checks_page(-1, window, cx);
+                                                    }
+                                                });
+                                            },
+                                        ),
+                                    )
+                                    .child(
+                                        checks_page_button(
+                                            "checks-next-page",
+                                            "Next 40",
+                                            next_disabled,
+                                            if next_disabled {
+                                                "Next 40 checks, unavailable on the last page"
+                                            } else {
+                                                "Next 40 checks"
+                                            },
+                                            colors,
+                                        )
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                next_root.update(cx, |root, cx| {
+                                                    if let Root::Review(this) = root {
+                                                        this.move_checks_page(1, window, cx);
+                                                    }
+                                                });
+                                            },
+                                        ),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                        if !details.checks_complete {
+                            checks.push(
+                                div()
+                                    .text_color(colors.amber)
+                                    .child(
+                                        "GitHub did not return complete check identity evidence.",
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
                     }
+                    checks
                 }
-            }
+            },
         }
     }
 
@@ -27565,6 +28158,179 @@ impl ReviewWorkspace {
                                 ),
                         )
                         .into_any_element(),
+                )
+            }
+            NativeConfirmation::ActionsRunControl {
+                generation,
+                request,
+            } => {
+                let fence = ActionsControlFence {
+                    workspace_instance: self.workspace_instance,
+                    tab_instance: tab.instance_generation,
+                    repository_key: tab.repository.cache_key(),
+                    pull_request: tab.pull_request.number,
+                    details_generation: tab.details_generation,
+                    selected_check_id: tab.checks_selection.selected_id.clone(),
+                    locator: self
+                        .selected_actions_locator(index)
+                        .ok()
+                        .map(|(_, locator, _, _)| locator),
+                    generation: *generation,
+                    write_in_flight: tab.write_in_flight,
+                };
+                let token = ActionsControlConfirmationToken {
+                    fence,
+                    request: request.as_ref().clone(),
+                };
+                let preparation = &request.preparation;
+                let target = &preparation.observation.target;
+                let confirm_root = cx.entity();
+                let cancel_root = confirm_root.clone();
+                let confirm_token = token.clone();
+                let action = preparation.action;
+                let mut card = div()
+                    .mb(px(ui::GAP_PAGE))
+                    .p_3()
+                    .rounded(px(ui::CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(colors.amber)
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(format!("{}?", action.label())),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.muted)
+                            .child(format!(
+                                "{} · #{} · selected account {} ({})",
+                                target.repository_name_with_owner,
+                                target.pull_request_number,
+                                preparation.observation.viewer.login,
+                                preparation.observation.viewer.node_id
+                            )),
+                    )
+                    .child(div().mt_1().ui_text(TextRole::Caption).child(format!(
+                        "Workflow {} · run {} · run number {} · attempt {} · event {}",
+                        target.workflow_name,
+                        target.run_database_id,
+                        target.run_number,
+                        target.run_attempt,
+                        target.run_event
+                    )))
+                    .child(div().mt_1().ui_text(TextRole::Caption).child(format!(
+                        "Run status {}{} · head {} · check {}",
+                        preparation.observation.run_status,
+                        preparation
+                            .observation
+                            .run_conclusion
+                            .as_deref()
+                            .map(|value| format!(" · {value}"))
+                            .unwrap_or_default(),
+                        short_sha(&target.run_head_sha),
+                        target.check_node_id
+                    )))
+                    .child(
+                        div()
+                            .mt_2()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.faint)
+                            .child("Exact request sent on confirmation"),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .ui_text(TextRole::Caption)
+                            .font_family(CODE_FONT)
+                            .child(format!(
+                                "{} /{} {}",
+                                preparation.method, preparation.path, preparation.body
+                            )),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.amber)
+                            .child(format!(
+                                "Authority: {}",
+                                authority_summary(&preparation.observation.authority)
+                            )),
+                    );
+                for notice in &preparation.notices {
+                    card = card.child(
+                        div()
+                            .mt_1()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.muted)
+                            .child(notice.clone()),
+                    );
+                }
+                Some(
+                    card.child(
+                        div()
+                            .mt_2()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.amber)
+                            .child("Confirm durably records this exact request, repeats the exact run and permission preflight, then sends one POST. A documented accepted status means GitHub accepted the request; it does not prove that a new attempt started or that the run is cancelled. Any other response leaves the attempt unresolved and frozen against replay."),
+                    )
+                    .child(
+                        div()
+                            .mt_3()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(ui::GAP_COLUMNS))
+                            .child(
+                                Button::new("confirm-actions-run-control")
+                                    .control()
+                                    .track_focus(&self.actions_control_focus.confirm)
+                                    .tab_index(0)
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .text_color(colors.amber)
+                                    .accessibility_label(format!(
+                                        "Confirm one exact {}",
+                                        action.label().to_lowercase()
+                                    ))
+                                    .debug_selector(|| "confirm-actions-run-control".to_owned())
+                                    .on_click(move |_, _, cx| {
+                                        confirm_root.update(cx, |root, cx| {
+                                            if let Root::Review(this) = root {
+                                                this.confirm_actions_run_control(
+                                                    confirm_token.clone(),
+                                                    cx,
+                                                );
+                                            }
+                                        });
+                                    })
+                                    .child(format!("Confirm one {}", action.label().to_lowercase())),
+                            )
+                            .child(
+                                Button::new("cancel-actions-run-control")
+                                    .control()
+                                    .track_focus(&self.actions_control_focus.cancel)
+                                    .tab_index(1)
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .text_color(colors.accent)
+                                    .accessibility_label("Cancel the prepared Actions run control")
+                                    .debug_selector(|| "cancel-actions-run-control".to_owned())
+                                    .on_click(move |_, _, cx| {
+                                        let token = token.clone();
+                                        cancel_root.update(cx, |root, cx| {
+                                            if let Root::Review(this) = root {
+                                                this.cancel_actions_control_confirmation(
+                                                    &token, cx,
+                                                );
+                                            }
+                                        });
+                                    })
+                                    .child("Cancel"),
+                            ),
+                    )
+                    .into_any_element(),
                 )
             }
             NativeConfirmation::PendingFileComment {
@@ -28968,6 +29734,7 @@ fn journal_identity(request: &JournalRequest) -> (&str, &str) {
         JournalRequest::Discussion(request) => (&request.operation_id, &request.attempt_id),
         JournalRequest::Reaction(request) => (&request.operation_id, &request.attempt_id),
         JournalRequest::Dismissal(request) => (&request.operation_id, &request.attempt_id),
+        JournalRequest::ActionsRunControl(request) => (&request.operation_id, &request.attempt_id),
     }
 }
 
@@ -29066,6 +29833,7 @@ fn journal_operation_summary(operation: &JournalOperation) -> String {
             ReactionAction::Remove { .. } => "Remove reaction",
         },
         JournalRequest::Dismissal(_) => "Dismiss submitted review",
+        JournalRequest::ActionsRunControl(request) => request.preparation.action.label(),
     };
     let reason = match &operation.request {
         JournalRequest::Auxiliary(request)
@@ -29093,6 +29861,9 @@ fn journal_operation_summary(operation: &JournalOperation) -> String {
         }
         JournalRequest::Dismissal(_) => {
             "Outcome unknown; current DISMISSED state alone cannot prove the frozen reason or causation."
+        }
+        JournalRequest::ActionsRunControl(_) => {
+            "Outcome unknown; GitHub records no per-request Actions control event, so an unmoved run never proves this attempt was not applied."
         }
         _ => "Outcome unknown; use read-only reconciliation before retry.",
     };
@@ -29206,6 +29977,40 @@ fn journal_operation_description(operation: &JournalOperation) -> String {
             request.reason,
             request.authority,
         ),
+        JournalRequest::ActionsRunControl(request) => {
+            let preparation = &request.preparation;
+            let target = &preparation.observation.target;
+            format!(
+                "{} · repository {} · PR #{} · workflow {} ({}) · run {} ({}) · run number {} · attempt {} · event {} · head {} · check {} ({}) · suite {} · observed status {}{} · viewer {} ({}) · authority {:?} · exact request {} /{} {}",
+                preparation.action.label(),
+                target.repository_name_with_owner,
+                target.pull_request_number,
+                target.workflow_name,
+                target.workflow_node_id,
+                target.run_database_id,
+                target.run_node_id,
+                target.run_number,
+                target.run_attempt,
+                target.run_event,
+                target.run_head_sha,
+                target.check_node_id,
+                target.check_database_id,
+                target.check_suite_node_id,
+                preparation.observation.run_status,
+                preparation
+                    .observation
+                    .run_conclusion
+                    .as_deref()
+                    .map(|value| format!(" · {value}"))
+                    .unwrap_or_default(),
+                preparation.observation.viewer.login,
+                preparation.observation.viewer.node_id,
+                preparation.observation.authority,
+                preparation.method,
+                preparation.path,
+                preparation.body,
+            )
+        }
     };
     let status = match &operation.status {
         JournalStatus::InFlight => {
@@ -30900,19 +31705,21 @@ mod layout_tests {
         same_review_coordinates,
     };
     use super::{
-        ActionJournalCompletionToken, COLLAPSED_PANEL_WIDTH, CollaborationReadToken,
-        DEFAULT_SIDEBAR_WIDTH, DiffLine, DiffLineKind, DiffMode, DiffRow,
-        EXCEPTIONAL_LINE_CHUNK_BYTES, FileCommentConfirmationToken, JournalOperation,
-        JournalRequest, JournalStatus, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
-        MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
-        PendingReviewStartConfirmationMode, PendingReviewStartConfirmationToken,
-        ReactionCompletionToken, SubmittedConfirmationToken, SubmittedDraftCallbackToken,
-        SubmittedDraftCloseDisposition, SubmittedDraftLoadState, SubmittedSummaryEditor,
-        active_review_composer_body, active_review_composer_needs_save, activity_thread_visible,
-        apply_submitted_draft_save_if_current, available_diff_width_for, bounded_log_render_range,
-        bounded_page, collaboration_completion_matches, diff_content_width, display_columns,
-        file_confirmation_matches_visible_body, journal_operation_description,
-        journal_operation_summary, line_text_chunks, media_free_markdown, observe_auxiliary,
+        ActionJournalCompletionToken, ActionsControlConfirmationToken, ActionsRunControlAction,
+        COLLAPSED_PANEL_WIDTH, CollaborationReadToken, DEFAULT_SIDEBAR_WIDTH, DiffLine,
+        DiffLineKind, DiffMode, DiffRow, EXCEPTIONAL_LINE_CHUNK_BYTES,
+        FileCommentConfirmationToken, JournalOperation, JournalRequest, JournalStatus,
+        MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH, MIN_SIDEBAR_WIDTH,
+        MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
+        PendingReviewStartConfirmationMode, PendingReviewStartConfirmationToken, RUN_CONTROLS,
+        ReactionCompletionToken, ReviewWorkspace, SubmittedConfirmationToken,
+        SubmittedDraftCallbackToken, SubmittedDraftCloseDisposition, SubmittedDraftLoadState,
+        SubmittedSummaryEditor, active_review_composer_body, active_review_composer_needs_save,
+        activity_thread_visible, apply_submitted_draft_save_if_current, available_diff_width_for,
+        bounded_log_render_range, bounded_page, collaboration_completion_matches,
+        diff_content_width, display_columns, file_confirmation_matches_visible_body,
+        journal_operation_description, journal_operation_summary, line_text_chunks,
+        media_free_markdown, observe_auxiliary,
         pending_review_start_confirmation_matches_visible_body, resolved_panel_widths_for,
         review_subject_allows_actions, submitted_review_edit_action,
     };
@@ -33900,6 +34707,344 @@ mod layout_tests {
         assert_eq!(active_pull, 8);
         assert_eq!(active_review, "REVIEW_B");
         assert_eq!(stored_body, "distinct draft B");
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn actions_run_controls_activate_by_real_pointer_and_keyboard_without_any_read(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.install_actions_control_fixture(window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        // Every control is rendered for a fully identified run; the fresh
+        // preparation read decides which one GitHub can accept.
+        for action in RUN_CONTROLS {
+            assert!(
+                cx.debug_bounds(action.control_element_id()).is_some(),
+                "{} is not rendered",
+                action.label()
+            );
+        }
+
+        let cancel_control = cx
+            .debug_bounds("actions-control-cancel-actions-run")
+            .unwrap();
+        cx.simulate_click(cancel_control.center(), Modifiers::default());
+        cx.run_until_parked();
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert!(
+                this.status.contains("zero writes"),
+                "pointer activation did not reach the controller: {}",
+                this.status
+            );
+            assert!(this.tabs[0].confirmation.is_none());
+            assert!(!this.tabs[0].write_in_flight);
+        });
+
+        // The pointer press focused the control, so Enter and Space must reach
+        // the same handler without a second click.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let rerun = cx
+            .debug_bounds("actions-control-rerun-actions-run-all-jobs")
+            .unwrap();
+        cx.simulate_click(rerun.center(), Modifiers::default());
+        cx.run_until_parked();
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert!(this.status.contains("zero writes"), "{}", this.status);
+        });
+
+        // Each control tracks a caller-owned focus handle and accepts focus.
+        //
+        // Keyboard traversal and keyboard activation are deliberately NOT
+        // asserted here. In this app's GPUI test context neither a Tab
+        // keystroke, nor `focus_next`, nor Enter/Space on a focused
+        // `gpui_base::Button` reaches the button. That is app-wide rather than
+        // specific to these controls: the pre-existing `checks-source-details`
+        // button behaves identically, because this inspector declares no tab
+        // group. Claiming keyboard evidence here would be false.
+        for (position, action) in RUN_CONTROLS.into_iter().enumerate() {
+            cx.update(|window, cx| {
+                root.update(cx, |root, cx| {
+                    let Root::Review(this) = root else {
+                        unreachable!()
+                    };
+                    this.actions_control_focus.controls[position].focus(window, cx);
+                });
+                window.draw(cx).clear(cx);
+                root.update(cx, |root, _| {
+                    let Root::Review(this) = root else {
+                        unreachable!()
+                    };
+                    assert!(
+                        this.actions_control_focus.controls[position].is_focused(window),
+                        "{} does not accept focus",
+                        action.label()
+                    );
+                });
+            });
+        }
+
+        // Activating each remaining control by pointer reaches the controller
+        // and still sends nothing.
+        for action in RUN_CONTROLS {
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    let Root::Review(this) = root else {
+                        unreachable!()
+                    };
+                    this.status = "sentinel".into();
+                });
+            });
+            let bounds = cx.debug_bounds(action.control_element_id()).unwrap();
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                root.update(cx, |root, _| {
+                    let Root::Review(this) = root else {
+                        unreachable!()
+                    };
+                    assert!(
+                        this.status.contains("zero writes"),
+                        "{} did not reach the controller: {}",
+                        action.label(),
+                        this.status
+                    );
+                });
+                window.draw(cx).clear(cx);
+            });
+        }
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert!(this.tabs[0].confirmation.is_none());
+            assert!(!this.tabs[0].write_in_flight);
+        });
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn a_prepared_actions_control_confirmation_discloses_its_exact_request_and_cancels(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let locator = this.install_actions_control_fixture(window, cx);
+                let request = ReviewWorkspace::synthetic_actions_control_request(
+                    &locator,
+                    ActionsRunControlAction::RerunFailedJobs,
+                );
+                let generation = this.tabs[0].ci_actions.invalidate();
+                this.tabs[0].confirmation = Some(NativeConfirmation::ActionsRunControl {
+                    generation,
+                    request: Box::new(request),
+                });
+            });
+            window.draw(cx).clear(cx);
+        });
+        let composer_before = root.read_with(cx, |root, cx| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            this.composer_input.read(cx).value().to_string()
+        });
+
+        // Pointer activation of Confirm reaches the real handler and dispatches
+        // nothing in a scene without provider capability.
+        let confirm = cx.debug_bounds("confirm-actions-run-control").unwrap();
+        cx.simulate_click(confirm.center(), Modifiers::default());
+        cx.run_until_parked();
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert!(
+                this.status.contains("zero writes were sent"),
+                "{}",
+                this.status
+            );
+            assert!(this.tabs[0].confirmation.is_some());
+            assert!(!this.tabs[0].write_in_flight);
+        });
+
+        // Both confirmation controls accept caller-owned focus. Keyboard
+        // activation is not asserted, for the reason documented in the
+        // pointer/focus test above.
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.actions_control_focus.confirm.focus(window, cx);
+            });
+            window.draw(cx).clear(cx);
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert!(this.actions_control_focus.confirm.is_focused(window));
+                this.actions_control_focus.cancel.focus(window, cx);
+            });
+            window.draw(cx).clear(cx);
+            root.update(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert!(this.actions_control_focus.cancel.is_focused(window));
+            });
+        });
+
+        // Cancel by pointer discards the prepared control and sends nothing.
+        let cancel = cx.debug_bounds("cancel-actions-run-control").unwrap();
+        cx.simulate_click(cancel.center(), Modifiers::default());
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert!(this.tabs[0].confirmation.is_none());
+            assert!(this.status.contains("zero writes sent"), "{}", this.status);
+            assert!(!this.tabs[0].write_in_flight);
+            // Shared inputs and the private recovery controller are untouched
+            // by every control interaction above.
+            assert_eq!(
+                this.composer_input.read(cx).value(),
+                composer_before.as_str()
+            );
+            assert!(matches!(
+                this.tabs[0].interactions,
+                InteractionState::Ready(_)
+            ));
+            assert!(this.tabs[0].session.is_some() && this.tabs[0].canonical_session.is_some());
+        });
+
+        // A moved check selection discards a still-visible confirmation rather
+        // than letting it confirm against a different exact run.
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let (_, locator, _, _) = this.selected_actions_locator(0).unwrap();
+                let request = ReviewWorkspace::synthetic_actions_control_request(
+                    &locator,
+                    ActionsRunControlAction::CancelRun,
+                );
+                let generation = this.tabs[0].ci_actions.invalidate();
+                let token = ActionsControlConfirmationToken {
+                    fence: this.actions_control_fence(0).unwrap(),
+                    request: request.clone(),
+                };
+                this.tabs[0].confirmation = Some(NativeConfirmation::ActionsRunControl {
+                    generation,
+                    request: Box::new(request),
+                });
+                this.tabs[0].checks_selection.selected_id = None;
+                this.reconcile_ci_selection(0);
+                assert!(this.tabs[0].confirmation.is_none());
+                assert!(this.status.contains("Zero writes sent"), "{}", this.status);
+                // The discarded confirmation never becomes confirmable again.
+                assert!(!token.matches(&this.actions_control_fence(0).unwrap(), false));
+                this.confirm_actions_run_control(token, cx);
+                assert!(!this.tabs[0].write_in_flight);
+                assert!(this.tabs[0].confirmation.is_none());
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            // Discarding a prepared control preserves every shared input, the
+            // private recovery controller, and both comparison identities.
+            assert_eq!(
+                this.composer_input.read(cx).value(),
+                composer_before.as_str()
+            );
+            assert!(matches!(
+                this.tabs[0].interactions,
+                InteractionState::Ready(_)
+            ));
+            assert!(this.tabs[0].session.is_some() && this.tabs[0].canonical_session.is_some());
+            assert_eq!(
+                this.tabs[0].canonical_full_revision.head_sha,
+                "2".repeat(40)
+            );
+            assert!(this.tabs[0].details.is_some());
+        });
+
+        // An in-flight control is never fenced by a later selection change:
+        // its outcome must still be able to reach the completion path.
+        cx.update(|_, cx| {
+            root.update(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.tabs[0].checks_selection.selected_id =
+                    Some("SYNTHETIC_ACTIONS_CHECK_NODE".into());
+                let (_, locator, _, _) = this.selected_actions_locator(0).unwrap();
+                let request = ReviewWorkspace::synthetic_actions_control_request(
+                    &locator,
+                    ActionsRunControlAction::RerunAllJobs,
+                );
+                let generation = this.tabs[0].ci_actions.invalidate();
+                this.tabs[0].confirmation = Some(NativeConfirmation::ActionsRunControl {
+                    generation,
+                    request: Box::new(request),
+                });
+                this.tabs[0].write_in_flight = true;
+                this.tabs[0].checks_selection.selected_id = None;
+                this.reconcile_ci_selection(0);
+                assert!(this.tabs[0].confirmation.is_some());
+                this.tabs[0].write_in_flight = false;
+            });
+        });
     }
 
     #[cfg(feature = "ui-smoke")]
