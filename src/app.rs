@@ -637,6 +637,12 @@ enum OpenPrIntent {
     ExplicitStartup,
 }
 
+struct InstallTabOptions<'a> {
+    activate: bool,
+    window: Option<&'a mut Window>,
+    start_background_work: bool,
+}
+
 type TabIdentity = (String, u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1104,12 +1110,12 @@ impl SubmittedSummaryEditor {
     }
 
     fn store_active_body(&mut self, body: String) -> bool {
-        if let Some(draft) = self.active_draft_mut() {
-            if draft.body != body {
-                draft.body = body;
-                self.edit_generation = self.edit_generation.saturating_add(1);
-                return true;
-            }
+        if let Some(draft) = self.active_draft_mut()
+            && draft.body != body
+        {
+            draft.body = body;
+            self.edit_generation = self.edit_generation.saturating_add(1);
+            return true;
         }
         false
     }
@@ -2123,9 +2129,11 @@ impl ReviewWorkspace {
                 restored.repository,
                 restored.pull_request,
                 Some(Ok(restored.context)),
-                false,
-                None,
-                true,
+                InstallTabOptions {
+                    activate: false,
+                    window: None,
+                    start_background_work: true,
+                },
                 cx,
             );
         }
@@ -8303,7 +8311,17 @@ impl ReviewWorkspace {
             .store
             .as_ref()
             .map(|store| store.load_review_context(&repository, pull_request.number));
-        self.install_tab_with_restore(repository, pull_request, restored, true, None, true, cx);
+        self.install_tab_with_restore(
+            repository,
+            pull_request,
+            restored,
+            InstallTabOptions {
+                activate: true,
+                window: None,
+                start_background_work: true,
+            },
+            cx,
+        );
     }
 
     fn install_tab_in_window(
@@ -8321,9 +8339,11 @@ impl ReviewWorkspace {
             repository,
             pull_request,
             restored,
-            true,
-            Some(window),
-            true,
+            InstallTabOptions {
+                activate: true,
+                window: Some(window),
+                start_background_work: true,
+            },
             cx,
         );
     }
@@ -8333,11 +8353,14 @@ impl ReviewWorkspace {
         repository: Repository,
         pull_request: PullRequest,
         restored: Option<anyhow::Result<PersistedComparisonContext>>,
-        activate: bool,
-        window: Option<&mut Window>,
-        start_background_work: bool,
+        options: InstallTabOptions<'_>,
         cx: &mut Context<Root>,
     ) {
+        let InstallTabOptions {
+            activate,
+            window,
+            start_background_work,
+        } = options;
         let revision = pull_request.revision();
         let (
             session,
@@ -19839,10 +19862,10 @@ mod layout_tests {
     use super::{
         ActionJournalCompletionToken, COLLAPSED_PANEL_WIDTH, CollaborationReadToken,
         DEFAULT_SIDEBAR_WIDTH, DiffLine, DiffLineKind, DiffMode, DiffRow,
-        EXCEPTIONAL_LINE_CHUNK_BYTES, JournalOperation, JournalRequest, JournalStatus, LoadState,
-        MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH, MIN_SIDEBAR_WIDTH,
-        MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout, RepoRuntime, Root,
-        Startup, SubmittedConfirmationToken, SubmittedDraftCallbackToken,
+        EXCEPTIONAL_LINE_CHUNK_BYTES, InstallTabOptions, JournalOperation, JournalRequest,
+        JournalStatus, LoadState, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
+        MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
+        RepoRuntime, Root, Startup, SubmittedConfirmationToken, SubmittedDraftCallbackToken,
         SubmittedDraftCloseDisposition, SubmittedDraftLoadState, SubmittedSummaryEditor,
         apply_submitted_draft_save_if_current, available_diff_width_for, bounded_page,
         collaboration_completion_matches, diff_content_width, display_columns,
@@ -20089,9 +20112,11 @@ mod layout_tests {
                         repository.clone(),
                         pull,
                         None,
-                        false,
-                        None,
-                        false,
+                        InstallTabOptions {
+                            activate: false,
+                            window: None,
+                            start_background_work: false,
+                        },
                         cx,
                     );
                 }

@@ -221,6 +221,12 @@ struct ReadRecord {
     metadata: fs::Metadata,
 }
 
+struct AtomicWriteHooks<AfterCreate, BeforeInstall, AfterErrorSync> {
+    after_create: AfterCreate,
+    before_install: BeforeInstall,
+    after_error_sync: AfterErrorSync,
+}
+
 impl DraftRecord {
     fn validate(&self, expected: &PullRequestIdentity) -> Result<()> {
         if self.schema_version != SCHEMA_VERSION {
@@ -514,9 +520,11 @@ impl SubmittedReviewDraftStore {
             name,
             expected_target,
             bytes,
-            |_, _| Ok(()),
-            || Ok(()),
-            || Ok(()),
+            AtomicWriteHooks {
+                after_create: |_: &File, _: &str| Ok(()),
+                before_install: || Ok(()),
+                after_error_sync: || Ok(()),
+            },
         )
     }
 
@@ -526,10 +534,17 @@ impl SubmittedReviewDraftStore {
         name: &str,
         expected_target: Option<&fs::Metadata>,
         bytes: &[u8],
-        after_create: impl FnOnce(&File, &str) -> Result<()>,
-        before_install: impl FnOnce() -> Result<()>,
-        after_mutated_error_sync: impl FnOnce() -> Result<()>,
+        hooks: AtomicWriteHooks<
+            impl FnOnce(&File, &str) -> Result<()>,
+            impl FnOnce() -> Result<()>,
+            impl FnOnce() -> Result<()>,
+        >,
     ) -> Result<()> {
+        let AtomicWriteHooks {
+            after_create,
+            before_install,
+            after_error_sync,
+        } = hooks;
         if bytes.len() as u64 > MAX_RECORD_BYTES {
             bail!("submitted-review draft atomic write exceeds its record bound");
         }
@@ -625,7 +640,7 @@ impl SubmittedReviewDraftStore {
                 .context("fsync submitted-review draft root after failed atomic install")
             {
                 Ok(()) => {
-                    if let Err(observer_error) = after_mutated_error_sync() {
+                    if let Err(observer_error) = after_error_sync() {
                         recovery_failures.push(format!(
                             "post-recovery durability check failed: {observer_error:#}"
                         ));
@@ -1671,29 +1686,31 @@ mod tests {
                 &identity.filename(),
                 Some(&current.metadata),
                 &candidate,
-                |_, _| Ok(()),
-                || {
-                    fs::rename(&target, &preserved_original)?;
-                    let mut file = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .open(&target)?;
-                    file.write_all(&replacement)?;
-                    file.sync_all()?;
-                    Ok(())
-                },
-                || {
-                    assert_eq!(fs::read(&target)?, replacement);
-                    assert!(fs::read_dir(&store.root)?.all(|entry| {
-                        !entry
-                            .unwrap()
-                            .file_name()
-                            .to_string_lossy()
-                            .starts_with(".tmp-")
-                    }));
-                    recovery_was_durably_observed.set(true);
-                    Ok(())
+                AtomicWriteHooks {
+                    after_create: |_: &File, _: &str| Ok(()),
+                    before_install: || {
+                        fs::rename(&target, &preserved_original)?;
+                        let mut file = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&target)?;
+                        file.write_all(&replacement)?;
+                        file.sync_all()?;
+                        Ok(())
+                    },
+                    after_error_sync: || {
+                        assert_eq!(fs::read(&target)?, replacement);
+                        assert!(fs::read_dir(&store.root)?.all(|entry| {
+                            !entry
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(".tmp-")
+                        }));
+                        recovery_was_durably_observed.set(true);
+                        Ok(())
+                    },
                 },
             )
         });
@@ -1721,21 +1738,23 @@ mod tests {
                 &identity.filename(),
                 None,
                 b"forced candidate",
-                |_, temporary| {
-                    retained_name.replace(Some(temporary.to_owned()));
-                    bail!("forced post-open metadata failure")
-                },
-                || unreachable!("post-open failure stops before install"),
-                || {
-                    let temporary = retained_name
-                        .borrow()
-                        .clone()
-                        .expect("post-create hook captured candidate name");
-                    let metadata = fs::symlink_metadata(store.root.join(temporary))?;
-                    assert!(metadata.is_file());
-                    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-                    recovery_was_durably_observed.set(true);
-                    Ok(())
+                AtomicWriteHooks {
+                    after_create: |_: &File, temporary: &str| {
+                        retained_name.replace(Some(temporary.to_owned()));
+                        bail!("forced post-open metadata failure")
+                    },
+                    before_install: || unreachable!("post-open failure stops before install"),
+                    after_error_sync: || {
+                        let temporary = retained_name
+                            .borrow()
+                            .clone()
+                            .expect("post-create hook captured candidate name");
+                        let metadata = fs::symlink_metadata(store.root.join(temporary))?;
+                        assert!(metadata.is_file());
+                        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+                        recovery_was_durably_observed.set(true);
+                        Ok(())
+                    },
                 },
             )
         });
