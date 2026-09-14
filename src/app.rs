@@ -8715,6 +8715,8 @@ impl ReviewWorkspace {
                 pull_request: tab.pull_request.number,
             };
             self.active_tab_input_restore = Some(token.clone());
+            self.composer_input
+                .update(cx, |input, cx| input.set_disabled(true, cx));
             self.submitted_summary_input
                 .update(cx, |input, cx| input.set_disabled(true, cx));
             self.defer_active_tab_input_restore(token, 0, cx);
@@ -8845,7 +8847,8 @@ impl ReviewWorkspace {
             .active_draft()
             .map(|draft| draft.body.clone())
             .unwrap_or_default();
-        let mutation_disabled = tab.write_in_flight;
+        let mutation_disabled =
+            tab.write_in_flight || tab.submitted_summary_editor.close_after_save;
         let submitted_disabled = mutation_disabled
             || tab.submitted_summary_editor.clear_in_flight
             || tab.submitted_summary_editor.pending_clear.is_some()
@@ -9208,12 +9211,34 @@ impl ReviewWorkspace {
         .detach();
     }
 
+    fn shared_composer_admitted(&self, index: usize) -> bool {
+        self.active_tab == Some(index)
+            && self.active_tab_input_restore.is_none()
+            && self.tabs.get(index).is_some_and(|tab| {
+                !tab.write_in_flight && !tab.submitted_summary_editor.close_after_save
+            })
+    }
+
+    fn update_shared_composer_disabled(&self, cx: &mut Context<Root>) {
+        let disabled = self
+            .active_tab
+            .is_none_or(|index| !self.shared_composer_admitted(index));
+        self.composer_input
+            .update(cx, |input, cx| input.set_disabled(disabled, cx));
+    }
+
     fn persist_active_composer_before_transition(
         &mut self,
         index: usize,
         message: &str,
         cx: &mut Context<Root>,
     ) -> bool {
+        if !self.shared_composer_admitted(index) {
+            self.status =
+                "Wait for the active editor restoration or local close operation to finish.".into();
+            cx.notify();
+            return true;
+        }
         let visible = self.composer_input.read(cx).value().to_string();
         let needs_save = matches!(
             &self.tabs[index].interactions,
@@ -9238,6 +9263,11 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) {
         let Some(index) = self.active_tab else { return };
+        if !self.restore_pending_active_tab_input_in_window(window, cx)
+            || !self.shared_composer_admitted(index)
+        {
+            return;
+        }
         if self.tabs[index].write_in_flight {
             self.status =
                 "This review state is frozen until the started write is reconciled.".into();
@@ -9339,6 +9369,11 @@ impl ReviewWorkspace {
 
     fn open_file_composer(&mut self, window: &mut Window, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if !self.restore_pending_active_tab_input_in_window(window, cx)
+            || !self.shared_composer_admitted(index)
+        {
+            return;
+        }
         if self.tabs[index].write_in_flight {
             self.status =
                 "This review state is frozen until the started write is reconciled.".into();
@@ -9394,6 +9429,11 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) {
         let Some(index) = self.active_tab else { return };
+        if !self.restore_pending_active_tab_input_in_window(window, cx)
+            || !self.shared_composer_admitted(index)
+        {
+            return;
+        }
         if self.tabs[index].write_in_flight {
             self.status = "Wait for the started review action before editing this comment.".into();
             return;
@@ -9452,6 +9492,11 @@ impl ReviewWorkspace {
 
     fn reopen_file_draft(&mut self, draft_id: &str, window: &mut Window, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if !self.restore_pending_active_tab_input_in_window(window, cx)
+            || !self.shared_composer_admitted(index)
+        {
+            return;
+        }
         if self.tabs[index].write_in_flight {
             self.status =
                 "Wait for the started review action before editing this file draft.".into();
@@ -9505,6 +9550,9 @@ impl ReviewWorkspace {
 
     fn persist_composer(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if !self.shared_composer_admitted(index) {
+            return;
+        }
         if self.tabs[index].write_in_flight {
             self.status = "Wait for the started review operation to settle.".into();
             return;
@@ -9603,6 +9651,9 @@ impl ReviewWorkspace {
 
     fn close_inline_composer(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if !self.shared_composer_admitted(index) {
+            return;
+        }
         if self.tabs[index].write_in_flight {
             self.status = "Wait for the started review action before closing this composer.".into();
             return;
@@ -9625,6 +9676,9 @@ impl ReviewWorkspace {
 
     fn start_comment_write(&mut self, immediate: bool, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if !self.shared_composer_admitted(index) {
+            return;
+        }
         if self.tabs[index].write_in_flight {
             self.status = "A review write is already in progress.".into();
             return;
@@ -10452,6 +10506,7 @@ impl ReviewWorkspace {
         } else if saved {
             self.start_next_submitted_draft_save(index, cx);
         }
+        self.update_shared_composer_disabled(cx);
         cx.notify();
         true
     }
@@ -10590,6 +10645,7 @@ impl ReviewWorkspace {
                 }
             }
         }
+        self.update_shared_composer_disabled(cx);
         cx.notify();
         true
     }
@@ -10837,6 +10893,9 @@ impl ReviewWorkspace {
 
     fn prepare_file_comment_confirmation(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if !self.shared_composer_admitted(index) {
+            return;
+        }
         if self.tabs[index].write_in_flight {
             self.status =
                 "Wait for the active review write before confirming this file comment.".into();
@@ -10962,7 +11021,7 @@ impl ReviewWorkspace {
             cx.notify();
             return;
         };
-        if self.active_tab != Some(index) || self.tabs[index].write_in_flight {
+        if !self.shared_composer_admitted(index) {
             self.status =
                 "The workspace or active action changed; zero file-comment writes sent.".into();
             cx.notify();
@@ -11027,6 +11086,9 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) {
         let Some(index) = self.active_tab else { return };
+        if !self.shared_composer_admitted(index) {
+            return;
+        }
         let (repository, number, mut composition, store, authority, expected, operation_id) = {
             let tab = &mut self.tabs[index];
             let InteractionState::Ready(controller) = &mut tab.interactions else {
@@ -11176,6 +11238,9 @@ impl ReviewWorkspace {
 
     fn dispatch_auxiliary_action(&mut self, action: ReviewAuxiliaryAction, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].submitted_summary_editor.close_after_save {
+            return;
+        }
         if self.tabs[index].write_in_flight {
             self.status = "Another mutation is still in progress.".into();
             return;
@@ -11454,6 +11519,9 @@ impl ReviewWorkspace {
 
     fn reconcile_review_operations(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].submitted_summary_editor.close_after_save {
+            return;
+        }
         if self.tabs[index].write_in_flight {
             self.status =
                 "Wait for the active operation before reconciling review outcomes.".into();
@@ -12955,6 +13023,8 @@ impl ReviewWorkspace {
             match editor.close_disposition() {
                 SubmittedDraftCloseDisposition::WaitForOperation => {
                     editor.close_after_save = true;
+                    self.composer_input
+                        .update(cx, |input, cx| input.set_disabled(true, cx));
                     self.submitted_summary_input
                         .update(cx, |input, cx| input.set_disabled(true, cx));
                     self.status = "Waiting for the exact local submitted-review draft operation before close…".into();
@@ -12968,6 +13038,8 @@ impl ReviewWorkspace {
                 }
                 SubmittedDraftCloseDisposition::Save => {
                     editor.close_after_save = true;
+                    self.composer_input
+                        .update(cx, |input, cx| input.set_disabled(true, cx));
                     editor.persistence_error = None;
                     editor.queue_current();
                     self.submitted_summary_input
@@ -21531,6 +21603,12 @@ mod layout_tests {
     fn existing_pr_and_post_close_transition_restore_target_submitted_input(
         cx: &mut gpui::TestAppContext,
     ) {
+        use super::review_interactions::{ControllerLoad, ReviewInteractionController};
+        use cibergit::{
+            domain::{ChangedFile, Comparison, Revision},
+            participation::{DiffSide, LineSelection},
+            review::ReviewSession,
+        };
         cx.update(gpui_base::init);
         let data = tempdir().unwrap();
         let data_root = data.path().to_owned();
@@ -21594,7 +21672,109 @@ mod layout_tests {
                     editor.durable = editor.current_snapshot();
                 }
 
+                let session = ReviewSession::new(Comparison {
+                    revision: Revision {
+                        base_sha: "1".repeat(40),
+                        head_sha: "2".repeat(40),
+                    },
+                    files: vec![ChangedFile {
+                        path: "src/lib.rs".into(),
+                        previous_path: None,
+                        raw_path: None,
+                        raw_previous_path: None,
+                        status: "modified".into(),
+                        additions: 1,
+                        deletions: 1,
+                        patch: Some("@@ -1 +1 @@\n-old\n+new".into()),
+                        patch_complete: true,
+                    }],
+                    complete: true,
+                    notice: None,
+                });
+                for (index, body) in ["file A", "line B", "file C"].into_iter().enumerate() {
+                    let mut controller = match ReviewInteractionController::load(
+                        data.path(),
+                        &repository,
+                        7 + index as u64,
+                        &session,
+                    )
+                    .unwrap()
+                    {
+                        ControllerLoad::Ready(controller) => controller,
+                        ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+                    };
+                    if index == 1 {
+                        controller
+                            .select_line(&session, LineSelection::single(DiffSide::New, 1))
+                            .unwrap();
+                    } else {
+                        controller
+                            .select_file_with_canonical(&session, &session)
+                            .unwrap();
+                    }
+                    let snapshot = controller.stage_composer_text(body.into()).unwrap();
+                    controller.store.save(&snapshot).unwrap();
+                    let id = controller
+                        .composer
+                        .as_ref()
+                        .and_then(|c| c.draft_id.clone())
+                        .or_else(|| {
+                            controller
+                                .file_composer
+                                .as_ref()
+                                .and_then(|c| c.draft_id.clone())
+                        })
+                        .unwrap();
+                    controller.finish_composer_save(&snapshot, &id, body, Ok(()));
+                    this.tabs[index].interactions = super::InteractionState::Ready(controller);
+                }
                 this.activate_tab_in_window(0, false, window, cx);
+                assert_eq!(this.composer_input.read(cx).value(), "file A");
+
+                // Start a real close handler while an owned submitted save is outstanding.
+                let editor = &mut this.tabs[0].submitted_summary_editor;
+                editor.queue_current();
+                assert!(editor.start_next().is_some());
+                let token = SubmittedDraftCallbackToken {
+                    workspace_instance: this.workspace_instance,
+                    tab_instance: this.tabs[0].instance_generation,
+                    repository_key: repository.cache_key(),
+                    pull_request: 7,
+                    generation: this.tabs[0].submitted_summary_editor.save_generation,
+                };
+                this.close_tab(&crate::CloseTab, window, cx);
+                assert!(this.tabs[0].submitted_summary_editor.close_after_save);
+                assert!(this.composer_input.read(cx).presentation().is_disabled());
+                let before = match &this.tabs[0].interactions {
+                    super::InteractionState::Ready(c) => c.composition.clone(),
+                    _ => unreachable!(),
+                };
+                this.open_inline_composer(DiffSide::New, 1, false, window, cx);
+                this.close_inline_composer(cx);
+                this.prepare_file_comment_confirmation(cx);
+                this.start_comment_write(false, cx);
+                // Even a queued Change carrying old widget text cannot cross the close barrier.
+                this.composer_input
+                    .update(cx, |input, cx| input.set_value("late text", window, cx));
+                this.persist_composer(cx);
+                let after = match &this.tabs[0].interactions {
+                    super::InteractionState::Ready(c) => c.composition.clone(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(before, after);
+                assert!(this.tabs[0].confirmation.is_none());
+                assert!(!this.tabs[0].write_in_flight);
+                this.composer_input
+                    .update(cx, |input, cx| input.set_value("file A", window, cx));
+                assert!(this.apply_submitted_draft_save_completion(
+                    &token,
+                    Err("controlled local failure".into()),
+                    cx
+                ));
+                assert!(!this.composer_input.read(cx).presentation().is_disabled());
+                assert_eq!(this.tabs.len(), 3);
+                this.tabs[0].submitted_summary_editor.persistence_error = None;
+
                 assert_eq!(
                     this.submitted_summary_input.read(cx).value(),
                     "exact draft A"
@@ -21603,6 +21783,7 @@ mod layout_tests {
                 // The already-open PR selection is a real synchronous handler path and must use
                 // the supplied Window rather than trying to reacquire it through App::with_window.
                 this.open_pr_in_window(0, 8, window, cx);
+                assert_eq!(this.composer_input.read(cx).value(), "line B");
                 assert_eq!(
                     this.submitted_summary_input.read(cx).value(),
                     "distinct draft B"
@@ -21629,6 +21810,17 @@ mod layout_tests {
                 // Two context-only transitions before deferred effects drain must never stage
                 // the still-visible B text into C or the replacement A tab.
                 this.activate_tab_context(1, false, cx);
+                assert!(this.composer_input.read(cx).presentation().is_disabled());
+                this.persist_composer(cx);
+                this.prepare_file_comment_confirmation(cx);
+                assert!(this.tabs[1].confirmation.is_none());
+                assert_eq!(
+                    match &this.tabs[1].interactions {
+                        super::InteractionState::Ready(c) => active_review_composer_body(c),
+                        _ => None,
+                    },
+                    Some("file C")
+                );
                 this.activate_tab_context(0, false, cx);
                 assert!(
                     this.submitted_summary_input
@@ -21652,6 +21844,7 @@ mod layout_tests {
                     this.submitted_summary_input.read(cx).value(),
                     "third draft C"
                 );
+                assert_eq!(this.composer_input.read(cx).value(), "file C");
                 this.finish_close_tab(1, cx);
             });
         });
@@ -21660,6 +21853,8 @@ mod layout_tests {
             let Root::Review(this) = root.read(cx) else {
                 unreachable!()
             };
+            assert_eq!(this.composer_input.read(cx).value(), "line B");
+            assert!(!this.composer_input.read(cx).presentation().is_disabled());
             let active = this.active_tab.unwrap();
             let editor = &this.tabs[active].submitted_summary_editor;
             (
