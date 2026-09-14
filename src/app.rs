@@ -2086,6 +2086,9 @@ pub struct ReviewWorkspace {
     dismissal_reason_input_owner: Option<DismissalReasonInputOwner>,
     dismissal_reason_subscription: Option<Subscription>,
     setup_open: bool,
+    repository_setup_state: LoadState,
+    repository_setup_generation: u64,
+    repository_picker_open: bool,
     command_palette: bool,
     creation_dialog: Option<Entity<pr_creation::PrCreationDialog>>,
     creation_subscription: Option<Subscription>,
@@ -2872,6 +2875,9 @@ impl ReviewWorkspace {
             dismissal_reason_input_owner: None,
             dismissal_reason_subscription: None,
             setup_open: startup.repository.is_none() && !startup_restore_pending,
+            repository_setup_state: LoadState::Ready,
+            repository_setup_generation: 0,
+            repository_picker_open: false,
             command_palette: false,
             creation_dialog: None,
             creation_subscription: None,
@@ -3101,6 +3107,17 @@ impl ReviewWorkspace {
             },
         );
         this.dismissal_reason_subscription = Some(dismissal_reason_changes);
+        for input in [&this.repository_input, &this.pr_input] {
+            this._subscriptions
+                .push(cx.subscribe(input, |root, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. })
+                        && let Root::Review(this) = root
+                        && this.setup_open
+                    {
+                        this.submit_repository_setup(cx);
+                    }
+                }));
+        }
         this._subscriptions.extend([
             activation,
             appearance,
@@ -11114,27 +11131,131 @@ impl ReviewWorkspace {
             .detach();
     }
 
+    fn open_repository_picker(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        self.setup_open = true;
+        self.command_palette = false;
+        if self.repository_picker_open
+            || matches!(self.repository_setup_state, LoadState::Loading(_))
+        {
+            cx.notify();
+            return;
+        }
+        self.repository_picker_open = true;
+        self.repository_setup_state = LoadState::Ready;
+        self.repository_setup_generation += 1;
+        let generation = self.repository_setup_generation;
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose repository folder".into()),
+        });
+        let root = cx.weak_entity();
+        window.spawn(cx, async move |window| {
+            let result = paths.await;
+            let _ = window.update(|window, cx| {
+                root.update(cx, |root, cx| {
+                    let Root::Review(this) = root else { return };
+                    if this.repository_setup_generation != generation {
+                        return;
+                    }
+                    this.repository_picker_open = false;
+                    match result {
+                        Ok(Ok(Some(paths))) => {
+                            if let Some(path) = paths.first() {
+                                if let Some(path) = path.to_str() {
+                                    this.repository_input.update(cx, |input, cx| {
+                                        input.set_value(path.to_owned(), window, cx);
+                                    });
+                                } else {
+                                    this.repository_setup_state = LoadState::Error(
+                                        "This folder path cannot be represented as text.".into(),
+                                    );
+                                }
+                            }
+                        }
+                        Ok(Ok(None)) => {} // Keep manual URL/path entry available on cancel.
+                        _ => {
+                            this.repository_setup_state = LoadState::Error(
+                                "Cannot open the folder picker. Enter a local path or GitHub URL below.".into(),
+                            );
+                        }
+                    }
+                    cx.notify();
+                })
+            });
+        }).detach();
+        cx.notify();
+    }
+
+    fn cancel_repository_setup(&mut self, cx: &mut Context<Root>) {
+        self.repository_setup_generation += 1;
+        self.repository_picker_open = false;
+        self.repository_setup_state = LoadState::Ready;
+        self.setup_open = false;
+        cx.notify();
+    }
+
+    fn submit_repository_setup(&mut self, cx: &mut Context<Root>) {
+        if self.repository_picker_open
+            || matches!(self.repository_setup_state, LoadState::Loading(_))
+        {
+            return;
+        }
+        let number = self.pr_input.read(cx).value().trim().to_owned();
+        self.startup_pr = if number.is_empty() {
+            None
+        } else if let Ok(number) = number.parse::<u64>()
+            && number > 0
+        {
+            Some(number)
+        } else {
+            self.repository_setup_state =
+                LoadState::Error("Enter a positive pull request number, or leave it empty.".into());
+            cx.notify();
+            return;
+        };
+        self.add_repository(cx);
+    }
+
     fn add_repository(&mut self, cx: &mut Context<Root>) {
+        if matches!(self.repository_setup_state, LoadState::Loading(_)) {
+            return;
+        }
         let input = self.repository_input.read(cx).value().trim().to_owned();
         let Some(account) = self.accounts.get(self.selected_account).cloned() else {
-            self.status = "Choose a discovered GitHub account".into();
+            self.status = if matches!(self.accounts_state, LoadState::Loading(_)) {
+                "Still discovering GitHub accounts. Try again when an account appears."
+            } else {
+                "No GitHub account selected. Run gh auth login in Terminal, then click Refresh accounts."
+            }.into();
+            self.repository_setup_state = LoadState::Error(self.status.clone());
             cx.notify();
             return;
         };
         if input.is_empty() {
             self.status = "Enter owner/name, a GitHub URL, or a local folder".into();
+            self.repository_setup_state = LoadState::Error(self.status.clone());
             cx.notify();
             return;
         }
         self.status = format!("Resolving {input} as {}…", account.login);
+        self.repository_setup_state = LoadState::Loading(self.status.clone());
+        self.repository_setup_generation += 1;
+        let generation = self.repository_setup_generation;
+        cx.notify();
         let task =
             cx.background_spawn(async move { GithubProvider::new(account).repository(&input) });
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
+                if this.repository_setup_generation != generation {
+                    return;
+                }
                 match result {
                     Ok(repository) => {
+                        this.repository_setup_state = LoadState::Ready;
                         let key = repository.cache_key();
                         let existing = this
                             .repositories
@@ -11174,6 +11295,7 @@ impl ReviewWorkspace {
                     }
                     Err(error) => {
                         this.status = format!("Cannot add repository: {error:#}");
+                        this.repository_setup_state = LoadState::Error(this.status.clone());
                     }
                 }
                 cx.notify();
@@ -19494,11 +19616,9 @@ impl ReviewWorkspace {
                     this.cycle_diff(action, window, cx)
                 }
             }))
-            .on_action(cx.listener(|root, _: &OpenRepositorySetup, _, cx| {
+            .on_action(cx.listener(|root, _: &OpenRepositorySetup, window, cx| {
                 if let Root::Review(this) = root {
-                    this.setup_open = true;
-                    this.command_palette = false;
-                    cx.notify();
+                    this.open_repository_picker(window, cx);
                 }
             }))
             .on_action(
@@ -20224,9 +20344,9 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|button| button.bg(colors.selected))
                             .child("＋ Add repository  ⌘O")
-                            .on_click(cx.listener(|root, _, _, cx| {
+                            .on_click(cx.listener(|root, _, window, cx| {
                                 if let Root::Review(this) = root {
-                                    this.setup_open = true;
+                                    this.open_repository_picker(window, cx);
                                     cx.notify();
                                 }
                             })),
@@ -20683,7 +20803,9 @@ impl ReviewWorkspace {
             side_control(&account.login, self.selected_account == index, colors)
                 .id(SharedString::from(format!("account-{index}")))
                 .on_click(cx.listener(move |root, _, _, cx| {
-                    if let Root::Review(this) = root {
+                    if let Root::Review(this) = root
+                        && !matches!(this.repository_setup_state, LoadState::Loading(_))
+                    {
                         this.selected_account = index;
                         cx.notify();
                     }
@@ -20721,6 +20843,26 @@ impl ReviewWorkspace {
                     )
                     .child(field_label("REPOSITORY", colors).mt_5())
                     .child(input_box(&self.repository_input, colors))
+                    .child(
+                        Button::new("browse-repository")
+                            .debug_selector(|| "browse-repository".into())
+                            .mt_2()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(colors.elevated)
+                            .disabled(
+                                self.repository_picker_open
+                                    || matches!(self.repository_setup_state, LoadState::Loading(_)),
+                            )
+                            .accessibility_label("Choose a local repository folder")
+                            .child("Choose folder…")
+                            .on_click(cx.listener(|root, _, window, cx| {
+                                if let Root::Review(this) = root {
+                                    this.open_repository_picker(window, cx);
+                                }
+                            })),
+                    )
                     .child(field_label("GITHUB ACCOUNT", colors).mt_4())
                     .child(div().mt_2().flex().flex_wrap().gap_2().children(accounts))
                     .child(
@@ -20730,8 +20872,47 @@ impl ReviewWorkspace {
                             .text_color(colors.faint)
                             .child(account_status),
                     )
+                    .child(
+                        Button::new("refresh-repository-accounts")
+                            .mt_2()
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(colors.elevated)
+                            .disabled(
+                                matches!(self.accounts_state, LoadState::Loading(_))
+                                    || matches!(self.repository_setup_state, LoadState::Loading(_)),
+                            )
+                            .accessibility_label("Refresh GitHub accounts")
+                            .child("Refresh accounts")
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                if let Root::Review(this) = root {
+                                    this.accounts_state =
+                                        LoadState::Loading("Discovering GitHub accounts…".into());
+                                    this.discover_accounts(None, cx);
+                                    cx.notify();
+                                }
+                            })),
+                    )
                     .child(field_label("OPEN PR NUMBER (OPTIONAL)", colors).mt_4())
                     .child(div().w(px(160.)).child(input_box(&self.pr_input, colors)))
+                    .when_some(self.repository_setup_state.notice(), |card, notice| {
+                        card.child(
+                            div()
+                                .id("repository-setup-notice")
+                                .debug_selector(|| "repository-setup-notice".into())
+                                .mt_3()
+                                .text_sm()
+                                .text_color(
+                                    if matches!(self.repository_setup_state, LoadState::Error(_)) {
+                                        colors.red
+                                    } else {
+                                        colors.muted
+                                    },
+                                )
+                                .child(notice),
+                        )
+                    })
                     .child(
                         div()
                             .mt_5()
@@ -20739,8 +20920,7 @@ impl ReviewWorkspace {
                             .justify_end()
                             .gap_2()
                             .child(
-                                div()
-                                    .id("cancel-setup")
+                                Button::new("cancel-setup")
                                     .px_4()
                                     .py_2()
                                     .rounded_md()
@@ -20748,26 +20928,40 @@ impl ReviewWorkspace {
                                     .child("Cancel")
                                     .on_click(cx.listener(|root, _, _, cx| {
                                         if let Root::Review(this) = root {
-                                            this.setup_open = false;
-                                            cx.notify();
+                                            this.cancel_repository_setup(cx);
                                         }
                                     })),
                             )
                             .child(
-                                div()
-                                    .id("confirm-add-repository")
+                                Button::new("confirm-add-repository")
+                                    .debug_selector(|| "confirm-add-repository".into())
+                                    .disabled(
+                                        self.repository_picker_open
+                                            || matches!(
+                                                self.repository_setup_state,
+                                                LoadState::Loading(_)
+                                            ),
+                                    )
+                                    .accessibility_label("Add selected repository")
                                     .px_4()
                                     .py_2()
                                     .rounded_md()
                                     .bg(colors.text)
                                     .text_color(colors.canvas)
                                     .cursor_pointer()
-                                    .child("Add repository")
+                                    .child(
+                                        if matches!(
+                                            self.repository_setup_state,
+                                            LoadState::Loading(_)
+                                        ) {
+                                            "Adding…"
+                                        } else {
+                                            "Add repository"
+                                        },
+                                    )
                                     .on_click(cx.listener(|root, _, _, cx| {
                                         if let Root::Review(this) = root {
-                                            this.startup_pr =
-                                                this.pr_input.read(cx).value().trim().parse().ok();
-                                            this.add_repository(cx);
+                                            this.submit_repository_setup(cx);
                                         }
                                     })),
                             ),
@@ -20802,9 +20996,9 @@ impl ReviewWorkspace {
                         .bg(colors.elevated)
                         .cursor_pointer()
                         .child("Add repository")
-                        .on_click(cx.listener(|root, _, _, cx| {
+                        .on_click(cx.listener(|root, _, window, cx| {
                             if let Root::Review(this) = root {
-                                this.setup_open = true;
+                                this.open_repository_picker(window, cx);
                                 cx.notify();
                             }
                         })),
@@ -27087,10 +27281,9 @@ impl ReviewWorkspace {
                             .id("command-add")
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
-                            .on_click(cx.listener(|root, _, _, cx| {
+                            .on_click(cx.listener(|root, _, window, cx| {
                                 if let Root::Review(this) = root {
-                                    this.setup_open = true;
-                                    this.command_palette = false;
+                                    this.open_repository_picker(window, cx);
                                     cx.notify();
                                 }
                             })),
@@ -29324,6 +29517,90 @@ mod layout_tests {
     };
     #[cfg(feature = "ui-smoke")]
     use tempfile::tempdir;
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn repository_setup_picker_and_manual_submission_report_errors(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let selected = data.path().join("folder with spaces");
+        fs::create_dir(&selected).unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().join("app-data")),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.dispatch_action(super::OpenRepositorySetup);
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|options| {
+            assert!(options.directories);
+            assert!(!options.files && !options.multiple);
+            Some(vec![selected.clone()])
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert!(this.setup_open);
+                assert!(!this.repository_picker_open);
+                assert_eq!(
+                    this.repository_input.read(cx).value().as_str(),
+                    selected.to_str().unwrap()
+                );
+                // Cancelling a second picker must retain the selected/manual path.
+                this.open_repository_picker(window, cx);
+            });
+        });
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    this.repository_input.read(cx).value().as_str(),
+                    selected.to_str().unwrap()
+                );
+                this.repository_input
+                    .update(cx, |input, cx| input.focus(window, cx));
+            });
+        });
+        // Exercise the input's actual Return event, with no discovered account.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { unreachable!() };
+                assert!(matches!(&this.repository_setup_state, LoadState::Error(message) if message.contains("gh auth login")));
+                assert!(this.setup_open && this.repositories.is_empty());
+                this.accounts.push(Account { host: "github.com".into(), login: "fixture".into() });
+                // The selected directory is not a Git repository: fail locally before credentials/network.
+                this.submit_repository_setup(cx);
+                assert!(matches!(this.repository_setup_state, LoadState::Loading(_)));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            root.update(cx, |root, _| {
+                let Root::Review(this) = root else { unreachable!() };
+                assert!(matches!(&this.repository_setup_state, LoadState::Error(message) if message.contains("Cannot add repository")));
+                assert!(this.setup_open && this.repositories.is_empty());
+            });
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("repository-setup-notice").is_some());
+    }
 
     fn submitted_review_fixture() -> (Repository, PullRequestReview) {
         let repository = Repository {
