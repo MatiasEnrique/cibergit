@@ -40,7 +40,7 @@ Cibergit's sizing and spacing follow this scale. Reuse `cibergit::ui` and the sh
 | Button xs / default / lg | 24 / 28 / 36 high |
 | Standalone pointer target | 40 desktop; 44 touch |
 
-Dense PR and file rows use a contiguous 28px pitch with a full-width hit region and keyboard navigation. Overlapping 40px targets on that pitch would make adjacent rows ambiguous. Standalone sidebar icon buttons reserve a real 40px layout target around a 28px painted control; PR page tabs use 40px targets. Touch sizing is a token for future touch surfaces, not a claim that this macOS app supports touch input. Splitter drag handles retain their dedicated geometry and keyboard alternatives.
+Dense PR and file rows use a contiguous 28px pitch with a full-width hit region and keyboard navigation. Overlapping 40px targets on that pitch would make adjacent rows ambiguous. Standalone sidebar icon buttons reserve a real 40px layout target around a 28px painted control; PR page tabs paint a 24px chip inside a 36px row that is the whole pointer target. Touch sizing is a token for future touch surfaces, not a claim that this macOS app supports touch input. Splitter drag handles retain their dedicated geometry and keyboard alternatives.
 
 Native macOS title-bar height/traffic-light clearance is platform-owned. Source editor text, scrollbars, tree indentation, split-pane widths, and multiline content are not single-line control heights. Expanded check/job cards grow to fit exact metadata instead of clipping to 28 or 44px. No minimum height should truncate a wrapped label or user content.
 

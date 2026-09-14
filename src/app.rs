@@ -184,6 +184,9 @@ const MIN_DETAILS_WIDTH: f32 = 220.;
 const MAX_PANEL_WIDTH: f32 = 460.;
 const COLLAPSED_PANEL_WIDTH: f32 = 34.;
 const SPLITTER_WIDTH: f32 = 8.;
+// The PR page's tab row: a 24px chip painted inside a full-row pointer
+// target, with the row itself kept close to the title above it.
+const PR_TAB_ROW_HEIGHT: f32 = 36.;
 const MIN_SPLIT_DIFF_WIDTH: f32 = 560.;
 const PANEL_KEYBOARD_STEP: f32 = 16.;
 // Menlo at the diff's 12px text size advances about 7.225px per ASCII cell on
@@ -21216,9 +21219,6 @@ impl ReviewWorkspace {
             .flex_none()
             .cursor(gpui::CursorStyle::ResizeLeftRight)
             .bg(colors.canvas)
-            .border_l_1()
-            .border_r_1()
-            .border_color(colors.border)
             .hover(|splitter| splitter.bg(colors.selected))
             .debug_selector(move || format!("splitter-{panel:?}"))
             .on_drag(drag, |drag, _, window, cx| {
@@ -21805,12 +21805,6 @@ impl ReviewWorkspace {
                     .flex()
                     .items_center()
                     .gap(px(ui::GAP_GROUP))
-                    .border_t_1()
-                    .border_color(if colors.dark {
-                        rgba(0xffffff12)
-                    } else {
-                        rgba(0x0000000d)
-                    })
                     .child(
                         div()
                             .size(px(22.))
@@ -22287,26 +22281,44 @@ impl ReviewWorkspace {
 
     fn render_tabs(&self, colors: Palette, cx: &mut Context<Root>) -> impl IntoElement {
         let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
+            let active = self.active_tab == Some(index);
+            let id = SharedString::from(format!("tab-{index}"));
+            // Open PRs read as rounded chips on the canvas. Dividers between
+            // them and a rule under the strip would repeat what the active
+            // chip's own fill already says. The chip is painted at control
+            // height inside a full-strip target, so the pointer area does not
+            // shrink with it.
             div()
-                .id(SharedString::from(format!("tab-{index}")))
-                .h(px(ui::DESKTOP_HIT))
-                .px(px(ui::CONTROL_INSET))
+                .id(id.clone())
+                .group(id.clone())
+                .h_full()
+                .flex_none()
                 .flex()
                 .items_center()
-                .gap(px(ui::GAP_GROUP))
-                .border_r_1()
-                .border_color(colors.border)
                 .cursor_pointer()
-                .when(self.active_tab == Some(index), |tab| tab.bg(colors.surface))
                 .child(
                     div()
-                        .max_w(px(220.))
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .child(format!(
-                            "{}  #{}",
-                            tab.repository.name, tab.pull_request.number
-                        )),
+                        .h(px(ui::CONTROL_HEIGHT))
+                        .px(px(ui::CONTROL_INSET))
+                        .flex()
+                        .items_center()
+                        .gap(px(ui::GAP_GROUP))
+                        .rounded(px(ui::CONTROL_RADIUS))
+                        .text_color(if active { colors.text } else { colors.muted })
+                        .when(active, |tab| tab.bg(colors.surface))
+                        .when(!active, |tab| {
+                            tab.group_hover(id, |tab| tab.bg(colors.selected))
+                        })
+                        .child(
+                            div()
+                                .max_w(px(220.))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(format!(
+                                    "{}  #{}",
+                                    tab.repository.name, tab.pull_request.number
+                                )),
+                        ),
                 )
                 .on_click(cx.listener(move |root, _, window, cx| {
                     if let Root::Review(this) = root {
@@ -22316,10 +22328,10 @@ impl ReviewWorkspace {
         });
         div()
             .h(px(ui::DESKTOP_HIT))
+            .px(px(ui::GAP_FIELD))
             .flex()
             .items_center()
-            .border_b_1()
-            .border_color(colors.border)
+            .gap(px(ui::GAP_ICON))
             .bg(colors.canvas)
             .children(tabs)
     }
@@ -22550,100 +22562,117 @@ impl ReviewWorkspace {
         let choices = [
             (
                 "pr-tab-conversation",
-                "Conversation".to_owned(),
+                "Conversation",
+                None,
                 Some(InspectorSection::Overview),
             ),
             (
                 "pr-tab-commits",
-                if tab.comparison_picker.inventory_ready() {
-                    format!("Commits  {}", tab.comparison_picker.commits().len())
-                } else {
-                    "Commits".into()
-                },
+                "Commits",
+                tab.comparison_picker
+                    .inventory_ready()
+                    .then(|| tab.comparison_picker.commits().len()),
                 Some(InspectorSection::Commits),
             ),
             (
                 "pr-tab-checks",
-                "Checks".to_owned(),
+                "Checks",
+                None,
                 Some(InspectorSection::Checks),
             ),
             (
                 "pr-tab-files",
-                format!(
-                    "Files changed  {}",
+                "Files changed",
+                Some(
                     tab.session
                         .as_ref()
                         .map(|session| session.comparison().files.len())
-                        .unwrap_or(0)
+                        .unwrap_or(0),
                 ),
                 None,
             ),
         ];
         div()
-            .px(px(ui::PANEL_GUTTER))
-            .h(px(48.))
+            // The gutter is spent on the row, the chip inset and the ring
+            // border, so the resting label still starts on the 20px gutter the
+            // title above it uses.
+            .px(px(ui::PANEL_GUTTER - ui::GAP_GROUP - 1.))
+            .h(px(PR_TAB_ROW_HEIGHT))
             .flex_none()
             .flex()
             .items_center()
             .gap(px(ui::GAP_ICON))
-            .border_b_1()
-            .border_color(colors.border)
             .bg(colors.surface)
-            .children(choices.into_iter().map(|(id, label, section)| {
+            .children(choices.into_iter().map(|(id, label, count, section)| {
                 let active = selected == section
                     || (section == Some(InspectorSection::Overview)
                         && selected == Some(InspectorSection::Activity));
-                div()
+                let spoken = match count {
+                    Some(count) => format!("{label}  {count}"),
+                    None => label.to_owned(),
+                };
+                // The chip is painted small; the button still reserves the full
+                // row as its pointer target, the way sidebar icons do.
+                Button::new(id)
+                    .debug_selector(move || id.to_owned())
+                    .group(id)
                     .h_full()
+                    .px_0()
+                    .py_0()
                     .flex()
                     .items_center()
-                    .border_b_2()
-                    .border_color(if active {
-                        colors.accent
-                    } else {
-                        rgba(0x00000000)
-                    })
+                    .rounded(px(ui::BADGE_RADIUS))
+                    .border_1()
+                    .border_color(rgba(0x00000000))
+                    .focus_ring(colors.accent, colors.selected)
+                    .cursor_pointer()
+                    .selected(active)
+                    .accessibility_label(format!(
+                        "{spoken} tab{}",
+                        if active { ", selected" } else { "" }
+                    ))
                     .child(
-                        Button::new(id)
-                            .control()
-                            .child(label.clone())
-                            .selected(active)
-                            .accessibility_label(format!(
-                                "{label} tab{}",
-                                if active { ", selected" } else { "" }
-                            ))
-                            .debug_selector(move || id.to_owned())
-                            .h(px(ui::DESKTOP_HIT))
-                            .px(px(ui::CONTROL_INSET))
-                            .bg(if active {
-                                colors.elevated
-                            } else {
-                                colors.surface
+                        div()
+                            .h(px(ui::BUTTON_XS))
+                            .px(px(ui::GAP_GROUP))
+                            .flex()
+                            .items_center()
+                            .gap(px(ui::GAP_FIELD))
+                            .rounded(px(ui::BADGE_RADIUS))
+                            .ui_text(TextRole::Caption)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if active { colors.text } else { colors.muted })
+                            .when(active, |chip| chip.bg(colors.elevated))
+                            .when(!active, |chip| {
+                                chip.group_hover(id, |chip| chip.bg(colors.selected))
                             })
-                            .text_color(colors.text)
-                            .on_click(cx.listener(move |root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    if let Some(section) = section {
-                                        this.inspector_open = true;
-                                        this.tabs[index].inspector_section = section;
-                                        if section == InspectorSection::Commits {
-                                            this.tabs[index].comparison_picker.expanded = true;
-                                        }
-                                        if section == InspectorSection::Checks {
-                                            this.open_checks(window, cx);
-                                        } else {
-                                            this.focus.focus(window, cx);
-                                        }
-                                    } else {
-                                        this.inspector_open = false;
-                                        this.focus.focus(window, cx);
-                                    }
-                                    this.inspector_scroll.set_offset(point(px(0.), px(0.)));
-                                    this.refresh_auto_layout(window);
-                                    cx.notify();
-                                }
-                            })),
+                            .child(label)
+                            .when_some(count, |chip, count| {
+                                chip.child(div().text_color(colors.faint).child(count.to_string()))
+                            }),
                     )
+                    .on_click(cx.listener(move |root, _, window, cx| {
+                        if let Root::Review(this) = root {
+                            if let Some(section) = section {
+                                this.inspector_open = true;
+                                this.tabs[index].inspector_section = section;
+                                if section == InspectorSection::Commits {
+                                    this.tabs[index].comparison_picker.expanded = true;
+                                }
+                                if section == InspectorSection::Checks {
+                                    this.open_checks(window, cx);
+                                } else {
+                                    this.focus.focus(window, cx);
+                                }
+                            } else {
+                                this.inspector_open = false;
+                                this.focus.focus(window, cx);
+                            }
+                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                            this.refresh_auto_layout(window);
+                            cx.notify();
+                        }
+                    }))
             }))
     }
 
@@ -22716,8 +22745,6 @@ impl ReviewWorkspace {
                 div()
                     .px(px(ui::PANEL_GUTTER))
                     .py_3()
-                    .border_b_1()
-                    .border_color(colors.border)
                     .child(
                         div()
                             .flex()
@@ -29053,8 +29080,6 @@ impl ReviewWorkspace {
             .flex()
             .items_center()
             .gap(px(ui::GAP_COLUMNS))
-            .border_t_1()
-            .border_color(colors.border)
             .bg(colors.canvas)
             .ui_text(TextRole::Caption)
             .text_color(colors.muted)
