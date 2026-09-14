@@ -1007,6 +1007,36 @@ enum InteractionState {
     RecoveryRequired(String),
 }
 
+fn active_review_composer_body(controller: &ReviewInteractionController) -> Option<&str> {
+    controller
+        .composer
+        .as_ref()
+        .map(|composer| composer.body.as_str())
+        .or_else(|| {
+            controller
+                .file_composer
+                .as_ref()
+                .map(|composer| composer.body.as_str())
+        })
+}
+
+fn active_review_composer_needs_save(
+    controller: &ReviewInteractionController,
+    visible_body: &str,
+) -> bool {
+    if let Some(composer) = controller.composer.as_ref() {
+        return composer.body != visible_body
+            || composer.draft_id.is_some() && !composer.durable
+            || composer.draft_id.is_none() && !visible_body.is_empty();
+    }
+    if let Some(composer) = controller.file_composer.as_ref() {
+        return composer.body != visible_body
+            || composer.draft_id.is_some() && !composer.durable
+            || composer.draft_id.is_none() && !visible_body.is_empty();
+    }
+    false
+}
+
 #[derive(Clone)]
 enum NativeConfirmation {
     Submit {
@@ -1439,6 +1469,20 @@ impl FileCommentConfirmationToken {
                     && source == &self.pending_source
             )
     }
+}
+
+fn file_confirmation_matches_visible_body(
+    token: &FileCommentConfirmationToken,
+    visible_body: &str,
+) -> bool {
+    token.body == visible_body
+}
+
+fn review_subject_allows_actions(subject: cibergit::domain::ReviewSubject) -> bool {
+    matches!(
+        subject,
+        cibergit::domain::ReviewSubject::Line | cibergit::domain::ReviewSubject::File
+    )
 }
 
 impl SubmittedConfirmationToken {
@@ -1934,9 +1978,7 @@ impl ReviewWorkspace {
                         let changed = matches!(
                             &this.tabs[index].interactions,
                             InteractionState::Ready(controller)
-                                if controller.composer.as_ref().is_some_and(|composer| {
-                                    composer.body != body || !composer.durable
-                                })
+                                if active_review_composer_needs_save(controller, &body)
                         );
                         if changed && !this.tabs[index].write_in_flight {
                             this.persist_composer(cx);
@@ -3808,8 +3850,9 @@ impl ReviewWorkspace {
                         })
                         .unwrap_or(false);
 
-                let exercised = match prepared {
-                    Ok((first_token, draft_id, original_target, readonly_target)) => window
+                let changed_body = "Visible edit made after the frozen confirmation opened; this text must survive a zero-write rejection.";
+                let mismatch_rejected = match prepared.as_ref() {
+                    Ok((token, draft_id, target, _)) => window
                         .update(|window, cx| {
                             weak.update(cx, |root, cx| {
                                 let Root::Review(this) = root else {
@@ -3818,7 +3861,138 @@ impl ReviewWorkspace {
                                 let index = this
                                     .active_tab
                                     .ok_or_else(|| "pending-file smoke has no tab".to_owned())?;
-                                this.cancel_file_comment_confirmation(&first_token, cx);
+                                this.composer_input.update(cx, |input, cx| {
+                                    input.set_value(changed_body, window, cx);
+                                });
+                                this.confirm_file_comment(token.clone(), cx);
+                                Ok(this.tabs[index].confirmation.is_none()
+                                    && this.status.contains("Zero writes were sent")
+                                    && this.composer_input.read(cx).value() == changed_body
+                                    && matches!(
+                                        &this.tabs[index].interactions,
+                                        InteractionState::Ready(controller)
+                                            if controller.file_composer.as_ref().is_some_and(|composer| {
+                                                composer.draft_id.as_deref() == Some(draft_id.as_str())
+                                                    && composer.body == changed_body
+                                                    && composer.target == *target
+                                            })
+                                                && controller.composition.operations.is_empty()
+                                    ))
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|error| {
+                            Err(format!("smoke window unavailable: {error:#}"))
+                        }),
+                    Err(error) => Err(error.clone()),
+                };
+
+                let changed_save_started = std::time::Instant::now();
+                let changed_durable = loop {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                    let durable = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                let Root::Review(this) = root else { return false };
+                                let Some(index) = this.active_tab else { return false };
+                                matches!(
+                                    this.tabs[index].interactions,
+                                    InteractionState::Ready(ref controller)
+                                        if controller.file_composer.as_ref().is_some_and(|composer| {
+                                            composer.durable && composer.body == changed_body
+                                        })
+                                )
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if durable || changed_save_started.elapsed() > Duration::from_secs(15) {
+                        break durable;
+                    }
+                };
+                let restore_started = mismatch_rejected.as_ref().is_ok_and(|passed| *passed)
+                    && changed_durable
+                    && window
+                        .update(|window, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else { return false };
+                                this.composer_input.update(cx, |input, cx| {
+                                    input.set_value(body, window, cx);
+                                });
+                                this.persist_composer(cx);
+                                true
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                let original_restored = if restore_started {
+                    let restore_wait_started = std::time::Instant::now();
+                    loop {
+                        window
+                            .background_executor()
+                            .timer(Duration::from_millis(100))
+                            .await;
+                        let restored = window
+                            .update(|_, cx| {
+                                weak.read_with(cx, |root, _| {
+                                    let Root::Review(this) = root else { return false };
+                                    let Some(index) = this.active_tab else { return false };
+                                    matches!(
+                                        this.tabs[index].interactions,
+                                        InteractionState::Ready(ref controller)
+                                            if controller.file_composer.as_ref().is_some_and(|composer| {
+                                                composer.durable && composer.body == body
+                                            })
+                                    )
+                                })
+                                .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if restored || restore_wait_started.elapsed() > Duration::from_secs(15) {
+                            break restored;
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                let exercised = match prepared {
+                    Ok((_first_token, draft_id, original_target, readonly_target)) => window
+                        .update(|window, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("pending-file smoke left the review workspace".to_owned());
+                                };
+                                let index = this
+                                    .active_tab
+                                    .ok_or_else(|| "pending-file smoke has no tab".to_owned())?;
+                                this.prepare_file_comment_confirmation(cx);
+                                let first_cancel_token = match &this.tabs[index].confirmation {
+                                    Some(NativeConfirmation::PendingFileComment {
+                                        generation,
+                                        draft_id,
+                                        body,
+                                        target,
+                                        source,
+                                    }) => FileCommentConfirmationToken {
+                                        workspace_instance: this.workspace_instance,
+                                        tab_instance: this.tabs[index].instance_generation,
+                                        repository_key: this.tabs[index].repository.cache_key(),
+                                        pull_request: this.tabs[index].pull_request.number,
+                                        generation: *generation,
+                                        draft_id: draft_id.clone(),
+                                        body: body.clone(),
+                                        target: target.clone(),
+                                        pending_source: source.clone(),
+                                    },
+                                    _ => return Err(this.status.clone()),
+                                };
+                                this.cancel_file_comment_confirmation(&first_cancel_token, cx);
                                 let retained_after_cancel = matches!(
                                     &this.tabs[index].interactions,
                                     InteractionState::Ready(controller)
@@ -3848,7 +4022,7 @@ impl ReviewWorkspace {
                                     },
                                     _ => return Err(this.status.clone()),
                                 };
-                                this.cancel_file_comment_confirmation(&first_token, cx);
+                                this.cancel_file_comment_confirmation(&first_cancel_token, cx);
                                 let stale_cancel_rejected = this.tabs[index]
                                     .confirmation
                                     .as_ref()
@@ -3916,9 +4090,13 @@ impl ReviewWorkspace {
 
                 let appearance = std::env::var("CIBERGIT_SMOKE_APPEARANCE")
                     .unwrap_or_else(|_| "system".into());
+                let mismatch_preserved = matches!(mismatch_rejected, Ok(true))
+                    && changed_durable
+                    && original_restored;
                 let (passed, report) = match exercised {
                     Ok((target, retained, stale, cancelled, switched, reopened)) => {
                         let passed = confirmation_captured
+                            && mismatch_preserved
                             && retained
                             && stale
                             && cancelled
@@ -3927,7 +4105,7 @@ impl ReviewWorkspace {
                         (
                             passed,
                             format!(
-                                "Native pending file-comment smoke ({appearance})\nReal public read-only preparation: {target}\nSynthetic authority: exact selected-account PENDING witness, clearly labelled and never sent\nActual open/save/confirm-view/cancel/reopen handlers: used\nComplete confirmation capture: {confirmation_captured}\nCancel retained exact draft: {retained}\nCancelled/reprepared identical confirmation rejected stale callback: {stale}\nCurrent cancellation retained zero writes: {cancelled}\nExact target switch and original-target restart recovery: {}\nRemote mutation transport: ZERO (confirm handler deliberately not invoked)\nPhysical input / AX / focus: not established; background native scene only\n",
+                                "Native pending file-comment smoke ({appearance})\nReal public read-only preparation: {target}\nSynthetic authority: exact selected-account PENDING witness, clearly labelled and never sent\nActual open/save/prepare/type/confirm/cancel/reopen handlers: used\nComplete confirmation capture: {confirmation_captured}\nChanged visible text rejected before dispatch and retained durably: {mismatch_preserved}\nCancel retained exact draft: {retained}\nCancelled/reprepared identical confirmation rejected stale callback: {stale}\nCurrent cancellation retained zero writes: {cancelled}\nExact target switch and original-target restart recovery: {}\nRemote mutation transport: ZERO (confirm handler reached only its pre-dispatch mismatch rejection)\nPhysical input / AX / focus: not established; background native scene only\n",
                                 switched && reopened
                             ),
                         )
@@ -7817,6 +7995,15 @@ impl ReviewWorkspace {
     }
 
     fn restore_full_comparison(&mut self, index: usize, cx: &mut Context<Root>) {
+        if self.active_tab == Some(index)
+            && self.persist_active_composer_before_transition(
+                index,
+                "Saving the exact active comment before changing comparisons; choose Full PR again after it is durable.",
+                cx,
+            )
+        {
+            return;
+        }
         self.capture_scroll(index);
         self.save_current_request_progress(index);
         let generation = self.issue_request_generation();
@@ -7870,6 +8057,15 @@ impl ReviewWorkspace {
         request: ComparisonRequest,
         cx: &mut Context<Root>,
     ) {
+        if self.active_tab == Some(index)
+            && self.persist_active_composer_before_transition(
+                index,
+                "Saving the exact active comment before changing comparisons; choose the comparison again after it is durable.",
+                cx,
+            )
+        {
+            return;
+        }
         if matches!(request, ComparisonRequest::FullPullRequest) {
             self.restore_full_comparison(index, cx);
             return;
@@ -8558,10 +8754,9 @@ impl ReviewWorkspace {
                     self.capture_scroll(previous);
                     let current = self.composer_input.read(cx).value().to_string();
                     let unsaved = match &self.tabs[previous].interactions {
-                        InteractionState::Ready(controller) => controller
-                            .composer
-                            .as_ref()
-                            .is_some_and(|composer| composer.body != current),
+                        InteractionState::Ready(controller) => {
+                            active_review_composer_needs_save(controller, &current)
+                        }
                         _ => false,
                     };
                     if unsaved {
@@ -8640,11 +8835,9 @@ impl ReviewWorkspace {
             return;
         };
         let composer_body = match &tab.interactions {
-            InteractionState::Ready(controller) => controller
-                .composer
-                .as_ref()
-                .map(|composer| composer.body.clone())
-                .unwrap_or_default(),
+            InteractionState::Ready(controller) => active_review_composer_body(controller)
+                .unwrap_or_default()
+                .to_owned(),
             _ => String::new(),
         };
         let submitted_body = tab
@@ -9015,6 +9208,27 @@ impl ReviewWorkspace {
         .detach();
     }
 
+    fn persist_active_composer_before_transition(
+        &mut self,
+        index: usize,
+        message: &str,
+        cx: &mut Context<Root>,
+    ) -> bool {
+        let visible = self.composer_input.read(cx).value().to_string();
+        let needs_save = matches!(
+            &self.tabs[index].interactions,
+            InteractionState::Ready(controller)
+                if active_review_composer_needs_save(controller, &visible)
+        );
+        if !needs_save {
+            return false;
+        }
+        self.persist_composer(cx);
+        self.status = message.into();
+        cx.notify();
+        true
+    }
+
     fn open_inline_composer(
         &mut self,
         side: DiffSide,
@@ -9027,6 +9241,13 @@ impl ReviewWorkspace {
         if self.tabs[index].write_in_flight {
             self.status =
                 "This review state is frozen until the started write is reconciled.".into();
+            return;
+        }
+        if self.persist_active_composer_before_transition(
+            index,
+            "Saving the current exact comment target; choose the line again after it is durable.",
+            cx,
+        ) {
             return;
         }
         let Some(session) = self.tabs[index].session.clone() else {
@@ -9123,31 +9344,11 @@ impl ReviewWorkspace {
                 "This review state is frozen until the started write is reconciled.".into();
             return;
         }
-        let current_body = self.composer_input.read(cx).value().to_string();
-        let transition_needs_save = match &self.tabs[index].interactions {
-            InteractionState::Ready(controller) => controller
-                .composer
-                .as_ref()
-                .map(|composer| {
-                    composer.body != current_body
-                        || composer.draft_id.is_some() && !composer.durable
-                        || composer.draft_id.is_none() && !current_body.is_empty()
-                })
-                .or_else(|| {
-                    controller.file_composer.as_ref().map(|composer| {
-                        composer.body != current_body
-                            || composer.draft_id.is_some() && !composer.durable
-                            || composer.draft_id.is_none() && !current_body.is_empty()
-                    })
-                })
-                .unwrap_or(false),
-            _ => false,
-        };
-        if transition_needs_save {
-            self.persist_composer(cx);
-            self.status =
-                "Saving the current exact comment target; choose Comment on file again after it is durable."
-                    .into();
+        if self.persist_active_composer_before_transition(
+            index,
+            "Saving the current exact comment target; choose Comment on file again after it is durable.",
+            cx,
+        ) {
             return;
         }
         let (Some(displayed), Some(canonical)) = (
@@ -9195,6 +9396,13 @@ impl ReviewWorkspace {
         let Some(index) = self.active_tab else { return };
         if self.tabs[index].write_in_flight {
             self.status = "Wait for the started review action before editing this comment.".into();
+            return;
+        }
+        if self.persist_active_composer_before_transition(
+            index,
+            "Saving the active comment before opening another draft; open the linked draft again after it is durable.",
+            cx,
+        ) {
             return;
         }
         let routed_to_full = !matches!(
@@ -9249,20 +9457,11 @@ impl ReviewWorkspace {
                 "Wait for the started review action before editing this file draft.".into();
             return;
         }
-        let current_body = self.composer_input.read(cx).value().to_string();
-        let needs_save = matches!(
-            &self.tabs[index].interactions,
-            InteractionState::Ready(controller)
-                if controller.file_composer.as_ref().is_some_and(|composer| {
-                    composer.body != current_body
-                        || composer.draft_id.is_some() && !composer.durable
-                        || composer.draft_id.is_none() && !current_body.is_empty()
-                })
-        );
-        if needs_save {
-            self.persist_composer(cx);
-            self.status = "Saving the active file draft before changing targets; open the saved draft again afterward."
-                .into();
+        if self.persist_active_composer_before_transition(
+            index,
+            "Saving the active comment before changing targets; open the saved file draft again afterward.",
+            cx,
+        ) {
             return;
         }
         if !matches!(
@@ -9408,25 +9607,11 @@ impl ReviewWorkspace {
             self.status = "Wait for the started review action before closing this composer.".into();
             return;
         }
-        let body = self.composer_input.read(cx).value().to_string();
-        let needs_save = match &self.tabs[index].interactions {
-            InteractionState::Ready(controller) => controller
-                .composer
-                .as_ref()
-                .map(|composer| !composer.durable || composer.body != body)
-                .or_else(|| {
-                    controller
-                        .file_composer
-                        .as_ref()
-                        .map(|composer| !composer.durable || composer.body != body)
-                })
-                .unwrap_or(false),
-            InteractionState::Loading | InteractionState::RecoveryRequired(_) => false,
-        };
-        if needs_save {
-            self.persist_composer(cx);
-            self.status =
-                "Saving local recovery before close; close again after it is durable.".into();
+        if self.persist_active_composer_before_transition(
+            index,
+            "Saving local recovery before close; close again after it is durable.",
+            cx,
+        ) {
             return;
         }
         if let InteractionState::Ready(controller) = &mut self.tabs[index].interactions {
@@ -10780,6 +10965,28 @@ impl ReviewWorkspace {
         if self.active_tab != Some(index) || self.tabs[index].write_in_flight {
             self.status =
                 "The workspace or active action changed; zero file-comment writes sent.".into();
+            cx.notify();
+            return;
+        }
+        let visible_body = self.composer_input.read(cx).value().to_string();
+        if !file_confirmation_matches_visible_body(&token, &visible_body) {
+            self.tabs[index].confirmation = None;
+            self.persist_composer(cx);
+            let staged = matches!(
+                &self.tabs[index].interactions,
+                InteractionState::Ready(controller)
+                    if controller.file_composer.as_ref().is_some_and(|composer|
+                        composer.draft_id.as_deref() == Some(token.draft_id.as_str())
+                            && composer.target == token.target
+                            && composer.body == visible_body)
+            );
+            self.status = if staged {
+                "The visible file-comment text changed after confirmation opened. Zero writes were sent; the new text is being retained locally and must be reviewed again."
+                    .into()
+            } else {
+                "The visible file-comment text changed after confirmation opened. Zero writes were sent, but the new text could not be staged; keep this composer open and save again."
+                    .into()
+            };
             cx.notify();
             return;
         }
@@ -12400,26 +12607,12 @@ impl ReviewWorkspace {
             cx.notify();
             return;
         }
-        let current = self.composer_input.read(cx).value().to_string();
-        if matches!(
-            &self.tabs[index].interactions,
-            InteractionState::Ready(controller)
-                if controller.file_composer.as_ref().is_some_and(|composer| {
-                    composer.body != current
-                        || composer.draft_id.is_some() && !composer.durable
-                        || composer.draft_id.is_none() && !current.is_empty()
-                })
+        if self.persist_active_composer_before_transition(
+            index,
+            "Saving the exact comment target before navigation; choose the file again after it is durable.",
+            cx,
         ) {
-            self.persist_composer(cx);
-            self.status =
-                "Saving the exact file-level target before navigation; choose the file again after it is durable."
-                    .into();
-            cx.notify();
             return;
-        }
-        if matches!(&self.tabs[index].interactions, InteractionState::Ready(controller) if controller.composer.as_ref().is_some_and(|composer| composer.body != current))
-        {
-            self.persist_composer(cx);
         }
         self.capture_scroll(index);
         if self.tabs[index]
@@ -12457,21 +12650,11 @@ impl ReviewWorkspace {
             cx.notify();
             return;
         }
-        let current = self.composer_input.read(cx).value().to_string();
-        if matches!(
-            &self.tabs[index].interactions,
-            InteractionState::Ready(controller)
-                if controller.file_composer.as_ref().is_some_and(|composer| {
-                    composer.body != current
-                        || composer.draft_id.is_some() && !composer.durable
-                        || composer.draft_id.is_none() && !current.is_empty()
-                })
+        if self.persist_active_composer_before_transition(
+            index,
+            "Saving the exact comment target before navigation; navigate again after it is durable.",
+            cx,
         ) {
-            self.persist_composer(cx);
-            self.status =
-                "Saving the exact file-level target before navigation; navigate again after it is durable."
-                    .into();
-            cx.notify();
             return;
         }
         self.capture_scroll(index);
@@ -12759,11 +12942,11 @@ impl ReviewWorkspace {
                 cx.notify();
                 return;
             }
-            let current = self.composer_input.read(cx).value().to_string();
-            if matches!(&self.tabs[index].interactions, InteractionState::Ready(controller) if controller.composer.as_ref().is_some_and(|composer| composer.body != current))
-            {
-                self.persist_composer(cx);
-            }
+            if self.persist_active_composer_before_transition(
+                index,
+                "Saving the exact active comment before closing this tab; close it again after the save finishes.",
+                cx,
+            ) { return; }
             let submitted_body = self.submitted_summary_input.read(cx).value().to_string();
             self.tabs[index]
                 .submitted_summary_editor
@@ -17441,6 +17624,8 @@ impl ReviewWorkspace {
                                             == cibergit::participation::DraftDisposition::Pending
                                     })
                                     .map(|draft| draft.id.clone());
+                                let known_subject =
+                                    review_subject_allows_actions(linked.comment.subject);
                                 pending_card = pending_card.child(
                                     div()
                                         .mt_2()
@@ -17464,7 +17649,9 @@ impl ReviewWorkspace {
                                             &linked.comment.body,
                                             colors,
                                         ))
-                                        .child(
+                                        .when(
+                                            known_subject,
+                                            |comment_card| comment_card.child(
                                             div()
                                                 .mt_1()
                                                 .flex()
@@ -17511,6 +17698,7 @@ impl ReviewWorkspace {
                                                         });
                                                     }),
                                                 ),
+                                            ),
                                         ),
                                 ).when(
                                     controller.composition.drafts.iter().all(|draft| {
@@ -21067,24 +21255,26 @@ mod layout_tests {
     use super::{
         ActionJournalCompletionToken, COLLAPSED_PANEL_WIDTH, CollaborationReadToken,
         DEFAULT_SIDEBAR_WIDTH, DiffLine, DiffLineKind, DiffMode, DiffRow,
-        EXCEPTIONAL_LINE_CHUNK_BYTES, FileCommentConfirmationToken, InstallTabOptions, JournalOperation, JournalRequest,
-        JournalStatus, LoadState, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
-        MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
-        RepoRuntime, Root, Startup, SubmittedConfirmationToken, SubmittedDraftCallbackToken,
-        SubmittedDraftCloseDisposition, SubmittedDraftLoadState, SubmittedSummaryEditor,
-        apply_submitted_draft_save_if_current, available_diff_width_for, bounded_page,
-        collaboration_completion_matches, diff_content_width, display_columns,
+        EXCEPTIONAL_LINE_CHUNK_BYTES, FileCommentConfirmationToken, InstallTabOptions,
+        JournalOperation, JournalRequest, JournalStatus, LoadState, MAX_PANEL_WIDTH,
+        MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH, MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH,
+        NativeConfirmation, PanelKind, PanelLayout, RepoRuntime, Root, Startup,
+        SubmittedConfirmationToken, SubmittedDraftCallbackToken, SubmittedDraftCloseDisposition,
+        SubmittedDraftLoadState, SubmittedSummaryEditor, active_review_composer_body,
+        active_review_composer_needs_save, apply_submitted_draft_save_if_current,
+        available_diff_width_for, bounded_page, collaboration_completion_matches,
+        diff_content_width, display_columns, file_confirmation_matches_visible_body,
         journal_operation_description, journal_operation_summary, line_text_chunks,
         media_free_markdown, observe_auxiliary, resolved_panel_widths_for,
-        submitted_review_edit_action,
+        review_subject_allows_actions, submitted_review_edit_action,
     };
     use cibergit::domain::{
-        Account, MergeEligibility, PendingFileCommentSource, ProviderCoordinates, PullRequest, PullRequestDetails,
-        PullRequestReview, Repository, ReviewAuxiliaryAction, ReviewAuxiliaryRequest,
-        SubmittedReviewEditCapability,
+        Account, MergeEligibility, PendingFileCommentSource, ProviderCoordinates, PullRequest,
+        PullRequestDetails, PullRequestReview, Repository, ReviewAuxiliaryAction,
+        ReviewAuxiliaryRequest, ReviewSubject, SubmittedReviewEditCapability,
     };
-    use tempfile::tempdir;
     use cibergit::participation::PublishedFile;
+    use tempfile::tempdir;
 
     fn submitted_review_fixture() -> (Repository, PullRequestReview) {
         let repository = Repository {
@@ -21969,6 +22159,17 @@ mod layout_tests {
             Some(&changed_witness)
         ));
         assert!(!matches(&token, 10, 20, &repository.cache_key(), 7, None));
+        assert!(file_confirmation_matches_visible_body(
+            &token,
+            "Whole-file rationale"
+        ));
+        assert!(!file_confirmation_matches_visible_body(
+            &token,
+            "Visible edit after confirmation"
+        ));
+        assert!(review_subject_allows_actions(ReviewSubject::Line));
+        assert!(review_subject_allows_actions(ReviewSubject::File));
+        assert!(!review_subject_allows_actions(ReviewSubject::Unknown));
     }
 
     #[test]
@@ -22355,6 +22556,109 @@ mod layout_tests {
         }
         assert_eq!(reopened.durable_composition.as_ref(), Some(&newest));
         assert_eq!(load().durable_composition.as_ref(), Some(&newest));
+    }
+
+    #[test]
+    fn shared_input_admission_preserves_unsaved_file_and_line_bodies_both_directions() {
+        use super::review_interactions::{ControllerLoad, ReviewInteractionController};
+        use cibergit::{
+            domain::{Account, ChangedFile, Comparison, Repository, Revision},
+            participation::{DiffSide, LineSelection},
+            review::ReviewSession,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let repository = Repository {
+            host: "github.com".into(),
+            owner: "octo".into(),
+            name: "repo".into(),
+            account: Account {
+                host: "github.com".into(),
+                login: "reader".into(),
+            },
+            local_path: None,
+        };
+        let session = ReviewSession::new(Comparison {
+            revision: Revision {
+                base_sha: "1".repeat(40),
+                head_sha: "2".repeat(40),
+            },
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                previous_path: None,
+                raw_path: None,
+                raw_previous_path: None,
+                status: "modified".into(),
+                additions: 1,
+                deletions: 1,
+                patch: Some("@@ -1 +1 @@\n-old\n+new".into()),
+                patch_complete: true,
+            }],
+            complete: true,
+            notice: None,
+        });
+        let mut controller =
+            match ReviewInteractionController::load(root.path(), &repository, 7, &session).unwrap()
+            {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+
+        controller
+            .select_file_with_canonical(&session, &session)
+            .unwrap();
+        let saved_file = controller.stage_composer_text("file A".into()).unwrap();
+        controller.store.save(&saved_file).unwrap();
+        let file_id = controller
+            .file_composer
+            .as_ref()
+            .and_then(|composer| composer.draft_id.clone())
+            .unwrap();
+        controller.finish_composer_save(&saved_file, &file_id, "file A", Ok(()));
+        assert_eq!(active_review_composer_body(&controller), Some("file A"));
+        assert!(active_review_composer_needs_save(&controller, "file B"));
+        let staged_file = controller.stage_composer_text("file B".into()).unwrap();
+        assert!(
+            controller
+                .select_line(&session, LineSelection::single(DiffSide::New, 1))
+                .unwrap_err()
+                .contains("Save the open file-level draft")
+        );
+        controller.store.save(&staged_file).unwrap();
+        controller.finish_composer_save(&staged_file, &file_id, "file B", Ok(()));
+        controller
+            .select_line(&session, LineSelection::single(DiffSide::New, 1))
+            .unwrap();
+        assert_eq!(
+            controller.composition.file_draft(&file_id).unwrap().body,
+            "file B"
+        );
+
+        let saved_line = controller.stage_composer_text("line A".into()).unwrap();
+        controller.store.save(&saved_line).unwrap();
+        let line_id = controller
+            .composer
+            .as_ref()
+            .and_then(|composer| composer.draft_id.clone())
+            .unwrap();
+        controller.finish_composer_save(&saved_line, &line_id, "line A", Ok(()));
+        assert_eq!(active_review_composer_body(&controller), Some("line A"));
+        assert!(active_review_composer_needs_save(&controller, "line B"));
+        let staged_line = controller.stage_composer_text("line B".into()).unwrap();
+        assert!(
+            controller
+                .select_file_with_canonical(&session, &session)
+                .unwrap_err()
+                .contains("Save the open inline draft")
+        );
+        controller.store.save(&staged_line).unwrap();
+        controller.finish_composer_save(&staged_line, &line_id, "line B", Ok(()));
+        controller
+            .select_file_with_canonical(&session, &session)
+            .unwrap();
+        assert_eq!(
+            controller.composition.draft(&line_id).unwrap().body,
+            "line B"
+        );
     }
 
     #[test]

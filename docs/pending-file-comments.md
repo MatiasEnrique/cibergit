@@ -8,7 +8,7 @@ Published review targets are a real sum type: `Line(PublishedPosition)` or `File
 
 The selected file must be proven identical to the retained canonical Full PR file at the same head. Patch text is not part of that proof, so empty, binary, and renamed files are eligible. A non-UTF-8 current path is rejected while its local draft remains available.
 
-Provider reads preserve the explicit GitHub `subjectType` as `FILE`, `LINE`, or `Unknown`. Missing legacy/cached provenance becomes `Unknown`; absence of a line is not treated as evidence of a file subject. File discussions appear in Activity with a whole-file label and are never placed on an invented inline row. Unknown discussions remain read-only.
+Provider reads preserve the explicit GitHub `subjectType` as `FILE`, `LINE`, or `Unknown`. Missing legacy/cached provenance becomes `Unknown`; absence of a line is not treated as evidence of a file subject. File discussions appear in Activity with a whole-file label and are never placed on an invented inline row. Unknown discussions remain read-only: their actions are hidden, and fresh auxiliary-action preflight rejects a missing or unrecognized subject before mutation transport.
 
 ## Pending-only write
 
@@ -33,6 +33,6 @@ If no existing selected-account pending review is observed, the UI reports that 
 
 ## Verification boundary
 
-Provider tests use a scripted `gh` transport and assert the exact GraphQL request/response tuple, fresh identity/head rejection, uncertain acknowledgement handling, durable no-replay behavior, and explicit subject parsing. Native smoke preparation may use public read-only GitHub data and a clearly labelled synthetic exact-pending witness, but it must stop at confirmation and record zero mutation transports. No physical-input claim follows from in-process handler capture.
+Provider tests use a scripted `gh` transport and assert the exact GraphQL request/response tuple, fresh identity/head rejection, uncertain acknowledgement handling, durable no-replay behavior, and explicit subject parsing. Native smoke preparation may use public read-only GitHub data and a clearly labelled synthetic exact-pending witness. It may invoke the confirm handler only with deliberately changed visible text so the pre-dispatch retention guard rejects it, and it must record zero mutation transports. No physical-input claim follows from in-process handler capture.
 
-The focused native scene is enabled with `CIBERGIT_SMOKE_PENDING_FILE=1`, alongside the existing `ui-smoke` feature and smoke environment. Use a disposable `CIBERGIT_DATA_DIR`, a dedicated `CIBERGIT_SMOKE_DIR`, `CIBERGIT_SMOKE_BACKGROUND=1`, and an explicit light or dark appearance. It writes `native-pending-file-confirmation.png` plus `native-pending-file-smoke.txt`, exercises open/save/confirmation/cancel/stale-token/target-switch/reopen handlers, and deliberately never invokes the final confirm handler.
+The focused native scene is enabled with `CIBERGIT_SMOKE_PENDING_FILE=1`, alongside the existing `ui-smoke` feature and smoke environment. Use a disposable `CIBERGIT_DATA_DIR`, a dedicated `CIBERGIT_SMOKE_DIR`, `CIBERGIT_SMOKE_BACKGROUND=1`, and an explicit light or dark appearance. It writes `native-pending-file-confirmation.png` plus `native-pending-file-smoke.txt`, exercises open/save/prepare/type/confirm-rejection/cancel/stale-token/target-switch/reopen handlers, and invokes no mutation transport.

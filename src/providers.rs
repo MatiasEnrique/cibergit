@@ -3344,7 +3344,7 @@ const REVIEW_NODE_QUERY: &str = r#"query ReviewIdentity($id: ID!) {
 const COMMENT_NODE_QUERY: &str = r#"query ReviewCommentIdentity($id: ID!) {
   node(id: $id) {
     ... on PullRequestReviewComment {
-      id author { login }
+      id author { login } subjectType
       pullRequestReview {
         id state author { login } commit { oid }
         pullRequest { id number repository { nameWithOwner } }
@@ -3650,6 +3650,7 @@ struct ActionCommentNodeData {
 struct ActionCommentNode {
     id: String,
     author: Option<GraphqlActor>,
+    subject_type: Option<String>,
     pull_request_review: ActionReviewNode,
 }
 
@@ -4584,6 +4585,14 @@ fn validate_owned_comment(
             .is_some_and(|author| author.login.eq_ignore_ascii_case(&provider.account.login))
     {
         return Err("review comment is foreign or linked to another review".into());
+    }
+    if ReviewSubject::from_provider(comment.subject_type.as_deref().unwrap_or_default())
+        == ReviewSubject::Unknown
+    {
+        return Err(
+            "review comment subject is missing or unknown; the read-only target cannot be mutated"
+                .into(),
+        );
     }
     Ok(())
 }

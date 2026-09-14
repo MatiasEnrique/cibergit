@@ -760,7 +760,7 @@ fn existing_pending_comment_edits_the_exact_provider_comment() {
         step(
             "query ReviewCommentIdentity",
             json!({"id":"COMMENT_existing"}),
-            json!({"data":{"node":{"id":"COMMENT_existing","author":{"login":"alice"},"pullRequestReview":{"id":"REVIEW_pending","state":"PENDING","author":{"login":"alice"},"commit":{"oid":HEAD},"pullRequest":{"id":"PR_node","number":7,"repository":{"nameWithOwner":"owner/repo"}}}}}}),
+            json!({"data":{"node":{"id":"COMMENT_existing","author":{"login":"alice"},"subjectType":"LINE","pullRequestReview":{"id":"REVIEW_pending","state":"PENDING","author":{"login":"alice"},"commit":{"oid":HEAD},"pullRequest":{"id":"PR_node","number":7,"repository":{"nameWithOwner":"owner/repo"}}}}}}),
         ),
         step(
             "mutation UpdateReviewComment",
@@ -869,7 +869,7 @@ fn updated_comment_acknowledgement_binds_comment_and_review_ids() {
             step(
                 "query ReviewCommentIdentity",
                 json!({"id":"COMMENT_existing"}),
-                json!({"data":{"node":{"id":"COMMENT_existing","author":{"login":"alice"},"pullRequestReview":{"id":"REVIEW_pending","state":"PENDING","author":{"login":"alice"},"commit":{"oid":HEAD},"pullRequest":{"id":"PR_node","number":7,"repository":{"nameWithOwner":"owner/repo"}}}}}}),
+                json!({"data":{"node":{"id":"COMMENT_existing","author":{"login":"alice"},"subjectType":"LINE","pullRequestReview":{"id":"REVIEW_pending","state":"PENDING","author":{"login":"alice"},"commit":{"oid":HEAD},"pullRequest":{"id":"PR_node","number":7,"repository":{"nameWithOwner":"owner/repo"}}}}}}),
             ),
             step(
                 "mutation UpdateReviewComment",
@@ -1996,6 +1996,65 @@ fn submitted_summary_edit_sends_one_exact_mutation_for_older_review_commit() {
     assert_eq!(ack.operation_id, "submitted-edit-1");
     assert_eq!(ack.review_id.as_deref(), Some("REVIEW_submitted"));
     assert_eq!(count(&dir), 3);
+}
+
+#[test]
+fn unknown_pending_comment_subject_is_rejected_before_delete_transport() {
+    for subject in [Value::Null, json!("FUTURE_SUBJECT")] {
+        let request = ReviewAuxiliaryRequest {
+            operation_id: "delete-unknown-subject".into(),
+            attempt_id: "attempt-delete-unknown".into(),
+            action: ReviewAuxiliaryAction::DeletePendingComment {
+                review: coordinates("REVIEW_pending"),
+                comment: coordinates("COMMENT_unknown"),
+            },
+        };
+        let comment = json!({
+            "data": {"node": {
+                "id": "COMMENT_unknown",
+                "author": {"login": "alice"},
+                "subjectType": subject,
+                "pullRequestReview": {
+                    "id": "REVIEW_pending",
+                    "state": "PENDING",
+                    "author": {"login": "alice"},
+                    "commit": {"oid": HEAD},
+                    "pullRequest": {
+                        "id": "PR_node",
+                        "number": 7,
+                        "repository": {"nameWithOwner": "owner/repo"}
+                    }
+                }
+            }}
+        });
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                step(
+                    "query ReviewActionContext",
+                    json!({"owner":"owner","name":"repo","number":7}),
+                    context(HEAD, "OPEN"),
+                ),
+                step(
+                    "query ReviewIdentity",
+                    json!({"id":"REVIEW_pending"}),
+                    review_node("REVIEW_pending", "alice", HEAD, "PENDING"),
+                ),
+                step(
+                    "query ReviewCommentIdentity",
+                    json!({"id":"COMMENT_unknown"}),
+                    comment,
+                ),
+            ],
+            Duration::from_secs(30),
+        );
+        let outcome = provider.execute_review_auxiliary(&repo("alice"), 7, &request);
+        let ProviderMutationOutcome::PreflightRejected { reason } = outcome else {
+            panic!("unknown subject must be rejected before delete mutation")
+        };
+        assert!(reason.contains("subject"), "{reason}");
+        assert_eq!(count(&dir), 3, "no mutation transport may be dispatched");
+    }
 }
 
 #[test]
