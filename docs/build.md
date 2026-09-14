@@ -305,7 +305,7 @@ cargo run --locked --features ui-smoke -- \
   --repo cli/cli --account YOUR_GH_LOGIN --pr 14130
 ```
 
-The comparison toolbar shows short revisions by default. **Show revision details** reveals the exact selected and published base/head SHAs.
+The Compare bar is one row: the four scopes, the selected base/head beside the pinned published PR head, and the commit list's toggle. Click the revision summary to reveal the exact selected and published base/head SHAs. The commit count appears with the list; an incomplete or capped inventory still states its reason in place.
 
 The focused harness writes `native-comparison-full-list.png`, commit/range/Since-fallback/return-full
 captures, `native-comparison-newer-head.png`, `native-comparison-two-tabs.png`, and a text report in

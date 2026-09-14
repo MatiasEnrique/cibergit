@@ -12,4 +12,6 @@ User instruction, 2026-09-14: follow Linear's layout and tabs, and remove the ch
 
 The open-PR strip, the PR title block, the PR tab row, the sidebar account footer and the status bar are separated by their own fill and by spacing, not by rules; the panel splitter is a plain drag band. Page tabs, and the open-PR chips above them, are small rounded chips: the selected one carries a quiet fill, the rest are muted text on the surface, and a count beside a tab label is rendered in the faint colour rather than repeating the label's weight. Keep rules for structure inside content, such as table headers and the diff's own columns.
 
+The chrome above a diff is three rows: title with its actions, branches with the local-edit and diff-mode controls, and the tab row, with the Compare bar as a fourth only where it applies. Information that a neighbouring row already carries does not get a row of its own: the published-revision label, the comparison line where the Compare bar is on screen, and a settled commit count are all dropped, and exact SHAs sit behind the revision summary. A warning about the comparison keeps its own line, always.
+
 These choices refine the existing agreed Codex-inspired/native-macOS requirement. They do not narrow any functional V1 requirement.

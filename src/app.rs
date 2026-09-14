@@ -22777,6 +22777,10 @@ impl ReviewWorkspace {
             .as_ref()
             .and_then(|session| session.available_revision())
             .is_some();
+        // The Compare bar sits under the tabs on the diff, and is the whole
+        // Commits section; on those screens the header would only repeat it.
+        let compare_visible =
+            !self.inspector_open || tab.inspector_section == InspectorSection::Commits;
         div()
             .flex_1()
             .min_h_0()
@@ -22786,7 +22790,7 @@ impl ReviewWorkspace {
             .child(
                 div()
                     .px(px(ui::PANEL_GUTTER))
-                    .py_3()
+                    .py_2()
                     .child(
                         div()
                             .flex()
@@ -22850,13 +22854,6 @@ impl ReviewWorkspace {
                                             this.prepare_merge_confirmation(cx);
                                         }
                                     })),
-                            )
-                            .child(
-                                div()
-                                    .px(px(ui::CONTROL_INSET))
-                                    .py_1()
-                                    .text_color(colors.muted)
-                                    .child("Published revision"),
                             ),
                     )
                     .child(
@@ -22872,11 +22869,12 @@ impl ReviewWorkspace {
                                 "{}  →  {}",
                                 tab.pull_request.source_branch, tab.pull_request.target_branch
                             ))
-                            .child("·")
-                            .child(format!(
-                                "{} · {revision}",
-                                tab.comparison_picker.request_label()
-                            ))
+                            .when(!compare_visible, |row| {
+                                row.child("·").child(format!(
+                                    "{} · {revision}",
+                                    tab.comparison_picker.request_label()
+                                ))
+                            })
                             .when(newer, |row| {
                                 row.child(
                                     div()
@@ -23737,14 +23735,36 @@ impl ReviewWorkspace {
         let canonical = &tab.canonical_full_revision;
         let inventory_ready = picker.inventory_ready();
         let mode = picker.mode();
-        let full = side_control("Full PR", mode == PickerMode::Full, colors)
+        // The Compare bar reads as a second row of chips under the tabs, so it
+        // uses their scale rather than the full control height.
+        let chip = |label: &'static str, selected: bool| {
+            div()
+                .h(px(ui::BUTTON_XS))
+                .px(px(ui::GAP_GROUP))
+                .flex_none()
+                .flex()
+                .items_center()
+                .rounded(px(ui::BADGE_RADIUS))
+                .ui_text(TextRole::Caption)
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .when(selected, |chip| {
+                    chip.bg(colors.elevated).text_color(colors.text)
+                })
+                .when(!selected, |chip| {
+                    chip.text_color(colors.muted)
+                        .hover(|chip| chip.bg(colors.selected))
+                })
+                .child(label)
+        };
+        let full = chip("Full PR", mode == PickerMode::Full)
             .id("comparison-full")
             .on_click(cx.listener(move |root, _, _, cx| {
                 if let Root::Review(this) = root {
                     this.restore_full_comparison(index, cx);
                 }
             }));
-        let commit = side_control("Commit", mode == PickerMode::Commit, colors)
+        let commit = chip("Commit", mode == PickerMode::Commit)
             .id("comparison-commit")
             .when(!inventory_ready, |button| button.opacity(0.55))
             .on_click(cx.listener(move |root, _, _, cx| {
@@ -23761,7 +23781,7 @@ impl ReviewWorkspace {
                     }
                 }
             }));
-        let range = side_control("Range", mode == PickerMode::Range, colors)
+        let range = chip("Range", mode == PickerMode::Range)
             .id("comparison-range")
             .when(!inventory_ready, |button| button.opacity(0.55))
             .on_click(cx.listener(move |root, _, _, cx| {
@@ -23778,35 +23798,69 @@ impl ReviewWorkspace {
                     }
                 }
             }));
-        let since = side_control("Since review", mode == PickerMode::SinceReview, colors)
+        let since = chip("Since review", mode == PickerMode::SinceReview)
             .id("comparison-since-review")
             .on_click(cx.listener(move |root, _, _, cx| {
                 if let Root::Review(this) = root {
                     this.select_since_last_review(index, cx);
                 }
             }));
+        // One row: the four scopes, the selected revisions beside the pinned
+        // published pair, and the commit list's own toggle. The exact SHAs and
+        // the commit count stay one click away instead of holding two lines.
         let mut view = div()
-            .border_b_1()
-            .border_color(colors.border)
             .bg(colors.canvas)
             .px(px(ui::PANEL_GUTTER))
             .py_2()
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
-                    .gap(px(ui::GAP_GROUP))
-                    .child(
-                        div()
-                            .ui_text(TextRole::Caption)
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(colors.muted)
-                            .child("COMPARE"),
-                    )
+                    .gap(px(ui::GAP_ICON))
                     .child(full)
                     .child(commit)
                     .child(range)
                     .child(since)
+                    .when_some(selected, |row, selected| {
+                        row.child(
+                            div()
+                                .id("toggle-comparison-revision-details")
+                                .debug_selector(|| "toggle-comparison-revision-details".into())
+                                .ml(px(ui::GAP_GROUP))
+                                .flex()
+                                .items_center()
+                                .gap(px(ui::GAP_ICON))
+                                .ui_text(TextRole::Caption)
+                                .text_color(colors.muted)
+                                .cursor_pointer()
+                                .hover(|summary| summary.text_color(colors.text))
+                                .aria_label(if picker.revision_details_expanded {
+                                    "Hide the exact selected and published revisions"
+                                } else {
+                                    "Show the exact selected and published revisions"
+                                })
+                                .child(format!(
+                                    "Viewing {} → {} · published PR {}",
+                                    comparison_picker::short_sha(&selected.base_sha),
+                                    comparison_picker::short_sha(&selected.head_sha),
+                                    comparison_picker::short_sha(&canonical.head_sha),
+                                ))
+                                .child(if picker.revision_details_expanded {
+                                    "⌃"
+                                } else {
+                                    "⌄"
+                                })
+                                .on_click(cx.listener(move |root, _, _, cx| {
+                                    if let Root::Review(this) = root {
+                                        let picker = &mut this.tabs[index].comparison_picker;
+                                        picker.revision_details_expanded =
+                                            !picker.revision_details_expanded;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                    })
                     .child(div().flex_1())
                     .child(
                         div()
@@ -23828,43 +23882,9 @@ impl ReviewWorkspace {
                             })),
                     ),
             )
-            .when_some(selected, |view, selected| {
-                view.child(
-                    div()
-                        .mt_2()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(ui::GAP_GROUP))
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.muted)
-                        .child(format!(
-                            "Viewing {} → {} · Published PR {}",
-                            comparison_picker::short_sha(&selected.base_sha),
-                            comparison_picker::short_sha(&selected.head_sha),
-                            comparison_picker::short_sha(&canonical.head_sha),
-                        ))
-                        .child(
-                            div()
-                                .id("toggle-comparison-revision-details")
-                                .text_color(colors.accent)
-                                .cursor_pointer()
-                                .child(if picker.revision_details_expanded {
-                                    "Hide revision details"
-                                } else {
-                                    "Show revision details"
-                                })
-                                .on_click(cx.listener(move |root, _, _, cx| {
-                                    if let Root::Review(this) = root {
-                                        let picker = &mut this.tabs[index].comparison_picker;
-                                        picker.revision_details_expanded =
-                                            !picker.revision_details_expanded;
-                                        cx.notify();
-                                    }
-                                })),
-                        ),
-                )
-                .when(picker.revision_details_expanded, |view| {
+            .when_some(
+                selected.filter(|_| picker.revision_details_expanded),
+                |view, selected| {
                     view.child(
                         div()
                             .mt_1()
@@ -23879,19 +23899,23 @@ impl ReviewWorkspace {
                                 canonical.head_sha,
                             )),
                     )
-                })
-            })
-            .child(
-                div()
-                    .mt_1()
-                    .ui_text(TextRole::Caption)
-                    .text_color(if inventory_ready {
-                        colors.faint
-                    } else {
-                        colors.amber
-                    })
-                    .child(picker.inventory_reason()),
-            );
+                },
+            )
+            // A settled inventory only ever said how many commits it holds,
+            // which the Commits tab and the list itself both carry.
+            .when(!inventory_ready || picker.expanded, |view| {
+                view.child(
+                    div()
+                        .mt_1()
+                        .ui_text(TextRole::Caption)
+                        .text_color(if inventory_ready {
+                            colors.faint
+                        } else {
+                            colors.amber
+                        })
+                        .child(picker.inventory_reason()),
+                )
+            });
         if let Some(notice) = picker
             .notice
             .clone()
@@ -32513,6 +32537,26 @@ mod layout_tests {
                 page.size.width > px(800.),
                 "PR content is squeezed into a sidebar"
             );
+            if id == "pr-tab-commits" {
+                // The Compare bar keeps the exact SHAs behind its revision
+                // summary, so that summary has to be the thing that opens them.
+                for expected in [true, false] {
+                    let summary = cx
+                        .debug_bounds("toggle-comparison-revision-details")
+                        .expect("the Compare bar must show a revision summary");
+                    cx.simulate_click(summary.center(), Modifiers::default());
+                    cx.update(|window, cx| window.draw(cx).clear(cx));
+                    root.read_with(cx, |root, _| {
+                        let Root::Review(this) = root else {
+                            unreachable!()
+                        };
+                        assert_eq!(
+                            this.tabs[0].comparison_picker.revision_details_expanded,
+                            expected
+                        );
+                    });
+                }
+            }
             if id == "pr-tab-checks" {
                 let disclosure = cx.debug_bounds("checks-source-details").unwrap();
                 cx.simulate_click(disclosure.center(), Modifiers::default());
