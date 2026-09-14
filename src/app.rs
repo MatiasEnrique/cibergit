@@ -22331,10 +22331,10 @@ impl ReviewWorkspace {
                         .child("Load log")
                         .on_click(move |_, window, cx| {
                             log_root.update(cx, |root, cx| {
-                                if let Root::Review(this) = root {
-                                    if this.start_actions_log(index, cx) {
-                                        this.focus_current_ci_pane(index, window, cx);
-                                    }
+                                if let Root::Review(this) = root
+                                    && this.start_actions_log(index, cx)
+                                {
+                                    this.focus_current_ci_pane(index, window, cx);
                                 }
                             });
                         }),
@@ -24224,12 +24224,12 @@ impl ReviewWorkspace {
                                         .on_click(
                                             move |_, window, cx| {
                                                 jobs_root.update(cx, |root, cx| {
-                                                    if let Root::Review(this) = root {
-                                                        if this.start_actions_jobs(index, cx) {
-                                                            this.focus_current_ci_pane(
-                                                                index, window, cx,
-                                                            );
-                                                        }
+                                                    if let Root::Review(this) = root
+                                                        && this.start_actions_jobs(index, cx)
+                                                    {
+                                                        this.focus_current_ci_pane(
+                                                            index, window, cx,
+                                                        );
                                                     }
                                                 });
                                             },
