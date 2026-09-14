@@ -53,11 +53,11 @@ use cibergit::{
     },
     domain::{
         ActionsAttemptLocator, ActionsHeadRelation, DismissalAuthority, MergeAction,
-        MergeExecutionRequest, MergeMethod, MergePreparation,
-        PendingFileReviewAbsence, PendingReviewCreationAcknowledgement, PendingReviewSnapshot,
-        ProviderCoordinates, ProviderMutationOutcome, ProviderReadEvidence, PullRequest,
-        PullRequestDetails, PullRequestDiscussionAction, PullRequestLifecycleAction, ReactableKind,
-        ReactionAction, ReactionContent, ReactionIntent, ReactionSubjectSnapshot, Repository,
+        MergeExecutionRequest, MergeMethod, MergePreparation, PendingFileReviewAbsence,
+        PendingReviewCreationAcknowledgement, PendingReviewSnapshot, ProviderCoordinates,
+        ProviderMutationOutcome, ProviderReadEvidence, PullRequest, PullRequestDetails,
+        PullRequestDiscussionAction, PullRequestLifecycleAction, ReactableKind, ReactionAction,
+        ReactionContent, ReactionIntent, ReactionSubjectSnapshot, Repository,
         ReviewAuxiliaryAction, ReviewAuxiliaryRequest, Revision,
         SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
     },
@@ -29284,8 +29284,9 @@ mod layout_tests {
     use super::{
         ActionsReadError, ActionsReadErrorCategory, ActionsReadFixture, CiCompletionToken, CiPane,
         DismissalConfirmationToken, DismissalPreparationToken, InspectorSection, InstallTabOptions,
-        InteractionState, LoadState, NextCheck, NextCheckPage, OpenChecks, OpenSelectedCheckJobs, RepoRuntime, Root,
-        Startup, ToggleCheckIdentity, check_identity_button, checks_page_button, palette,
+        InteractionState, LoadState, NextCheck, NextCheckPage, OpenChecks, OpenSelectedCheckJobs,
+        RepoRuntime, Root, Startup, ToggleCheckIdentity, check_identity_button, checks_page_button,
+        palette,
     };
     use cibergit::domain::{
         Account, MergeEligibility, PendingFileCommentSource, PendingFileReviewAbsence,
@@ -29298,8 +29299,9 @@ mod layout_tests {
         ActionsAttemptKey, ActionsAttemptLocator, ActionsHeadRelation, ActionsJob, ActionsJobLog,
         ActionsJobsSnapshot, ActionsLinkage, ActionsLogProvenance, ActionsRunAttemptObservation,
         CheckKind, CheckRepositoryIdentity, CheckShaClass, CheckSuiteIdentity, DismissalAuthority,
-        FreshReviewDismissalCapability, PendingReviewCreationAcknowledgement, ProviderMutationOutcome, PullRequest, PullRequestCheck,
-        SelectedViewer, SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
+        FreshReviewDismissalCapability, PendingReviewCreationAcknowledgement,
+        ProviderMutationOutcome, PullRequest, PullRequestCheck, SelectedViewer,
+        SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
         SubmittedReviewDismissalTarget, WorkflowRunIdentity,
     };
     use cibergit::participation::{
@@ -30662,6 +30664,357 @@ mod layout_tests {
             maximum_rendered_log_rows.load(Ordering::Relaxed)
                 <= super::MAX_RENDERED_LOG_ROWS as u64
         );
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn ci_async_completion_preserves_created_review_checkpoint_and_local_stop(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::review_interactions::PendingReviewStartJournal;
+        use cibergit::domain::{ChangedFile, Comparison};
+
+        fn preserved(this: &super::ReviewWorkspace, cx: &gpui::App) -> serde_json::Value {
+            let tab = &this.tabs[0];
+            let InteractionState::Ready(controller) = &tab.interactions else {
+                panic!("missing controller")
+            };
+            serde_json::json!({
+                "session": tab.session,
+                "canonical": tab.canonical_session,
+                "pin": tab.canonical_full_revision,
+                "composition": controller.composition,
+                "durable": controller.durable_composition,
+                "submitted": format!("{:?}", tab.submitted_summary_editor.current_snapshot()),
+                "dismissal": format!("{:?}", tab.dismissal_editor),
+                "journal": format!("{:?}", tab.journal_operations),
+                "shared": [this.composer_input.read(cx).value().to_string(),
+                    this.submitted_summary_input.read(cx).value().to_string(),
+                    this.review_summary_input.read(cx).value().to_string(),
+                    this.dismissal_reason_input.read(cx).value().to_string()],
+                "restore": format!("{:?}", this.active_tab_input_restore),
+            })
+        }
+
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        let (repository, submitted_review) = submitted_review_fixture();
+        let (checkpoint, before) = cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let mut pull = transition_pull_request(7);
+                pull.base_sha = "1".repeat(40);
+                pull.head_sha = "2".repeat(40);
+                this.install_tab_with_restore(
+                    repository.clone(),
+                    pull,
+                    None,
+                    InstallTabOptions {
+                        activate: true,
+                        window: Some(window),
+                        start_background_work: false,
+                    },
+                    cx,
+                );
+                let session = super::ReviewSession::new(Comparison {
+                    revision: super::Revision {
+                        base_sha: "1".repeat(40),
+                        head_sha: "2".repeat(40),
+                    },
+                    files: vec![ChangedFile {
+                        path: "src/lib.rs".into(),
+                        previous_path: None,
+                        raw_path: None,
+                        raw_previous_path: None,
+                        status: "modified".into(),
+                        additions: 1,
+                        deletions: 1,
+                        patch: Some("@@ -1 +1 @@\n-old\n+new\n".into()),
+                        patch_complete: true,
+                    }],
+                    complete: true,
+                    notice: None,
+                });
+                let mut controller = match super::ReviewInteractionController::load(
+                    &this.interaction_root,
+                    &repository,
+                    7,
+                    &session,
+                )
+                .unwrap()
+                {
+                    super::ControllerLoad::Ready(controller) => controller,
+                    super::ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+                };
+                controller
+                    .select_line_with_canonical(
+                        &session,
+                        &session,
+                        super::LineSelection::single(super::DiffSide::New, 1),
+                    )
+                    .unwrap();
+                let saved = controller
+                    .stage_composer_text("retained LINE rationale".into())
+                    .unwrap();
+                controller.store.save(&saved).unwrap();
+                let line_id = controller
+                    .composer
+                    .as_ref()
+                    .unwrap()
+                    .draft_id
+                    .clone()
+                    .unwrap();
+                controller.finish_composer_save(
+                    &saved,
+                    &line_id,
+                    "retained LINE rationale",
+                    Ok(()),
+                );
+                controller
+                    .select_file_with_canonical(&session, &session)
+                    .unwrap();
+                let saved = controller
+                    .stage_composer_text("retained FILE rationale".into())
+                    .unwrap();
+                controller.store.save(&saved).unwrap();
+                let file_id = controller
+                    .file_composer
+                    .as_ref()
+                    .unwrap()
+                    .draft_id
+                    .clone()
+                    .unwrap();
+                controller.finish_composer_save(
+                    &saved,
+                    &file_id,
+                    "retained FILE rationale",
+                    Ok(()),
+                );
+                let absence = PendingFileReviewAbsence {
+                    viewer_login: repository.account.login.clone(),
+                    repository: repository.clone(),
+                    pull_request: ProviderCoordinates {
+                        provider: "github".into(),
+                        host: repository.host.clone(),
+                        owner: repository.owner.clone(),
+                        repository: repository.name.clone(),
+                        pull_request: 7,
+                        remote_id: "PR_node".into(),
+                    },
+                    pull_request_url: "https://github.com/octo/repo/pull/7".into(),
+                    pull_request_state: "OPEN".into(),
+                    current_base_sha: "1".repeat(40),
+                    current_head_sha: "2".repeat(40),
+                };
+                let intent = controller
+                    .prepare_pending_file_review_start(
+                        &absence,
+                        "combined-flow".into(),
+                        "combined-create".into(),
+                        "combined-file".into(),
+                    )
+                    .unwrap();
+                let mut record = super::PendingReviewStartRecord::new(intent.clone()).unwrap();
+                record
+                    .mark_create_in_flight("synthetic-created-attempt".into())
+                    .unwrap();
+                record
+                    .mark_review_created(PendingReviewCreationAcknowledgement {
+                        operation_id: intent.create_operation_id.clone(),
+                        review: ProviderCoordinates {
+                            remote_id: "SYNTHETIC_CREATED_REVIEW".into(),
+                            ..intent.pull_request.clone()
+                        },
+                        review_author: repository.account.login.clone(),
+                        review_commit_sha: "2".repeat(40),
+                        pull_request: intent.pull_request.clone(),
+                        repository_name_with_owner: repository.full_name(),
+                    })
+                    .unwrap();
+                PendingReviewStartJournal::open(&this.interaction_root, intent.key.clone())
+                    .unwrap()
+                    .seed_created_fixture(&record)
+                    .unwrap();
+                assert!(
+                    controller
+                        .authority
+                        .execute_if_current(
+                            &controller.store,
+                            controller.durable_composition.as_ref(),
+                            || ()
+                        )
+                        .is_err()
+                );
+                controller.pending_review_start = Some(record.clone());
+                assert!(!controller.composition.drafts.is_empty());
+                assert!(!controller.composition.file_drafts.is_empty());
+                this.tabs[0].interactions = InteractionState::Ready(controller);
+                this.tabs[0].session = Some(session.clone());
+                this.tabs[0].canonical_session = Some(session);
+                this.tabs[0]
+                    .submitted_summary_editor
+                    .begin(submitted_review.clone());
+                this.tabs[0]
+                    .submitted_summary_editor
+                    .store_active_body("retained submitted text".into());
+                this.tabs[0]
+                    .dismissal_editor
+                    .begin(submitted_review.coordinates.clone());
+                this.tabs[0]
+                    .dismissal_editor
+                    .store_active_reason("retained dismissal reason".into());
+                this.tabs[0].journal_operations.push(JournalOperation {
+                    request: JournalRequest::Auxiliary(Box::new(ReviewAuxiliaryRequest {
+                        operation_id: "synthetic-unrelated-journal".into(),
+                        attempt_id: "synthetic-unrelated-attempt".into(),
+                        action: ReviewAuxiliaryAction::Reply {
+                            thread: submitted_review.coordinates.clone(),
+                            pending_review: None,
+                            body: "retained unrelated journal text".into(),
+                        },
+                    })),
+                    status: JournalStatus::Uncertain {
+                        reason: "synthetic history, no transport".into(),
+                    },
+                });
+                this.composer_input.update(cx, |input, cx| {
+                    input.set_value("retained FILE rationale", window, cx)
+                });
+                this.submitted_summary_input.update(cx, |input, cx| {
+                    input.set_value("retained submitted text", window, cx)
+                });
+                this.review_summary_input.update(cx, |input, cx| {
+                    input.set_value("retained pending summary", window, cx)
+                });
+                this.replace_dismissal_reason_input(
+                    "retained dismissal reason".into(),
+                    false,
+                    super::DismissalReasonInputOwner::for_tab(
+                        this.workspace_instance,
+                        &this.tabs[0],
+                    ),
+                    cx.entity().downgrade(),
+                    window,
+                    cx,
+                );
+                let details = actions_details_fixture(&repository);
+                this.tabs[0].checks_selection.reconcile(&details.checks);
+                this.tabs[0].details = Some(details);
+                this.tabs[0].details_state = LoadState::Ready;
+                let (_, locator, _, _) = this.selected_actions_locator(0).unwrap();
+                let mut jobs = actions_snapshot(&locator, 42, &[1]);
+                jobs.jobs[0].check_run_database_id = locator.check_database_id;
+                jobs.jobs[0].check_run_url = format!(
+                    "https://api.github.com/repos/{}/check-runs/{}",
+                    repository.full_name(),
+                    locator.check_database_id
+                );
+                let log = actions_log(&jobs, 1);
+                this.actions_read_fixture = Some(Arc::new(ActionsReadFixture {
+                    jobs,
+                    log,
+                    jobs_dispatches: Arc::new(AtomicU64::new(0)),
+                    log_dispatches: Arc::new(AtomicU64::new(0)),
+                    maximum_rendered_log_rows: Arc::new(AtomicU64::new(0)),
+                    final_log_row_materializations: Arc::new(AtomicU64::new(0)),
+                }));
+                let before = preserved(this, cx);
+                assert!(this.start_actions_jobs(0, cx));
+                (record, before)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert_eq!(preserved(this, cx), before);
+                assert!(matches!(this.tabs[0].ci_read.jobs, MemoryRead::Fresh(_)));
+                assert!(
+                    this.general_reads
+                        .selected_account_readiness_at(&repository.account, Instant::now())
+                        .is_ok()
+                );
+                let InteractionState::Ready(controller) = &this.tabs[0].interactions else {
+                    unreachable!()
+                };
+                assert_eq!(controller.pending_review_start.as_ref(), Some(&checkpoint));
+                assert_eq!(
+                    PendingReviewStartJournal::open(
+                        &this.interaction_root,
+                        checkpoint.intent.key.clone()
+                    )
+                    .unwrap()
+                    .record()
+                    .unwrap()
+                    .as_ref(),
+                    Some(&checkpoint)
+                );
+                assert!(this.start_actions_log(0, cx));
+                // The explicit local stop overlaps the admitted read. It sends no provider request.
+                this.stop_pending_review_start(&checkpoint.intent.flow_id, cx);
+            })
+        });
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert_eq!(preserved(this, cx), before);
+            assert!(matches!(this.tabs[0].ci_read.log, MemoryRead::Fresh(_)));
+            assert!(!this.tabs[0].write_in_flight);
+            assert!(
+                this.general_reads
+                    .selected_account_readiness_at(&repository.account, Instant::now())
+                    .is_ok()
+            );
+            let fixture = this.actions_read_fixture.as_ref().unwrap();
+            assert_eq!(fixture.jobs_dispatches.load(Ordering::Relaxed), 1);
+            assert_eq!(fixture.log_dispatches.load(Ordering::Relaxed), 1);
+            let InteractionState::Ready(controller) = &this.tabs[0].interactions else {
+                unreachable!()
+            };
+            let stopped = controller.pending_review_start.as_ref().unwrap();
+            assert!(matches!(
+                stopped.stage,
+                super::PendingReviewStartStage::StoppedAfterReviewCreated { .. }
+            ));
+            assert_eq!(stopped.creation(), checkpoint.creation());
+            assert_eq!(
+                PendingReviewStartJournal::open(
+                    &this.interaction_root,
+                    checkpoint.intent.key.clone()
+                )
+                .unwrap()
+                .record()
+                .unwrap()
+                .as_ref(),
+                Some(stopped)
+            );
+            controller
+                .authority
+                .execute_if_current(
+                    &controller.store,
+                    controller.durable_composition.as_ref(),
+                    || (),
+                )
+                .unwrap();
+        });
     }
 
     #[test]
@@ -32265,6 +32618,7 @@ mod layout_tests {
                 cx,
                 Startup {
                     data_dir: Some(data_root),
+                    provider_reads_disabled: true,
                     ..Default::default()
                 },
             )
@@ -32419,6 +32773,7 @@ mod layout_tests {
                 cx,
                 Startup {
                     data_dir: Some(data_root),
+                    provider_reads_disabled: true,
                     ..Default::default()
                 },
             )
@@ -32562,6 +32917,7 @@ mod layout_tests {
                 cx,
                 Startup {
                     data_dir: Some(data_root),
+                    provider_reads_disabled: true,
                     ..Default::default()
                 },
             )

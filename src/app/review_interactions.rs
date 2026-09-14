@@ -2909,6 +2909,18 @@ impl PendingReviewStartJournal {
         self.record_unlocked()
     }
 
+    #[cfg(all(test, feature = "ui-smoke"))]
+    pub(super) fn seed_created_fixture(
+        &self,
+        record: &PendingReviewStartRecord,
+    ) -> Result<(), String> {
+        if !matches!(record.stage, PendingReviewStartStage::ReviewCreated { .. }) {
+            return Err("the fixture must represent a created-review checkpoint".into());
+        }
+        let _lock = self.target.acquire()?;
+        self.save_if_current_unlocked(None, record)
+    }
+
     fn record_unlocked(&self) -> Result<Option<PendingReviewStartRecord>, String> {
         let path = self.path()?;
         let Some(bytes) = read_bounded(&path, MAX_PENDING_REVIEW_START_BYTES)? else {
