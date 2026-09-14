@@ -808,6 +808,49 @@ sys.exit(0 if status in [200, 304] else 1)
     }
 
     #[test]
+    fn rest_poll_floor_is_recorded_before_aggregate_byte_rejection() {
+        let endpoint = "repos/owner/repo";
+        let mut response = rest(endpoint, 200, None, Some(json!({"name": "repo"})));
+        response["headers"] = json!({"X-Poll-Interval": "45"});
+        let (dir, provider) = fixture("alice", vec![response]);
+        let outcome = provider.general_read(|provider| {
+            let mut session = Session::new(provider);
+            session.bytes = super::super::MAX_OPERATION_BYTES;
+            session.get::<Value>(endpoint)
+        });
+        let (result, _, poll, failure) = outcome.into_parts();
+        assert!(result.is_err());
+        assert_eq!(failure, Some(GeneralReadFailureKind::Incomplete));
+        assert_eq!(poll.x_poll_interval, Some(GeneralReadDelay::Seconds(45)));
+        assert_eq!(calls(&dir), 1);
+    }
+
+    #[test]
+    fn graphql_exhaustion_floor_is_recorded_before_aggregate_byte_rejection() {
+        let (dir, provider) = fixture(
+            "alice",
+            vec![graphql(
+                200,
+                json!({"Retry-After": "75", "X-RateLimit-Remaining": "0"}),
+                Some(json!({
+                    "data": null,
+                    "errors": [{"type": "RATE_LIMITED", "message": "withheld"}]
+                })),
+            )],
+        );
+        let outcome = provider.general_read(|provider| {
+            let mut session = Session::new(provider);
+            session.bytes = super::super::MAX_OPERATION_BYTES;
+            session.graphql::<Value>("query First { viewer { login } }", json!({}))
+        });
+        let (result, _, poll, failure) = outcome.into_parts();
+        assert!(result.is_err());
+        assert_eq!(failure, Some(GeneralReadFailureKind::RateLimited));
+        assert_eq!(poll.rate_limit, Some(GeneralReadDelay::Seconds(75)));
+        assert_eq!(calls(&dir), 1);
+    }
+
+    #[test]
     fn cache_limits_bound_entries_total_bytes_and_single_body_size() {
         let provider = GithubProvider::new(account("alice"));
         let repository = repo("alice");

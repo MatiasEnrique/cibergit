@@ -1680,16 +1680,38 @@ impl<'a> Session<'a> {
             }
         };
         self.record_general_poll(&metadata.poll);
-        self.bytes = self
-            .bytes
-            .checked_add(output.stdout.len())
-            .context("GitHub operation output limit reached")?;
+        let Some(total_bytes) = self.bytes.checked_add(output.stdout.len()) else {
+            if let Some(delay) = metadata.graphql_rate_limit.clone() {
+                self.record_general_poll(&conditional::RestPollDirective {
+                    x_poll_interval: None,
+                    rate_limit: Some(delay),
+                });
+            } else {
+                self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
+            }
+            bail!("GitHub operation output limit reached");
+        };
+        self.bytes = total_bytes;
         if self.bytes > MAX_OPERATION_BYTES {
-            self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
+            if let Some(delay) = metadata.graphql_rate_limit.clone() {
+                self.record_general_poll(&conditional::RestPollDirective {
+                    x_poll_interval: None,
+                    rate_limit: Some(delay),
+                });
+            } else {
+                self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
+            }
             bail!("GitHub operation output limit reached");
         }
         let envelope: GraphqlEnvelope<T> = decode(&bytes).inspect_err(|_| {
-            self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
+            if let Some(delay) = metadata.graphql_rate_limit.clone() {
+                self.record_general_poll(&conditional::RestPollDirective {
+                    x_poll_interval: None,
+                    rate_limit: Some(delay),
+                });
+            } else {
+                self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
+            }
         })?;
         if !envelope.errors.is_empty()
             && let Some(delay) = metadata.graphql_rate_limit
