@@ -170,7 +170,7 @@ impl GithubProvider {
         } else {
             (input.to_owned(), None)
         };
-        let (owner, name) = parse_repository(&remote)?;
+        let (owner, name) = self.runner.resolve_repository(&remote)?;
         let mut session = Session::new(self);
         let metadata: ApiRepository = session.get(&format!("repos/{owner}/{name}"))?;
         ensure!(
@@ -1369,6 +1369,10 @@ fn parse_repository(input: &str) -> Result<(String, String)> {
     } else {
         input
     };
+    parse_repository_path(path)
+}
+
+fn parse_repository_path(path: &str) -> Result<(String, String)> {
     let path = path.trim_end_matches('/');
     let (owner, name) = path
         .split_once('/')
@@ -2655,6 +2659,7 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 struct Runner {
     gh: PathBuf,
     git: PathBuf,
+    ssh: PathBuf,
     curl: PathBuf,
     timeout: Duration,
     input_timeout: Option<Duration>,
@@ -2665,6 +2670,7 @@ impl Default for Runner {
         Self {
             gh: "gh".into(),
             git: "git".into(),
+            ssh: "/usr/bin/ssh".into(),
             curl: "/usr/bin/curl".into(),
             timeout: Duration::from_secs(30),
             input_timeout: None,
@@ -2673,6 +2679,54 @@ impl Default for Runner {
     }
 }
 impl Runner {
+    fn resolve_repository(&self, input: &str) -> Result<(String, String)> {
+        let ssh_remote = if let Some(rest) = input.strip_prefix("ssh://git@") {
+            Some(
+                rest.split_once('/')
+                    .context("Expected SSH host/owner/repository")?,
+            )
+        } else if let Some(rest) = input.strip_prefix("git@") {
+            Some(
+                rest.split_once(':')
+                    .context("Expected SSH host:owner/repository")?,
+            )
+        } else {
+            None
+        };
+        let Some((host, path)) = ssh_remote else {
+            return parse_repository(input);
+        };
+        ensure!(
+            !host.is_empty()
+                && host.len() <= 253
+                && host.as_bytes()[0].is_ascii_alphanumeric()
+                && host
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)),
+            "Invalid SSH host in repository URL"
+        );
+        // Validate the repository path before consulting local SSH configuration.
+        let repository = parse_repository_path(path)?;
+        if !host.eq_ignore_ascii_case(HOST) {
+            // -G evaluates the user's SSH aliases without connecting or authenticating.
+            // Git's SSH identity does not select the account used for GitHub API reads.
+            let mut command = Command::new(&self.ssh);
+            command.args(["-G", "-o", "CanonicalizeHostname=no", "-o", "BatchMode=yes"]);
+            command.arg(format!("git@{host}"));
+            let config = self.run(command, "resolve repository SSH host")?;
+            let config =
+                std::str::from_utf8(&config).context("Invalid SSH configuration output")?;
+            let hostname = config
+                .lines()
+                .find_map(|line| line.strip_prefix("hostname "));
+            ensure!(
+                hostname.is_some_and(|hostname| hostname.eq_ignore_ascii_case(HOST)),
+                "Repository SSH host '{host}' does not resolve to github.com; choose a GitHub repository"
+            );
+        }
+        Ok(repository)
+    }
+
     fn gh_command(&self) -> Command {
         let mut command = Command::new(&self.gh);
         for name in [
@@ -9161,6 +9215,90 @@ else:
             assert!(!patch_is_complete(patch, 1, 1));
         }
         assert!(!patch_is_complete("@@ -1 +1 @@\n-a\n+b", 2, 2));
+    }
+
+    #[test]
+    fn repository_ssh_alias_resolves_local_folder_without_changing_identity_or_config() {
+        let checkout = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(checkout.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(checkout.path())
+                .args(["remote", "add", "origin", "git@github-work:owner/repo.git"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let config_path = checkout.path().join(".git/config");
+        let before = fs::read(&config_path).unwrap();
+        let (dir, mut provider) = fixture(
+            "alice",
+            vec![step(
+                "repos/owner/repo",
+                json!({"name":"repo","owner":{"login":"owner"}}),
+            )],
+        );
+        let ssh_config = dir.path().join("ssh-config");
+        fs::write(
+            &ssh_config,
+            "Host github-work\n  HostName github.com\nHost foreign-work\n  HostName example.com\n",
+        )
+        .unwrap();
+        let ssh = dir.path().join("ssh");
+        fs::write(
+            &ssh,
+            "#!/bin/sh\nexec /usr/bin/ssh -F \"$(dirname \"$0\")/ssh-config\" \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        provider.runner.ssh = ssh;
+        let resolved = provider
+            .repository(checkout.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(resolved.full_name(), "owner/repo");
+        assert_eq!(resolved.account, account("alice"));
+        assert_eq!(
+            resolved.local_path,
+            Some(checkout.path().canonicalize().unwrap())
+        );
+        assert_eq!(fs::read(&config_path).unwrap(), before);
+        exhausted(&dir, 1);
+        assert_eq!(
+            provider
+                .runner
+                .resolve_repository("ssh://git@github-work/owner/repo.git")
+                .unwrap(),
+            ("owner".into(), "repo".into())
+        );
+        for remote in [
+            "git@foreign-work:owner/repo.git",
+            "git@unknown-work:owner/repo.git",
+        ] {
+            assert!(
+                provider
+                    .repository(remote)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not resolve to github.com")
+            );
+        }
+        for remote in [
+            "git@-G:owner/repo.git",
+            "git@github-work:owner/repo/extra",
+            "git@github-work:https://github.com/owner/repo",
+            "ssh://git@github-work/owner/repo?token=x",
+        ] {
+            assert!(provider.repository(remote).is_err(), "accepted {remote}");
+        }
+        exhausted(&dir, 1);
     }
 
     #[test]
