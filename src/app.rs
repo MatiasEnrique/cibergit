@@ -36,8 +36,8 @@ use checks_view::{
 use ci_read::{CiOperation, CiPane, CiReadState, jobs_page};
 #[cfg(feature = "ui-smoke")]
 use cibergit::domain::{
-    ActionsLinkage, CheckAppIdentity, CheckKind, CheckShaClass, CheckSuiteIdentity,
-    PullRequestCheck, WorkflowRunIdentity,
+    ActionsJobLog, ActionsJobsSnapshot, ActionsLinkage, CheckAppIdentity, CheckKind, CheckShaClass,
+    CheckSuiteIdentity, PullRequestCheck, WorkflowRunIdentity,
 };
 #[cfg(feature = "ui-smoke")]
 use cibergit::participation::ReviewOperationPayload;
@@ -121,6 +121,24 @@ fn bounded_log_render_range(requested: Range<usize>, total: usize) -> Range<usiz
         .min(total);
     start..end
 }
+
+fn normalize_actions_read<T>(
+    outcome: cibergit::providers::GeneralReadOutcome<Result<T, ActionsReadError>>,
+) -> (
+    Result<T, ActionsReadError>,
+    Option<cibergit::providers::GeneralReadCache>,
+    cibergit::providers::GeneralReadDirective,
+) {
+    let (outer, cache, directive, failure) = outcome.into_parts();
+    let result = outer.unwrap_or_else(|_| {
+        Err(ActionsReadError::closed(match failure {
+            Some(GeneralReadFailureKind::RateLimited) => ActionsReadErrorCategory::RateLimited,
+            Some(GeneralReadFailureKind::Unavailable) => ActionsReadErrorCategory::Unavailable,
+            _ => ActionsReadErrorCategory::InvalidResponse,
+        }))
+    });
+    (result, cache, directive)
+}
 const DEFAULT_SIDEBAR_WIDTH: f32 = 292.;
 const DEFAULT_FILE_TREE_WIDTH: f32 = 250.;
 const DEFAULT_DETAILS_WIDTH: f32 = 274.;
@@ -172,6 +190,9 @@ pub struct Startup {
     pub account: Option<String>,
     pub pull_request: Option<u64>,
     pub data_dir: Option<PathBuf>,
+    #[cfg(feature = "ui-smoke")]
+    #[doc(hidden)]
+    pub provider_reads_disabled: bool,
 }
 
 pub enum Root {
@@ -725,6 +746,15 @@ struct CiCompletionToken {
     selected_job_id: Option<u64>,
     jobs_observation_id: Option<u64>,
     operation: CiOperation,
+}
+
+#[cfg(feature = "ui-smoke")]
+#[derive(Clone)]
+struct ActionsReadFixture {
+    jobs: ActionsJobsSnapshot,
+    log: ActionsJobLog,
+    jobs_dispatches: Arc<AtomicU64>,
+    log_dispatches: Arc<AtomicU64>,
 }
 
 impl CiCompletionToken {
@@ -1963,6 +1993,8 @@ pub struct ReviewWorkspace {
     collaboration_read_disabled: bool,
     #[cfg(feature = "ui-smoke")]
     collaboration_read_attempts: Arc<AtomicU64>,
+    #[cfg(feature = "ui-smoke")]
+    actions_read_fixture: Option<Arc<ActionsReadFixture>>,
     composer_edit_generation: u64,
     next_request_generation: u64,
     _subscriptions: Vec<Subscription>,
@@ -2355,34 +2387,46 @@ impl ReviewWorkspace {
             operation: operation.clone(),
         };
         let (read_token, _) = admission.into_parts();
+        #[cfg(feature = "ui-smoke")]
+        let fixture = self.actions_read_fixture.clone();
         let task = cx.background_spawn(async move {
-            let provider = GithubProvider::new(repository.account.clone());
-            let outcome = provider.general_read(|provider| {
-                Ok(provider.read_actions_jobs(
-                    &repository,
-                    &locator,
-                    &current_head,
-                    &operation.cancellation,
-                ))
-            });
-            (read_token, token, outcome)
+            #[cfg(feature = "ui-smoke")]
+            let completed = if let Some(fixture) = fixture {
+                fixture.jobs_dispatches.fetch_add(1, Ordering::Relaxed);
+                (
+                    Ok(fixture.jobs.clone()),
+                    None,
+                    cibergit::providers::GeneralReadDirective::default(),
+                )
+            } else {
+                let provider = GithubProvider::new(repository.account.clone());
+                normalize_actions_read(provider.general_read(|provider| {
+                    Ok(provider.read_actions_jobs(
+                        &repository,
+                        &locator,
+                        &current_head,
+                        &operation.cancellation,
+                    ))
+                }))
+            };
+            #[cfg(not(feature = "ui-smoke"))]
+            let completed = {
+                let provider = GithubProvider::new(repository.account.clone());
+                normalize_actions_read(provider.general_read(|provider| {
+                    Ok(provider.read_actions_jobs(
+                        &repository,
+                        &locator,
+                        &current_head,
+                        &operation.cancellation,
+                    ))
+                }))
+            };
+            (read_token, token, completed)
         });
         cx.spawn(async move |root, cx| {
-            let (read_token, token, outcome) = task.await;
+            let (read_token, token, (result, cache, directive)) = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
-                let (outer, cache, directive, failure) = outcome.into_parts();
-                let result = outer.unwrap_or_else(|_| {
-                    Err(ActionsReadError::closed(match failure {
-                        Some(GeneralReadFailureKind::RateLimited) => {
-                            ActionsReadErrorCategory::RateLimited
-                        }
-                        Some(GeneralReadFailureKind::Unavailable) => {
-                            ActionsReadErrorCategory::Unavailable
-                        }
-                        _ => ActionsReadErrorCategory::InvalidResponse,
-                    }))
-                });
                 let current = this.ci_completion_is_current(&token);
                 let disposition = this.general_reads.complete(
                     &read_token,
@@ -2457,34 +2501,46 @@ impl ReviewWorkspace {
             operation: operation.clone(),
         };
         let (read_token, _) = admission.into_parts();
+        #[cfg(feature = "ui-smoke")]
+        let fixture = self.actions_read_fixture.clone();
         let task = cx.background_spawn(async move {
-            let provider = GithubProvider::new(repository.account.clone());
-            let outcome = provider.general_read(|provider| {
-                Ok(provider.read_actions_job_log(
-                    &repository,
-                    &snapshot,
-                    selected_job_id,
-                    &operation.cancellation,
-                ))
-            });
-            (read_token, token, outcome)
+            #[cfg(feature = "ui-smoke")]
+            let completed = if let Some(fixture) = fixture {
+                fixture.log_dispatches.fetch_add(1, Ordering::Relaxed);
+                (
+                    Ok(fixture.log.clone()),
+                    None,
+                    cibergit::providers::GeneralReadDirective::default(),
+                )
+            } else {
+                let provider = GithubProvider::new(repository.account.clone());
+                normalize_actions_read(provider.general_read(|provider| {
+                    Ok(provider.read_actions_job_log(
+                        &repository,
+                        &snapshot,
+                        selected_job_id,
+                        &operation.cancellation,
+                    ))
+                }))
+            };
+            #[cfg(not(feature = "ui-smoke"))]
+            let completed = {
+                let provider = GithubProvider::new(repository.account.clone());
+                normalize_actions_read(provider.general_read(|provider| {
+                    Ok(provider.read_actions_job_log(
+                        &repository,
+                        &snapshot,
+                        selected_job_id,
+                        &operation.cancellation,
+                    ))
+                }))
+            };
+            (read_token, token, completed)
         });
         cx.spawn(async move |root, cx| {
-            let (read_token, token, outcome) = task.await;
+            let (read_token, token, (result, cache, directive)) = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
-                let (outer, cache, directive, failure) = outcome.into_parts();
-                let result = outer.unwrap_or_else(|_| {
-                    Err(ActionsReadError::closed(match failure {
-                        Some(GeneralReadFailureKind::RateLimited) => {
-                            ActionsReadErrorCategory::RateLimited
-                        }
-                        Some(GeneralReadFailureKind::Unavailable) => {
-                            ActionsReadErrorCategory::Unavailable
-                        }
-                        _ => ActionsReadErrorCategory::InvalidResponse,
-                    }))
-                });
                 let current = this.ci_completion_is_current(&token);
                 let disposition = this.general_reads.complete(
                     &read_token,
@@ -2520,6 +2576,8 @@ impl ReviewWorkspace {
     }
 
     fn new(window: &mut Window, cx: &mut Context<Root>, startup: Startup) -> Self {
+        #[cfg(feature = "ui-smoke")]
+        let provider_reads_disabled = startup.provider_reads_disabled;
         let data_root = startup.data_dir.clone().unwrap_or_else(|| {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -2722,6 +2780,8 @@ impl ReviewWorkspace {
             .is_some(),
             #[cfg(feature = "ui-smoke")]
             collaboration_read_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "ui-smoke")]
+            actions_read_fixture: None,
             composer_edit_generation: 0,
             next_request_generation: 0,
             _subscriptions: Vec::new(),
@@ -2905,8 +2965,18 @@ impl ReviewWorkspace {
             submitted_summary_changes,
         ]);
         this.start_workspace_restore(cx);
-        this.start_notifications(cx);
-        this.discover_accounts(startup.account, cx);
+        #[cfg(feature = "ui-smoke")]
+        if provider_reads_disabled {
+            this.accounts_state = LoadState::Ready;
+        } else {
+            this.start_notifications(cx);
+            this.discover_accounts(startup.account, cx);
+        }
+        #[cfg(not(feature = "ui-smoke"))]
+        {
+            this.start_notifications(cx);
+            this.discover_accounts(startup.account, cx);
+        }
         for index in 0..this.repositories.len() {
             this.refresh_repository(index, cx);
         }
@@ -21846,7 +21916,11 @@ impl ReviewWorkspace {
                                 .take(range.len())
                                 .enumerate()
                                 .map(|(offset, line)| {
+                                    let row_number = range.start + offset + 1;
                                     div()
+                                        .debug_selector(move || {
+                                            format!("actions-log-row-{row_number}")
+                                        })
                                         .h(px(20.))
                                         .w(px(line_width))
                                         .flex()
@@ -21858,7 +21932,7 @@ impl ReviewWorkspace {
                                                 .px_2()
                                                 .text_right()
                                                 .text_color(colors.faint)
-                                                .child((range.start + offset + 1).to_string()),
+                                                .child(row_number.to_string()),
                                         )
                                         .child(
                                             div()
@@ -27093,7 +27167,7 @@ mod layout_tests {
     };
     #[cfg(feature = "ui-smoke")]
     use super::{
-        ActionsReadError, ActionsReadErrorCategory, CiCompletionToken, CiPane,
+        ActionsReadError, ActionsReadErrorCategory, ActionsReadFixture, CiCompletionToken, CiPane,
         DismissalConfirmationToken, DismissalPreparationToken, InspectorSection, InstallTabOptions,
         LoadState, NextCheck, NextCheckPage, OpenChecks, OpenSelectedCheckJobs, RepoRuntime, Root,
         Startup, ToggleCheckIdentity, check_identity_button, checks_page_button, palette,
@@ -27119,7 +27193,16 @@ mod layout_tests {
     use gpui::{Modifiers, WindowAppearance, point, px, size};
     use std::time::{Duration, Instant, UNIX_EPOCH};
     #[cfg(feature = "ui-smoke")]
-    use std::{cell::Cell, fs, path::PathBuf, rc::Rc};
+    use std::{
+        cell::Cell,
+        fs,
+        path::PathBuf,
+        rc::Rc,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
     #[cfg(feature = "ui-smoke")]
     use tempfile::tempdir;
 
@@ -28231,12 +28314,17 @@ mod layout_tests {
                 cx,
                 Startup {
                     data_dir: Some(data_root),
+                    provider_reads_disabled: true,
                     ..Default::default()
                 },
             )
         });
-        let (repository, _) = submitted_review_fixture();
+        let (mut repository, _) = submitted_review_fixture();
+        repository.owner = "cli".into();
+        repository.name = "cli".into();
         let pull = transition_pull_request(7);
+        let jobs_dispatches = Arc::new(AtomicU64::new(0));
+        let log_dispatches = Arc::new(AtomicU64::new(0));
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
                 let Root::Review(this) = root else {
@@ -28260,60 +28348,129 @@ mod layout_tests {
                 this.tabs[0].inspector_section = InspectorSection::Checks;
                 this.inspector_open = true;
                 let (_, locator, _, _) = this.selected_actions_locator(0).unwrap();
-                let jobs_operation = this.tabs[0].ci_read.begin_jobs(locator.clone());
                 let ids = (1..=80).collect::<Vec<_>>();
                 let snapshot = actions_snapshot(&locator, 50, &ids);
-                assert!(
-                    this.tabs[0]
-                        .ci_read
-                        .finish_jobs(&jobs_operation, Ok(snapshot.clone()),)
-                );
-                this.tabs[0].ci_read.pane = CiPane::Jobs;
-                cx.notify();
-            });
-            window.draw(cx).clear(cx);
-        });
-        cx.update(|window, cx| {
-            root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
-                let snapshot = this.tabs[0].ci_read.jobs.visible().unwrap().clone();
-                let (operation, _, selected_job_id) = this.tabs[0].ci_read.begin_log().unwrap();
-                let mut log = actions_log(&snapshot, selected_job_id);
+                let mut log = actions_log(&snapshot, snapshot.selected_check_job_id);
                 log.sanitized_text = (0..200_000)
                     .map(|index| {
                         if index == 199_999 {
-                            "FINAL-SENTINEL".to_owned()
+                            format!(
+                                "SYNTHETIC-FINAL-ROW-LEFT {} SYNTHETIC-HORIZONTAL-END-RIGHT",
+                                "0123456789abcdef".repeat(512)
+                            )
                         } else {
-                            format!("line-{index}")
+                            format!("synthetic-line-{index}")
                         }
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
                 log.raw_byte_count = log.sanitized_text.len();
                 log.line_count = 200_000;
-                assert!(this.tabs[0].ci_read.finish_log(&operation, Ok(log)));
-                this.tabs[0].ci_read.pane = CiPane::Log;
-                this.tabs[0]
-                    .log_scroll
-                    .scroll_to_item(199_999, gpui::ScrollStrategy::Center);
+                this.actions_read_fixture = Some(Arc::new(ActionsReadFixture {
+                    jobs: snapshot,
+                    log,
+                    jobs_dispatches: jobs_dispatches.clone(),
+                    log_dispatches: log_dispatches.clone(),
+                }));
+                assert!(this.start_actions_jobs(0, cx));
+                assert!(matches!(
+                    this.tabs[0].ci_read.jobs,
+                    MemoryRead::Loading { .. }
+                ));
+                this.focus_current_ci_pane(0, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert!(matches!(this.tabs[0].ci_read.jobs, MemoryRead::Fresh(_)));
+                assert_eq!(jobs_dispatches.load(Ordering::Relaxed), 1);
+                assert!(
+                    this.general_reads
+                        .selected_account_readiness_at(&repository.account, Instant::now())
+                        .is_ok()
+                );
+                this.status = "Synthetic Actions jobs sink · actual Root admission, controller completion, and strict apply fence · no credentials or provider calls".into();
+                window.resize(size(px(1440.), px(900.)));
                 cx.notify();
             });
             window.draw(cx).clear(cx);
         });
+
+        cx.update(|_, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert!(this.start_actions_log(0, cx));
+                assert!(matches!(
+                    this.tabs[0].ci_read.log,
+                    MemoryRead::Loading { .. }
+                ));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert!(matches!(this.tabs[0].ci_read.log, MemoryRead::Fresh(_)));
+                assert_eq!(log_dispatches.load(Ordering::Relaxed), 1);
+                assert!(
+                    this.general_reads
+                        .selected_account_readiness_at(&repository.account, Instant::now())
+                        .is_ok()
+                );
+                this.tabs[0]
+                    .log_scroll
+                    .scroll_to_item(199_999, gpui::ScrollStrategy::Center);
+                this.status = "Synthetic maximum-line Actions log sink · final row and horizontal sentinels · actual Root admission/controller completion · no credentials, provider, or storage calls".into();
+                this.focus_current_ci_pane(0, window, cx);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("actions-log-row-200000").is_some(),
+            "the native list must materialize the final displayed row"
+        );
         root.read_with(cx, |root, _| {
             let Root::Review(this) = root else {
                 unreachable!()
             };
             let log = this.tabs[0].ci_read.log.visible().unwrap();
             assert_eq!(log.line_count, 200_000);
-            assert!(log.sanitized_text.ends_with("FINAL-SENTINEL"));
+            assert!(
+                log.sanitized_text
+                    .ends_with("SYNTHETIC-HORIZONTAL-END-RIGHT")
+            );
             assert_eq!(
                 bounded_log_render_range(0..200_000, log.line_count).len(),
                 super::MAX_RENDERED_LOG_ROWS,
             );
         });
+
+        let horizontal_maximum = cx.update(|_, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let maximum = this.tabs[0].log_horizontal.max_offset().x.as_f32();
+                assert!(maximum > 1_000.);
+                this.tabs[0]
+                    .log_horizontal
+                    .set_offset(point(px(-maximum), px(0.)));
+                cx.notify();
+                maximum
+            })
+        });
+        assert!(horizontal_maximum > 1_000.);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("actions-log-row-200000").is_some());
     }
 
     #[test]
