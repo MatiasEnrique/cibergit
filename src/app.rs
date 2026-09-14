@@ -33,7 +33,7 @@ use checks_view::{
     PreviousJobPage, RefreshSelectedCheckJobs, ReturnToChecks, ReturnToJobs, ToggleCheckIdentity,
     checks_page, identity_fields, kind_label, linkage_label, required_label, sha_label,
 };
-use ci_read::{CiPane, CiReadState, jobs_page};
+use ci_read::{CiOperation, CiPane, CiReadState, jobs_page};
 #[cfg(feature = "ui-smoke")]
 use cibergit::domain::{
     ActionsLinkage, CheckAppIdentity, CheckKind, CheckShaClass, CheckSuiteIdentity,
@@ -48,15 +48,18 @@ use cibergit::{
         select_github_comparison, select_local_comparison,
     },
     domain::{
-        DismissalAuthority, MergeAction, MergeExecutionRequest, MergeMethod, MergePreparation,
-        PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome, ProviderReadEvidence,
-        PullRequest, PullRequestDetails, PullRequestDiscussionAction, PullRequestLifecycleAction,
-        ReactableKind, ReactionAction, ReactionContent, ReactionIntent, ReactionSubjectSnapshot,
-        Repository, ReviewAuxiliaryAction, ReviewAuxiliaryRequest, Revision,
+        ActionsAttemptLocator, ActionsHeadRelation, DismissalAuthority, MergeAction,
+        MergeExecutionRequest, MergeMethod, MergePreparation, PendingReviewSnapshot,
+        ProviderCoordinates, ProviderMutationOutcome, ProviderReadEvidence, PullRequest,
+        PullRequestDetails, PullRequestDiscussionAction, PullRequestLifecycleAction, ReactableKind,
+        ReactionAction, ReactionContent, ReactionIntent, ReactionSubjectSnapshot, Repository,
+        ReviewAuxiliaryAction, ReviewAuxiliaryRequest, Revision,
         SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
     },
     participation::{DiffSide, LineSelection, ReviewEvent, ReviewKey},
-    providers::{GeneralReadFailureKind, GithubProvider},
+    providers::{
+        ActionsReadError, ActionsReadErrorCategory, GeneralReadFailureKind, GithubProvider,
+    },
     review::{
         AlignedRow, DiffLine, DiffLineKind, DiffMode, ParsedDiff, PatchStatus, ReviewSession,
         file_key, load_local_file, local_pr_inventory, parse_file,
@@ -108,6 +111,16 @@ use view_editor::{RepositoryPulls, SidebarRow, ViewEditorController, compose_sid
 
 const UI_FONT: &str = "IBM Plex Sans";
 const CODE_FONT: &str = "Menlo";
+const MAX_RENDERED_LOG_ROWS: usize = 128;
+
+fn bounded_log_render_range(requested: Range<usize>, total: usize) -> Range<usize> {
+    let start = requested.start.min(total);
+    let end = requested
+        .end
+        .min(start.saturating_add(MAX_RENDERED_LOG_ROWS))
+        .min(total);
+    start..end
+}
 const DEFAULT_SIDEBAR_WIDTH: f32 = 292.;
 const DEFAULT_FILE_TREE_WIDTH: f32 = 250.;
 const DEFAULT_DETAILS_WIDTH: f32 = 274.;
@@ -700,6 +713,40 @@ struct TabReadEpoch {
     generation: u64,
 }
 
+#[derive(Clone)]
+struct CiCompletionToken {
+    workspace_instance: u64,
+    tab_instance: u64,
+    repository_key: String,
+    pull_request: u64,
+    details_generation: u64,
+    selected_check_id: String,
+    locator: ActionsAttemptLocator,
+    selected_job_id: Option<u64>,
+    jobs_observation_id: Option<u64>,
+    operation: CiOperation,
+}
+
+impl CiCompletionToken {
+    fn matches(&self, workspace: &ReviewWorkspace, tab: &ReviewTab) -> bool {
+        self.workspace_instance == workspace.workspace_instance
+            && self.tab_instance == tab.instance_generation
+            && self.repository_key == tab.repository.cache_key()
+            && self.pull_request == tab.pull_request.number
+            && self.details_generation == tab.details_generation
+            && tab.checks_selection.selected_id.as_deref() == Some(&self.selected_check_id)
+            && tab.ci_read.frozen_locator.as_ref() == Some(&self.locator)
+            && tab.ci_read.selected_job_id == self.selected_job_id
+            && self.jobs_observation_id.is_none_or(|observation| {
+                tab.ci_read
+                    .jobs
+                    .visible()
+                    .is_some_and(|snapshot| snapshot.observation_id == observation)
+            })
+            && tab.ci_read.owns(&self.operation)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StartupRestoreToken {
     workspace_instance: u64,
@@ -1240,10 +1287,13 @@ struct ReviewTab {
     diff_scroll: ListState,
     diff_horizontal: ScrollHandle,
     diff_content_width: f32,
+    log_scroll: UniformListScrollHandle,
+    log_horizontal: ScrollHandle,
     file_tree: FileTree,
     file_tree_scroll: UniformListScrollHandle,
     inspector_section: InspectorSection,
     checks_selection: ChecksSelection,
+    ci_read: CiReadState,
     local_inventory: bool,
     session_persistence_error: Option<String>,
     details: Option<PullRequestDetails>,
@@ -1875,6 +1925,8 @@ pub struct ReviewWorkspace {
     view_editor_scroll: ScrollHandle,
     inspector_scroll: ScrollHandle,
     checks_focus: FocusHandle,
+    jobs_focus: FocusHandle,
+    log_focus: FocusHandle,
     query: Entity<InputState>,
     composer_input: Entity<TextareaState>,
     review_summary_input: Entity<TextareaState>,
@@ -2053,6 +2105,7 @@ impl ReviewWorkspace {
             .map(|details| details.checks.as_slice())
             .unwrap_or_default();
         tab.checks_selection.move_selection(checks, delta);
+        self.reconcile_ci_selection(index);
         self.scroll_selected_check_into_view(index);
         self.checks_focus.focus(window, cx);
         cx.notify();
@@ -2072,6 +2125,7 @@ impl ReviewWorkspace {
             .map(|details| details.checks.as_slice())
             .unwrap_or_default();
         tab.checks_selection.move_page(checks, delta);
+        self.reconcile_ci_selection(index);
         self.scroll_selected_check_into_view(index);
         self.checks_focus.focus(window, cx);
         cx.notify();
@@ -2087,6 +2141,7 @@ impl ReviewWorkspace {
     fn activate_check(&mut self, remote_id: &str, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         self.tabs[index].checks_selection.activate(remote_id);
+        self.reconcile_ci_selection(index);
         self.scroll_selected_check_into_view(index);
         cx.notify();
     }
@@ -2118,6 +2173,342 @@ impl ReviewWorkspace {
         self.inspector_scroll.scroll_to_top_of_item(row_on_page + 2);
     }
 
+    fn selected_actions_locator(
+        &self,
+        index: usize,
+    ) -> Result<(Repository, ActionsAttemptLocator, String, String), String> {
+        let tab = self
+            .tabs
+            .get(index)
+            .ok_or_else(|| "Actions tab is unavailable.".to_owned())?;
+        let details = tab
+            .details
+            .as_ref()
+            .or_else(|| {
+                tab.cached_collaboration
+                    .as_ref()
+                    .map(|cached| &cached.details)
+            })
+            .ok_or_else(|| "Load complete Checks identity before loading jobs.".to_owned())?;
+        let selected_id = tab
+            .checks_selection
+            .selected_id
+            .as_ref()
+            .ok_or_else(|| "Select an exact check run before loading jobs.".to_owned())?;
+        let check = details
+            .checks
+            .iter()
+            .find(|check| check.coordinates.remote_id == *selected_id)
+            .ok_or_else(|| "The selected check identity is no longer present.".to_owned())?;
+        let provider = GithubProvider::new(tab.repository.account.clone());
+        let locator = provider
+            .actions_attempt_locator(&tab.repository, details, check)
+            .map_err(|error| error.to_string())?;
+        Ok((
+            tab.repository.clone(),
+            locator,
+            tab.pull_request.head_sha.clone(),
+            selected_id.clone(),
+        ))
+    }
+
+    fn reconcile_ci_selection(&mut self, index: usize) {
+        let selected = self.tabs[index].checks_selection.selected_id.as_deref();
+        if self.tabs[index]
+            .ci_read
+            .frozen_locator
+            .as_ref()
+            .is_some_and(|locator| Some(locator.check_node_id.as_str()) != selected)
+        {
+            self.tabs[index].ci_read.reconcile_locator(None);
+        }
+    }
+
+    fn reconcile_ci_details(&mut self, index: usize) {
+        let locator = self
+            .selected_actions_locator(index)
+            .ok()
+            .map(|(_, locator, _, _)| locator);
+        self.tabs[index].ci_read.reconcile_locator(locator.as_ref());
+    }
+
+    fn ci_completion_index(&self, token: &CiCompletionToken) -> Option<usize> {
+        if self.workspace_instance != token.workspace_instance {
+            return None;
+        }
+        self.tabs.iter().position(|tab| {
+            tab.instance_generation == token.tab_instance
+                && tab.repository.cache_key() == token.repository_key
+                && tab.pull_request.number == token.pull_request
+        })
+    }
+
+    fn ci_completion_is_current(&self, token: &CiCompletionToken) -> bool {
+        self.ci_completion_index(token)
+            .is_some_and(|index| token.matches(self, &self.tabs[index]))
+    }
+
+    fn apply_actions_jobs_completion(
+        &mut self,
+        token: &CiCompletionToken,
+        result: Result<cibergit::domain::ActionsJobsSnapshot, ActionsReadError>,
+    ) -> bool {
+        let Some(index) = self.ci_completion_index(token) else {
+            return false;
+        };
+        if !token.matches(self, &self.tabs[index]) {
+            self.tabs[index].ci_read.release(&token.operation);
+            return false;
+        }
+        self.tabs[index]
+            .ci_read
+            .finish_jobs(&token.operation, result);
+        self.status = self.tabs[index]
+            .ci_read
+            .jobs
+            .notice()
+            .unwrap_or("Fresh exact Actions jobs loaded read-only.")
+            .to_owned();
+        true
+    }
+
+    fn apply_actions_log_completion(
+        &mut self,
+        token: &CiCompletionToken,
+        result: Result<cibergit::domain::ActionsJobLog, ActionsReadError>,
+    ) -> bool {
+        let Some(index) = self.ci_completion_index(token) else {
+            return false;
+        };
+        if !token.matches(self, &self.tabs[index]) {
+            self.tabs[index].ci_read.release(&token.operation);
+            return false;
+        }
+        let loaded = result.is_ok();
+        self.tabs[index]
+            .ci_read
+            .finish_log(&token.operation, result);
+        if loaded {
+            self.tabs[index].log_scroll = UniformListScrollHandle::new();
+            self.tabs[index].log_horizontal = ScrollHandle::new();
+        }
+        self.status = self.tabs[index]
+            .ci_read
+            .log
+            .notice()
+            .unwrap_or("Fresh exact Actions job log loaded read-only.")
+            .to_owned();
+        true
+    }
+
+    fn start_actions_jobs(&mut self, index: usize, cx: &mut Context<Root>) {
+        if !general_read_tab_can_start(self.tabs[index].submitted_summary_editor.close_after_save) {
+            self.status =
+                "Finish the pending local draft save before starting an Actions read.".into();
+            cx.notify();
+            return;
+        }
+        let (repository, locator, current_head, selected_check_id) =
+            match self.selected_actions_locator(index) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.status = error;
+                    cx.notify();
+                    return;
+                }
+            };
+        let admission = match self.general_reads.begin(&repository.account) {
+            Ok(admission) => admission,
+            Err(read_sync::ReadDeferral::Busy) => {
+                self.tabs[index].ci_read.cancel_active();
+                self.status =
+                    "Cancelling the prior account read; load jobs again after it releases.".into();
+                cx.notify();
+                return;
+            }
+            Err(read_sync::ReadDeferral::Server(notice)) => {
+                self.status = notice.into();
+                cx.notify();
+                return;
+            }
+        };
+        let operation = self.tabs[index].ci_read.begin_jobs(locator.clone());
+        let selected_job_id = self.tabs[index].ci_read.selected_job_id;
+        let token = CiCompletionToken {
+            workspace_instance: self.workspace_instance,
+            tab_instance: self.tabs[index].instance_generation,
+            repository_key: repository.cache_key(),
+            pull_request: self.tabs[index].pull_request.number,
+            details_generation: self.tabs[index].details_generation,
+            selected_check_id,
+            locator: locator.clone(),
+            selected_job_id,
+            jobs_observation_id: None,
+            operation: operation.clone(),
+        };
+        let (read_token, _) = admission.into_parts();
+        let task = cx.background_spawn(async move {
+            let provider = GithubProvider::new(repository.account.clone());
+            let outcome = provider.general_read(|provider| {
+                Ok(provider.read_actions_jobs(
+                    &repository,
+                    &locator,
+                    &current_head,
+                    &operation.cancellation,
+                ))
+            });
+            (read_token, token, outcome)
+        });
+        cx.spawn(async move |root, cx| {
+            let (read_token, token, outcome) = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let (outer, cache, directive, failure) = outcome.into_parts();
+                let result = outer.unwrap_or_else(|_| {
+                    Err(ActionsReadError::closed(match failure {
+                        Some(GeneralReadFailureKind::RateLimited) => {
+                            ActionsReadErrorCategory::RateLimited
+                        }
+                        Some(GeneralReadFailureKind::Unavailable) => {
+                            ActionsReadErrorCategory::Unavailable
+                        }
+                        _ => ActionsReadErrorCategory::InvalidResponse,
+                    }))
+                });
+                let current = this.ci_completion_is_current(&token);
+                let disposition = this.general_reads.complete(
+                    &read_token,
+                    &directive,
+                    cache,
+                    current && result.is_ok(),
+                );
+                if !disposition.matching_operation_released {
+                    return;
+                }
+                this.apply_actions_jobs_completion(&token, result);
+                this.resume_general_read_followups(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn start_actions_log(&mut self, index: usize, cx: &mut Context<Root>) {
+        if !general_read_tab_can_start(self.tabs[index].submitted_summary_editor.close_after_save) {
+            self.status =
+                "Finish the pending local draft save before starting an Actions read.".into();
+            cx.notify();
+            return;
+        }
+        if self.tabs[index].ci_read.log_target().is_none() {
+            self.status = "Select a fresh exact job before loading its log.".into();
+            cx.notify();
+            return;
+        }
+        let repository = self.tabs[index].repository.clone();
+        let admission = match self.general_reads.begin(&repository.account) {
+            Ok(admission) => admission,
+            Err(read_sync::ReadDeferral::Busy) => {
+                self.tabs[index].ci_read.cancel_active();
+                self.status =
+                    "Cancelling the prior account read; load the log again after it releases."
+                        .into();
+                cx.notify();
+                return;
+            }
+            Err(read_sync::ReadDeferral::Server(notice)) => {
+                self.status = notice.into();
+                cx.notify();
+                return;
+            }
+        };
+        let Some((operation, snapshot, selected_job_id)) = self.tabs[index].ci_read.begin_log()
+        else {
+            let (read_token, _) = admission.into_parts();
+            self.general_reads.complete(
+                &read_token,
+                &cibergit::providers::GeneralReadDirective::default(),
+                None,
+                false,
+            );
+            self.resume_general_read_followups(cx);
+            return;
+        };
+        let token = CiCompletionToken {
+            workspace_instance: self.workspace_instance,
+            tab_instance: self.tabs[index].instance_generation,
+            repository_key: repository.cache_key(),
+            pull_request: self.tabs[index].pull_request.number,
+            details_generation: self.tabs[index].details_generation,
+            selected_check_id: snapshot.attempt.key.locator.check_node_id.clone(),
+            locator: snapshot.attempt.key.locator.clone(),
+            selected_job_id: Some(selected_job_id),
+            jobs_observation_id: Some(snapshot.observation_id),
+            operation: operation.clone(),
+        };
+        let (read_token, _) = admission.into_parts();
+        let task = cx.background_spawn(async move {
+            let provider = GithubProvider::new(repository.account.clone());
+            let outcome = provider.general_read(|provider| {
+                Ok(provider.read_actions_job_log(
+                    &repository,
+                    &snapshot,
+                    selected_job_id,
+                    &operation.cancellation,
+                ))
+            });
+            (read_token, token, outcome)
+        });
+        cx.spawn(async move |root, cx| {
+            let (read_token, token, outcome) = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let (outer, cache, directive, failure) = outcome.into_parts();
+                let result = outer.unwrap_or_else(|_| {
+                    Err(ActionsReadError::closed(match failure {
+                        Some(GeneralReadFailureKind::RateLimited) => {
+                            ActionsReadErrorCategory::RateLimited
+                        }
+                        Some(GeneralReadFailureKind::Unavailable) => {
+                            ActionsReadErrorCategory::Unavailable
+                        }
+                        _ => ActionsReadErrorCategory::InvalidResponse,
+                    }))
+                });
+                let current = this.ci_completion_is_current(&token);
+                let disposition = this.general_reads.complete(
+                    &read_token,
+                    &directive,
+                    cache,
+                    current && result.is_ok(),
+                );
+                if !disposition.matching_operation_released {
+                    return;
+                }
+                this.apply_actions_log_completion(&token, result);
+                this.resume_general_read_followups(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn move_job_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        self.tabs[index].ci_read.move_job(delta);
+        self.jobs_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn move_jobs_page(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        self.tabs[index].ci_read.move_job_page(delta);
+        self.jobs_focus.focus(window, cx);
+        cx.notify();
+    }
+
     fn new(window: &mut Window, cx: &mut Context<Root>, startup: Startup) -> Self {
         let data_root = startup.data_dir.clone().unwrap_or_else(|| {
             std::env::var_os("HOME")
@@ -2146,6 +2537,13 @@ impl ReviewWorkspace {
             KeyBinding::new("enter", ToggleCheckIdentity, Some("ChecksPane")),
             KeyBinding::new("pageup", PreviousCheckPage, Some("ChecksPane")),
             KeyBinding::new("pagedown", NextCheckPage, Some("ChecksPane")),
+            KeyBinding::new("up", PreviousJob, Some("ChecksJobsPane")),
+            KeyBinding::new("down", NextJob, Some("ChecksJobsPane")),
+            KeyBinding::new("pageup", PreviousJobPage, Some("ChecksJobsPane")),
+            KeyBinding::new("pagedown", NextJobPage, Some("ChecksJobsPane")),
+            KeyBinding::new("enter", LoadSelectedJobLog, Some("ChecksJobsPane")),
+            KeyBinding::new("escape", ReturnToChecks, Some("ChecksJobsPane")),
+            KeyBinding::new("escape", ReturnToJobs, Some("ChecksLogPane")),
         ]);
         let store_result = startup
             .data_dir
@@ -2215,6 +2613,8 @@ impl ReviewWorkspace {
         let file_tree_focus = cx.focus_handle();
         let diff_focus = cx.focus_handle();
         let checks_focus = cx.focus_handle();
+        let jobs_focus = cx.focus_handle();
+        let log_focus = cx.focus_handle();
         window.focus(&focus, cx);
         let repositories = workspace
             .repositories
@@ -2271,6 +2671,8 @@ impl ReviewWorkspace {
             view_editor_scroll: ScrollHandle::new(),
             inspector_scroll: ScrollHandle::new(),
             checks_focus,
+            jobs_focus,
+            log_focus,
             query,
             composer_input,
             review_summary_input,
@@ -11901,10 +12303,13 @@ impl ReviewWorkspace {
             diff_scroll: ListState::new(0, ListAlignment::Top, px(480.)),
             diff_horizontal: ScrollHandle::new(),
             diff_content_width: 0.,
+            log_scroll: UniformListScrollHandle::new(),
+            log_horizontal: ScrollHandle::new(),
             file_tree,
             file_tree_scroll: UniformListScrollHandle::new(),
             inspector_section: InspectorSection::Overview,
             checks_selection: ChecksSelection::default(),
+            ci_read: CiReadState::default(),
             local_inventory,
             session_persistence_error,
             details: None,
@@ -16223,6 +16628,7 @@ impl ReviewWorkspace {
                                     controller.pending_complete = false;
                                     controller.notice = Some(notice);
                                 }
+                                this.reconcile_ci_details(tab_index);
                                 this.rebuild_diff(tab_index, this.wide);
                                 if this.tabs[tab_index].inspector_section
                                     == InspectorSection::Checks
@@ -16344,6 +16750,7 @@ impl ReviewWorkspace {
                             })
                             .detach();
                         }
+                        this.reconcile_ci_details(tab_index);
                         this.rebuild_diff(tab_index, this.wide);
                         if this.tabs[tab_index].inspector_section == InspectorSection::Checks {
                             this.scroll_selected_check_into_view(tab_index);
@@ -17228,6 +17635,70 @@ impl ReviewWorkspace {
             .on_action(cx.listener(|root, _: &ToggleCheckIdentity, _, cx| {
                 if let Root::Review(this) = root {
                     this.toggle_selected_check(cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &OpenSelectedCheckJobs, window, cx| {
+                if let Root::Review(this) = root
+                    && let Some(index) = this.active_tab
+                {
+                    this.start_actions_jobs(index, cx);
+                    this.jobs_focus.focus(window, cx);
+                }
+            }))
+            .on_action(
+                cx.listener(|root, _: &RefreshSelectedCheckJobs, window, cx| {
+                    if let Root::Review(this) = root
+                        && let Some(index) = this.active_tab
+                    {
+                        this.start_actions_jobs(index, cx);
+                        this.jobs_focus.focus(window, cx);
+                    }
+                }),
+            )
+            .on_action(cx.listener(|root, _: &PreviousJob, window, cx| {
+                if let Root::Review(this) = root {
+                    this.move_job_selection(-1, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &NextJob, window, cx| {
+                if let Root::Review(this) = root {
+                    this.move_job_selection(1, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &PreviousJobPage, window, cx| {
+                if let Root::Review(this) = root {
+                    this.move_jobs_page(-1, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &NextJobPage, window, cx| {
+                if let Root::Review(this) = root {
+                    this.move_jobs_page(1, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &LoadSelectedJobLog, window, cx| {
+                if let Root::Review(this) = root
+                    && let Some(index) = this.active_tab
+                {
+                    this.start_actions_log(index, cx);
+                    this.log_focus.focus(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &ReturnToChecks, window, cx| {
+                if let Root::Review(this) = root
+                    && let Some(index) = this.active_tab
+                {
+                    this.tabs[index].ci_read.pane = CiPane::Checks;
+                    this.checks_focus.focus(window, cx);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|root, _: &ReturnToJobs, window, cx| {
+                if let Root::Review(this) = root
+                    && let Some(index) = this.active_tab
+                {
+                    this.tabs[index].ci_read.pane = CiPane::Jobs;
+                    this.jobs_focus.focus(window, cx);
+                    cx.notify();
                 }
             }))
             .on_action(cx.listener(|root, action: &CycleDiffMode, window, cx| {
@@ -20992,6 +21463,441 @@ impl ReviewWorkspace {
         )
     }
 
+    fn render_actions_jobs(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> Vec<AnyElement> {
+        let tab = &self.tabs[index];
+        let mut content = Vec::new();
+        let back_root = cx.entity();
+        let refresh_root = back_root.clone();
+        content.push(
+            div()
+                .mb_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    action_link_with_id("actions-jobs-back".into(), "Back to checks", colors)
+                        .on_click(move |_, window, cx| {
+                            back_root.update(cx, |root, cx| {
+                                if let Root::Review(this) = root {
+                                    this.tabs[index].ci_read.pane = CiPane::Checks;
+                                    this.checks_focus.focus(window, cx);
+                                    cx.notify();
+                                }
+                            });
+                        }),
+                )
+                .child(
+                    action_link_with_id("actions-jobs-refresh".into(), "Refresh jobs", colors)
+                        .on_click(move |_, _, cx| {
+                            refresh_root.update(cx, |root, cx| {
+                                if let Root::Review(this) = root {
+                                    this.start_actions_jobs(index, cx);
+                                }
+                            });
+                        }),
+                )
+                .into_any_element(),
+        );
+        if let Some(notice) = tab.ci_read.jobs.notice() {
+            content.push(
+                div()
+                    .mb_2()
+                    .text_xs()
+                    .text_color(colors.amber)
+                    .child(notice.to_owned())
+                    .into_any_element(),
+            );
+        }
+        let Some(snapshot) = tab.ci_read.jobs.visible() else {
+            content.push(
+                div()
+                    .text_xs()
+                    .text_color(colors.muted)
+                    .child("No exact Actions jobs snapshot is available in memory.")
+                    .into_any_element(),
+            );
+            return content;
+        };
+        let locator = &snapshot.attempt.key.locator;
+        let relation = match snapshot.attempt.relation {
+            ActionsHeadRelation::CurrentHead => "current PR head",
+            ActionsHeadRelation::HistoricalHead => "historical PR head",
+            ActionsHeadRelation::Unknown => "PR association unknown",
+        };
+        content.push(
+            div()
+                .mb_3()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border)
+                .child(detail(
+                    "Exact attempt",
+                    format!(
+                        "{} · run {} · attempt {}",
+                        locator.base_repository.name_with_owner,
+                        locator.workflow_run.database_id,
+                        locator.workflow_run.run_attempt
+                    ),
+                    colors,
+                ))
+                .child(detail("Commit", locator.check_commit_sha.clone(), colors))
+                .child(detail("Relation", relation, colors))
+                .child(detail(
+                    "Viewer",
+                    format!(
+                        "{} · {}",
+                        snapshot.attempt.key.viewer_login, snapshot.attempt.key.viewer_node_id
+                    ),
+                    colors,
+                ))
+                .child(detail(
+                    "Observation",
+                    format!("{} · memory-only", snapshot.observation_id),
+                    colors,
+                ))
+                .into_any_element(),
+        );
+        let (page, pages, range) = jobs_page(snapshot.jobs.len(), tab.ci_read.jobs_page);
+        for job in &snapshot.jobs[range.clone()] {
+            let id = job.id;
+            let selected = tab.ci_read.selected_job_id == Some(id);
+            let row_root = cx.entity();
+            let focus = self.jobs_focus.clone();
+            content.push(
+                Button::new(format!("actions-job-{id}"))
+                    .mb_2()
+                    .p_2()
+                    .w_full()
+                    .flex_col()
+                    .items_stretch()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if selected {
+                        colors.accent
+                    } else {
+                        colors.border
+                    })
+                    .selected(selected)
+                    .aria_selected(selected)
+                    .accessibility_label(format!(
+                        "{}; job {}; check run {}; {}; {}",
+                        job.name,
+                        job.id,
+                        job.check_run_database_id,
+                        job.status,
+                        job.conclusion.as_deref().unwrap_or("no conclusion")
+                    ))
+                    .when(selected, |row| row.bg(colors.selected))
+                    .cursor_pointer()
+                    .hover(|row| row.bg(colors.selected))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(div().min_w_0().flex_1().child(job.name.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors.muted)
+                                    .child(format!("{} steps", job.steps.len())),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(colors.muted)
+                            .child(format!(
+                                "{}{} · job ID {} · check-run ID {}",
+                                job.status,
+                                job.conclusion
+                                    .as_ref()
+                                    .map(|value| format!(" · {value}"))
+                                    .unwrap_or_default(),
+                                job.id,
+                                job.check_run_database_id
+                            )),
+                    )
+                    .on_click(move |_, window, cx| {
+                        focus.focus(window, cx);
+                        row_root.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                this.tabs[index].ci_read.select_job(Some(id));
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .into_any_element(),
+            );
+        }
+        content.push(
+            div()
+                .mt_2()
+                .text_xs()
+                .text_color(colors.muted)
+                .child(format!(
+                    "Showing {}–{} of {} jobs · page {} of {}.",
+                    range.start.saturating_add(1).min(snapshot.jobs.len()),
+                    range.end,
+                    snapshot.jobs.len(),
+                    page + 1,
+                    pages
+                ))
+                .into_any_element(),
+        );
+        let previous_root = cx.entity();
+        let next_root = previous_root.clone();
+        let log_root = previous_root.clone();
+        content.push(
+            div()
+                .mt_2()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(
+                    checks_page_button(
+                        "actions-jobs-previous-page",
+                        "Previous 40",
+                        page == 0,
+                        "Previous 40 jobs",
+                        colors,
+                    )
+                    .on_click(move |_, window, cx| {
+                        previous_root.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                this.move_jobs_page(-1, window, cx);
+                            }
+                        });
+                    }),
+                )
+                .child(
+                    checks_page_button(
+                        "actions-jobs-next-page",
+                        "Next 40",
+                        page + 1 == pages,
+                        "Next 40 jobs",
+                        colors,
+                    )
+                    .on_click(move |_, window, cx| {
+                        next_root.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                this.move_jobs_page(1, window, cx);
+                            }
+                        });
+                    }),
+                )
+                .child(
+                    Button::new("actions-load-selected-log")
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .text_xs()
+                        .text_color(colors.accent)
+                        .disabled(tab.ci_read.selected_job_id.is_none())
+                        .accessibility_label("Load the selected exact job log read-only")
+                        .child("Load log")
+                        .on_click(move |_, window, cx| {
+                            log_root.update(cx, |root, cx| {
+                                if let Root::Review(this) = root {
+                                    this.start_actions_log(index, cx);
+                                    this.log_focus.focus(window, cx);
+                                }
+                            });
+                        }),
+                )
+                .into_any_element(),
+        );
+        content
+    }
+
+    fn render_actions_log(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> Vec<AnyElement> {
+        let tab = &self.tabs[index];
+        let mut content = Vec::new();
+        let back_root = cx.entity();
+        content.push(
+            action_link_with_id("actions-log-back".into(), "Back to jobs", colors)
+                .on_click(move |_, window, cx| {
+                    back_root.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.tabs[index].ci_read.pane = CiPane::Jobs;
+                            this.jobs_focus.focus(window, cx);
+                            cx.notify();
+                        }
+                    });
+                })
+                .mb_3()
+                .into_any_element(),
+        );
+        if let Some(notice) = tab.ci_read.log.notice() {
+            content.push(
+                div()
+                    .mb_2()
+                    .text_xs()
+                    .text_color(colors.amber)
+                    .child(notice.to_owned())
+                    .into_any_element(),
+            );
+        }
+        let Some(log) = tab.ci_read.log.visible().cloned() else {
+            content.push(
+                div()
+                    .text_xs()
+                    .text_color(colors.muted)
+                    .child("No exact job log is available in memory.")
+                    .into_any_element(),
+            );
+            return content;
+        };
+        let locator = &log.key.locator;
+        content.push(
+            div()
+                .mb_3()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border)
+                .child(detail(
+                    "Exact job",
+                    format!("{} · REST job ID {}", log.job.name, log.job.id),
+                    colors,
+                ))
+                .child(detail(
+                    "Exact attempt",
+                    format!(
+                        "{} · run {} · attempt {}",
+                        locator.base_repository.name_with_owner,
+                        locator.workflow_run.database_id,
+                        locator.workflow_run.run_attempt
+                    ),
+                    colors,
+                ))
+                .child(detail("Commit", locator.check_commit_sha.clone(), colors))
+                .child(detail(
+                    "Bounded payload",
+                    format!(
+                        "{} bytes · {} displayed rows · memory-only",
+                        log.raw_byte_count, log.line_count
+                    ),
+                    colors,
+                ))
+                .into_any_element(),
+        );
+        let scroll = tab.log_scroll.clone();
+        let horizontal = tab.log_horizontal.clone();
+        let line_width = log
+            .sanitized_text
+            .split_terminator('\n')
+            .map(str::len)
+            .max()
+            .unwrap_or_default()
+            .saturating_mul(8)
+            .saturating_add(80)
+            .max(320) as f32;
+        let rows_log = log.clone();
+        let rows_horizontal = horizontal.clone();
+        content.push(
+            div()
+                .id("actions-log-viewport")
+                .h(px(420.))
+                .min_h(px(220.))
+                .relative()
+                .border_1()
+                .border_color(colors.border)
+                .overflow_x_scroll()
+                .restrict_scroll_to_axis()
+                .track_scroll(&horizontal)
+                .child(
+                    uniform_list(
+                        SharedString::from(format!("actions-log-lines-{index}")),
+                        log.line_count,
+                        move |requested: Range<usize>, _, _| {
+                            let range = bounded_log_render_range(requested, rows_log.line_count);
+                            rows_log
+                                .sanitized_text
+                                .split_terminator('\n')
+                                .skip(range.start)
+                                .take(range.len())
+                                .enumerate()
+                                .map(|(offset, line)| {
+                                    div()
+                                        .h(px(20.))
+                                        .w(px(line_width))
+                                        .flex()
+                                        .font_family(CODE_FONT)
+                                        .text_xs()
+                                        .child(
+                                            div()
+                                                .w(px(62.))
+                                                .px_2()
+                                                .text_right()
+                                                .text_color(colors.faint)
+                                                .child((range.start + offset + 1).to_string()),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .whitespace_nowrap()
+                                                .text_color(colors.text)
+                                                .child(line.to_owned()),
+                                        )
+                                })
+                                .collect()
+                        },
+                    )
+                    .track_scroll(&scroll)
+                    .w(px(line_width))
+                    .h_full(),
+                )
+                .child(
+                    div().absolute().inset_0().child(
+                        Scrollbar::vertical(&scroll)
+                            .id(SharedString::from(format!("actions-log-vscroll-{index}")))
+                            .viewport_from_layout(),
+                    ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(px(12.))
+                        .child(
+                            Scrollbar::horizontal(&rows_horizontal)
+                                .id(SharedString::from(format!("actions-log-hscroll-{index}")))
+                                .viewport_from_layout(),
+                        ),
+                )
+                .into_any_element(),
+        );
+        content.push(
+            div()
+                .mt_2()
+                .text_xs()
+                .text_color(colors.muted)
+                .child(format!(
+                    "Virtualized plain text · at most {MAX_RENDERED_LOG_ROWS} rows are materialized per render request. Escape returns to jobs."
+                ))
+                .into_any_element(),
+        );
+        content
+    }
+
     fn render_inspector(
         &self,
         index: usize,
@@ -22590,132 +23496,161 @@ impl ReviewWorkspace {
                 vec![div().children(activity).into_any_element()]
             }
             InspectorSection::Checks => {
-                let mut checks: Vec<AnyElement> = vec![
-                    detail(
-                        "Status",
-                        empty_unknown(&tab.pull_request.check_status),
-                        colors,
-                    )
-                    .into_any_element(),
-                ];
-                let source_identity = displayed_details
-                    .map(|details| {
-                        let repository =
-                            |repository: Option<&cibergit::domain::CheckRepositoryIdentity>| {
-                                repository
-                                    .map(|repository| repository.name_with_owner.clone())
-                                    .unwrap_or_else(|| "Unknown".into())
-                            };
-                        div()
-                            .mb_2()
-                            .p_2()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(colors.border)
-                            .child(detail(
-                                "Observed PR head",
-                                details
-                                    .observed_head_sha
-                                    .clone()
-                                    .unwrap_or_else(|| "Unknown".into()),
+                match tab.ci_read.pane {
+                    CiPane::Jobs => self.render_actions_jobs(index, colors, cx),
+                    CiPane::Log => self.render_actions_log(index, colors, cx),
+                    CiPane::Checks => {
+                        let mut checks: Vec<AnyElement> = vec![
+                            detail(
+                                "Status",
+                                empty_unknown(&tab.pull_request.check_status),
                                 colors,
-                            ))
-                            .child(detail(
-                                "Checks rollup commit",
-                                details
-                                    .rollup_commit_sha
-                                    .clone()
-                                    .unwrap_or_else(|| "No rollup observed".into()),
-                                colors,
-                            ))
-                            .child(detail(
-                                "Merge candidate",
-                                details
-                                    .potential_merge_commit_sha
-                                    .clone()
-                                    .unwrap_or_else(|| "Not observed".into()),
-                                colors,
-                            ))
-                            .child(detail(
-                                "Base repository",
-                                repository(details.base_repository.as_ref()),
-                                colors,
-                            ))
-                            .child(detail(
-                                "Head repository",
-                                repository(details.head_repository.as_ref()),
-                                colors,
-                            ))
-                            .child(detail(
-                                "Rollup repository",
-                                repository(details.rollup_repository.as_ref()),
-                                colors,
-                            ))
-                    })
-                    .unwrap_or_else(|| {
-                        div()
-                            .mb_2()
-                            .text_xs()
-                            .text_color(colors.muted)
-                            .child("Observed Checks source identity is unavailable.")
-                    });
-                checks.push(source_identity.into_any_element());
-                if let Some(details) = displayed_details {
-                    let (page, pages, range) =
-                        checks_page(details.checks.len(), tab.checks_selection.page);
-                    for check in &details.checks[range.clone()] {
-                        let remote_id = check.coordinates.remote_id.clone();
-                        let selected =
-                            tab.checks_selection.selected_id.as_deref() == Some(remote_id.as_str());
-                        let expanded =
-                            tab.checks_selection.expanded_id.as_deref() == Some(remote_id.as_str());
-                        let row_root = root.clone();
-                        let accessibility_label = format!(
-                            "{}; {}; {}; {}; {}; {}; {}",
-                            check.name,
-                            kind_label(check),
-                            required_label(check),
-                            sha_label(check),
-                            linkage_label(check),
-                            if selected { "selected" } else { "not selected" },
-                            if expanded { "expanded" } else { "collapsed" },
-                        );
-                        let row = check_identity_button(
-                            format!("check-row-{remote_id}"),
-                            accessibility_label,
-                            selected,
-                            expanded,
-                            colors,
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .whitespace_normal()
-                                        .overflow_hidden()
-                                        .child(check.name.clone()),
+                            )
+                            .into_any_element(),
+                        ];
+                        let source_identity = displayed_details
+                            .map(|details| {
+                                let repository = |repository: Option<
+                                    &cibergit::domain::CheckRepositoryIdentity,
+                                >| {
+                                    repository
+                                        .map(|repository| repository.name_with_owner.clone())
+                                        .unwrap_or_else(|| "Unknown".into())
+                                };
+                                div()
+                                    .mb_2()
+                                    .p_2()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .child(detail(
+                                        "Observed PR head",
+                                        details
+                                            .observed_head_sha
+                                            .clone()
+                                            .unwrap_or_else(|| "Unknown".into()),
+                                        colors,
+                                    ))
+                                    .child(detail(
+                                        "Checks rollup commit",
+                                        details
+                                            .rollup_commit_sha
+                                            .clone()
+                                            .unwrap_or_else(|| "No rollup observed".into()),
+                                        colors,
+                                    ))
+                                    .child(detail(
+                                        "Merge candidate",
+                                        details
+                                            .potential_merge_commit_sha
+                                            .clone()
+                                            .unwrap_or_else(|| "Not observed".into()),
+                                        colors,
+                                    ))
+                                    .child(detail(
+                                        "Base repository",
+                                        repository(details.base_repository.as_ref()),
+                                        colors,
+                                    ))
+                                    .child(detail(
+                                        "Head repository",
+                                        repository(details.head_repository.as_ref()),
+                                        colors,
+                                    ))
+                                    .child(detail(
+                                        "Rollup repository",
+                                        repository(details.rollup_repository.as_ref()),
+                                        colors,
+                                    ))
+                            })
+                            .unwrap_or_else(|| {
+                                div()
+                                    .mb_2()
+                                    .text_xs()
+                                    .text_color(colors.muted)
+                                    .child("Observed Checks source identity is unavailable.")
+                            });
+                        checks.push(source_identity.into_any_element());
+                        if self.selected_actions_locator(index).is_ok() {
+                            let jobs_root = root.clone();
+                            checks.push(
+                                div()
+                                    .mb_3()
+                                    .child(
+                                        action_link_with_id(
+                                            "checks-open-actions-jobs".into(),
+                                            "Load exact Actions jobs",
+                                            colors,
+                                        )
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                jobs_root.update(cx, |root, cx| {
+                                                    if let Root::Review(this) = root {
+                                                        this.start_actions_jobs(index, cx);
+                                                        this.jobs_focus.focus(window, cx);
+                                                    }
+                                                });
+                                            },
+                                        ),
+                                    )
+                                    .child(div().mt_1().text_xs().text_color(colors.muted).child(
+                                        "Read-only · exact run attempt · memory-only result",
+                                    ))
+                                    .into_any_element(),
+                            );
+                        }
+                        if let Some(details) = displayed_details {
+                            let (page, pages, range) =
+                                checks_page(details.checks.len(), tab.checks_selection.page);
+                            for check in &details.checks[range.clone()] {
+                                let remote_id = check.coordinates.remote_id.clone();
+                                let selected = tab.checks_selection.selected_id.as_deref()
+                                    == Some(remote_id.as_str());
+                                let expanded = tab.checks_selection.expanded_id.as_deref()
+                                    == Some(remote_id.as_str());
+                                let row_root = root.clone();
+                                let accessibility_label = format!(
+                                    "{}; {}; {}; {}; {}; {}; {}",
+                                    check.name,
+                                    kind_label(check),
+                                    required_label(check),
+                                    sha_label(check),
+                                    linkage_label(check),
+                                    if selected { "selected" } else { "not selected" },
+                                    if expanded { "expanded" } else { "collapsed" },
+                                );
+                                let row = check_identity_button(
+                                    format!("check-row-{remote_id}"),
+                                    accessibility_label,
+                                    selected,
+                                    expanded,
+                                    colors,
                                 )
                                 .child(
                                     div()
-                                        .flex_none()
-                                        .whitespace_nowrap()
-                                        .text_xs()
-                                        .text_color(colors.muted)
-                                        .child(if expanded { "Hide" } else { "Details" }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(colors.muted)
-                                .child(format!(
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .whitespace_normal()
+                                                .overflow_hidden()
+                                                .child(check.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .whitespace_nowrap()
+                                                .text_xs()
+                                                .text_color(colors.muted)
+                                                .child(if expanded { "Hide" } else { "Details" }),
+                                        ),
+                                )
+                                .child(div().mt_1().text_xs().text_color(colors.muted).child(
+                                    format!(
                                     "{} · {}{}",
                                     kind_label(check),
                                     check.status,
@@ -22724,73 +23659,73 @@ impl ReviewWorkspace {
                                         .as_ref()
                                         .map(|value| format!(" · {value}"))
                                         .unwrap_or_default()
-                                )),
-                        )
-                        .child(div().text_xs().text_color(colors.faint).child(format!(
-                            "{} · {} · {}",
-                            required_label(check),
-                            sha_label(check),
-                            linkage_label(check)
-                        )))
-                        .when(expanded, |row| {
-                            row.child(
-                                div()
-                                    .mt_2()
-                                    .pt_2()
-                                    .border_t_1()
-                                    .border_color(colors.border)
-                                    .children(identity_fields(check).into_iter().map(
-                                        |(label, value)| {
-                                            div()
-                                                .mb_1()
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(colors.muted)
-                                                        .child(label),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(colors.text)
-                                                        .child(value),
-                                                )
-                                        },
-                                    )),
-                            )
-                        })
-                        .on_click(move |_, _, cx| {
-                            row_root.update(cx, |root, cx| {
-                                if let Root::Review(this) = root {
-                                    this.activate_check(&remote_id, cx);
-                                }
-                            });
-                        });
-                        checks.push(row.into_any_element());
-                    }
-                    if !details.checks.is_empty() {
-                        checks.push(
-                            div()
-                                .mt_2()
-                                .text_xs()
-                                .text_color(colors.muted)
-                                .child(format!(
-                                    "Showing {}–{} of {} observed checks · page {} of {}.",
-                                    range.start + 1,
-                                    range.end,
-                                    details.checks.len(),
-                                    page + 1,
-                                    pages
+                                ),
                                 ))
-                                .into_any_element(),
-                        );
-                    }
-                    if pages > 1 {
-                        let previous_root = root.clone();
-                        let next_root = root.clone();
-                        let previous_disabled = page == 0;
-                        let next_disabled = page + 1 == pages;
-                        checks.push(
+                                .child(div().text_xs().text_color(colors.faint).child(format!(
+                                    "{} · {} · {}",
+                                    required_label(check),
+                                    sha_label(check),
+                                    linkage_label(check)
+                                )))
+                                .when(expanded, |row| {
+                                    row.child(
+                                        div()
+                                            .mt_2()
+                                            .pt_2()
+                                            .border_t_1()
+                                            .border_color(colors.border)
+                                            .children(identity_fields(check).into_iter().map(
+                                                |(label, value)| {
+                                                    div()
+                                                        .mb_1()
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(colors.muted)
+                                                                .child(label),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(colors.text)
+                                                                .child(value),
+                                                        )
+                                                },
+                                            )),
+                                    )
+                                })
+                                .on_click(move |_, _, cx| {
+                                    row_root.update(cx, |root, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.activate_check(&remote_id, cx);
+                                        }
+                                    });
+                                });
+                                checks.push(row.into_any_element());
+                            }
+                            if !details.checks.is_empty() {
+                                checks.push(
+                                    div()
+                                        .mt_2()
+                                        .text_xs()
+                                        .text_color(colors.muted)
+                                        .child(format!(
+                                            "Showing {}–{} of {} observed checks · page {} of {}.",
+                                            range.start + 1,
+                                            range.end,
+                                            details.checks.len(),
+                                            page + 1,
+                                            pages
+                                        ))
+                                        .into_any_element(),
+                                );
+                            }
+                            if pages > 1 {
+                                let previous_root = root.clone();
+                                let next_root = root.clone();
+                                let previous_disabled = page == 0;
+                                let next_disabled = page + 1 == pages;
+                                checks.push(
                             div()
                                 .mt_2()
                                 .flex()
@@ -22841,17 +23776,19 @@ impl ReviewWorkspace {
                                 )
                                 .into_any_element(),
                         );
-                    }
-                    if !details.checks_complete {
-                        checks.push(
+                            }
+                            if !details.checks_complete {
+                                checks.push(
                             div()
                                 .text_color(colors.amber)
                                 .child("GitHub did not return complete check identity evidence.")
                                 .into_any_element(),
                         );
+                            }
+                        }
+                        checks
                     }
                 }
-                checks
             }
         };
         let (_, _, details_width) = self.resolved_panel_widths(window);
@@ -22938,11 +23875,30 @@ impl ReviewWorkspace {
                         |panel, confirmation| panel.child(confirmation),
                     )
                     .when(!confirmation_open, |panel| panel.children(content))
-                    .when(current == InspectorSection::Checks, |panel| {
-                        panel
-                            .key_context("ChecksPane")
-                            .track_focus(&self.checks_focus)
-                    })
+                    .when(
+                        current == InspectorSection::Checks && tab.ci_read.pane == CiPane::Checks,
+                        |panel| {
+                            panel
+                                .key_context("ChecksPane")
+                                .track_focus(&self.checks_focus)
+                        },
+                    )
+                    .when(
+                        current == InspectorSection::Checks && tab.ci_read.pane == CiPane::Jobs,
+                        |panel| {
+                            panel
+                                .key_context("ChecksJobsPane")
+                                .track_focus(&self.jobs_focus)
+                        },
+                    )
+                    .when(
+                        current == InspectorSection::Checks && tab.ci_read.pane == CiPane::Log,
+                        |panel| {
+                            panel
+                                .key_context("ChecksLogPane")
+                                .track_focus(&self.log_focus)
+                        },
+                    )
                     .track_scroll(&self.inspector_scroll),
             )
     }
@@ -23852,6 +24808,51 @@ impl ReviewWorkspace {
                             .on_click(cx.listener(|root, _, window, cx| {
                                 if let Root::Review(this) = root {
                                     this.open_checks(window, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        command_row("Load exact Actions jobs", "Checks", colors)
+                            .id("command-actions-jobs")
+                            .cursor_pointer()
+                            .hover(|row| row.bg(colors.selected))
+                            .on_click(cx.listener(|root, _, window, cx| {
+                                if let Root::Review(this) = root
+                                    && let Some(index) = this.active_tab
+                                {
+                                    this.command_palette = false;
+                                    this.start_actions_jobs(index, cx);
+                                    this.jobs_focus.focus(window, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        command_row("Refresh exact Actions jobs", "Jobs", colors)
+                            .id("command-actions-jobs-refresh")
+                            .cursor_pointer()
+                            .hover(|row| row.bg(colors.selected))
+                            .on_click(cx.listener(|root, _, window, cx| {
+                                if let Root::Review(this) = root
+                                    && let Some(index) = this.active_tab
+                                {
+                                    this.command_palette = false;
+                                    this.start_actions_jobs(index, cx);
+                                    this.jobs_focus.focus(window, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        command_row("Load selected exact job log", "Enter in Jobs", colors)
+                            .id("command-actions-log")
+                            .cursor_pointer()
+                            .hover(|row| row.bg(colors.selected))
+                            .on_click(cx.listener(|root, _, window, cx| {
+                                if let Root::Review(this) = root
+                                    && let Some(index) = this.active_tab
+                                {
+                                    this.command_palette = false;
+                                    this.start_actions_log(index, cx);
+                                    this.log_focus.focus(window, cx);
                                 }
                             })),
                     )
@@ -26054,6 +27055,8 @@ impl EditorWorkspace {
 
 #[cfg(test)]
 mod layout_tests {
+    #[cfg(feature = "ui-smoke")]
+    use super::ci_read::MemoryRead;
     use super::submitted_review_drafts::{
         DraftSnapshot as SubmittedDraftStoreSnapshot, SubmittedSummaryDraft,
         same_review_coordinates,
@@ -26067,14 +27070,15 @@ mod layout_tests {
         ReactionCompletionToken, SubmittedConfirmationToken, SubmittedDraftCallbackToken,
         SubmittedDraftCloseDisposition, SubmittedDraftLoadState, SubmittedSummaryEditor,
         active_review_composer_body, active_review_composer_needs_save, activity_thread_visible,
-        apply_submitted_draft_save_if_current, available_diff_width_for, bounded_page,
-        collaboration_completion_matches, diff_content_width, display_columns,
+        apply_submitted_draft_save_if_current, available_diff_width_for, bounded_log_render_range,
+        bounded_page, collaboration_completion_matches, diff_content_width, display_columns,
         file_confirmation_matches_visible_body, journal_operation_description,
         journal_operation_summary, line_text_chunks, media_free_markdown, observe_auxiliary,
         resolved_panel_widths_for, review_subject_allows_actions, submitted_review_edit_action,
     };
     #[cfg(feature = "ui-smoke")]
     use super::{
+        ActionsReadError, ActionsReadErrorCategory, CiCompletionToken, CiPane,
         DismissalConfirmationToken, DismissalPreparationToken, InspectorSection, InstallTabOptions,
         LoadState, NextCheck, NextCheckPage, OpenChecks, RepoRuntime, Root, Startup,
         ToggleCheckIdentity, check_identity_button, checks_page_button, palette,
@@ -26087,10 +27091,12 @@ mod layout_tests {
     };
     #[cfg(feature = "ui-smoke")]
     use cibergit::domain::{
-        ActionsLinkage, CheckKind, CheckShaClass, DismissalAuthority,
+        ActionsAttemptKey, ActionsAttemptLocator, ActionsHeadRelation, ActionsJob, ActionsJobLog,
+        ActionsJobsSnapshot, ActionsLinkage, ActionsLogProvenance, ActionsRunAttemptObservation,
+        CheckKind, CheckRepositoryIdentity, CheckShaClass, CheckSuiteIdentity, DismissalAuthority,
         FreshReviewDismissalCapability, ProviderMutationOutcome, PullRequest, PullRequestCheck,
         SelectedViewer, SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
-        SubmittedReviewDismissalTarget,
+        SubmittedReviewDismissalTarget, WorkflowRunIdentity,
     };
     use cibergit::participation::PublishedFile;
     use cibergit::providers::{GeneralReadDelay, GeneralReadDirective};
@@ -26352,6 +27358,172 @@ mod layout_tests {
             })
             .collect();
         details
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn actions_details_fixture(repository: &Repository) -> PullRequestDetails {
+        let identity = CheckRepositoryIdentity {
+            node_id: "REPO_node".into(),
+            name_with_owner: repository.full_name(),
+        };
+        let mut details = details_with_reviews(Vec::new());
+        details.number = 7;
+        details.pull_request_node_id = Some("PR_node".into());
+        details.base_repository = Some(identity.clone());
+        details.observed_head_sha = Some("2".repeat(40));
+        details.head_repository = Some(identity.clone());
+        details.rollup_commit_sha = Some("3".repeat(40));
+        details.rollup_repository = Some(identity.clone());
+        details.checks = vec![PullRequestCheck {
+            coordinates: ProviderCoordinates {
+                provider: "github".into(),
+                host: repository.host.clone(),
+                owner: repository.owner.clone(),
+                repository: repository.name.clone(),
+                pull_request: 7,
+                remote_id: "CHECK_node".into(),
+            },
+            kind: CheckKind::CheckRun,
+            name: "Exact Actions check".into(),
+            status: "COMPLETED".into(),
+            conclusion: Some("SUCCESS".into()),
+            description: None,
+            details_url: None,
+            github_permalink: None,
+            started_at: None,
+            completed_at: None,
+            required: Some(true),
+            database_id: Some(9),
+            suite: Some(CheckSuiteIdentity {
+                node_id: "SUITE_node".into(),
+                database_id: Some(8),
+                repository: identity.clone(),
+                app: None,
+            }),
+            commit_sha: Some("2".repeat(40)),
+            commit_repository: Some(identity.clone()),
+            sha_class: CheckShaClass::Head,
+            actions_linkage: ActionsLinkage::Linked(WorkflowRunIdentity {
+                node_id: "RUN_node".into(),
+                database_id: 6,
+                run_attempt: 2,
+                run_number: 5,
+                event: "pull_request".into(),
+                github_url: format!(
+                    "https://github.com/{}/actions/runs/6",
+                    repository.full_name()
+                ),
+                workflow_node_id: "WORKFLOW_node".into(),
+                workflow_database_id: 4,
+                workflow_name: "CI".into(),
+            }),
+        }];
+        details
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn actions_job(id: u64, locator: &ActionsAttemptLocator) -> ActionsJob {
+        ActionsJob {
+            id,
+            node_id: format!("JOB_{id}"),
+            run_id: locator.workflow_run.database_id,
+            run_attempt: locator.workflow_run.run_attempt,
+            head_sha: locator.check_commit_sha.clone(),
+            check_run_database_id: id + 100,
+            check_run_url: format!(
+                "https://api.github.com/repos/{}/check-runs/{}",
+                locator.base_repository.name_with_owner,
+                id + 100
+            ),
+            name: format!("job {id}"),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            started_at: None,
+            completed_at: None,
+            api_url: format!(
+                "https://api.github.com/repos/{}/actions/jobs/{id}",
+                locator.base_repository.name_with_owner
+            ),
+            html_url: format!("{}/job/{id}", locator.workflow_run.github_url),
+            steps: vec![],
+        }
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn actions_snapshot(
+        locator: &ActionsAttemptLocator,
+        observation_id: u64,
+        ids: &[u64],
+    ) -> ActionsJobsSnapshot {
+        let jobs = ids
+            .iter()
+            .map(|id| actions_job(*id, locator))
+            .collect::<Vec<_>>();
+        ActionsJobsSnapshot {
+            attempt: ActionsRunAttemptObservation {
+                key: ActionsAttemptKey {
+                    locator: locator.clone(),
+                    viewer_node_id: "VIEWER_node".into(),
+                    viewer_login: "alice".into(),
+                },
+                status: "completed".into(),
+                conclusion: Some("success".into()),
+                api_url: "https://api.github.com/exact-run".into(),
+                html_url: locator.workflow_run.github_url.clone(),
+                workflow_url: "https://api.github.com/exact-workflow".into(),
+                returned_pull_requests: vec![],
+                relation: ActionsHeadRelation::Unknown,
+                observed_at_unix_ms: 1,
+            },
+            provider_ordered_job_ids: ids.to_vec(),
+            selected_check_job_id: ids[0],
+            jobs,
+            complete: true,
+            observed_at_unix_ms: 1,
+            observation_id,
+        }
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn actions_log(snapshot: &ActionsJobsSnapshot, job_id: u64) -> ActionsJobLog {
+        ActionsJobLog {
+            key: snapshot.attempt.key.clone(),
+            job: snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == job_id)
+                .unwrap()
+                .clone(),
+            jobs_observation_id: snapshot.observation_id,
+            raw_byte_count: 15,
+            line_count: 1,
+            sanitized_text: "fixture log row".into(),
+            observed_at_unix_ms: 2,
+            provenance: ActionsLogProvenance::FreshExactRead,
+        }
+    }
+
+    #[test]
+    fn log_render_window_is_bounded_and_reaches_final_sentinel() {
+        let text = (0..200_000)
+            .map(|index| {
+                if index == 199_999 {
+                    "FINAL-SENTINEL".to_owned()
+                } else {
+                    format!("line-{index}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let broad = bounded_log_render_range(0..200_000, 200_000);
+        assert_eq!(broad.len(), super::MAX_RENDERED_LOG_ROWS);
+        let tail = bounded_log_render_range(199_999..200_000, 200_000);
+        let rendered = text
+            .split_terminator('\n')
+            .skip(tail.start)
+            .take(tail.len())
+            .collect::<Vec<_>>();
+        assert_eq!(rendered, ["FINAL-SENTINEL"]);
     }
 
     #[cfg(feature = "ui-smoke")]
@@ -26689,6 +27861,261 @@ mod layout_tests {
                 expected.as_deref()
             );
             cx.notify();
+        });
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn actions_root_apply_preserves_selected_refresh_and_fences_stale_ok_err(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    ..Default::default()
+                },
+            )
+        });
+        let (repository, _) = submitted_review_fixture();
+        let pull = transition_pull_request(7);
+        root.update(cx, |root, cx| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            this.install_tab_with_restore(
+                repository.clone(),
+                pull,
+                None,
+                InstallTabOptions {
+                    activate: true,
+                    window: None,
+                    start_background_work: false,
+                },
+                cx,
+            );
+            let details = actions_details_fixture(&repository);
+            this.tabs[0].checks_selection.reconcile(&details.checks);
+            this.tabs[0].details = Some(details);
+            this.tabs[0].details_state = LoadState::Ready;
+            let (_, locator, _, selected_check_id) = this.selected_actions_locator(0).unwrap();
+
+            let initial = this.tabs[0].ci_read.begin_jobs(locator.clone());
+            assert!(
+                this.tabs[0]
+                    .ci_read
+                    .finish_jobs(&initial, Ok(actions_snapshot(&locator, 10, &[11, 12])),)
+            );
+            this.tabs[0].ci_read.select_job(Some(12));
+
+            let refresh = this.tabs[0].ci_read.begin_jobs(locator.clone());
+            let refresh_token = CiCompletionToken {
+                workspace_instance: this.workspace_instance,
+                tab_instance: this.tabs[0].instance_generation,
+                repository_key: repository.cache_key(),
+                pull_request: 7,
+                details_generation: this.tabs[0].details_generation,
+                selected_check_id: selected_check_id.clone(),
+                locator: locator.clone(),
+                selected_job_id: this.tabs[0].ci_read.selected_job_id,
+                jobs_observation_id: None,
+                operation: refresh,
+            };
+            assert_eq!(refresh_token.selected_job_id, Some(12));
+            assert!(this.apply_actions_jobs_completion(
+                &refresh_token,
+                Ok(actions_snapshot(&locator, 11, &[11, 12])),
+            ));
+            assert_eq!(this.tabs[0].ci_read.selected_job_id, Some(12));
+            assert!(matches!(
+                &this.tabs[0].ci_read.jobs,
+                MemoryRead::Fresh(snapshot) if snapshot.observation_id == 11
+            ));
+
+            let exact_jobs = this.tabs[0].ci_read.jobs.visible().unwrap().clone();
+            let (log_operation, _, selected_job_id) = this.tabs[0].ci_read.begin_log().unwrap();
+            let log_token = CiCompletionToken {
+                jobs_observation_id: Some(exact_jobs.observation_id),
+                operation: log_operation,
+                ..refresh_token.clone()
+            };
+            assert_eq!(selected_job_id, 12);
+            this.tabs[0].ci_read.select_job(Some(11));
+            assert!(
+                !this.apply_actions_log_completion(&log_token, Ok(actions_log(&exact_jobs, 12)),)
+            );
+            assert!(!matches!(&this.tabs[0].ci_read.log, MemoryRead::Fresh(_)));
+            this.tabs[0].ci_read.select_job(Some(12));
+
+            let stale_operation = this.tabs[0].ci_read.begin_jobs(locator.clone());
+            let stale_token = CiCompletionToken {
+                operation: stale_operation,
+                ..refresh_token.clone()
+            };
+            let mut locator_b = locator.clone();
+            locator_b.workflow_run.run_attempt = 3;
+            let current = this.tabs[0].ci_read.begin_jobs(locator_b.clone());
+            assert!(!this.apply_actions_jobs_completion(
+                &stale_token,
+                Ok(actions_snapshot(&locator, 12, &[11, 12])),
+            ));
+            assert!(!this.apply_actions_jobs_completion(
+                &stale_token,
+                Err(ActionsReadError::closed(
+                    ActionsReadErrorCategory::Unavailable,
+                )),
+            ));
+            assert!(this.tabs[0].ci_read.owns(&current));
+            assert_eq!(
+                this.tabs[0].ci_read.frozen_locator.as_ref(),
+                Some(&locator_b)
+            );
+            assert!(matches!(
+                &this.tabs[0].ci_read.jobs,
+                MemoryRead::Loading { operation_id, .. }
+                    if *operation_id == current.operation_id
+            ));
+
+            let stale_same_lifetime = this.tabs[0].ci_read.begin_jobs(locator.clone());
+            let stale_same_lifetime_token = CiCompletionToken {
+                operation: stale_same_lifetime,
+                selected_job_id: this.tabs[0].ci_read.selected_job_id,
+                ..refresh_token.clone()
+            };
+            this.tabs[0].details_generation = this.tabs[0].details_generation.saturating_add(1);
+            assert!(!this.apply_actions_jobs_completion(
+                &stale_same_lifetime_token,
+                Err(ActionsReadError::closed(
+                    ActionsReadErrorCategory::Cancelled,
+                )),
+            ));
+            assert!(matches!(
+                &this.tabs[0].ci_read.jobs,
+                MemoryRead::Unavailable { .. }
+            ));
+
+            let replacement_operation = this.tabs[0].ci_read.begin_jobs(locator.clone());
+            let replacement_token = CiCompletionToken {
+                workspace_instance: this.workspace_instance,
+                details_generation: this.tabs[0].details_generation,
+                operation: replacement_operation.clone(),
+                ..refresh_token
+            };
+            this.workspace_instance = this.workspace_instance.saturating_add(1);
+            assert!(!this.apply_actions_jobs_completion(
+                &replacement_token,
+                Err(ActionsReadError::closed(
+                    ActionsReadErrorCategory::Unavailable,
+                )),
+            ));
+            assert!(this.tabs[0].ci_read.owns(&replacement_operation));
+            assert!(matches!(
+                &this.tabs[0].ci_read.jobs,
+                MemoryRead::Loading { operation_id, .. }
+                    if *operation_id == replacement_operation.operation_id
+            ));
+        });
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn actions_native_jobs_and_large_log_render_at_the_final_row(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    ..Default::default()
+                },
+            )
+        });
+        let (repository, _) = submitted_review_fixture();
+        let pull = transition_pull_request(7);
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.install_tab_with_restore(
+                    repository.clone(),
+                    pull,
+                    None,
+                    InstallTabOptions {
+                        activate: true,
+                        window: Some(window),
+                        start_background_work: false,
+                    },
+                    cx,
+                );
+                let details = actions_details_fixture(&repository);
+                this.tabs[0].checks_selection.reconcile(&details.checks);
+                this.tabs[0].details = Some(details);
+                this.tabs[0].details_state = LoadState::Ready;
+                this.tabs[0].inspector_section = InspectorSection::Checks;
+                this.inspector_open = true;
+                let (_, locator, _, _) = this.selected_actions_locator(0).unwrap();
+                let jobs_operation = this.tabs[0].ci_read.begin_jobs(locator.clone());
+                let ids = (1..=80).collect::<Vec<_>>();
+                let snapshot = actions_snapshot(&locator, 50, &ids);
+                assert!(
+                    this.tabs[0]
+                        .ci_read
+                        .finish_jobs(&jobs_operation, Ok(snapshot.clone()),)
+                );
+                this.tabs[0].ci_read.pane = CiPane::Jobs;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let snapshot = this.tabs[0].ci_read.jobs.visible().unwrap().clone();
+                let (operation, _, selected_job_id) = this.tabs[0].ci_read.begin_log().unwrap();
+                let mut log = actions_log(&snapshot, selected_job_id);
+                log.sanitized_text = (0..200_000)
+                    .map(|index| {
+                        if index == 199_999 {
+                            "FINAL-SENTINEL".to_owned()
+                        } else {
+                            format!("line-{index}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                log.raw_byte_count = log.sanitized_text.len();
+                log.line_count = 200_000;
+                assert!(this.tabs[0].ci_read.finish_log(&operation, Ok(log)));
+                this.tabs[0].ci_read.pane = CiPane::Log;
+                this.tabs[0]
+                    .log_scroll
+                    .scroll_to_item(199_999, gpui::ScrollStrategy::Center);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            let log = this.tabs[0].ci_read.log.visible().unwrap();
+            assert_eq!(log.line_count, 200_000);
+            assert!(log.sanitized_text.ends_with("FINAL-SENTINEL"));
+            assert_eq!(
+                bounded_log_render_range(0..200_000, log.line_count).len(),
+                super::MAX_RENDERED_LOG_ROWS,
+            );
         });
     }
 
