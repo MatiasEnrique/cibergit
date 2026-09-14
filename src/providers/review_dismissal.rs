@@ -584,17 +584,12 @@ fn validate_acknowledgement(
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum RequestedNullable<T> {
+    #[default]
     Missing,
     Null,
     Value(T),
-}
-
-impl<T> Default for RequestedNullable<T> {
-    fn default() -> Self {
-        Self::Missing
-    }
 }
 
 impl<T> RequestedNullable<T> {
