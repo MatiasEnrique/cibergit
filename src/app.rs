@@ -21788,25 +21788,18 @@ impl ReviewWorkspace {
             .when(!self.inspector_open, |view| {
                 view.child(self.render_comparison_picker(index, colors, cx))
             })
-            .when_some(tab.state.notice(), |view, notice| {
-                view.child(
-                    div()
-                        .px(px(ui::PANEL_GUTTER))
-                        .py_2()
-                        .bg(colors.elevated)
-                        .text_color(colors.muted)
-                        .child(notice),
-                )
-            })
             .when_some(
-                session.and_then(|session| session.comparison().notice.clone()),
+                match &tab.state {
+                    LoadState::Error(error) => Some(error.clone()),
+                    _ => None,
+                },
                 |view, notice| {
                     view.child(
                         div()
                             .px(px(ui::PANEL_GUTTER))
                             .py_2()
                             .bg(colors.elevated)
-                            .text_color(colors.amber)
+                            .text_color(colors.red)
                             .child(notice),
                     )
                 },
