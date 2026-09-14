@@ -22637,13 +22637,22 @@ impl ReviewWorkspace {
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .child(check.name.clone())
+                                .gap_2()
                                 .child(
-                                    div().text_xs().text_color(colors.muted).child(if expanded {
-                                        "Hide"
-                                    } else {
-                                        "Details"
-                                    }),
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .whitespace_normal()
+                                        .overflow_hidden()
+                                        .child(check.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .whitespace_nowrap()
+                                        .text_xs()
+                                        .text_color(colors.muted)
+                                        .child(if expanded { "Hide" } else { "Details" }),
                                 ),
                         )
                         .child(
