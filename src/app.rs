@@ -22270,7 +22270,7 @@ mod layout_tests {
             durable: SubmittedDraftStoreSnapshot {
                 generation: Some(12),
                 active_review: Some(draft_b.review.coordinates.clone()),
-                drafts: editor.drafts.clone(),
+                drafts: vec![draft_a.clone(), draft_b.clone()],
             },
             clear_in_flight: true,
             ..Default::default()
