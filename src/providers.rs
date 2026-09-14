@@ -7929,6 +7929,69 @@ else:
     }
 
     #[test]
+    fn combined_details_preserve_check_identity_and_dismissal_authority() {
+        for (admin, partial) in [(true, false), (false, false), (true, true)] {
+            let head = "b".repeat(40);
+            let base = repository_identity("R-base", "owner/repo");
+            let mut pull = details_overview();
+            install_rollup(
+                &mut pull,
+                &head,
+                base.clone(),
+                json!([complete_check_run(
+                    "CHECK-combined",
+                    &head,
+                    base,
+                    complete_workflow_run(),
+                )]),
+            );
+            pull["reviews"] = json!({
+                "nodes": [{
+                    "id": "REVIEW-combined", "author": null, "body": "approved",
+                    "state": "APPROVED", "submittedAt": "2026-09-12T11:00:00Z",
+                    "commit": {"oid": "a".repeat(40)},
+                    "viewerDidAuthor": false, "viewerCanUpdate": false,
+                    "viewerCannotUpdateReasons": ["NOT_AUTHOR"],
+                    "viewerCanReact": true, "reactionGroups": [],
+                    "url": "https://github.com/owner/repo/pull/1#pullrequestreview-combined"
+                }],
+                "pageInfo": {"hasNextPage": false, "endCursor": null}
+            });
+            let mut response = details_response(pull);
+            response["data"]["repository"]["viewerCanAdminister"] = json!(admin);
+            if partial {
+                response["errors"] = json!([{"message": "some requested data was unavailable"}]);
+            }
+            let (dir, provider) =
+                fixture("alice", vec![details_step(response, json!({"number": 1}))]);
+            let details = provider.details(&repo("alice"), 1).unwrap();
+            assert_eq!(details.base_repository.as_ref().unwrap().node_id, "R-base");
+            assert_eq!(details.observed_head_sha.as_deref(), Some(head.as_str()));
+            assert_eq!(details.checks[0].coordinates.remote_id, "CHECK-combined");
+            assert_eq!(details.checks_complete, !partial);
+            assert!(matches!(
+                details.checks[0].actions_linkage,
+                ActionsLinkage::Linked(_)
+            ));
+            let capability = details.reviews[0].dismissal_capability.as_ref();
+            if partial {
+                assert!(capability.is_none());
+            } else {
+                let capability =
+                    capability.expect("fresh dismissal authority must survive integration");
+                assert_eq!(capability.viewer.login, "alice");
+                assert_eq!(capability.pull_request.remote_id, "PR1");
+                assert_eq!(
+                    matches!(capability.authority, DismissalAuthority::Available),
+                    admin
+                );
+                assert!(capability.authority.permits_attempt());
+            }
+            exhausted(&dir, 1);
+        }
+    }
+
+    #[test]
     fn complete_details_read_preserves_submitted_review_edit_capability() {
         let mut pull = details_overview();
         pull["reviews"] = json!({
