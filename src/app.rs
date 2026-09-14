@@ -5032,12 +5032,20 @@ impl ReviewWorkspace {
                             let LoadState::Cached(read_notice) = &tab.details_state else {
                                 return Err("offline fixture lost its cached read notice".into());
                             };
-                            if !read_notice.contains("failed")
+                            // The refused details fixture returns a body-level error,
+                            // mapped by general reads to the fixed incomplete notice.
+                            // Disk-load ordering may prepend the cached observation.
+                            let expected_failure = general_read_failure_notice(Some(
+                                GeneralReadFailureKind::Incomplete,
+                            ));
+                            if !read_notice.ends_with(expected_failure)
                                 || read_notice.contains("refreshing current data")
+                                || this.collaboration_read_attempts.load(Ordering::Acquire) == 0
                             {
                                 return Err(
-                                    "settled offline notice did not preserve the failed current read"
-                                        .into(),
+                                    format!(
+                                        "settled offline notice did not preserve the failed current read: {read_notice}"
+                                    ),
                                 );
                             }
                             if tab.canonical_full_revision != baseline {
