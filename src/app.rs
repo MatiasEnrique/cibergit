@@ -10504,6 +10504,7 @@ impl ReviewWorkspace {
                     .is_some();
                 if restored {
                     this.active_tab_input_restore = None;
+                    cx.notify();
                 } else if attempt == 0 {
                     this.defer_active_tab_input_restore(token, 1, cx);
                 } else {
