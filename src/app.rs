@@ -36,8 +36,10 @@ use checks_view::{
 use ci_read::{CiOperation, CiPane, CiReadState, jobs_page};
 #[cfg(feature = "ui-smoke")]
 use cibergit::domain::{
-    ActionsJobLog, ActionsJobsSnapshot, ActionsLinkage, CheckAppIdentity, CheckKind, CheckShaClass,
-    CheckSuiteIdentity, PullRequestCheck, WorkflowRunIdentity,
+    ActionsAttemptKey, ActionsJob, ActionsJobLog, ActionsJobsSnapshot, ActionsLinkage,
+    ActionsLogProvenance, ActionsRunAttemptObservation, CheckAppIdentity, CheckKind,
+    CheckRepositoryIdentity, CheckShaClass, CheckSuiteIdentity, PullRequestCheck,
+    WorkflowRunIdentity,
 };
 #[cfg(feature = "ui-smoke")]
 use cibergit::participation::ReviewOperationPayload;
@@ -755,6 +757,8 @@ struct ActionsReadFixture {
     log: ActionsJobLog,
     jobs_dispatches: Arc<AtomicU64>,
     log_dispatches: Arc<AtomicU64>,
+    maximum_rendered_log_rows: Arc<AtomicU64>,
+    final_log_row_materializations: Arc<AtomicU64>,
 }
 
 impl CiCompletionToken {
@@ -1995,6 +1999,8 @@ pub struct ReviewWorkspace {
     collaboration_read_attempts: Arc<AtomicU64>,
     #[cfg(feature = "ui-smoke")]
     actions_read_fixture: Option<Arc<ActionsReadFixture>>,
+    #[cfg(feature = "ui-smoke")]
+    provider_reads_disabled: bool,
     composer_edit_generation: u64,
     next_request_generation: u64,
     _subscriptions: Vec<Subscription>,
@@ -2782,6 +2788,8 @@ impl ReviewWorkspace {
             collaboration_read_attempts: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "ui-smoke")]
             actions_read_fixture: None,
+            #[cfg(feature = "ui-smoke")]
+            provider_reads_disabled,
             composer_edit_generation: 0,
             next_request_generation: 0,
             _subscriptions: Vec::new(),
@@ -3532,6 +3540,10 @@ impl ReviewWorkspace {
         }
         if std::env::var_os("CIBERGIT_SMOKE_CHECKS").is_some() {
             self.start_checks_smoke(window, cx, output);
+            return;
+        }
+        if std::env::var_os("CIBERGIT_SMOKE_ACTIONS_JOBS_LOGS").is_some() {
+            self.start_actions_jobs_logs_smoke(window, cx, output);
             return;
         }
         if std::env::var_os("CIBERGIT_SMOKE_LOCAL_CHECKOUT").is_some() {
@@ -5025,6 +5037,528 @@ impl ReviewWorkspace {
             submitted_before.drafts.len(),
             journal_before.len(),
         ))
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn start_actions_jobs_logs_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+        output: PathBuf,
+    ) {
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                let _ = std::fs::create_dir_all(&output);
+                let appearance = std::env::var("CIBERGIT_SMOKE_APPEARANCE")
+                    .unwrap_or_else(|_| "system".into());
+                let setup = window
+                    .update(|window, cx| {
+                        window.resize(size(px(1440.), px(900.)));
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err(
+                                    "Actions Jobs/Logs smoke started outside the review workspace"
+                                        .to_owned(),
+                                );
+                            };
+                            this.install_actions_jobs_logs_smoke_fixture(window, cx)?;
+                            if !this.start_actions_jobs(0, cx) {
+                                return Err(
+                                    "synthetic Jobs read was refused after fixture admission"
+                                        .into(),
+                                );
+                            }
+                            this.focus_current_ci_pane(0, window, cx);
+                            Ok(())
+                        })
+                        .unwrap_or_else(|error| {
+                            Err(format!("Actions Jobs/Logs smoke entity unavailable: {error:#}"))
+                        })
+                    })
+                    .unwrap_or_else(|error| {
+                        Err(format!("Actions Jobs/Logs smoke window unavailable: {error:#}"))
+                    });
+                if let Err(error) = setup {
+                    let failure = format!("Synthetic Actions Jobs/Logs setup failed: {error}\n");
+                    let _ = std::fs::write(
+                        output.join(format!(
+                            "native-actions-jobs-logs-setup-failure-{appearance}.txt"
+                        )),
+                        &failure,
+                    );
+                    panic!("{failure}");
+                }
+
+                let jobs_started = std::time::Instant::now();
+                let jobs_ready = loop {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this)
+                                    if this.tabs.first().is_some_and(|tab| {
+                                        tab.ci_read.pane == CiPane::Jobs
+                                            && matches!(tab.ci_read.jobs, MemoryRead::Fresh(_))
+                                    })
+                                    && this.actions_read_fixture.as_ref().is_some_and(|fixture| {
+                                        fixture.jobs_dispatches.load(Ordering::Relaxed) == 1
+                                    }))
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready || jobs_started.elapsed() > Duration::from_secs(5) {
+                        break ready;
+                    }
+                };
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let jobs_name = format!("native-actions-jobs-synthetic-{appearance}.png");
+                let jobs_capture = jobs_ready
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image.save(output.join(&jobs_name)).map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+
+                let log_started = jobs_capture
+                    && window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else { return false };
+                                this.start_actions_log(0, cx)
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                let log_wait_started = std::time::Instant::now();
+                let log_ready = loop {
+                    if !log_started {
+                        break false;
+                    }
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this)
+                                    if this.tabs.first().is_some_and(|tab| {
+                                        tab.ci_read.pane == CiPane::Log
+                                            && matches!(tab.ci_read.log, MemoryRead::Fresh(_))
+                                    })
+                                    && this.actions_read_fixture.as_ref().is_some_and(|fixture| {
+                                        fixture.log_dispatches.load(Ordering::Relaxed) == 1
+                                    }))
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready || log_wait_started.elapsed() > Duration::from_secs(5) {
+                        break ready;
+                    }
+                };
+                let tail_requested = log_ready
+                    && window
+                        .update(|window, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else { return false };
+                                let Some(tab) = this.tabs.first_mut() else {
+                                    return false;
+                                };
+                                tab.log_horizontal.set_offset(point(px(0.), px(0.)));
+                                tab.log_scroll
+                                    .scroll_to_item_strict(199_999, ScrollStrategy::Bottom);
+                                this.status = "SYNTHETIC maximum-line Actions log · final row left edge · zero credentials/provider/storage".into();
+                                this.focus_current_ci_pane(0, window, cx);
+                                cx.notify();
+                                true
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(400))
+                    .await;
+                let left_name = format!("native-actions-log-final-left-synthetic-{appearance}.png");
+                let left_capture = tail_requested
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image.save(output.join(&left_name)).map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let (left_materialized, maximum_rendered, horizontal_maximum) = window
+                    .update(|_, cx| {
+                        weak.read_with(cx, |root, _| {
+                            let Root::Review(this) = root else {
+                                return (false, 0, 0.);
+                            };
+                            let Some(tab) = this.tabs.first() else {
+                                return (false, 0, 0.);
+                            };
+                            let Some(fixture) = &this.actions_read_fixture else {
+                                return (false, 0, 0.);
+                            };
+                            let valid_log = tab.ci_read.log.visible().is_some_and(|log| {
+                                log.line_count == 200_000
+                                    && log
+                                        .sanitized_text
+                                        .ends_with("SYNTHETIC-HORIZONTAL-END-RIGHT")
+                            });
+                            (
+                                valid_log
+                                    && fixture
+                                        .final_log_row_materializations
+                                        .load(Ordering::Relaxed)
+                                        > 0
+                                    && tab.log_scroll.is_scrolled_to_end() == Some(true),
+                                fixture
+                                    .maximum_rendered_log_rows
+                                    .load(Ordering::Relaxed),
+                                tab.log_horizontal.max_offset().x.as_f32(),
+                            )
+                        })
+                        .unwrap_or((false, 0, 0.))
+                    })
+                    .unwrap_or((false, 0, 0.));
+                let right_requested = left_capture
+                    && left_materialized
+                    && maximum_rendered > 0
+                    && maximum_rendered <= MAX_RENDERED_LOG_ROWS as u64
+                    && horizontal_maximum > 1_000.
+                    && window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else { return false };
+                                let Some(tab) = this.tabs.first_mut() else {
+                                    return false;
+                                };
+                                tab.log_horizontal
+                                    .set_offset(point(px(-horizontal_maximum), px(0.)));
+                                this.status = "SYNTHETIC maximum-line Actions log · final row far-right sentinel · zero credentials/provider/storage".into();
+                                cx.notify();
+                                true
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let right_name =
+                    format!("native-actions-log-final-right-synthetic-{appearance}.png");
+                let right_capture = right_requested
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image.save(output.join(&right_name)).map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                let right_offset_reached = window
+                    .update(|_, cx| {
+                        weak.read_with(cx, |root, _| {
+                            matches!(root, Root::Review(this) if this.tabs.first().is_some_and(
+                                |tab| (-tab.log_horizontal.offset().x.as_f32()
+                                    - horizontal_maximum)
+                                    .abs()
+                                    < 1.
+                            ))
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                let (jobs_dispatches, log_dispatches, final_materializations) = window
+                    .update(|_, cx| {
+                        weak.read_with(cx, |root, _| {
+                            let Root::Review(this) = root else { return (0, 0, 0) };
+                            this.actions_read_fixture.as_ref().map_or((0, 0, 0), |fixture| {
+                                (
+                                    fixture.jobs_dispatches.load(Ordering::Relaxed),
+                                    fixture.log_dispatches.load(Ordering::Relaxed),
+                                    fixture
+                                        .final_log_row_materializations
+                                        .load(Ordering::Relaxed),
+                                )
+                            })
+                        })
+                        .unwrap_or((0, 0, 0))
+                    })
+                    .unwrap_or((0, 0, 0));
+                let passed = jobs_capture
+                    && log_ready
+                    && left_capture
+                    && left_materialized
+                    && right_capture
+                    && right_offset_reached
+                    && jobs_dispatches == 1
+                    && log_dispatches == 1
+                    && final_materializations > 0
+                    && maximum_rendered <= MAX_RENDERED_LOG_ROWS as u64;
+                let report = format!(
+                    "Native Actions Jobs/Logs synthetic scene ({appearance})\nDisposable data state was empty before scene installation: true\nBootstrap/account/notification/provider reads disabled by smoke-only Startup gate: true\nFixture credential/provider/storage capability: ZERO\nActual Root + GeneralReadController Jobs admission/completion/apply dispatch count: {jobs_dispatches}\nActual Root + GeneralReadController Log admission/completion/apply dispatch count: {log_dispatches}\nJobs capture: {}\nFinal displayed row materializations: {final_materializations}\nMaximum rows in one native render request: {maximum_rendered} (bound {MAX_RENDERED_LOG_ROWS})\nHorizontal maximum: {horizontal_maximum:.1}px\nFinal row left-edge capture: {}\nFinal row far-right capture: {}\nFar-right offset reached: {right_offset_reached}\nAll identities, jobs, and log text: explicitly synthetic; no live transport or storage compatibility claim\nCredential resolution, /user, API, storage, mutation, OS notification, foreground/focus request, settings, preview, and physical input calls from scene: 0\n",
+                    if jobs_capture { &jobs_name } else { "failed" },
+                    if left_capture { &left_name } else { "failed" },
+                    if right_capture { &right_name } else { "failed" },
+                );
+                let _ = std::fs::write(
+                    output.join(format!("native-actions-jobs-logs-synthetic-{appearance}.txt")),
+                    report,
+                );
+                if !passed {
+                    panic!("native Actions Jobs/Logs synthetic scene failed");
+                }
+                let _ = window.update(|_, cx| cx.quit());
+            })
+            .detach();
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn install_actions_jobs_logs_smoke_fixture(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) -> Result<(), String> {
+        if !self.provider_reads_disabled {
+            return Err("smoke-only provider-read kill switch is not active".into());
+        }
+        if !self.accounts.is_empty() || !self.repositories.is_empty() || !self.tabs.is_empty() {
+            return Err("Actions Jobs/Logs scene requires disposable empty state".into());
+        }
+        let repository = Repository {
+            host: "github.com".into(),
+            owner: "cli".into(),
+            name: "cli".into(),
+            account: cibergit::domain::Account {
+                host: "github.com".into(),
+                login: "synthetic-actions-viewer".into(),
+            },
+            local_path: None,
+        };
+        let pull = PullRequest {
+            number: 7,
+            title: "SYNTHETIC Actions Jobs/Logs scene".into(),
+            source_branch: "synthetic-actions-source".into(),
+            target_branch: "main".into(),
+            author: "synthetic-author".into(),
+            state: "OPEN".into(),
+            base_sha: "1".repeat(40),
+            head_sha: "2".repeat(40),
+            url: "https://github.com/cli/cli/pull/7".into(),
+            ..Default::default()
+        };
+        self.install_tab_with_restore(
+            repository.clone(),
+            pull,
+            None,
+            InstallTabOptions {
+                activate: true,
+                window: Some(window),
+                start_background_work: false,
+            },
+            cx,
+        );
+        let identity = CheckRepositoryIdentity {
+            node_id: "SYNTHETIC_REPOSITORY_NODE".into(),
+            name_with_owner: repository.full_name(),
+        };
+        let check = PullRequestCheck {
+            coordinates: ProviderCoordinates {
+                provider: "github".into(),
+                host: repository.host.clone(),
+                owner: repository.owner.clone(),
+                repository: repository.name.clone(),
+                pull_request: 7,
+                remote_id: "SYNTHETIC_ACTIONS_CHECK_NODE".into(),
+            },
+            kind: CheckKind::CheckRun,
+            name: "SYNTHETIC exact Actions check".into(),
+            status: "COMPLETED".into(),
+            conclusion: Some("SUCCESS".into()),
+            description: Some("Synthetic identity fixture; zero remote capability".into()),
+            details_url: None,
+            github_permalink: None,
+            started_at: None,
+            completed_at: None,
+            required: Some(true),
+            database_id: Some(9),
+            suite: Some(CheckSuiteIdentity {
+                node_id: "SYNTHETIC_SUITE_NODE".into(),
+                database_id: Some(8),
+                repository: identity.clone(),
+                app: Some(CheckAppIdentity {
+                    node_id: "SYNTHETIC_APP_NODE".into(),
+                    name: "Synthetic Actions Renderer".into(),
+                    slug: "synthetic-actions-renderer".into(),
+                }),
+            }),
+            commit_sha: Some("2".repeat(40)),
+            commit_repository: Some(identity.clone()),
+            sha_class: CheckShaClass::Head,
+            actions_linkage: ActionsLinkage::Linked(WorkflowRunIdentity {
+                node_id: "SYNTHETIC_RUN_NODE".into(),
+                database_id: 6,
+                run_attempt: 2,
+                run_number: 5,
+                event: "pull_request".into(),
+                github_url: "https://github.com/cli/cli/actions/runs/6".into(),
+                workflow_node_id: "SYNTHETIC_WORKFLOW_NODE".into(),
+                workflow_database_id: 4,
+                workflow_name: "SYNTHETIC CI".into(),
+            }),
+        };
+        let details = PullRequestDetails {
+            number: 7,
+            pull_request_node_id: Some("SYNTHETIC_PULL_REQUEST_NODE".into()),
+            base_repository: Some(identity.clone()),
+            observed_head_sha: Some("2".repeat(40)),
+            rollup_commit_sha: Some("3".repeat(40)),
+            potential_merge_commit_sha: None,
+            head_repository: Some(identity.clone()),
+            rollup_repository: Some(identity.clone()),
+            potential_merge_commit_repository: None,
+            body: "Synthetic Actions renderer scene".into(),
+            requested_reviewers: Vec::new(),
+            labels: vec!["synthetic".into()],
+            assignees: Vec::new(),
+            merge_eligibility: cibergit::domain::MergeEligibility {
+                state: "OPEN".into(),
+                draft: false,
+                mergeable: "UNKNOWN".into(),
+                merge_state_status: "UNKNOWN".into(),
+                review_status: "UNKNOWN".into(),
+                check_status: "SUCCESS".into(),
+                maintainer_can_modify: false,
+                can_rebase: false,
+                can_update_branch: false,
+                auto_merge_enabled: false,
+                in_merge_queue: false,
+            },
+            issue_comments: Vec::new(),
+            reviews: Vec::new(),
+            review_threads: Vec::new(),
+            reactions: Vec::new(),
+            checks: vec![check],
+            activity_complete: true,
+            checks_complete: true,
+            notice: Some("SYNTHETIC identity fixture · no live read".into()),
+        };
+        self.tabs[0].checks_selection.reconcile(&details.checks);
+        self.tabs[0].details = Some(details);
+        self.tabs[0].details_state = LoadState::Ready;
+        self.tabs[0].inspector_section = InspectorSection::Checks;
+        self.inspector_open = true;
+        self.panel_layout.sidebar_collapsed = true;
+        self.panel_layout.file_tree_collapsed = true;
+        self.panel_layout.details_width = MAX_PANEL_WIDTH;
+        let (_, locator, _, _) = self.selected_actions_locator(0)?;
+        let ids = (1..=80).collect::<Vec<_>>();
+        let jobs = ids
+            .iter()
+            .map(|id| ActionsJob {
+                id: *id,
+                node_id: format!("SYNTHETIC_JOB_NODE_{id}"),
+                run_id: locator.workflow_run.database_id,
+                run_attempt: locator.workflow_run.run_attempt,
+                head_sha: locator.check_commit_sha.clone(),
+                check_run_database_id: id + 100,
+                check_run_url: format!(
+                    "https://api.github.com/repos/{}/check-runs/{}",
+                    locator.base_repository.name_with_owner,
+                    id + 100
+                ),
+                name: format!("SYNTHETIC job {id:02}"),
+                status: "completed".into(),
+                conclusion: Some(if id % 9 == 0 { "neutral" } else { "success" }.into()),
+                started_at: None,
+                completed_at: None,
+                api_url: format!(
+                    "https://api.github.com/repos/{}/actions/jobs/{id}",
+                    locator.base_repository.name_with_owner
+                ),
+                html_url: format!("{}/job/{id}", locator.workflow_run.github_url),
+                steps: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let snapshot = ActionsJobsSnapshot {
+            attempt: ActionsRunAttemptObservation {
+                key: ActionsAttemptKey {
+                    locator: locator.clone(),
+                    viewer_node_id: "SYNTHETIC_VIEWER_NODE".into(),
+                    viewer_login: "synthetic-actions-viewer".into(),
+                },
+                status: "completed".into(),
+                conclusion: Some("success".into()),
+                api_url: "https://api.github.com/synthetic-exact-run".into(),
+                html_url: locator.workflow_run.github_url.clone(),
+                workflow_url: "https://api.github.com/synthetic-exact-workflow".into(),
+                returned_pull_requests: Vec::new(),
+                relation: ActionsHeadRelation::Unknown,
+                observed_at_unix_ms: 1,
+            },
+            provider_ordered_job_ids: ids,
+            jobs,
+            selected_check_job_id: 1,
+            complete: true,
+            observed_at_unix_ms: 1,
+            observation_id: 50,
+        };
+        let sanitized_text = (0..200_000)
+            .map(|index| {
+                if index == 199_999 {
+                    format!(
+                        "SYNTHETIC-FINAL-ROW-LEFT {} SYNTHETIC-HORIZONTAL-END-RIGHT",
+                        "0123456789abcdef".repeat(512)
+                    )
+                } else {
+                    format!("synthetic-line-{index}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let log = ActionsJobLog {
+            key: snapshot.attempt.key.clone(),
+            job: snapshot.jobs[0].clone(),
+            jobs_observation_id: snapshot.observation_id,
+            raw_byte_count: sanitized_text.len(),
+            line_count: 200_000,
+            sanitized_text,
+            observed_at_unix_ms: 2,
+            provenance: ActionsLogProvenance::FreshExactRead,
+        };
+        self.actions_read_fixture = Some(Arc::new(ActionsReadFixture {
+            jobs: snapshot,
+            log,
+            jobs_dispatches: Arc::new(AtomicU64::new(0)),
+            log_dispatches: Arc::new(AtomicU64::new(0)),
+            maximum_rendered_log_rows: Arc::new(AtomicU64::new(0)),
+            final_log_row_materializations: Arc::new(AtomicU64::new(0)),
+        }));
+        self.status = "SYNTHETIC Actions Jobs/Logs native scene · disposable empty state · zero credentials/provider/storage".into();
+        cx.notify();
+        Ok(())
     }
 
     #[cfg(feature = "ui-smoke")]
@@ -21892,6 +22426,8 @@ impl ReviewWorkspace {
             .max(320) as f32;
         let rows_log = log.clone();
         let rows_horizontal = horizontal.clone();
+        #[cfg(feature = "ui-smoke")]
+        let render_fixture = self.actions_read_fixture.clone();
         content.push(
             div()
                 .id("actions-log-viewport")
@@ -21909,6 +22445,18 @@ impl ReviewWorkspace {
                         log.line_count,
                         move |requested: Range<usize>, _, _| {
                             let range = bounded_log_render_range(requested, rows_log.line_count);
+                            #[cfg(feature = "ui-smoke")]
+                            if let Some(fixture) = &render_fixture {
+                                fixture.maximum_rendered_log_rows.fetch_max(
+                                    u64::try_from(range.len()).unwrap_or(u64::MAX),
+                                    Ordering::Relaxed,
+                                );
+                                if !range.is_empty() && range.end == rows_log.line_count {
+                                    fixture
+                                        .final_log_row_materializations
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                             rows_log
                                 .sanitized_text
                                 .split_terminator('\n')
@@ -28325,6 +28873,8 @@ mod layout_tests {
         let pull = transition_pull_request(7);
         let jobs_dispatches = Arc::new(AtomicU64::new(0));
         let log_dispatches = Arc::new(AtomicU64::new(0));
+        let maximum_rendered_log_rows = Arc::new(AtomicU64::new(0));
+        let final_log_row_materializations = Arc::new(AtomicU64::new(0));
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
                 let Root::Review(this) = root else {
@@ -28371,6 +28921,8 @@ mod layout_tests {
                     log,
                     jobs_dispatches: jobs_dispatches.clone(),
                     log_dispatches: log_dispatches.clone(),
+                    maximum_rendered_log_rows: maximum_rendered_log_rows.clone(),
+                    final_log_row_materializations: final_log_row_materializations.clone(),
                 }));
                 assert!(this.start_actions_jobs(0, cx));
                 assert!(matches!(
@@ -28471,6 +29023,11 @@ mod layout_tests {
         assert!(horizontal_maximum > 1_000.);
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("actions-log-row-200000").is_some());
+        assert!(final_log_row_materializations.load(Ordering::Relaxed) > 0);
+        assert!(
+            maximum_rendered_log_rows.load(Ordering::Relaxed)
+                <= super::MAX_RENDERED_LOG_ROWS as u64
+        );
     }
 
     #[test]

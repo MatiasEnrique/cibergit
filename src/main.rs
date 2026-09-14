@@ -137,6 +137,12 @@ fn parse_startup() -> Result<Startup, String> {
     if startup.data_dir.is_none() {
         startup.data_dir = std::env::var_os("CIBERGIT_DATA_DIR").map(PathBuf::from);
     }
+    #[cfg(feature = "ui-smoke")]
+    if std::env::var_os("CIBERGIT_SMOKE_DIR").is_some()
+        && std::env::var_os("CIBERGIT_SMOKE_ACTIONS_JOBS_LOGS").is_some()
+    {
+        startup.provider_reads_disabled = true;
+    }
     if startup.pull_request.is_some() && startup.repository.is_none() {
         return Err("--pr requires --repo".into());
     }
