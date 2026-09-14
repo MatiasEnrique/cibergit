@@ -139,7 +139,8 @@ fn parse_startup() -> Result<Startup, String> {
     }
     #[cfg(feature = "ui-smoke")]
     if std::env::var_os("CIBERGIT_SMOKE_DIR").is_some()
-        && std::env::var_os("CIBERGIT_SMOKE_ACTIONS_JOBS_LOGS").is_some()
+        && (std::env::var_os("CIBERGIT_SMOKE_ACTIONS_JOBS_LOGS").is_some()
+            || std::env::var_os("CIBERGIT_SMOKE_SIDEBAR").is_some())
     {
         startup.provider_reads_disabled = true;
     }

@@ -310,7 +310,7 @@ fn palette(dark: bool) -> Palette {
         Palette {
             canvas: rgba(0x18191bff),
             surface: rgba(0x202124ff),
-            sidebar: rgba(0x17181abe),
+            sidebar: rgba(0x1c1d20ff),
             elevated: rgba(0x292b2fff),
             text: rgba(0xf1f2f3ff),
             muted: rgba(0xb8bbc1ff),
@@ -327,7 +327,7 @@ fn palette(dark: bool) -> Palette {
         Palette {
             canvas: rgba(0xfafaf9ff),
             surface: rgba(0xffffffff),
-            sidebar: rgba(0xf8f8f7b5),
+            sidebar: rgba(0xf3f3f1ff),
             elevated: rgba(0xf2f2f0ff),
             text: rgba(0x202124ff),
             muted: rgba(0x56595eff),
@@ -2089,6 +2089,7 @@ pub struct ReviewWorkspace {
     repository_setup_state: LoadState,
     repository_setup_generation: u64,
     repository_picker_open: bool,
+    sidebar_search_generation: u64,
     command_palette: bool,
     creation_dialog: Option<Entity<pr_creation::PrCreationDialog>>,
     creation_subscription: Option<Subscription>,
@@ -2878,6 +2879,7 @@ impl ReviewWorkspace {
             repository_setup_state: LoadState::Ready,
             repository_setup_generation: 0,
             repository_picker_open: false,
+            sidebar_search_generation: 0,
             command_palette: false,
             creation_dialog: None,
             creation_subscription: None,
@@ -3107,6 +3109,35 @@ impl ReviewWorkspace {
             },
         );
         this.dismissal_reason_subscription = Some(dismissal_reason_changes);
+        this._subscriptions.push(
+            cx.subscribe(&this.query, |root, _, event: &InputEvent, cx| {
+                let Root::Review(this) = root else { return };
+                match event {
+                    InputEvent::PressEnter { .. } => {
+                        this.apply_filter(this.workspace.view().filter.personal, cx);
+                    }
+                    InputEvent::Change => {
+                        this.sidebar_search_generation += 1;
+                        let generation = this.sidebar_search_generation;
+                        cx.spawn(async move |root, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(180))
+                                .await;
+                            let _ = root.update(cx, |root, cx| {
+                                if let Root::Review(this) = root
+                                    && this.sidebar_search_generation == generation
+                                {
+                                    this.apply_filter(this.workspace.view().filter.personal, cx);
+                                }
+                            });
+                        })
+                        .detach();
+                    }
+                    _ => {}
+                }
+            }),
+        );
+
         for input in [&this.repository_input, &this.pr_input] {
             this._subscriptions
                 .push(cx.subscribe(input, |root, _, event: &InputEvent, cx| {
@@ -3430,6 +3461,10 @@ impl ReviewWorkspace {
     }
 
     fn start_polling(&mut self, cx: &mut Context<Root>) {
+        #[cfg(feature = "ui-smoke")]
+        if self.provider_reads_disabled {
+            return;
+        }
         cx.spawn(async move |root, cx| {
             let mut tick = 0u64;
             loop {
@@ -3687,6 +3722,10 @@ impl ReviewWorkspace {
         let Some(output) = std::env::var_os("CIBERGIT_SMOKE_DIR").map(PathBuf::from) else {
             return;
         };
+        if std::env::var_os("CIBERGIT_SMOKE_SIDEBAR").is_some() {
+            self.start_sidebar_smoke(window, cx, output);
+            return;
+        }
         if std::env::var_os("CIBERGIT_SMOKE_NOTIFICATIONS").is_some() {
             self.start_notifications_smoke(window, cx, output);
             return;
@@ -5194,6 +5233,59 @@ impl ReviewWorkspace {
             submitted_before.drafts.len(),
             journal_before.len(),
         ))
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn start_sidebar_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+        output: PathBuf,
+    ) {
+        assert!(
+            self.provider_reads_disabled
+                && self.accounts.is_empty()
+                && self.repositories.is_empty()
+        );
+        let root = cx.weak_entity();
+        window.spawn(cx, async move |window| {
+            std::fs::create_dir_all(&output).unwrap();
+            for populated in [false, true] {
+                window.update(|_, cx| {
+                    root.update(cx, |root, cx| {
+                        let Root::Review(this) = root else { unreachable!() };
+                        this.setup_open = false;
+                        if populated {
+                            let repository = Repository {
+                                host: "github.com".into(), owner: "acme".into(), name: "workspace".into(),
+                                account: cibergit::domain::Account { host: "github.com".into(), login: "maya".into() },
+                                local_path: None,
+                            };
+                            let pull_requests = [
+                                (142, "Keep repository selection on restart", "maya"),
+                                (139, "Improve keyboard navigation in the file tree", "alex"),
+                                (137, "Fix line wrapping in review comments", "sam"),
+                            ].into_iter().map(|(number, title, author)| PullRequest {
+                                number, title: title.into(), author: author.into(), state: "OPEN".into(),
+                                source_branch: "feature/sidebar".into(), target_branch: "main".into(),
+                                ..Default::default()
+                            }).collect();
+                            this.repositories.push(RepoRuntime {
+                                repository, pull_requests, state: LoadState::Ready,
+                                generation: 0, refresh: RefreshGate::default(),
+                            });
+                        }
+                        cx.notify();
+                    }).unwrap();
+                }).unwrap();
+                window.background_executor().timer(Duration::from_millis(400)).await;
+                window.update(|window, _| {
+                    window.render_to_image().unwrap().save(output.join(if populated { "sidebar-populated.png" } else { "sidebar-empty.png" })).unwrap();
+                }).unwrap();
+            }
+            std::fs::write(output.join("report.txt"), "Sidebar layout: synthetic repositories only. Provider bootstrap and polling disabled; no credentials or remote calls. Empty and populated native captures.\n").unwrap();
+            window.update(|_, cx| cx.quit()).unwrap();
+        }).detach();
     }
 
     #[cfg(feature = "ui-smoke")]
@@ -19273,6 +19365,7 @@ impl ReviewWorkspace {
     }
 
     fn apply_filter(&mut self, personal: PersonalFilter, cx: &mut Context<Root>) {
+        self.sidebar_search_generation += 1;
         let mut view = self.workspace.view();
         view.filter.search = self.query.read(cx).value().trim().to_owned();
         view.filter.personal = personal;
@@ -19376,6 +19469,7 @@ impl ReviewWorkspace {
     }
 
     fn select_view(&mut self, index: usize, window: &mut Window, cx: &mut Context<Root>) {
+        self.sidebar_search_generation += 1;
         if index >= self.workspace.views.len() {
             return;
         }
@@ -19918,7 +20012,7 @@ impl ReviewWorkspace {
                 .child(
                     div()
                         .id("restore-sidebar")
-                        .mt_3()
+                        .mt_12()
                         .px_2()
                         .py_1()
                         .rounded_md()
@@ -19941,13 +20035,17 @@ impl ReviewWorkspace {
             .iter()
             .enumerate()
             .map(|(index, saved)| {
-                side_control(&saved.name, self.workspace.selected_view == index, colors)
-                    .id(SharedString::from(format!("saved-view-{index}")))
-                    .on_click(cx.listener(move |root, _, window, cx| {
-                        if let Root::Review(this) = root {
-                            this.select_view(index, window, cx)
-                        }
-                    }))
+                sidebar_nav_button(
+                    format!("saved-view-{index}"),
+                    &saved.name,
+                    self.workspace.selected_view == index,
+                    colors,
+                )
+                .on_click(cx.listener(move |root, _, window, cx| {
+                    if let Root::Review(this) = root {
+                        this.select_view(index, window, cx)
+                    }
+                }))
             });
         let participating_incomplete = view.filter.personal == PersonalFilter::Participating
             && self.repositories.iter().any(|runtime| {
@@ -20027,20 +20125,14 @@ impl ReviewWorkspace {
                             .when(selected, |row| row.bg(colors.selected))
                             .hover(|row| row.bg(colors.selected))
                             .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(
-                                        div().text_color(colors.faint).child(format!("#{number}")),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .child(pull_request.title),
-                                    ),
+                                div().flex().gap_2().child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .child(pull_request.title),
+                                ),
                             )
                             .when(unread > 0, |row| {
                                 row.child(div().mt_1().text_xs().text_color(colors.accent).child(
@@ -20057,7 +20149,7 @@ impl ReviewWorkspace {
                                     .text_color(colors.muted)
                                     .overflow_hidden()
                                     .text_ellipsis()
-                                    .child(pull_request.source_branch),
+                                    .child(format!("#{number}  ·  {}", pull_request.author)),
                             )
                             .on_click(cx.listener(move |root, _, window, cx| {
                                 if let Root::Review(this) = root {
@@ -20072,11 +20164,11 @@ impl ReviewWorkspace {
         if rows.is_empty() {
             rows.push(
                 div()
-                    .px_5()
-                    .py_4()
-                    .text_xs()
-                    .text_color(colors.faint)
-                    .child("No pull requests match this view.")
+                    .px_4().py_5()
+                    .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(colors.muted)
+                        .child(if self.repositories.is_empty() { "No repositories yet" } else { "No pull requests" }))
+                    .child(div().mt_1().text_xs().text_color(colors.muted).line_height(px(18.))
+                        .child(if self.repositories.is_empty() { "Add a repository to start reviewing." } else { "Nothing matches these filters. Try another view or clear your search." }))
                     .into_any_element(),
             );
         }
@@ -20093,6 +20185,35 @@ impl ReviewWorkspace {
                 );
             }
         }
+        let filters = [
+            ("filter-all", "All pull requests", PersonalFilter::All),
+            (
+                "filter-review",
+                "Needs review",
+                PersonalFilter::ReviewRequested,
+            ),
+            ("filter-mine", "Created by me", PersonalFilter::Own),
+            (
+                "filter-participating",
+                "Participating",
+                PersonalFilter::Participating,
+            ),
+        ]
+        .into_iter()
+        .map(|(id, label, personal)| {
+            sidebar_nav_button(
+                id.to_owned(),
+                label,
+                view.filter.personal == personal,
+                colors,
+            )
+            .on_click(cx.listener(move |root, _, _, cx| {
+                if let Root::Review(this) = root {
+                    this.apply_filter(personal.clone(), cx);
+                }
+            }))
+        });
+        let unread = self.notifications.unread_count();
         div()
             .w(px(sidebar_width))
             .min_w(px(sidebar_width))
@@ -20104,198 +20225,179 @@ impl ReviewWorkspace {
             .border_color(colors.border)
             .child(
                 div()
+                    .id("sidebar-titlebar")
                     .h(px(48.))
-                    .px_4()
+                    .flex_none()
+                    .pl(px(88.))
+                    .pr_3()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("cibergit"))
                     .child(
                         div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("cibergit"),
+                    )
+                    .child(
+                        Button::new("collapse-sidebar")
+                            .size(px(28.))
+                            .rounded_md()
                             .flex()
                             .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(colors.faint)
-                                    .child("NATIVE REVIEW"),
-                            )
-                            .child(
-                                div()
-                                    .id("open-notifications")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .text_color(colors.accent)
-                                    .child(format!("Alerts {}", self.notifications.unread_count()))
-                                    .on_click(cx.listener(|root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.notifications.toggle_open();
-                                            cx.notify();
-                                        }
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("collapse-sidebar")
-                                    .cursor_pointer()
-                                    .text_color(colors.accent)
-                                    .child("‹")
-                                    .on_click(cx.listener(|root, _, window, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.panel_layout.sidebar_collapsed = true;
-                                            this.refresh_auto_layout(window);
-                                            cx.notify();
-                                        }
-                                    })),
-                            ),
+                            .justify_center()
+                            .text_color(colors.muted)
+                            .hover(|button| button.bg(colors.selected))
+                            .accessibility_label("Collapse sidebar")
+                            .child("‹")
+                            .on_click(cx.listener(|root, _, window, cx| {
+                                if let Root::Review(this) = root {
+                                    this.panel_layout.sidebar_collapsed = true;
+                                    this.refresh_auto_layout(window);
+                                    cx.notify();
+                                }
+                            })),
                     ),
             )
             .child(
                 div()
                     .px_3()
-                    .pb_2()
+                    .pb_3()
+                    .flex_none()
+                    .child(
+                        Button::new("open-notifications")
+                            .h(px(34.))
+                            .w_full()
+                            .px_2()
+                            .mb_2()
+                            .rounded_md()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_color(colors.muted)
+                            .hover(|row| row.bg(colors.selected))
+                            .accessibility_label(format!("Inbox, {unread} unread notifications"))
+                            .child("Inbox")
+                            .when(unread > 0, |row| {
+                                row.child(
+                                    div()
+                                        .px_2()
+                                        .rounded_md()
+                                        .text_xs()
+                                        .bg(colors.selected)
+                                        .child(unread.to_string()),
+                                )
+                            })
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                if let Root::Review(this) = root {
+                                    this.notifications.toggle_open();
+                                    cx.notify();
+                                }
+                            })),
+                    )
                     .child(
                         div()
-                            .h(px(32.))
+                            .h(px(34.))
                             .px_2()
                             .rounded_md()
-                            .bg(colors.elevated)
+                            .bg(if colors.dark {
+                                colors.elevated
+                            } else {
+                                colors.surface
+                            })
                             .border_1()
                             .border_color(colors.border)
                             .font_family(UI_FONT)
                             .child(Input::new(&self.query)),
-                    )
-                    .child(
-                        div()
-                            .id("apply-sidebar-search")
-                            .pt_1()
-                            .text_xs()
-                            .text_color(colors.accent)
-                            .cursor_pointer()
-                            .child("Apply search")
-                            .on_click(cx.listener(|root, _, _, cx| {
-                                if let Root::Review(this) = root {
-                                    let personal = this.workspace.view().filter.personal;
-                                    this.apply_filter(personal, cx);
-                                }
-                            })),
                     ),
             )
             .child(
                 div()
                     .px_3()
-                    .pt_2()
+                    .pb_3()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(filters),
+            )
+            .when(self.workspace.views.len() > 1, |sidebar| {
+                sidebar.child(
+                    div()
+                        .px_3()
+                        .pb_3()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child("Saved views"),
+                        )
+                        .children(saved_views),
+                )
+            })
+            .child(div().mx_4().h(px(1.)).flex_none().bg(colors.border))
+            .child(
+                div()
+                    .px_4()
+                    .pt_4()
+                    .pb_2()
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .text_xs()
                     .child(
                         div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
+                            .text_xs()
                             .font_weight(FontWeight::MEDIUM)
-                            .child(view.name.clone()),
+                            .text_color(colors.muted)
+                            .child("Pull requests"),
                     )
                     .child(
-                        div()
-                            .id("edit-view")
-                            .cursor_pointer()
-                            .text_color(colors.accent)
-                            .child("Edit view…")
+                        Button::new("edit-view")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(colors.muted)
+                            .hover(|button| button.bg(colors.selected))
+                            .accessibility_label("Edit filters and grouping")
+                            .child("View options")
                             .on_click(cx.listener(|root, _, window, cx| {
                                 if let Root::Review(this) = root {
-                                    this.open_view_editor(window, cx)
+                                    this.open_view_editor(window, cx);
                                 }
                             })),
                     ),
             )
-            .child(
-                div()
-                    .px_3()
-                    .pt_2()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .children(saved_views),
+            .when(
+                view.groups != vec![GroupBy::Repository]
+                    || !matches!(view.filter.state.as_str(), "" | "open"),
+                |sidebar| {
+                    sidebar.child(
+                        div()
+                            .px_4()
+                            .pb_2()
+                            .text_xs()
+                            .text_color(colors.muted)
+                            .child(view_summary(&view)),
+                    )
+                },
             )
             .when(participating_incomplete, |sidebar| {
                 sidebar.child(
                     div()
-                        .px_3()
-                        .pt_2()
+                        .px_4()
+                        .pb_2()
                         .text_xs()
                         .text_color(colors.amber)
-                        .child("Participating results may be incomplete; known participants still match."),
+                        .child("Some participant information is unavailable."),
                 )
             })
-            .child(
-                div()
-                    .px_3()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .child(
-                        side_control(
-                            "All open",
-                            view.filter.personal == PersonalFilter::All,
-                            colors,
-                        )
-                        .id("filter-all")
-                        .on_click(cx.listener(|root, _, _, cx| {
-                            if let Root::Review(this) = root {
-                                this.apply_filter(PersonalFilter::All, cx)
-                            }
-                        })),
-                    )
-                    .child(
-                        side_control(
-                            "Needs review",
-                            view.filter.personal == PersonalFilter::ReviewRequested,
-                            colors,
-                        )
-                        .id("filter-review")
-                        .on_click(cx.listener(|root, _, _, cx| {
-                            if let Root::Review(this) = root {
-                                this.apply_filter(PersonalFilter::ReviewRequested, cx)
-                            }
-                        })),
-                    )
-                    .child(
-                        side_control("Mine", view.filter.personal == PersonalFilter::Own, colors)
-                            .id("filter-mine")
-                            .on_click(cx.listener(|root, _, _, cx| {
-                                if let Root::Review(this) = root {
-                                    this.apply_filter(PersonalFilter::Own, cx)
-                                }
-                            })),
-                    )
-                    .child(
-                        side_control(
-                            "Participating",
-                            view.filter.personal == PersonalFilter::Participating,
-                            colors,
-                        )
-                        .id("filter-participating")
-                        .on_click(cx.listener(|root, _, _, cx| {
-                            if let Root::Review(this) = root {
-                                this.apply_filter(PersonalFilter::Participating, cx)
-                            }
-                        })),
-                    ),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .pt_2()
-                    .pb_1()
-                    .text_xs()
-                    .text_color(colors.faint)
-                    .child(view_summary(&view)),
-            )
             .child(
                 div()
                     .id("sidebar-scroll")
@@ -20306,25 +20408,25 @@ impl ReviewWorkspace {
             )
             .child(
                 div()
-                    .px_3()
-                    .py_3()
+                    .p_3()
+                    .flex_none()
                     .border_t_1()
                     .border_color(colors.border)
                     .child(
-                        div()
-                            .id("open-pr-creation")
-                            .h(px(32.))
-                            .px_3()
-                            .mb_2()
+                        Button::new("open-pr-creation")
+                            .w_full()
+                            .h(px(34.))
+                            .px_2()
+                            .mb_1()
+                            .rounded_md()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .bg(colors.text)
-                            .text_color(colors.canvas)
-                            .cursor_pointer()
-                            .hover(|button| button.opacity(0.9))
-                            .child("Create pull request  ⇧⌘N")
+                            .justify_between()
+                            .text_color(colors.muted)
+                            .hover(|button| button.bg(colors.selected))
+                            .accessibility_label("Create pull request")
+                            .child("New pull request")
+                            .child(div().text_xs().text_color(colors.faint).child("⇧⌘N"))
                             .on_click(cx.listener(|root, _, window, cx| {
                                 if let Root::Review(this) = root {
                                     this.open_creation_dialog(window, cx);
@@ -20332,22 +20434,28 @@ impl ReviewWorkspace {
                             })),
                     )
                     .child(
-                        div()
-                            .id("add-repository")
-                            .h(px(32.))
-                            .px_3()
+                        Button::new("add-repository")
+                            .w_full()
+                            .h(px(36.))
+                            .px_2()
+                            .rounded_md()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .bg(colors.elevated)
-                            .cursor_pointer()
+                            .justify_between()
+                            .bg(if colors.dark {
+                                colors.elevated
+                            } else {
+                                colors.surface
+                            })
+                            .border_1()
+                            .border_color(colors.border)
                             .hover(|button| button.bg(colors.selected))
-                            .child("＋ Add repository  ⌘O")
+                            .accessibility_label("Add repository")
+                            .child("Add repository…")
+                            .child(div().text_xs().text_color(colors.faint).child("⌘O"))
                             .on_click(cx.listener(|root, _, window, cx| {
                                 if let Root::Review(this) = root {
                                     this.open_repository_picker(window, cx);
-                                    cx.notify();
                                 }
                             })),
                     ),
@@ -27441,6 +27549,43 @@ fn file_status_badge(status: &str) -> &'static str {
     }
 }
 
+fn sidebar_nav_button(id: String, label: &str, selected: bool, colors: Palette) -> Button {
+    let selector = id.clone();
+    Button::new(id)
+        .debug_selector(move || selector.clone())
+        .w_full()
+        .h(px(32.))
+        .px_2()
+        .rounded_md()
+        .flex()
+        .items_center()
+        .gap_2()
+        .selected(selected)
+        .text_size(px(13.))
+        .text_color(if selected { colors.text } else { colors.muted })
+        .when(selected, |row| {
+            row.bg(colors.selected).font_weight(FontWeight::MEDIUM)
+        })
+        .hover(|row| row.bg(colors.selected))
+        .accessibility_label(format!(
+            "{label}{}",
+            if selected { ", selected" } else { "" }
+        ))
+        .child(div().w(px(3.)).h(px(14.)).rounded_full().bg(if selected {
+            colors.accent
+        } else {
+            rgba(0x00000000)
+        }))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(label.to_owned()),
+        )
+}
+
 fn side_control(label: &str, selected: bool, colors: Palette) -> Div {
     div()
         .px_2()
@@ -29600,6 +29745,60 @@ mod layout_tests {
             window.draw(cx).clear(cx);
         });
         assert!(cx.debug_bounds("repository-setup-notice").is_some());
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn sidebar_search_updates_without_apply_and_filter_click_keeps_query(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.setup_open = false;
+                this.query.update(cx, |input, cx| input.focus(window, cx));
+            });
+        });
+        cx.simulate_input("sidebar");
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert_eq!(this.workspace.view().filter.search, "sidebar");
+            });
+            window.draw(cx).clear(cx);
+        });
+        let button = cx.debug_bounds("filter-mine").unwrap();
+        cx.simulate_click(button.center(), Modifiers::default());
+        cx.update(|_, cx| {
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let filter = this.workspace.view().filter;
+                assert_eq!(filter.search, "sidebar");
+                assert_eq!(filter.personal, cibergit::workspace::PersonalFilter::Own);
+            });
+        });
     }
 
     fn submitted_review_fixture() -> (Repository, PullRequestReview) {
