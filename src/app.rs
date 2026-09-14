@@ -2158,6 +2158,10 @@ pub struct ReviewWorkspace {
     /// this control, instead of inferring it from a painted ring, which a
     /// clipped or unfocused frame can hide.
     checks_details_focus: FocusHandle,
+    /// Caller-owned handle for the first job row on the current Jobs page. It
+    /// is the row keyboard traversal reaches first, and owning it lets a
+    /// regression ask that row directly whether Enter reached it.
+    jobs_first_row_focus: FocusHandle,
     jobs_focus: FocusHandle,
     log_focus: FocusHandle,
     query: Entity<InputState>,
@@ -2889,6 +2893,7 @@ impl ReviewWorkspace {
         let diff_focus = cx.focus_handle();
         let checks_focus = cx.focus_handle();
         let checks_details_focus = cx.focus_handle();
+        let jobs_first_row_focus = cx.focus_handle();
         let jobs_focus = cx.focus_handle();
         let log_focus = cx.focus_handle();
         let actions_control_focus = ActionsControlFocus {
@@ -2962,6 +2967,7 @@ impl ReviewWorkspace {
             inspector_scroll: ScrollHandle::new(),
             checks_focus,
             checks_details_focus,
+            jobs_first_row_focus,
             jobs_focus,
             log_focus,
             actions_control_focus,
@@ -20927,12 +20933,22 @@ impl ReviewWorkspace {
                     this.move_jobs_page(1, window, cx);
                 }
             }))
+            // Enter is bound to this pane-level shortcut in the ChecksJobsPane
+            // context, and a key binding matches against the focused node's
+            // whole context stack. Without this guard a focused job row would
+            // never answer its own Enter: the pane shortcut would load the
+            // already-selected job's log instead of selecting the focused row.
             .on_action(cx.listener(|root, _: &LoadSelectedJobLog, window, cx| {
-                if let Root::Review(this) = root
-                    && let Some(index) = this.active_tab
-                    && this.start_actions_log(index, cx)
-                {
-                    this.focus_current_ci_pane(index, window, cx);
+                if let Root::Review(this) = root {
+                    if !this.jobs_focus.is_focused(window) {
+                        cx.propagate();
+                        return;
+                    }
+                    if let Some(index) = this.active_tab
+                        && this.start_actions_log(index, cx)
+                    {
+                        this.focus_current_ci_pane(index, window, cx);
+                    }
                 }
             }))
             .on_action(cx.listener(|root, _: &ReturnToChecks, window, cx| {
@@ -25271,14 +25287,21 @@ impl ReviewWorkspace {
                 .into_any_element(),
         );
         let (page, pages, range) = jobs_page(snapshot.jobs.len(), tab.ci_read.jobs_page);
+        let first_row_id = snapshot.jobs[range.clone()].first().map(|job| job.id);
         for job in &snapshot.jobs[range.clone()] {
             let id = job.id;
             let selected = tab.ci_read.selected_job_id == Some(id);
             let row_root = cx.entity();
             let focus = self.jobs_focus.clone();
+            let row = Button::new(format!("actions-job-{id}"))
+                .debug_selector(move || format!("actions-job-{id}"));
+            let row = if first_row_id == Some(id) {
+                row.track_focus(&self.jobs_first_row_focus)
+            } else {
+                row
+            };
             content.push(
-                Button::new(format!("actions-job-{id}"))
-                    .control()
+                row.control()
                     .h_auto()
                     .min_h(px(ui::TWO_LINE_ROW))
                     .ui_text(TextRole::Body)
@@ -35113,44 +35136,36 @@ mod layout_tests {
             );
         }
 
-        let cancel_control = cx
-            .debug_bounds("actions-control-cancel-actions-run")
-            .unwrap();
-        cx.simulate_click(cancel_control.center(), Modifiers::default());
-        cx.run_until_parked();
-        root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
-            assert!(
-                this.status.contains("zero writes"),
-                "pointer activation did not reach the controller: {}",
-                this.status
-            );
-            assert!(this.tabs[0].confirmation.is_none());
-            assert!(!this.tabs[0].write_in_flight);
-        });
-
-        // The pointer press focused the control, so Enter and Space must reach
-        // the same handler without a second click.
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        let rerun = cx
-            .debug_bounds("actions-control-rerun-actions-run-all-jobs")
-            .unwrap();
-        cx.simulate_click(rerun.center(), Modifiers::default());
-        cx.run_until_parked();
-        root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
-            assert!(
-                this.status
-                    .contains(ActionsRunControlAction::CancelRun.label()),
-                "the pointer press did not reach the cancel control: {}",
-                this.status
-            );
-            assert!(this.status.contains("zero writes"), "{}", this.status);
-        });
+        // Real hit-tested pointer activation, control by control. The status
+        // names the exact action, so a press that landed on a neighbour cannot
+        // satisfy these.
+        for action in RUN_CONTROLS {
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    let Root::Review(this) = root else {
+                        unreachable!()
+                    };
+                    this.status = "sentinel".into();
+                });
+            });
+            let bounds = cx.debug_bounds(action.control_element_id()).unwrap();
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            cx.run_until_parked();
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert!(
+                    this.status.contains(action.label()) && this.status.contains("zero writes"),
+                    "the pointer press did not reach {}: {}",
+                    action.label(),
+                    this.status
+                );
+                assert!(this.tabs[0].confirmation.is_none());
+                assert!(!this.tabs[0].write_in_flight);
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
 
         // Each control tracks a caller-owned focus handle and accepts focus.
         //
@@ -35185,9 +35200,329 @@ mod layout_tests {
             });
         }
 
-        // Activating each remaining control by pointer reaches the controller
-        // and still sends nothing.
-        for action in RUN_CONTROLS {
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert!(this.tabs[0].confirmation.is_none());
+            assert!(!this.tabs[0].write_in_flight);
+        });
+    }
+
+    /// The Jobs pane has the same shape of Enter interception the Checks pane
+    /// had, and it is reachable: a focused job row would never answer its own
+    /// Enter, because the pane shortcut would load the already-selected job's
+    /// log instead of selecting the focused row.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn a_focused_jobs_row_answers_enter_and_the_pane_shortcut_survives(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{KeyDownEvent, KeyUpEvent, Keystroke};
+
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        let (mut repository, _) = submitted_review_fixture();
+        repository.owner = "cli".into();
+        repository.name = "cli".into();
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.install_tab_with_restore(
+                    repository.clone(),
+                    transition_pull_request(7),
+                    None,
+                    InstallTabOptions {
+                        activate: true,
+                        window: Some(window),
+                        start_background_work: false,
+                    },
+                    cx,
+                );
+                let details = actions_details_fixture(&repository);
+                this.tabs[0].checks_selection.reconcile(&details.checks);
+                this.tabs[0].details = Some(details);
+                this.tabs[0].details_state = LoadState::Ready;
+                this.tabs[0].inspector_section = InspectorSection::Checks;
+                this.inspector_open = true;
+                this.panel_layout.sidebar_collapsed = true;
+                this.panel_layout.file_tree_collapsed = true;
+                let (_, locator, _, _) = this.selected_actions_locator(0).unwrap();
+                let snapshot = actions_snapshot(&locator, 7, &[11, 12, 13]);
+                // Present the jobs pane directly: this regression is about key
+                // dispatch, not about the read path that fills it.
+                this.tabs[0].ci_read.reconcile_locator(Some(&locator));
+                this.tabs[0].ci_read.install_fresh_jobs_for_test(snapshot);
+                this.tabs[0].ci_read.select_job(Some(13));
+                this.focus_current_ci_pane(0, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        let press = |cx: &mut gpui::VisualTestContext, key: &str| {
+            let keystroke = Keystroke::parse(key).unwrap();
+            cx.simulate_event(KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(KeyUpEvent { keystroke });
+            cx.run_until_parked();
+        };
+        press(cx, "tab");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            cx.debug_bounds("actions-job-11").is_some(),
+            "the first job row must be painted for this regression to mean anything"
+        );
+
+        let row_handle = root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            this.jobs_first_row_focus.clone()
+        });
+        let mut reached = cx.update(|window, _| row_handle.is_focused(window));
+        for _ in 0..200 {
+            if reached {
+                break;
+            }
+            cx.update(|window, cx| window.focus_next(cx));
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            reached = cx.update(|window, _| row_handle.is_focused(window));
+        }
+        assert!(reached, "Tab traversal must land on the first job row");
+
+        // Job 13 is selected and job 11 is focused, so the two outcomes are
+        // distinguishable: the row's own Enter selects 11, while the pane
+        // shortcut would leave the selection alone and start a log read.
+        press(cx, "enter");
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert_eq!(
+                this.tabs[0].ci_read.selected_job_id,
+                Some(11),
+                "a focused job row must answer its own Enter instead of the pane shortcut"
+            );
+            assert_eq!(
+                this.tabs[0].ci_read.pane,
+                CiPane::Jobs,
+                "the pane shortcut must not have loaded a log from a focused row"
+            );
+        });
+
+        // Guarding the shortcut must not delete it: with focus back on the pane
+        // itself, Enter still reaches the pane-level log action.
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.status = "sentinel".into();
+                this.jobs_focus.focus(window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        press(cx, "enter");
+        root.read_with(cx, |root, _| {
+            let Root::Review(this) = root else {
+                unreachable!()
+            };
+            assert_ne!(
+                this.status, "sentinel",
+                "the pane-level Enter shortcut must still act when the pane itself holds focus"
+            );
+        });
+    }
+
+    /// Real keyboard operation of every Actions run control.
+    ///
+    /// Written to the convention validated while the Checks pane Enter
+    /// interception was diagnosed: focus only through Tab traversal onto the
+    /// control's own caller-owned handle, never through a pointer press, which
+    /// a click handler can move off the button; redraw between focusing and
+    /// pressing, because GPUI registers a focused element's Enter and Space
+    /// listeners only while painting it focused; and assert real controller
+    /// state rather than a painted ring, which clipping or mouse modality can
+    /// hide.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn actions_run_controls_are_tab_reachable_and_activate_on_enter_and_space(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{KeyDownEvent, KeyUpEvent, Keystroke};
+
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.install_actions_control_fixture(window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        let press = |cx: &mut gpui::VisualTestContext, key: &str| {
+            let keystroke = Keystroke::parse(key).unwrap();
+            cx.simulate_event(KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(KeyUpEvent { keystroke });
+            cx.run_until_parked();
+        };
+        // Enter keyboard modality with a real keystroke before traversing.
+        press(cx, "tab");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let visible_area = gpui::Bounds {
+            origin: gpui::point(px(0.), px(0.)),
+            size: viewport,
+        };
+        for (position, action) in RUN_CONTROLS.into_iter().enumerate() {
+            // Establish the control is genuinely on screen first, so an
+            // offscreen fixture layout can never masquerade as a keyboard
+            // defect. debug_bounds alone would not prove this.
+            let bounds = cx
+                .debug_bounds(action.control_element_id())
+                .unwrap_or_else(|| panic!("{} must be painted", action.label()));
+            assert!(
+                bounds.intersects(&visible_area) && bounds.size.width > px(0.),
+                "{} must have real painted area inside the viewport",
+                action.label()
+            );
+
+            let focused_now = |cx: &mut gpui::VisualTestContext| {
+                let handle = root.read_with(cx, |root, _| {
+                    let Root::Review(this) = root else {
+                        unreachable!()
+                    };
+                    this.actions_control_focus.controls[position].clone()
+                });
+                cx.update(|window, _| handle.is_focused(window))
+            };
+            let mut reached = focused_now(cx);
+            for _ in 0..200 {
+                if reached {
+                    break;
+                }
+                cx.update(|window, cx| window.focus_next(cx));
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                reached = focused_now(cx);
+            }
+            assert!(
+                reached,
+                "Tab traversal must land on {}; it is painted every frame, so \
+                 failing here means the control is absent from the tab ring",
+                action.label()
+            );
+
+            for key in ["enter", "space"] {
+                cx.update(|_, cx| {
+                    root.update(cx, |root, _| {
+                        let Root::Review(this) = root else {
+                            unreachable!()
+                        };
+                        this.status = "sentinel".into();
+                    });
+                });
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                assert!(
+                    focused_now(cx),
+                    "{} lost focus before {key}",
+                    action.label()
+                );
+                press(cx, key);
+                root.read_with(cx, |root, _| {
+                    let Root::Review(this) = root else {
+                        unreachable!()
+                    };
+                    // The status names the exact control, so a key answered by
+                    // some other element cannot satisfy this.
+                    assert!(
+                        this.status.contains(action.label()) && this.status.contains("zero writes"),
+                        "{key} on a focused {} did not reach the controller: {}",
+                        action.label(),
+                        this.status
+                    );
+                });
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
+        }
+
+        // The same for both confirmation controls, on a prepared request.
+        cx.update(|window, cx| {
+            root.update(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.install_synthetic_actions_confirmation(
+                    ActionsRunControlAction::RerunFailedJobs,
+                );
+            });
+            window.draw(cx).clear(cx);
+        });
+        for (selector, confirm) in [
+            ("confirm-actions-run-control", true),
+            ("cancel-actions-run-control", false),
+        ] {
+            let handle = root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                if confirm {
+                    this.actions_control_focus.confirm.clone()
+                } else {
+                    this.actions_control_focus.cancel.clone()
+                }
+            });
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} is not painted"
+            );
+            let mut reached = cx.update(|window, _| handle.is_focused(window));
+            for _ in 0..200 {
+                if reached {
+                    break;
+                }
+                cx.update(|window, cx| window.focus_next(cx));
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                reached = cx.update(|window, _| handle.is_focused(window));
+            }
+            assert!(reached, "Tab traversal must land on {selector}");
+
             cx.update(|_, cx| {
                 root.update(cx, |root, _| {
                     let Root::Review(this) = root else {
@@ -35196,32 +35531,39 @@ mod layout_tests {
                     this.status = "sentinel".into();
                 });
             });
-            let bounds = cx.debug_bounds(action.control_element_id()).unwrap();
-            cx.simulate_click(bounds.center(), Modifiers::default());
-            cx.run_until_parked();
-            cx.update(|window, cx| {
-                root.update(cx, |root, _| {
-                    let Root::Review(this) = root else {
-                        unreachable!()
-                    };
-                    // The status names the exact control, so a press that
-                    // landed on a different element cannot satisfy this.
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            press(cx, "enter");
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                if confirm {
+                    // Confirm reaches the dispatch path and stops at the
+                    // synthetic scene's zero-capability guard.
                     assert!(
-                        this.status.contains(action.label()) && this.status.contains("zero writes"),
-                        "{} did not reach the controller: {}",
-                        action.label(),
+                        this.status.contains("not dispatched")
+                            && this.status.contains("zero writes were sent"),
+                        "Enter on a focused Confirm did not reach the controller: {}",
                         this.status
                     );
-                });
-                window.draw(cx).clear(cx);
+                    assert!(this.tabs[0].confirmation.is_some());
+                } else {
+                    assert!(
+                        this.status.contains("retired"),
+                        "Enter on a focused Cancel did not retire the request: {}",
+                        this.status
+                    );
+                    assert!(this.tabs[0].confirmation.is_none());
+                }
             });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
         }
         root.read_with(cx, |root, _| {
             let Root::Review(this) = root else {
                 unreachable!()
             };
-            assert!(this.tabs[0].confirmation.is_none());
             assert!(!this.tabs[0].write_in_flight);
+            assert!(this.tabs[0].ci_actions.in_flight.is_none());
         });
     }
 

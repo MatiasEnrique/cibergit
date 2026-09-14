@@ -344,6 +344,16 @@ impl CiReadState {
         self.select_job(selected);
     }
 
+    /// Present an already-observed snapshot directly. Regressions about key
+    /// dispatch do not need the read path that would normally fill this.
+    #[cfg(all(test, feature = "ui-smoke"))]
+    pub(super) fn install_fresh_jobs_for_test(&mut self, snapshot: ActionsJobsSnapshot) {
+        self.frozen_locator = Some(snapshot.attempt.key.locator.clone());
+        self.selected_job_id = Some(snapshot.selected_check_job_id);
+        self.jobs = MemoryRead::Fresh(snapshot);
+        self.pane = CiPane::Jobs;
+    }
+
     pub(super) fn select_job(&mut self, selected: Option<u64>) {
         if self.selected_job_id != selected {
             self.cancel_active();
