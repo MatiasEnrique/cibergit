@@ -109,6 +109,17 @@ pub(crate) fn active_general_read_tracker() -> Option<GeneralReadTracker> {
     GENERAL_READ_STACK.with(|stack| stack.borrow().last().cloned())
 }
 
+pub(crate) fn record_general_poll_from_included_prefix(prefix: &[u8]) {
+    let poll = general_poll_from_included_prefix(prefix);
+    if let Some(tracker) = active_general_read_tracker() {
+        tracker.record_poll(&poll);
+    }
+}
+
+pub(crate) fn general_poll_from_included_prefix(prefix: &[u8]) -> RestPollDirective {
+    rejected_header_poll(&prefix[..prefix.len().min(MAX_HEADER_BYTES)], false)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RestValidators {
     pub(crate) etag: Option<String>,
@@ -223,11 +234,16 @@ enum RestReadErrorKind {
 pub(crate) struct RestReadError {
     kind: RestReadErrorKind,
     poll: RestPollDirective,
+    status: Option<u16>,
 }
 
 impl RestReadError {
     fn new(kind: RestReadErrorKind, poll: RestPollDirective) -> Self {
-        Self { kind, poll }
+        Self {
+            kind,
+            poll,
+            status: None,
+        }
     }
     pub(crate) fn credential() -> Self {
         Self::new(RestReadErrorKind::Credential, RestPollDirective::default())
@@ -247,6 +263,9 @@ impl RestReadError {
     pub(crate) fn poll(&self) -> &RestPollDirective {
         &self.poll
     }
+    pub(crate) fn http_status(&self) -> Option<u16> {
+        self.status
+    }
     pub(crate) fn invalidates_cached_body(&self) -> bool {
         matches!(self.kind, RestReadErrorKind::InvalidBody)
     }
@@ -264,6 +283,10 @@ impl RestReadError {
     }
     fn with_poll(mut self, poll: RestPollDirective) -> Self {
         self.poll = poll;
+        self
+    }
+    fn with_status(mut self, status: u16) -> Self {
+        self.status = Some(status);
         self
     }
 }
@@ -355,10 +378,10 @@ fn parse_included_response_for(
             RestReadErrorKind::InvalidFraming,
             error_poll,
         )),
-        _ => Err(RestReadError::new(
-            RestReadErrorKind::HttpFailure,
-            error_poll,
-        )),
+        _ => Err(
+            RestReadError::new(RestReadErrorKind::HttpFailure, error_poll)
+                .with_status(collected.status),
+        ),
     }
 }
 

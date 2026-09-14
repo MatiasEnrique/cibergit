@@ -13,6 +13,15 @@ actions!(
         ToggleCheckIdentity,
         PreviousCheckPage,
         NextCheckPage,
+        OpenSelectedCheckJobs,
+        RefreshSelectedCheckJobs,
+        PreviousJob,
+        NextJob,
+        PreviousJobPage,
+        NextJobPage,
+        LoadSelectedJobLog,
+        ReturnToChecks,
+        ReturnToJobs,
     ]
 );
 

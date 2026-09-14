@@ -1023,6 +1023,126 @@ pub struct PullRequestCheck {
     pub actions_linkage: ActionsLinkage,
 }
 
+/// Complete in-memory locator for one GitHub Actions run attempt. This value is
+/// deliberately not serializable: a cached Checks row may locate a fresh read,
+/// but it never makes Jobs or Logs current by itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionsAttemptLocator {
+    pub account: Account,
+    pub base_repository: CheckRepositoryIdentity,
+    pub pull_request_node_id: String,
+    pub pull_request_number: u64,
+    pub observed_head_sha: String,
+    pub head_repository: CheckRepositoryIdentity,
+    pub rollup_commit_sha: String,
+    pub rollup_repository: CheckRepositoryIdentity,
+    pub check_node_id: String,
+    pub check_database_id: u64,
+    pub check_commit_sha: String,
+    pub check_repository: CheckRepositoryIdentity,
+    pub suite: CheckSuiteIdentity,
+    pub workflow_run: WorkflowRunIdentity,
+}
+
+/// A locator plus the freshly resolved server-side viewer identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionsAttemptKey {
+    pub locator: ActionsAttemptLocator,
+    pub viewer_node_id: String,
+    pub viewer_login: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionsHeadRelation {
+    CurrentHead,
+    HistoricalHead,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionsPullRequestIdentity {
+    pub number: u64,
+    pub base_repository: CheckRepositoryIdentity,
+    pub base_sha: String,
+    pub head_repository: CheckRepositoryIdentity,
+    pub head_sha: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionsRunAttemptObservation {
+    pub key: ActionsAttemptKey,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub api_url: String,
+    pub html_url: String,
+    pub workflow_url: String,
+    pub returned_pull_requests: Vec<ActionsPullRequestIdentity>,
+    pub relation: ActionsHeadRelation,
+    pub observed_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionsJobStep {
+    pub number: u64,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionsJob {
+    /// REST job ID. It is unrelated to the CheckRun database ID.
+    pub id: u64,
+    pub node_id: String,
+    pub run_id: u64,
+    pub run_attempt: u64,
+    pub head_sha: String,
+    /// Parsed only from the canonical `check_run_url` route.
+    pub check_run_database_id: u64,
+    pub check_run_url: String,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub api_url: String,
+    pub html_url: String,
+    pub steps: Vec<ActionsJobStep>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionsJobsSnapshot {
+    pub attempt: ActionsRunAttemptObservation,
+    /// Provider order retained for the second-pass movement proof.
+    pub provider_ordered_job_ids: Vec<u64>,
+    /// Presentation order only; selection remains keyed by REST job ID.
+    pub jobs: Vec<ActionsJob>,
+    pub selected_check_job_id: u64,
+    pub complete: bool,
+    pub observed_at_unix_ms: u64,
+    pub observation_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionsLogProvenance {
+    FreshExactRead,
+    HistoricalDisplay,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionsJobLog {
+    pub key: ActionsAttemptKey,
+    pub job: ActionsJob,
+    pub jobs_observation_id: u64,
+    pub raw_byte_count: usize,
+    pub line_count: usize,
+    pub sanitized_text: String,
+    pub observed_at_unix_ms: u64,
+    pub provenance: ActionsLogProvenance,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeEligibility {
     /// OPEN, CLOSED, or MERGED.

@@ -37,11 +37,16 @@ use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
 
+mod actions_jobs_logs;
 mod conditional;
 mod general_sync;
 pub mod notifications;
@@ -49,6 +54,7 @@ mod pr_lifecycle;
 mod reactions;
 mod review_dismissal;
 mod stacks;
+pub use actions_jobs_logs::{ActionsCancellation, ActionsReadError, ActionsReadErrorCategory};
 #[cfg(feature = "ui-smoke")]
 pub use general_sync::synthetic_exact_304_smoke_fixture;
 pub use general_sync::{
@@ -90,6 +96,25 @@ impl GithubProvider {
             account,
             runner: Runner {
                 gh,
+                timeout,
+                ..Runner::default()
+            },
+        }
+    }
+
+    #[cfg(any(test, feature = "ui-smoke"))]
+    #[doc(hidden)]
+    pub fn synthetic_with_actions_transport(
+        account: Account,
+        gh: PathBuf,
+        curl: PathBuf,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            account,
+            runner: Runner {
+                gh,
+                curl,
                 timeout,
                 ..Runner::default()
             },
@@ -1398,16 +1423,50 @@ fn validate_node_id(id: &str) -> Result<()> {
 struct Session<'a> {
     provider: &'a GithubProvider,
     started: Instant,
+    deadline: Option<Instant>,
     bytes: usize,
     general_read: Option<conditional::GeneralReadTracker>,
+    cancellation: Option<Arc<AtomicBool>>,
+    byte_limit: usize,
 }
 impl<'a> Session<'a> {
     fn new(provider: &'a GithubProvider) -> Self {
+        let started = Instant::now();
+        Self {
+            provider,
+            started,
+            deadline: started.checked_add(Duration::from_secs(180)),
+            bytes: 0,
+            general_read: conditional::active_general_read_tracker(),
+            cancellation: None,
+            byte_limit: MAX_OPERATION_BYTES,
+        }
+    }
+    fn new_actions(provider: &'a GithubProvider, cancellation: Arc<AtomicBool>) -> Self {
+        let started = Instant::now();
+        Self {
+            provider,
+            started,
+            deadline: started.checked_add(Duration::from_secs(180)),
+            bytes: 0,
+            general_read: conditional::active_general_read_tracker(),
+            cancellation: Some(cancellation),
+            byte_limit: actions_jobs_logs::MAX_ACTIONS_JSON_BYTES,
+        }
+    }
+    fn new_actions_until(
+        provider: &'a GithubProvider,
+        cancellation: Arc<AtomicBool>,
+        deadline: Instant,
+    ) -> Self {
         Self {
             provider,
             started: Instant::now(),
+            deadline: Some(deadline),
             bytes: 0,
             general_read: conditional::active_general_read_tracker(),
+            cancellation: Some(cancellation),
+            byte_limit: actions_jobs_logs::MAX_ACTIONS_JSON_BYTES,
         }
     }
     fn get<T: serde::de::DeserializeOwned>(&mut self, endpoint: &str) -> Result<T> {
@@ -1477,7 +1536,10 @@ impl<'a> Session<'a> {
         if let Some(tracker) = &self.general_read {
             tracker.check_not_halted()?;
         }
-        if self.started.elapsed() >= Duration::from_secs(180) {
+        if self
+            .deadline
+            .is_none_or(|deadline| Instant::now() >= deadline)
+        {
             self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
             return Err(RestReadError::operation_limit());
         }
@@ -1493,7 +1555,12 @@ impl<'a> Session<'a> {
         let token = self
             .provider
             .runner
-            .run(token_command, "resolve selected GitHub credential")
+            .run_maybe_cancelled(
+                token_command,
+                "resolve selected GitHub credential",
+                self.cancellation.as_deref(),
+                self.deadline,
+            )
             .map_err(|_| {
                 self.record_general_failure(conditional::GeneralReadFailureKind::Unavailable);
                 RestReadError::credential()
@@ -1530,7 +1597,12 @@ impl<'a> Session<'a> {
         let output = self
             .provider
             .runner
-            .run_with_status(command, "GitHub conditional read request")
+            .run_with_status_maybe_cancelled(
+                command,
+                "GitHub conditional read request",
+                self.cancellation.as_deref(),
+                self.deadline,
+            )
             .map_err(|_| {
                 self.record_general_failure(conditional::GeneralReadFailureKind::Unavailable);
                 RestReadError::transport()
@@ -1549,7 +1621,7 @@ impl<'a> Session<'a> {
             self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
             RestReadError::operation_limit()
         })?;
-        if self.bytes > MAX_OPERATION_BYTES {
+        if self.bytes > self.byte_limit {
             self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
             return Err(RestReadError::operation_limit());
         }
@@ -2513,6 +2585,7 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 struct Runner {
     gh: PathBuf,
     git: PathBuf,
+    curl: PathBuf,
     timeout: Duration,
     input_timeout: Option<Duration>,
     output_limit: usize,
@@ -2522,6 +2595,7 @@ impl Default for Runner {
         Self {
             gh: "gh".into(),
             git: "git".into(),
+            curl: "/usr/bin/curl".into(),
             timeout: Duration::from_secs(30),
             input_timeout: None,
             output_limit: 16 * 1024 * 1024,
@@ -2569,6 +2643,17 @@ impl Runner {
         let output = self.run_inner(&mut command, action, None)?;
         ensure_success(output, action)
     }
+    fn run_maybe_cancelled(
+        &self,
+        mut command: Command,
+        action: &'static str,
+        cancellation: Option<&AtomicBool>,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<u8>> {
+        let output =
+            self.run_inner_maybe_cancelled(&mut command, action, None, cancellation, deadline)?;
+        ensure_success(output, action)
+    }
     fn run_with_input(
         &self,
         mut command: Command,
@@ -2586,14 +2671,30 @@ impl Runner {
     ) -> Result<RunnerOutput> {
         self.run_inner(&mut command, action, Some(input))
     }
-    fn run_with_status(&self, mut command: Command, action: &'static str) -> Result<RunnerOutput> {
-        self.run_inner(&mut command, action, None)
-    }
     fn run_inner(
         &self,
         command: &mut Command,
         action: &'static str,
         input: Option<&[u8]>,
+    ) -> Result<RunnerOutput> {
+        self.run_inner_maybe_cancelled(command, action, input, None, None)
+    }
+    fn run_with_status_maybe_cancelled(
+        &self,
+        mut command: Command,
+        action: &'static str,
+        cancellation: Option<&AtomicBool>,
+        deadline: Option<Instant>,
+    ) -> Result<RunnerOutput> {
+        self.run_inner_maybe_cancelled(&mut command, action, None, cancellation, deadline)
+    }
+    fn run_inner_maybe_cancelled(
+        &self,
+        command: &mut Command,
+        action: &'static str,
+        input: Option<&[u8]>,
+        cancellation: Option<&AtomicBool>,
+        deadline: Option<Instant>,
     ) -> Result<RunnerOutput> {
         let input = input.map(<[u8]>::to_vec);
         command
@@ -2664,6 +2765,14 @@ impl Runner {
         let mut stderr_done = false;
         let mut status = None;
         loop {
+            if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                terminate_process_group(&mut child);
+                bail!("Cancelled while attempting to {action}");
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                terminate_process_group(&mut child);
+                bail!("Timed out attempting to {action}");
+            }
             loop {
                 match rx.try_recv() {
                     Ok(PipeEvent::Input(result)) => {
@@ -2676,7 +2785,16 @@ impl Runner {
                     Ok(PipeEvent::Output(is_stdout, result)) => {
                         let bytes = match result {
                             Ok(bytes) if bytes.len() <= limit => bytes,
-                            _ => {
+                            Ok(bytes) => {
+                                if is_stdout && action == "GitHub conditional read request" {
+                                    conditional::record_general_poll_from_included_prefix(&bytes);
+                                }
+                                terminate_process_group(&mut child);
+                                bail!(
+                                    "Subprocess output failed or exceeded limit while attempting to {action}"
+                                );
+                            }
+                            Err(_) => {
                                 terminate_process_group(&mut child);
                                 bail!(
                                     "Subprocess output failed or exceeded limit while attempting to {action}"
