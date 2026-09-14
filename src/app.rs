@@ -5477,29 +5477,35 @@ impl ReviewWorkspace {
         let ids = (1..=80).collect::<Vec<_>>();
         let jobs = ids
             .iter()
-            .map(|id| ActionsJob {
-                id: *id,
-                node_id: format!("SYNTHETIC_JOB_NODE_{id}"),
-                run_id: locator.workflow_run.database_id,
-                run_attempt: locator.workflow_run.run_attempt,
-                head_sha: locator.check_commit_sha.clone(),
-                check_run_database_id: id + 100,
-                check_run_url: format!(
-                    "https://api.github.com/repos/{}/check-runs/{}",
-                    locator.base_repository.name_with_owner,
+            .map(|id| {
+                let check_run_database_id = if *id == 1 {
+                    locator.check_database_id
+                } else {
                     id + 100
-                ),
-                name: format!("SYNTHETIC job {id:02}"),
-                status: "completed".into(),
-                conclusion: Some(if id % 9 == 0 { "neutral" } else { "success" }.into()),
-                started_at: None,
-                completed_at: None,
-                api_url: format!(
-                    "https://api.github.com/repos/{}/actions/jobs/{id}",
-                    locator.base_repository.name_with_owner
-                ),
-                html_url: format!("{}/job/{id}", locator.workflow_run.github_url),
-                steps: Vec::new(),
+                };
+                ActionsJob {
+                    id: *id,
+                    node_id: format!("SYNTHETIC_JOB_NODE_{id}"),
+                    run_id: locator.workflow_run.database_id,
+                    run_attempt: locator.workflow_run.run_attempt,
+                    head_sha: locator.check_commit_sha.clone(),
+                    check_run_database_id,
+                    check_run_url: format!(
+                        "https://api.github.com/repos/{}/check-runs/{check_run_database_id}",
+                        locator.base_repository.name_with_owner,
+                    ),
+                    name: format!("SYNTHETIC job {id:02}"),
+                    status: "completed".into(),
+                    conclusion: Some(if id % 9 == 0 { "neutral" } else { "success" }.into()),
+                    started_at: None,
+                    completed_at: None,
+                    api_url: format!(
+                        "https://api.github.com/repos/{}/actions/jobs/{id}",
+                        locator.base_repository.name_with_owner
+                    ),
+                    html_url: format!("{}/job/{id}", locator.workflow_run.github_url),
+                    steps: Vec::new(),
+                }
             })
             .collect::<Vec<_>>();
         let snapshot = ActionsJobsSnapshot {
