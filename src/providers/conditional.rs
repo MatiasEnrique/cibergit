@@ -721,7 +721,7 @@ fn rate_limit_delay(
 fn graphql_rate_limit_delay(
     status: u16,
     rate: &ParsedRateHeaders<'_>,
-    structural_error: bool,
+    _structural_error: bool,
 ) -> Option<BoundedDelay> {
     if status != 200 {
         return None;
@@ -729,13 +729,11 @@ fn graphql_rate_limit_delay(
     if let Some(delay) = bounded_delay(rate.retry_after) {
         return Some(delay);
     }
+    if rate.retry_error || rate.remaining_error || rate.reset_error {
+        return Some(BoundedDelay::Suspend);
+    }
     if rate.remaining == Some("0") {
         return Some(rate_delay(rate.retry_after, rate.remaining, rate.reset));
-    }
-    if rate.retry_error
-        || (structural_error && (rate.remaining_error || rate.reset_error || rate.retry_error))
-    {
-        return Some(BoundedDelay::Suspend);
     }
     None
 }
@@ -954,6 +952,23 @@ mod tests {
             Some(BoundedDelay::Seconds(90))
         );
         assert_eq!(error.poll().rate_limit, None);
+    }
+
+    #[test]
+    fn graphql_ambiguous_exhaustion_metadata_suspends_without_shortening_the_floor() {
+        let error = parse_graphql_included_response(
+            b"HTTP/2 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 9999999998\r\nX-RateLimit-Reset: 9999999999\r\n\r\n{\"errors\":[{\"message\":\"rate limited\"}]}",
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Suspend));
+
+        let error = parse_graphql_included_response(
+            b"HTTP/2 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Remaining: 1\r\nX-RateLimit-Reset: 9999999999\r\n\r\n{\"errors\":[{\"message\":\"rate limited\"}]}",
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.poll().rate_limit, Some(BoundedDelay::Suspend));
     }
 
     #[test]
