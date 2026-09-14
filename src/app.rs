@@ -3101,7 +3101,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.smoke_ready())
+                                matches!(root, Root::Review(this) if this.checks_smoke_ready())
                             })
                             .unwrap_or(false)
                         })
@@ -7702,6 +7702,19 @@ impl ReviewWorkspace {
                 && matches!(tab.interactions, InteractionState::Ready(_))
         });
         repositories_finished && !self.tabs.is_empty() && tabs_finished
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn checks_smoke_ready(&self) -> bool {
+        self.smoke_ready()
+            && self.active_tab.is_some_and(|index| {
+                self.general_reads
+                    .selected_account_readiness_at(
+                        &self.tabs[index].repository.account,
+                        std::time::Instant::now(),
+                    )
+                    .is_ok()
+            })
     }
 
     #[cfg(feature = "ui-smoke")]
