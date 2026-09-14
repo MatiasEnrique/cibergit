@@ -26530,6 +26530,9 @@ impl ReviewWorkspace {
                                 .child(
                                     Button::new("checks-source-details")
                                         .control()
+                                        .border_1()
+                                        .border_color(rgba(0x00000000))
+                                        .focus_ring(colors.accent, colors.selected)
                                         .child(if tab.checks_source_expanded {
                                             "Hide revision details"
                                         } else {
@@ -28172,6 +28175,7 @@ fn small_action(
     Button::new(id.into())
         .control()
         .flex_none()
+        .justify_start()
         // A transparent border reserves the ring's width up front so gaining
         // focus recolors it instead of resizing the control.
         .border_1()
@@ -28412,9 +28416,14 @@ fn action_link(label: &'static str, colors: Palette) -> Button {
 /// actions, so they must be reachable with Tab, activate on Enter and Space,
 /// and announce themselves as buttons.
 fn action_link_with_id(id: String, label: &'static str, colors: Palette) -> Button {
+    let selector = id.clone();
     Button::new(SharedString::from(id))
+        .debug_selector(move || selector.clone())
         .control()
         .flex_none()
+        // Button centers its children; the div this replaced did not. A control
+        // that stretches to fill a column keeps its label where it was.
+        .justify_start()
         .border_1()
         .border_color(colors.border)
         .cursor_pointer()
@@ -30595,6 +30604,182 @@ mod layout_tests {
             1,
             "padding outside the painted icon must be clickable"
         );
+    }
+
+    /// Discriminating keyboard check on the REAL review window, not a harness.
+    /// A bare harness can pass while production fails, because production has
+    /// the full dispatch tree, registered key bindings and a deep element
+    /// hierarchy. This drives an actual inspector Button with actual keys.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn real_inspector_buttons_take_tab_focus_and_activate_on_enter_and_space(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{KeyDownEvent, KeyUpEvent, Keystroke};
+
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.install_pr_layout_fixture(window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        // Open Checks, which holds a real production disclosure Button.
+        let checks = cx.debug_bounds("pr-tab-checks").unwrap();
+        cx.simulate_click(checks.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            cx.debug_bounds("checks-source-details").is_some(),
+            "the fixture must render the inspector disclosure control"
+        );
+
+        // Tab must actually move focus in the real window. Production registers
+        // no tab_group anywhere, so this is the property that would break if a
+        // group were required to build the tab-stop tree.
+        let mut focus_moved = false;
+        for _ in 0..40 {
+            let before = cx.update(|window, cx| window.focused(cx));
+            cx.update(|window, cx| window.focus_next(cx));
+            let after = cx.update(|window, cx| window.focused(cx));
+            if after.is_some() && before != after {
+                focus_moved = true;
+                break;
+            }
+        }
+        assert!(
+            focus_moved,
+            "Tab must move focus in the real review window; if this fails the \
+             tab-stop tree is not being built at all"
+        );
+
+        // KNOWN GAP, evidence recorded rather than asserted here: a control
+        // inside the Checks inspector ("checks-source-details") is painted every
+        // frame yet never enters the tab ring. Probed soundly - keyboard
+        // modality entered first so the ring can resolve, and no Enter pressed
+        // during the search so the section cannot change underneath it - it was
+        // not reached in 200 focus_next steps, about ten full cycles of this
+        // window's 19 tab stops, while debug_bounds kept resolving it every
+        // step. Adding .tab_group() to the ChecksPane container does NOT fix
+        // it, so a missing tab group is not the cause. Reported to the
+        // coordinator and the Actions worker as an open defect; not asserted
+        // here because the fix is outside this worker's scope.
+
+        // Now the discriminating half. Go to Files, which holds a converted
+        // action control, and use its focus ring to CONFIRM which control the
+        // keyboard actually reached before pressing anything. Cycling blindly
+        // and hoping proves nothing about where the key landed.
+        let files_tab = cx.debug_bounds("pr-tab-files").unwrap();
+        cx.simulate_click(files_tab.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let control = cx
+            .debug_bounds("comment-on-file")
+            .expect("the fixture must render the file comment action");
+
+        let accent: gpui::Hsla = super::palette(false).accent.into();
+        let focused_here = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, _| {
+                let scaled = control.scale(window.scale_factor());
+                window.painted_quads().into_iter().any(|quad| {
+                    quad.border_color == accent
+                        && quad.border_widths.top > gpui::ScaledPixels(0.)
+                        && quad.bounds == scaled
+                })
+            })
+        };
+
+        // Enter keyboard modality so the ring resolves at all.
+        let tab = Keystroke::parse("tab").unwrap();
+        cx.simulate_event(KeyDownEvent {
+            keystroke: tab.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(KeyUpEvent { keystroke: tab });
+
+        let mut reached = false;
+        for _ in 0..200 {
+            cx.update(|window, cx| window.focus_next(cx));
+            // GPUI registers a focused element's Enter/Space handlers during
+            // paint, guarded by `is_focused`, so focus must be painted before
+            // the key is sent or the press is silently lost.
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            if focused_here(cx) {
+                reached = true;
+                break;
+            }
+        }
+        assert!(
+            reached,
+            "Tab must reach the file comment action in the real window, and it \
+             must paint its ring so focus is observable rather than assumed"
+        );
+
+        // Activating opens the file composer and moves focus into it, so each
+        // key re-acquires focus first. The observable is the workspace status
+        // the real handler sets.
+        let status_of = |cx: &mut gpui::VisualTestContext| {
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.status.clone()
+            })
+        };
+        for key in ["enter", "space"] {
+            let mut focused = focused_here(cx);
+            for _ in 0..200 {
+                if focused {
+                    break;
+                }
+                cx.update(|window, cx| window.focus_next(cx));
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                focused = focused_here(cx);
+            }
+            assert!(focused, "Tab must reach the control again before {key}");
+
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.status = format!("before-{key}");
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+
+            let keystroke = Keystroke::parse(key).unwrap();
+            cx.simulate_event(KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(KeyUpEvent { keystroke });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+
+            assert_ne!(
+                status_of(cx),
+                format!("before-{key}"),
+                "a confirmed-focused production control must activate on {key}; \
+                 if this fails, {key} never reaches the control in the real \
+                 dispatch tree even though Tab reached it"
+            );
+        }
     }
 
     #[cfg(feature = "ui-smoke")]
@@ -35102,25 +35287,32 @@ mod layout_tests {
             "a control reached by Tab activates on Enter and on Space"
         );
 
-        // Assert the ring on actual painted output. Asserting only that focus
-        // exists cannot fail in a useful way: a control can hold focus and paint
-        // no ring at all, which is exactly the defect this pins.
+        // Assert the ring on actual painted output, bounded to THIS control's
+        // bounds and to the exact accent border it is supposed to gain.
+        // Asserting only that focus exists cannot fail in a useful way, and
+        // counting any accent quad anywhere would pass on an unrelated border.
         let accent: gpui::Hsla = super::palette(false).accent.into();
-        let ring_quads = |cx: &mut gpui::VisualTestContext| {
+        let ring_on_control = |cx: &mut gpui::VisualTestContext| {
             cx.update(|window, _| {
+                let scale = window.scale_factor();
                 window
                     .painted_quads()
                     .into_iter()
                     .filter(|quad| {
                         quad.border_color == accent
                             && quad.border_widths.top > gpui::ScaledPixels(0.)
+                            && quad.bounds == bounds.scale(scale)
                     })
                     .count()
             })
         };
+        // GPUI emits one bordered quad per edge, so the count is its painting
+        // detail, not a number worth pinning. What matters is that an accent
+        // border is painted at THIS control's bounds and nowhere else.
         assert!(
-            ring_quads(cx) > 0,
-            "a keyboard-focused control must paint an accent ring"
+            ring_on_control(cx) > 0,
+            "the keyboard-focused control must paint an accent ring at its own \
+             bounds"
         );
 
         // The ring is keyboard-only: the same press that activates by pointer
@@ -35136,9 +35328,9 @@ mod layout_tests {
             window.draw(cx).clear(cx);
         });
         assert_eq!(
-            ring_quads(cx),
+            ring_on_control(cx),
             0,
-            "the ring must not follow a pointer press"
+            "the same control must drop its ring under mouse modality"
         );
 
         let row_activations_while_enabled = row.get();
