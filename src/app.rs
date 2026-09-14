@@ -26023,8 +26023,8 @@ mod layout_tests {
     };
     #[cfg(feature = "ui-smoke")]
     use cibergit::domain::{
-        DismissalAuthority, FreshReviewDismissalCapability, PullRequest, SelectedViewer,
-        SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
+        DismissalAuthority, FreshReviewDismissalCapability, ProviderMutationOutcome, PullRequest,
+        SelectedViewer, SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
         SubmittedReviewDismissalTarget,
     };
     use cibergit::participation::PublishedFile;
