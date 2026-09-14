@@ -1655,17 +1655,17 @@ thread_local! {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ui-smoke"))]
 fn fail_next_pending_start_readback_after_execution() {
     FAIL_PENDING_START_READBACK_AFTER_EXECUTION.with(|fail| fail.set(true));
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ui-smoke"))]
 fn take_pending_start_save_trace() -> Vec<&'static str> {
     PENDING_START_SAVE_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ui-smoke"))]
 fn fail_next_pending_start_save(stage: &'static str) {
     FAIL_PENDING_START_SAVE_STAGE.with(|fail| fail.set(Some(stage)));
 }
