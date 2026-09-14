@@ -33,9 +33,9 @@ use checks_view::{
     PreviousJobPage, RefreshSelectedCheckJobs, ReturnToChecks, ReturnToJobs, ToggleCheckIdentity,
     checks_page, identity_fields, kind_label, linkage_label, required_label, sha_label,
 };
-use ci_read::{CiOperation, CiPane, CiReadState, jobs_page};
 #[cfg(feature = "ui-smoke")]
 use ci_read::MemoryRead;
+use ci_read::{CiOperation, CiPane, CiReadState, jobs_page};
 #[cfg(feature = "ui-smoke")]
 use cibergit::domain::{
     ActionsAttemptKey, ActionsJob, ActionsJobLog, ActionsJobsSnapshot, ActionsLinkage,
