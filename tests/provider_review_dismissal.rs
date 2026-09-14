@@ -680,6 +680,99 @@ print(json.dumps(step['response']))
         }
 
         #[test]
+        fn acknowledgement_tuple_mismatches_are_uncertain() {
+            let source = dismissal_target_response(
+                "APPROVED",
+                "Original submitted review body.",
+                "alice",
+                Some("bob"),
+                Some(DISMISS_OLD_COMMIT),
+                true,
+            );
+            for mismatch in ["operation", "type", "state", "body", "parent"] {
+                let mut ack = dismissal_ack_response(
+                    "dismiss-ack-mismatch",
+                    "Original submitted review body.",
+                    Some("bob"),
+                    Some(DISMISS_OLD_COMMIT),
+                );
+                match mismatch {
+                    "operation" => {
+                        ack["data"]["dismissPullRequestReview"]["clientMutationId"] =
+                            json!("another-operation")
+                    }
+                    "type" => {
+                        ack["data"]["dismissPullRequestReview"]["pullRequestReview"]
+                            ["__typename"] = json!("IssueComment")
+                    }
+                    "state" => {
+                        ack["data"]["dismissPullRequestReview"]["pullRequestReview"]["state"] =
+                            json!("APPROVED")
+                    }
+                    "body" => {
+                        ack["data"]["dismissPullRequestReview"]["pullRequestReview"]["body"] =
+                            json!("changed body")
+                    }
+                    "parent" => {
+                        ack["data"]["dismissPullRequestReview"]["pullRequestReview"]
+                            ["pullRequest"]["id"] = json!("PR_other")
+                    }
+                    _ => unreachable!(),
+                }
+                let operation = "dismiss-ack-mismatch";
+                let variables =
+                    json!({"owner":"owner","name":"repo","number":7,"reviewId":"REVIEW_target"});
+                let (directory, provider) = dismissal_fixture(vec![
+                    dismissal_step(
+                        "query SubmittedReviewDismissalTarget(",
+                        variables.clone(),
+                        source.clone(),
+                    ),
+                    dismissal_step(
+                        "query SubmittedReviewDismissalTarget(",
+                        variables,
+                        source.clone(),
+                    ),
+                    dismissal_step(
+                        "mutation DismissSubmittedReview(",
+                        json!({"reviewId":"REVIEW_target","message":DISMISS_REASON,"clientMutationId":operation}),
+                        ack,
+                    ),
+                ]);
+                let review = displayed_dismissal_review(
+                    "APPROVED",
+                    Some("bob"),
+                    Some(DISMISS_OLD_COMMIT),
+                    DismissalAuthority::Available,
+                );
+                let request = provider
+                    .prepare_review_dismissal(
+                        &dismissal_repo("alice"),
+                        7,
+                        &review,
+                        DISMISS_REASON.into(),
+                        operation.into(),
+                        format!("attempt-{mismatch}"),
+                    )
+                    .unwrap();
+                let mut admission = dismissal_admission();
+                assert!(matches!(
+                    provider.execute_review_dismissal(
+                        &dismissal_repo("alice"),
+                        &request,
+                        &mut admission,
+                    ),
+                    ProviderMutationOutcome::Uncertain { .. }
+                ));
+                assert_eq!(dismissal_count(&directory), 3, "{mismatch}");
+                assert!(matches!(
+                    admission.state.lock().unwrap().terminal.as_slice(),
+                    [MutationTerminalRecord::Uncertain { .. }]
+                ));
+            }
+        }
+
+        #[test]
         fn read_only_reconciliation_observes_dismissed_without_proving_reason() {
             let (directory, provider) = dismissal_fixture(vec![dismissal_step(
                 "query SubmittedReviewDismissalTarget(",
