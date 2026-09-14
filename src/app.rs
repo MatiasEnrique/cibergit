@@ -5445,7 +5445,7 @@ impl ReviewWorkspace {
                     .operations()
                     .expect("read disposable dismissal transport journal")
                     .into_iter()
-                    .any(|operation| matches!(operation.status, JournalStatus::NotStarted { .. }));
+                    .any(|operation| matches!(operation.status, JournalStatus::NotApplied { .. }));
                 assert!(
                     hard_zero && terminal,
                     "dismissal transport was not hard-zero and durably terminal: {transport_outcome:?}"
@@ -25947,10 +25947,10 @@ mod layout_tests {
     use cibergit::participation::PublishedFile;
     use cibergit::providers::{GeneralReadDelay, GeneralReadDirective};
     #[cfg(feature = "ui-smoke")]
-    use gpui::{point, px};
+    use gpui::{WindowAppearance, point, px, size};
     use std::time::{Duration, Instant, UNIX_EPOCH};
     #[cfg(feature = "ui-smoke")]
-    use std::{cell::Cell, rc::Rc};
+    use std::{cell::Cell, fs, path::PathBuf, rc::Rc};
     #[cfg(feature = "ui-smoke")]
     use tempfile::tempdir;
 
@@ -26995,17 +26995,14 @@ mod layout_tests {
         let review_b_coordinates = review_b.coordinates.clone();
         let _notification_subscription = cx.update(|_, cx| {
             cx.observe(&root, move |root, cx| {
-                if root
-                    .read_with(cx, |root, _| {
-                        matches!(root, Root::Review(this)
-                        if this.active_tab == Some(1)
-                            && this.active_tab_input_restore.is_none()
-                            && this.dismissal_reason_input_owner.as_ref().is_some_and(
-                                |owner| owner.review.as_ref() == Some(&review_b_coordinates)
-                            ))
-                    })
-                    .unwrap_or(false)
-                {
+                if root.read_with(cx, |root, _| {
+                    matches!(root, Root::Review(this)
+                    if this.active_tab == Some(1)
+                        && this.active_tab_input_restore.is_none()
+                        && this.dismissal_reason_input_owner.as_ref().is_some_and(
+                            |owner| owner.review.as_ref() == Some(&review_b_coordinates)
+                        ))
+                }) {
                     mounted_notification_witness
                         .set(mounted_notification_witness.get().saturating_add(1));
                 }
