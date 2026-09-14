@@ -4,6 +4,18 @@ Baseline: `23db8a1ff11ccb7dead7b4c2ca9d280e7945cdb3`, recorded 2026-09-12. Sourc
 
 PLAN-1 owns this file only. Its assigned thread is `thr_germtczfdt`, branch `worker/requirements`, worktree `/Users/matias/Development/cibergit-requirements`, and base is the baseline above. Parent `thr_w6kmysabvr` owns integration, source, manifests, lockfiles, and shared contracts. Integration branch is `integration/v1` in `/Users/matias/Development/cibergit`, observed at the baseline. The PLAN-1 commit and verified artifact/version IDs belong in its durable handoff and the parent's state checkpoint; this initial file does not predict those IDs or its own commit SHA.
 
+## Current implementation checkpoint, 2026-09-14
+
+The September 13 records below are historical snapshots. Their descriptions of upcoming Jobs/Log and no-existing-pending FILE work no longer describe the current source. Both flows were integrated before this UI wave, through `1e818340c4c25e96efd013170a4e445589c21295`.
+
+The UI wave on base `229f85113ef4d812987c372af7870a5b67d9ef14` adds native button behavior, visible keyboard focus, dense controls, overflow fixes, and matching form surfaces. Existing full-width PR tabs, splitter behavior, virtualized navigation, and the file-header diff toggle remain in place. Checks and Jobs pane shortcuts now let focused child buttons answer Enter while retaining the shortcuts when the pane itself holds focus.
+
+Multiple-tip stacks now require an explicit tip choice when more than one candidate exists. Each offered tip contains the opening PR on its proven dependency path. Removing the selected tip clears the comparison and retains the unavailable identity through repeated refreshes until the user selects another tip. This is the bounded implementation chosen under the September 14 instruction to finish missing features. It does not authorize grouped writes, synthesized merges, or descendant rewriting. See [stack navigation](stack-ui.md).
+
+Actions run controls now prepare and confirm one exact run/attempt, admit the frozen request through the durable action journal, repeat the provider preflight, and send one rerun-all, rerun-failed, or cancel request. Ambiguous outcomes remain unresolved without automatic replay. See [run controls](actions-run-controls.md). Automated write verification uses synthetic transports only.
+
+Combined validation and release-binary attribution are recorded in the integration report under `.bb-artifacts/opus-wave-integration/`. Worker results apply only to their reported commits; they do not substitute for the combined gate. Full V1 and signed/notarized distribution remain open. Stack aggregate review, ordered merge, descendant rewriting, and broader Actions management remain absent.
+
 ## Execution checkpoint — 2026-09-13
 
 Integration branch: `integration/v1`. Real PR review and persistent local editing are runnable. M0 is proven; G1–G5 remain open. Every acceptance below is scoped. Historical source/report chains remain in coordinator state artifact `art_4093b33c-94aa-410e-88b3-3ff83175ee7e`, revision 28 and successors.
@@ -157,7 +169,7 @@ Dependencies name tasks or `G0` through `G5`, the runnable milestone gates below
 | M4-REBASE | Linear graphical plan, edit/split and dirty preparation; B01-B03, E14 | M4 | Accepted M3 backend; G3 for final native gate | C0 | running | Lifecycle651037f and native N1 correction565b61f independently accepted | art_63cc3dbd-330a-43ae-a827-c4c6fe20b43e |
 | M4-CONFLICT | Editable three-way result, external resolution and recovery; B04, B05, E14 | M4 | M4-REBASE, accepted Document backend; native M3-EXTERNAL | Coordinator | running | Native three-way 4b5c43e independently accepted; final G4 input validation pending | Three-way reports above |
 | M4-PUBLISH | Inspect rewritten commits, explicit lease-protected push; B06, E15 | M4 | M4-CONFLICT, M3-GIT | C0 | running | Native source/destination plus exact recovery ea28933 independently accepted; final G4/live-write gate open | Publish recovery reports above |
-| M4-TIPS | Implement accepted multiple-tip behavior and evidence | M4 | M4-STACK, D60 | U | dependent | pending | pending |
+| M4-TIPS | Explicit multiple-tip choice and evidence | M4 | M4-STACK, D60 | C0 | awaiting integration validation | `8a63157`, `6410b90` | Current checkpoint and integration report |
 | M4-COMMENT | Implement accepted aggregate comment routing and evidence | M4 | M4-STACK, M2-REVIEW, D61 | U | dependent | pending | pending |
 | M4-GROUP | Implement accepted grouped review behavior and evidence | M4 | M4-STACK, M2-REVIEW, D62 | U | dependent | pending | pending |
 | M4-MERGE | Implement accepted stack integration behavior and evidence | M4 | M4-STACK, M2-MERGE, D63 | U | dependent | pending | pending |
@@ -319,11 +331,11 @@ These rows preserve design recommendations and upstream constraints as engineeri
 
 ## Open product decisions
 
-All eight records below are **open, unanswered proposals**. D60 has a concise asynchronous user question pending; no answer is recorded yet. They are not approved defaults. Q67 is resolved by the Apple Silicon clarification and maps to F02. Prepare a concrete recommendation only when its dependent behavior needs the answer; continue independent work rather than restarting the interview. A decision's closure evidence must include the accepted answer, affected scope and updated acceptance criteria. If a proposal is changed or deferred, preserve that decision rather than marking the original proposal implemented.
+D60 now has the bounded implementation described in the September 14 checkpoint under the later instruction to finish missing features. The other seven records remain open proposals; no answer to the original interview is inferred. Q67 is resolved by the Apple Silicon clarification and maps to F02. Prepare a concrete recommendation only when its dependent behavior needs the answer; continue independent work rather than restarting the interview. A decision's closure evidence must include the accepted answer, affected scope and updated acceptance criteria. If a proposal is changed or deferred, preserve that decision rather than marking the original proposal implemented.
 
 | Decision / origin | Unaccepted proposal | Dependent task / milestone | Acceptance after a decision |
 | --- | --- | --- | --- |
-| D60 / Q60, open | Select one tip and show its dependency path for a multiple-tip stack | M4-TIPS / M4 | Accepted branched-graph selection rule plus comparison fixtures for multiple tips; no silent synthesized merge/path choice. |
+| D60 / Q60, implemented in current wave | Explicitly select one candidate tip and show its proven dependency path | M4-TIPS / M4 | `8a63157` and `6410b90` carry candidate selection, stale-reply fencing and repeated-removal tests. Synthetic light/dark previews are attributed to worker `a182ef1`. No stack-wide write behavior follows from this choice. |
 | D61 / Q61, open | Direct aggregate comment only for unambiguous mapping, otherwise individual PR | M4-COMMENT / M4 | Accepted routing rule, overlapping-layer/ambiguous line cases and revision-correct destination evidence. |
 | D62 / Q62, open | One grouped panel submits distinct per-PR decisions with individual results | M4-GROUP / M4 | Accepted submission semantics, per-PR outcomes and partial-failure/retry evidence if grouping is selected. |
 | D63 / Q63, open | Native asynchronous stack merge with affected PRs; sequential guidance for inferred stacks | M4-MERGE / M4 | Accepted native/inferred integration behavior, authorized execution evidence and final failure/success reconciliation. |

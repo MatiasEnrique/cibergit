@@ -6,6 +6,14 @@ The target is macOS on Apple Silicon, with GitHub.com integration through the Gi
 
 Implementation is underway. The native application can open real PRs, display pinned diffs and collaboration details, and restore review tabs and file progress. The complete V1 scope remains in progress; see the [implementation ledger](docs/implementation-ledger.md) for acceptance status.
 
+## Current app
+
+The review workspace has full-width Conversation, Commits, Checks, and Files changed tabs, a resizable repository sidebar, and a Unified / Side by side button in the file header. Large PR and file lists render visible rows instead of building every row on each redraw.
+
+This implementation also includes explicit selection among stack tips and confirmed Actions run controls for re-running all jobs, re-running failed jobs, or cancelling a run. See [stack navigation](docs/stack-ui.md), [Actions jobs and logs](docs/actions-jobs-logs.md), and [run controls](docs/actions-run-controls.md) for their behavior and limits.
+
+Full V1 remains unfinished. Stack-wide review and merge operations, automatic descendant rewriting, broader GitHub Actions management, and signed/notarized distribution are not complete.
+
 ## Documentation
 
 - [Technical design](docs/technical-design.md): technology choices, provider integration, state ownership, local Git, synchronization, implementation milestones, and unresolved details.
