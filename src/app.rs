@@ -35,6 +35,8 @@ use checks_view::{
 };
 use ci_read::{CiOperation, CiPane, CiReadState, jobs_page};
 #[cfg(feature = "ui-smoke")]
+use ci_read::MemoryRead;
+#[cfg(feature = "ui-smoke")]
 use cibergit::domain::{
     ActionsAttemptKey, ActionsJob, ActionsJobLog, ActionsJobsSnapshot, ActionsLinkage,
     ActionsLogProvenance, ActionsRunAttemptObservation, CheckAppIdentity, CheckKind,
