@@ -21351,10 +21351,9 @@ mod layout_tests {
     use super::{
         ActionJournalCompletionToken, COLLAPSED_PANEL_WIDTH, CollaborationReadToken,
         DEFAULT_SIDEBAR_WIDTH, DiffLine, DiffLineKind, DiffMode, DiffRow,
-        EXCEPTIONAL_LINE_CHUNK_BYTES, FileCommentConfirmationToken, InstallTabOptions,
-        JournalOperation, JournalRequest, JournalStatus, LoadState, MAX_PANEL_WIDTH,
-        MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH, MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH,
-        NativeConfirmation, PanelKind, PanelLayout, RepoRuntime, Root, Startup,
+        EXCEPTIONAL_LINE_CHUNK_BYTES, FileCommentConfirmationToken, JournalOperation,
+        JournalRequest, JournalStatus, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
+        MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
         SubmittedConfirmationToken, SubmittedDraftCallbackToken, SubmittedDraftCloseDisposition,
         SubmittedDraftLoadState, SubmittedSummaryEditor, active_review_composer_body,
         active_review_composer_needs_save, apply_submitted_draft_save_if_current,
@@ -21364,12 +21363,17 @@ mod layout_tests {
         media_free_markdown, observe_auxiliary, resolved_panel_widths_for,
         review_subject_allows_actions, submitted_review_edit_action,
     };
+    #[cfg(feature = "ui-smoke")]
+    use super::{InstallTabOptions, LoadState, RepoRuntime, Root, Startup};
+    #[cfg(feature = "ui-smoke")]
+    use cibergit::domain::PullRequest;
     use cibergit::domain::{
-        Account, MergeEligibility, PendingFileCommentSource, ProviderCoordinates, PullRequest,
+        Account, MergeEligibility, PendingFileCommentSource, ProviderCoordinates,
         PullRequestDetails, PullRequestReview, Repository, ReviewAuxiliaryAction,
         ReviewAuxiliaryRequest, ReviewSubject, SubmittedReviewEditCapability,
     };
     use cibergit::participation::PublishedFile;
+    #[cfg(feature = "ui-smoke")]
     use tempfile::tempdir;
 
     fn submitted_review_fixture() -> (Repository, PullRequestReview) {
@@ -21407,6 +21411,7 @@ mod layout_tests {
         (repository, review)
     }
 
+    #[cfg(feature = "ui-smoke")]
     fn transition_pull_request(number: u64) -> PullRequest {
         PullRequest {
             number,
