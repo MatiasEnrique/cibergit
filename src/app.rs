@@ -32080,17 +32080,9 @@ mod layout_tests {
              tab-stop tree is not being built at all"
         );
 
-        // KNOWN GAP, evidence recorded rather than asserted here: a control
-        // inside the Checks inspector ("checks-source-details") is painted every
-        // frame yet never enters the tab ring. Probed soundly - keyboard
-        // modality entered first so the ring can resolve, and no Enter pressed
-        // during the search so the section cannot change underneath it - it was
-        // not reached in 200 focus_next steps, about ten full cycles of this
-        // window's 19 tab stops, while debug_bounds kept resolving it every
-        // step. Adding .tab_group() to the ChecksPane container does NOT fix
-        // it, so a missing tab group is not the cause. Reported to the
-        // coordinator and the Actions worker as an open defect; not asserted
-        // here because the fix is outside this worker's scope.
+        // The Checks-specific activation regression below verifies the pane
+        // shortcut no longer intercepts Enter on a focused child control.
+        // This test separately covers a file-header action in the real window.
 
         // Now the discriminating half. Go to Files, which holds a converted
         // action control, and use its focus ring to CONFIRM which control the
