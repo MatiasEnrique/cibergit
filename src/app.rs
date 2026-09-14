@@ -639,6 +639,13 @@ impl RefreshGate {
         !self.active && (self.explicit_pending || self.automatic_pending)
     }
 
+    #[cfg(feature = "ui-smoke")]
+    fn clear_smoke_pending_after_witness(&mut self) {
+        debug_assert!(!self.active);
+        self.explicit_pending = false;
+        self.automatic_pending = false;
+    }
+
     fn superseded_by_explicit(&self) -> bool {
         self.active && self.explicit_pending
     }
@@ -3802,6 +3809,11 @@ impl ReviewWorkspace {
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
                         if let Root::Review(this) = root {
+                            if let Some(index) = this.active_tab {
+                                this.tabs[index]
+                                    .metadata_refresh
+                                    .clear_smoke_pending_after_witness();
+                            }
                             this.status = read_sync::POLL_DEFERRED_NOTICE.into();
                             cx.notify();
                         }
@@ -3863,12 +3875,18 @@ impl ReviewWorkspace {
                             .is_ok()
                     })
                     .unwrap_or(false);
+                let root_report = root_fixture.as_ref().map_or_else(
+                    |error| format!("Root fixture failed: {error}"),
+                    Clone::clone,
+                );
+                let conditional_report = conditional_fixture.as_ref().map_or_else(
+                    |error| format!("Synthetic conditional fixture failed: {error}"),
+                    Clone::clone,
+                );
                 let report = format!(
-                    "Bounded general-read synchronization native smoke ({appearance})\n{}\n{}\nActual Root metadata rate-deferral notice capture: {}\nFixed poll-notice presentation capture (set directly after the controller assertion; not a provider callback): {}\nFixed unavailable-notice presentation capture (set directly; not a provider callback): {}\nSynthetic directive timers: 90 seconds with injected monotonic/wall clocks; no real sleeps\nRemote mutation transport from harness: 0\nOS notification/prompt/focus/global-setting calls from harness: 0\nThe ordinary preparation read is real and read-only. Scheduling directives and the exact 200/304 sequence are synthetic; no live 304 is claimed.\n",
-                    root_fixture.as_deref().unwrap_or("Root fixture: failed"),
-                    conditional_fixture
-                        .as_deref()
-                        .unwrap_or("Synthetic conditional fixture: failed"),
+                    "Bounded general-read synchronization native smoke ({appearance})\n{}\n{}\nActual Root metadata rate-deferral notice capture: {}\nHarness-only scene isolation cleared the already-proven synthetic queued follow-up after the rate capture: true\nFixed poll-notice presentation capture (set directly after the controller assertion; not a provider callback): {}\nFixed unavailable-notice presentation capture (set directly; not a provider callback): {}\nSynthetic directive timers: 90 seconds with injected monotonic/wall clocks; no real sleeps\nRemote mutation transport from harness: 0\nOS notification/prompt/focus/global-setting calls from harness: 0\nThe ordinary preparation read is real and read-only. Scheduling directives and the exact 200/304 sequence are synthetic; no live 304 is claimed.\n",
+                    root_report,
+                    conditional_report,
                     if rate_capture { &rate_name } else { "failed" },
                     if poll_capture { &poll_name } else { "failed" },
                     if unavailable_capture {

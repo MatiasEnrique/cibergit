@@ -66,7 +66,7 @@ The opt-in native harness waits for the ordinary real, read-only workspace prepa
 4. proves a different synthetic account is admitted while the primary account operation is active;
 5. installs a separate synthetic poll directive and verifies later same-account deferral;
 6. compares the serialized pinned session, canonical revision, recovery collections, journal, and shared input text exactly;
-7. captures the actual Root metadata rate-deferral notice, then directly presents the fixed poll and unavailable notices after their controller/mapping assertions; the latter two are presentation checks, not simulated provider callbacks;
+7. captures the actual Root metadata rate-deferral notice, clears only that already-proven synthetic queued follow-up for scene isolation, then directly presents the fixed poll and unavailable notices after their controller/mapping assertions; the latter two are presentation checks, not simulated provider callbacks;
 8. runs a pure in-memory exact `200` then `304` fixture through the production single-PR retained-body resolver and rejects an orphan `304`.
 
 The scheduling directives and conditional sequence are synthetic fixtures. The report explicitly states that no live `304` is claimed. The harness issues zero remote mutations and invokes no OS notification, prompt, focus, preview, PID, or global-setting path.
