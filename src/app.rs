@@ -3737,8 +3737,14 @@ impl ReviewWorkspace {
                     .unwrap_or_else(|_| "system".into());
                 let rate_name = format!("native-general-sync-rate-{appearance}.png");
                 let rate_capture = window
-                    .update(|window, _| {
-                        window
+                    .update(|window, cx| {
+                        let visible = weak
+                            .read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.status == read_sync::RATE_DEFERRED_NOTICE)
+                            })
+                            .unwrap_or(false);
+                        visible
+                            && window
                             .render_to_image()
                             .and_then(|image| {
                                 image.save(output.join(&rate_name)).map_err(Into::into)
@@ -3760,8 +3766,14 @@ impl ReviewWorkspace {
                     .await;
                 let poll_name = format!("native-general-sync-poll-{appearance}.png");
                 let poll_capture = window
-                    .update(|window, _| {
-                        window
+                    .update(|window, cx| {
+                        let visible = weak
+                            .read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.status == read_sync::POLL_DEFERRED_NOTICE)
+                            })
+                            .unwrap_or(false);
+                        visible
+                            && window
                             .render_to_image()
                             .and_then(|image| {
                                 image.save(output.join(&poll_name)).map_err(Into::into)
@@ -3787,8 +3799,14 @@ impl ReviewWorkspace {
                 let unavailable_name =
                     format!("native-general-sync-unavailable-{appearance}.png");
                 let unavailable_capture = window
-                    .update(|window, _| {
-                        window
+                    .update(|window, cx| {
+                        let visible = weak
+                            .read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.status == read_sync::PROVIDER_UNAVAILABLE_NOTICE)
+                            })
+                            .unwrap_or(false);
+                        visible
+                            && window
                             .render_to_image()
                             .and_then(|image| {
                                 image
