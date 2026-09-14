@@ -21732,7 +21732,11 @@ mod layout_tests {
                 assert_eq!(this.composer_input.read(cx).value(), "file A");
 
                 // Start a real close handler while an owned submitted save is outstanding.
+                this.submitted_summary_input.update(cx, |input, cx| {
+                    input.set_value("pending draft A", window, cx)
+                });
                 let editor = &mut this.tabs[0].submitted_summary_editor;
+                editor.store_active_body("pending draft A".into());
                 editor.queue_current();
                 assert!(editor.start_next().is_some());
                 let token = SubmittedDraftCallbackToken {
@@ -21774,6 +21778,13 @@ mod layout_tests {
                 assert!(!this.composer_input.read(cx).presentation().is_disabled());
                 assert_eq!(this.tabs.len(), 3);
                 this.tabs[0].submitted_summary_editor.persistence_error = None;
+                this.tabs[0]
+                    .submitted_summary_editor
+                    .store_active_body("exact draft A".into());
+                this.tabs[0].submitted_summary_editor.durable =
+                    this.tabs[0].submitted_summary_editor.current_snapshot();
+                this.submitted_summary_input
+                    .update(cx, |input, cx| input.set_value("exact draft A", window, cx));
 
                 assert_eq!(
                     this.submitted_summary_input.read(cx).value(),
