@@ -5,6 +5,7 @@
 //! intentionally separate from per-PR review journals: a creation has no PR
 //! number until GitHub acknowledges it.
 
+use super::ControlPresentation;
 #[cfg(feature = "ui-smoke")]
 use super::Root;
 use super::{Palette, input_style, is_dark, palette};
@@ -24,11 +25,12 @@ use cibergit::{
 };
 use gpui::{
     AnyWindowHandle, App, Context, Div, ElementId, Entity, EventEmitter, FocusHandle, FontWeight,
-    IntoElement, Render, SharedString, Stateful, Subscription, Window, div, prelude::*, px,
-    relative, rems, rgba,
+    IntoElement, Render, SharedString, Subscription, Window, div, prelude::*, px, relative, rems,
+    rgba,
 };
 #[cfg(feature = "ui-smoke")]
 use gpui::{WeakEntity, size};
+use gpui_base::Button;
 use gpui_base::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,6 +47,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+/// Longest a repository or branch chip grows before its label truncates. A
+/// wrapping row of chips stays readable instead of one long name taking a line.
+const CHOICE_PILL_MAX_WIDTH: f32 = 260.;
+/// Height of the Markdown description field: five Body lines plus the field
+/// inset, so a short description is visible without scrolling.
+const DESCRIPTION_FIELD_HEIGHT: f32 = 5. * 18. + 2. * ui::CELL_INSET;
 const RECORD_VERSION: u64 = 1;
 const MAX_DRAFT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: usize = 4 * 1024 * 1024;
@@ -1955,7 +1963,7 @@ impl PrCreationDialog {
             cx,
         );
         let mut panel = div()
-            .child(section_label("TARGET REPOSITORY + ACCOUNT", colors))
+            .child(section_label("Target repository + account", colors))
             .child(
                 div()
                     .mt_2()
@@ -1964,7 +1972,7 @@ impl PrCreationDialog {
                     .gap(px(ui::GAP_GROUP))
                     .children(target_repositories),
             )
-            .child(field_label("TARGET BASE BRANCH", colors).mt_3())
+            .child(field_label("Target base branch", colors).mt(px(ui::GAP_GROUP)))
             .child(editor_box(&self.base_branch, colors))
             .child(branch_choices(
                 "target",
@@ -1974,7 +1982,7 @@ impl PrCreationDialog {
                 colors,
                 cx,
             ))
-            .child(section_label("PUBLISHED SOURCE REPOSITORY", colors).mt(px(ui::GAP_PAGE)))
+            .child(section_label("Published source repository", colors).mt(px(ui::GAP_PAGE)))
             .child(
                 div()
                     .mt_2()
@@ -1983,7 +1991,7 @@ impl PrCreationDialog {
                     .gap(px(ui::GAP_GROUP))
                     .children(source_repositories),
             )
-            .child(field_label("PUBLISHED SOURCE BRANCH", colors).mt_3())
+            .child(field_label("Published source branch", colors).mt(px(ui::GAP_GROUP)))
             .child(editor_box(&self.source_branch, colors))
             .child(branch_choices(
                 "source",
@@ -1993,18 +2001,21 @@ impl PrCreationDialog {
                 colors,
                 cx,
             ))
-            .child(field_label("LOCAL BRANCH · INFORMATIONAL ONLY", colors).mt_3())
+            .child(field_label("Local branch · informational only", colors).mt(px(ui::GAP_GROUP)))
             .child(editor_box(&self.local_branch, colors))
-            .child(field_label("TITLE", colors).mt_3())
+            .child(field_label("Title", colors).mt(px(ui::GAP_GROUP)))
             .child(editor_box(&self.title, colors))
-            .child(field_label("DESCRIPTION · MARKDOWN", colors).mt_3())
+            .child(field_label("Description · Markdown", colors).mt(px(ui::GAP_GROUP)))
             .child(
                 div()
-                    .mt_1()
-                    .h(px(112.))
+                    .mt(px(ui::GAP_FIELD))
+                    .h(px(DESCRIPTION_FIELD_HEIGHT))
+                    .p(px(ui::CELL_INSET))
+                    .bg(colors.elevated)
                     .border_1()
                     .border_color(colors.border)
                     .rounded(px(ui::CONTROL_RADIUS))
+                    .ui_text(TextRole::Body)
                     .overflow_hidden()
                     .child(Textarea::new(&self.body)),
             )
@@ -2064,7 +2075,7 @@ impl PrCreationDialog {
             .border_1()
             .border_color(colors.amber)
             .bg(colors.elevated)
-            .child(div().font_weight(FontWeight::MEDIUM).child("Confirm immutable PR creation"))
+            .child(div().ui_text(TextRole::Subtitle).child("Confirm immutable PR creation"))
             .child(div().mt_2().child(format!("{}:{}  →  {}:{}", input.source_repository.full_name(), input.source_branch, input.target_repository.full_name(), input.base_branch)))
             .child(div().mt_1().text_color(colors.muted).child(format!("Account {} · {}", preparation.viewer_login, if input.draft { "draft" } else { "normal" })))
             .child(div().mt_2().child(input.title.clone()))
@@ -2072,7 +2083,7 @@ impl PrCreationDialog {
             .child(clickable("creation-details-disclosure", if self.details_disclosed { "Hide full request details" } else { "Show full request details" }, colors, true)
                 .on_click(cx.listener(|this, _, _, cx| { this.details_disclosed = !this.details_disclosed; cx.notify(); })))
             .when(self.details_disclosed, |panel| panel.child(
-                div().mt_2().p_3().rounded(px(ui::CONTROL_RADIUS)).bg(colors.canvas).ui_text(TextRole::Caption).child(confirmation_details(frozen))
+                div().mt_2().p(px(ui::CELL_INSET)).rounded(px(ui::CONTROL_RADIUS)).bg(colors.canvas).ui_text(TextRole::Caption).child(confirmation_details(frozen))
             ))
     }
 
@@ -2080,7 +2091,7 @@ impl PrCreationDialog {
         match &self.state {
             DialogState::Acknowledged(ack) => div()
                 .p(px(ui::PANEL_GUTTER)).rounded(px(ui::CONTROL_RADIUS)).border_1().border_color(colors.green).bg(colors.elevated)
-                .child(div().font_weight(FontWeight::MEDIUM).child(format!("Created #{}", ack.pull_request.pull_request)))
+                .child(div().ui_text(TextRole::Subtitle).child(format!("Created #{}", ack.pull_request.pull_request)))
                 .child(div().mt_1().child(ack.url.clone()))
                 .child(div().mt_2().child(format!("Actual created head: {}", ack.actual_head_sha)))
                 .child(div().mt_1().text_color(if ack.actual_head_sha == ack.reviewed_head_sha { colors.muted } else { colors.amber }).child(format!("Reviewed preparation head: {}", ack.reviewed_head_sha)))
@@ -2092,7 +2103,7 @@ impl PrCreationDialog {
                 }))),
             DialogState::Uncertain(reason) => div()
                 .p(px(ui::PANEL_GUTTER)).rounded(px(ui::CONTROL_RADIUS)).border_1().border_color(colors.red).bg(colors.elevated)
-                .child(div().font_weight(FontWeight::MEDIUM).child("Creation outcome unresolved"))
+                .child(div().ui_text(TextRole::Subtitle).child("Creation outcome unresolved"))
                 .child(div().mt_2().text_color(colors.red).child(reason.clone()))
                 .child(div().mt_2().child("The exact request/context is durable. Do not retry: an unknown ID, lost reply, or terminal-save failure cannot be resolved by body search, branch-only adoption, or absence.")),
             _ => div(),
@@ -2350,51 +2361,81 @@ fn section_label(label: &str, colors: Palette) -> Div {
         .child(label.to_owned())
 }
 
+// Matches the review window's `input_box`: the same inset and field surface, so
+// a text field does not change shape between the two dialogs.
 fn editor_box(editor: &Entity<InputState>, colors: Palette) -> Div {
     div()
         .mt(px(ui::GAP_FIELD))
         .h(px(ui::CONTROL_HEIGHT))
+        .px(px(ui::CELL_INSET))
+        .bg(colors.elevated)
         .border_1()
         .border_color(colors.border)
         .rounded(px(ui::CONTROL_RADIUS))
+        .ui_text(TextRole::Body)
         .child(Input::new(editor))
 }
 
-fn clickable(
-    id: impl Into<ElementId>,
-    label: &str,
-    colors: Palette,
-    enabled: bool,
-) -> Stateful<Div> {
-    div()
-        .id(id)
+/// A native Button rather than a clickable div, so every action in this dialog
+/// is reachable with Tab and activates on Enter and Space.
+fn clickable(id: impl Into<ElementId>, label: &str, colors: Palette, enabled: bool) -> Button {
+    Button::new(id)
         .mt(px(ui::GAP_GROUP))
         .control()
+        .disabled(!enabled)
+        .disabled_presentation()
+        .focus_ring(colors.accent, colors.selected)
+        .accessibility_label(label.to_owned())
         .rounded(px(ui::CONTROL_RADIUS))
+        .max_w(px(CHOICE_PILL_MAX_WIDTH))
         .border_1()
         .border_color(colors.border)
+        .flex_none()
         .text_color(if enabled { colors.accent } else { colors.faint })
         .when(enabled, |view| {
             view.cursor_pointer().hover(|view| view.bg(colors.selected))
         })
-        .child(label.to_owned())
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(label.to_owned()),
+        )
 }
 
-fn pill(id: String, label: String, selected: bool, colors: Palette) -> Stateful<Div> {
-    div()
-        .id(SharedString::from(id))
-        .px(px(ui::CONTROL_INSET))
-        .py_1()
+fn pill(id: String, label: String, selected: bool, enabled: bool, colors: Palette) -> Button {
+    Button::new(SharedString::from(id))
+        .control()
+        .disabled(!enabled)
+        .disabled_presentation()
+        .focus_ring(colors.accent, colors.selected)
+        .selected(selected)
+        .accessibility_label(label.clone())
+        .max_w(px(CHOICE_PILL_MAX_WIDTH))
         .rounded(px(ui::CONTROL_RADIUS))
         .border_1()
-        .border_color(if selected {
+        .border_color(if selected && enabled {
             colors.accent
         } else {
             colors.border
         })
         .when(selected, |view| view.bg(colors.selected))
-        .cursor_pointer()
-        .child(label)
+        .text_color(if enabled { colors.text } else { colors.faint })
+        // An inert chip drops the pointer cursor and the hover response rather
+        // than presenting itself as a live choice.
+        .when(enabled, |view| {
+            view.cursor_pointer().hover(|view| view.bg(colors.selected))
+        })
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(label),
+        )
 }
 
 fn repository_choices(
@@ -2404,7 +2445,7 @@ fn repository_choices(
     inert: bool,
     colors: Palette,
     cx: &mut Context<PrCreationDialog>,
-) -> Vec<Stateful<Div>> {
+) -> Vec<Button> {
     repositories
         .iter()
         .enumerate()
@@ -2414,6 +2455,7 @@ fn repository_choices(
                 format!("creation-repository-{target}-{index}"),
                 label,
                 selected == index,
+                !inert,
                 colors,
             );
             if !inert {

@@ -1,4 +1,5 @@
 //! Explicit PR checkout setup. Published review state is never owned here.
+use super::ControlPresentation;
 use super::local_workspace::{
     LocalWorkspace, LocalWorkspaceAppearance, LocalWorkspaceContext, PrPublishContext,
 };
@@ -14,6 +15,7 @@ use cibergit::{
     },
 };
 use gpui::{prelude::*, *};
+use gpui_base::Button;
 use gpui_base::input::{Input, InputState};
 use std::path::PathBuf;
 
@@ -454,24 +456,75 @@ impl Render for LocalCheckout {
             WindowAppearance::Dark | WindowAppearance::VibrantDark
         );
         let colors = super::palette(dark);
-        div().size_full().flex().flex_col().p(px(ui::PANEL_GUTTER)).gap(px(ui::GAP_PAGE)).bg(colors.surface).text_color(colors.text)
-            .child(div().ui_text(TextRole::Title).font_weight(FontWeight::MEDIUM).child("Edit this pull request locally"))
-            .child(format!("{} #{} · Review commit {}", self.repository.full_name(), self.pull.number, &self.revision.head_sha[..self.revision.head_sha.len().min(12)]))
-            .when_some(self.source.as_ref(), |view, source| view.child(format!("PR source: {} · {}",
-                source.source_repository.as_ref().map(Repository::full_name).unwrap_or_else(|| "repository unavailable".into()), source.source_branch)))
-            .child(div().text_color(colors.muted).child("A dedicated checkout keeps local edits separate. Existing checkouts are attached only when you choose them. Closing this tab keeps the checkout and recovery files."))
-            .child(div().h(px(ui::CONTROL_HEIGHT)).flex_shrink_0().child(Input::new(&self.branch_input)))
-            .child(div().id("create-pr-checkout").control().bg(colors.selected).cursor_pointer()
-                .child(if self.busy { "Working…" } else { "Create dedicated checkout" })
-                .on_click(cx.listener(|this, _, _, cx| this.create(cx))))
-            .child(div().h(px(ui::CONTROL_HEIGHT)).flex_shrink_0().child(Input::new(&self.path_input)))
-            .child(div().id("attach-pr-checkout").control().bg(colors.selected).cursor_pointer()
-                .child("Verify and attach existing checkout")
-                .on_click(cx.listener(|this, _, _, cx| this.inspect_attachment(cx))))
-            .child(div().id("reconcile-pr-checkout").control().cursor_pointer()
-                .child("Reconcile interrupted setup")
-                .on_click(cx.listener(|this, _, _, cx| this.reconcile_setup(cx))))
-            .child(div().ui_text(TextRole::Body).text_color(colors.muted).child(self.notice.clone()))
+        // The page is three separate paths (create, attach, reconcile). Each
+        // field sits directly above the control that consumes it, and the
+        // common path comes first.
+        let setup_field = |label: &'static str, input: &Entity<InputState>| {
+            div()
+                .flex_none()
+                .child(super::field_label(label, colors))
+                .child(
+                    div()
+                        .mt(px(ui::GAP_FIELD))
+                        .h(px(ui::CONTROL_HEIGHT))
+                        .px(px(ui::CELL_INSET))
+                        .flex_shrink_0()
+                        .bg(colors.elevated)
+                        .border_1()
+                        .border_color(colors.border)
+                        .rounded(px(ui::CONTROL_RADIUS))
+                        .ui_text(TextRole::Body)
+                        .child(Input::new(input)),
+                )
+        };
+        let setup_button = |id: &'static str, label: &'static str, primary: bool| {
+            Button::new(id)
+                .control()
+                .mt(px(ui::GAP_GROUP))
+                .flex_none()
+                .accessibility_label(label)
+                .border_1()
+                .border_color(if primary {
+                    colors.accent
+                } else {
+                    colors.border
+                })
+                .disabled_presentation()
+                .focus_ring(colors.accent, colors.selected)
+                .when(primary, |button| button.bg(colors.selected))
+                .cursor_pointer()
+                .hover(|button| button.bg(colors.selected))
+                .child(label)
+        };
+        div().size_full().flex().flex_col().p(px(ui::PANEL_GUTTER)).gap(px(ui::GAP_GROUP)).bg(colors.surface).text_color(colors.text).id("pr-checkout-setup").overflow_y_scroll()
+            .child(div().ui_text(TextRole::Title).child("Edit this pull request locally"))
+            .child(div().ui_text(TextRole::Body).text_color(colors.muted).child(format!("{} #{} · Review commit {}", self.repository.full_name(), self.pull.number, &self.revision.head_sha[..self.revision.head_sha.len().min(12)])))
+            .when_some(self.source.as_ref(), |view, source| view.child(div().ui_text(TextRole::Body).text_color(colors.muted).child(format!("PR source: {} · {}",
+                source.source_repository.as_ref().map(Repository::full_name).unwrap_or_else(|| "repository unavailable".into()), source.source_branch))))
+            .child(div().ui_text(TextRole::Body).text_color(colors.muted).child("A dedicated checkout keeps local edits separate. Existing checkouts are attached only when you choose them. Closing this tab keeps the checkout and recovery files."))
+            .child(super::section_label("New checkout", colors))
+            .child(setup_field("Branch name", &self.branch_input))
+            .child(
+                setup_button("create-pr-checkout", "Create dedicated checkout", true)
+                    .disabled(self.busy)
+                    .when(self.busy, |button| {
+                        button
+                            .text_color(colors.muted)
+                            .child(" · working…")
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.create(cx))),
+            )
+            .child(super::section_label("Existing checkout", colors))
+            .child(setup_field("Checkout path", &self.path_input))
+            .child(
+                setup_button("attach-pr-checkout", "Verify and attach existing checkout", false)
+                    .on_click(cx.listener(|this, _, _, cx| this.inspect_attachment(cx))),
+            )
+            .child(
+                setup_button("reconcile-pr-checkout", "Reconcile interrupted setup", false)
+                    .on_click(cx.listener(|this, _, _, cx| this.reconcile_setup(cx))),
+            )
+            .child(div().mt(px(ui::GAP_GROUP)).ui_text(TextRole::Body).text_color(colors.muted).child(self.notice.clone()))
             .into_any_element()
     }
 }

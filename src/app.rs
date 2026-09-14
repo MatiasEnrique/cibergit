@@ -125,6 +125,15 @@ use view_editor::{SidebarRow, ViewEditorController};
 const UI_FONT: &str = "IBM Plex Sans";
 const CODE_FONT: &str = "Menlo";
 const MAX_RENDERED_LOG_ROWS: usize = 128;
+/// How many tab stops the PR-layout smoke advances before capturing the
+/// keyboard-focus scene, so the ring lands on a control inside the page rather
+/// than on the first stop in the window chrome.
+#[cfg(feature = "ui-smoke")]
+const PR_LAYOUT_SMOKE_TAB_STOPS: usize = 3;
+/// Opacity of a disabled control. Low enough to read as unavailable at a glance,
+/// high enough that its label stays legible so the user can still see what the
+/// control would do once it becomes available.
+const DISABLED_OPACITY: f32 = 0.45;
 
 fn bounded_log_render_range(requested: Range<usize>, total: usize) -> Range<usize> {
     let start = requested.start.min(total);
@@ -152,6 +161,12 @@ fn normalize_actions_read<T>(
     });
     (result, cache, directive)
 }
+/// Longest a choice chip (account, grouping, filter value) grows before its
+/// label truncates, so one long value cannot take a whole wrapped row.
+const CHOICE_MAX_WIDTH: f32 = 260.;
+/// Width of the centered repository-setup card. Capped to the window so the
+/// card and its controls stay whole on a narrow window.
+const SETUP_CARD_WIDTH: f32 = 560.;
 const DEFAULT_SIDEBAR_WIDTH: f32 = 292.;
 const DEFAULT_FILE_TREE_WIDTH: f32 = 250.;
 const DEFAULT_DETAILS_WIDTH: f32 = 274.;
@@ -5420,6 +5435,90 @@ impl ReviewWorkspace {
                         })
                         .unwrap();
                 }
+                // Capture the same sections at the window's minimum size. Wide
+                // captures alone cannot show a control crowding or a label
+                // clipping, which is exactly where dense rows fail first.
+                window
+                    .update(|window, _| window.resize(size(px(1040.), px(620.))))
+                    .unwrap();
+                for (name, section) in [
+                    ("conversation", Some(InspectorSection::Overview)),
+                    ("files", None),
+                ] {
+                    window
+                        .update(|window, cx| {
+                            root.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    unreachable!()
+                                };
+                                this.inspector_open = section.is_some();
+                                if let Some(section) = section {
+                                    this.tabs[0].inspector_section = section;
+                                }
+                                this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                                this.refresh_auto_layout(window);
+                                cx.notify();
+                            })
+                            .unwrap()
+                        })
+                        .unwrap();
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(400))
+                        .await;
+                    window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .unwrap()
+                                .save(output.join(format!("{name}-narrow.png")))
+                                .unwrap()
+                        })
+                        .unwrap();
+                }
+                // Focus-visible styling resolves only when the focused handle is
+                // focused AND the window's last input was a key, so a capture of
+                // an idle scene can never show the ring. Dispatch a synthetic
+                // in-process Tab to enter keyboard modality, then walk the tab
+                // stops. This is application-owned synthetic input; it makes no
+                // OS call and requests no activation.
+                window
+                    .update(|window, cx| {
+                        window.resize(size(px(1440.), px(900.)));
+                        window.dispatch_event(
+                            gpui::PlatformInput::KeyDown(KeyDownEvent {
+                                keystroke: gpui::Keystroke::parse("tab").unwrap(),
+                                is_held: false,
+                                prefer_character_input: false,
+                            }),
+                            cx,
+                        );
+                        for _ in 0..PR_LAYOUT_SMOKE_TAB_STOPS {
+                            window.focus_next(cx);
+                        }
+                        assert!(
+                            window.last_input_was_keyboard(),
+                            "the ring capture must be taken in keyboard modality"
+                        );
+                        assert!(
+                            window.focused(cx).is_some(),
+                            "the ring capture must have a focused control"
+                        );
+                    })
+                    .unwrap();
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(400))
+                    .await;
+                window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .unwrap()
+                            .save(output.join("keyboard-focus.png"))
+                            .unwrap()
+                    })
+                    .unwrap();
                 window.update(|_, cx| cx.quit()).unwrap();
             })
             .detach();
@@ -20842,13 +20941,21 @@ impl ReviewWorkspace {
                             .child(
                                 div()
                                     .flex_1()
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .ui_text(TextRole::Label)
                                     .child(group_label(Some(group))),
                             )
                             .child(
-                                small_action("Change", colors)
-                                    .id(SharedString::from(format!("change-view-group-{index}")))
-                                    .on_click(cx.listener(move |root, _, _, cx| {
+                                small_action(
+                                    SharedString::from(format!("change-view-group-{index}")),
+                                    "Change",
+                                    "Change grouping level",
+                                    colors,
+                                )
+                                .on_click(cx.listener(
+                                    move |root, _, _, cx| {
                                         if let Root::Review(this) = root {
                                             let prefix = ViewEditorInputs::value(
                                                 &this.view_inputs.source_prefix,
@@ -20857,37 +20964,56 @@ impl ReviewWorkspace {
                                             this.view_editor.cycle_group(index, &prefix);
                                             cx.notify();
                                         }
-                                    })),
+                                    },
+                                )),
                             )
                             .child(
-                                small_action("↑", colors)
-                                    .id(SharedString::from(format!("move-up-view-group-{index}")))
-                                    .on_click(cx.listener(move |root, _, _, cx| {
+                                small_action(
+                                    SharedString::from(format!("move-up-view-group-{index}")),
+                                    "↑",
+                                    "Move grouping level up",
+                                    colors,
+                                )
+                                .on_click(cx.listener(
+                                    move |root, _, _, cx| {
                                         if let Root::Review(this) = root {
                                             this.view_editor.move_group(index, -1);
                                             cx.notify();
                                         }
-                                    })),
+                                    },
+                                )),
                             )
                             .child(
-                                small_action("↓", colors)
-                                    .id(SharedString::from(format!("move-down-view-group-{index}")))
-                                    .on_click(cx.listener(move |root, _, _, cx| {
+                                small_action(
+                                    SharedString::from(format!("move-down-view-group-{index}")),
+                                    "↓",
+                                    "Move grouping level down",
+                                    colors,
+                                )
+                                .on_click(cx.listener(
+                                    move |root, _, _, cx| {
                                         if let Root::Review(this) = root {
                                             this.view_editor.move_group(index, 1);
                                             cx.notify();
                                         }
-                                    })),
+                                    },
+                                )),
                             )
                             .child(
-                                small_action("Remove", colors)
-                                    .id(SharedString::from(format!("remove-view-group-{index}")))
-                                    .on_click(cx.listener(move |root, _, _, cx| {
+                                small_action(
+                                    SharedString::from(format!("remove-view-group-{index}")),
+                                    "Remove",
+                                    "Remove grouping level",
+                                    colors,
+                                )
+                                .on_click(cx.listener(
+                                    move |root, _, _, cx| {
                                         if let Root::Review(this) = root {
                                             this.view_editor.remove_group(index);
                                             cx.notify();
                                         }
-                                    })),
+                                    },
+                                )),
                             ),
                     )
                     .when(is_source, |row| {
@@ -21119,15 +21245,21 @@ impl ReviewWorkspace {
                             .child(section_label("GROUPING ORDER", colors))
                             .children(groups)
                             .child(
-                                small_action("＋ Add grouping level", colors)
-                                    .id("add-view-group")
-                                    .mt_2()
-                                    .on_click(cx.listener(|root, _, _, cx| {
+                                small_action(
+                                    "add-view-group",
+                                    "＋ Add grouping level",
+                                    "Add grouping level",
+                                    colors,
+                                )
+                                .mt_2()
+                                .on_click(cx.listener(
+                                    |root, _, _, cx| {
                                         if let Root::Review(this) = root {
                                             this.view_editor.add_group();
                                             cx.notify();
                                         }
-                                    })),
+                                    },
+                                )),
                             )
                             .child(
                                 div()
@@ -21154,21 +21286,20 @@ impl ReviewWorkspace {
                             .border_t_1()
                             .border_color(colors.border)
                             .child(
-                                modal_button("Delete view", false, colors)
-                                    .id("delete-view")
-                                    .on_click(cx.listener(|root, _, window, cx| {
+                                modal_button("delete-view", "Delete view", false, colors).on_click(
+                                    cx.listener(|root, _, window, cx| {
                                         if let Root::Review(this) = root {
                                             this.delete_current_view(window, cx);
                                         }
-                                    })),
+                                    }),
+                                ),
                             )
                             .child(
                                 div()
                                     .flex()
                                     .gap(px(ui::GAP_GROUP))
                                     .child(
-                                        modal_button("Cancel", false, colors)
-                                            .id("cancel-view-editor")
+                                        modal_button("cancel-view-editor", "Cancel", false, colors)
                                             .on_click(cx.listener(|root, _, window, cx| {
                                                 if let Root::Review(this) = root {
                                                     this.cancel_view_editor(window, cx);
@@ -21176,8 +21307,7 @@ impl ReviewWorkspace {
                                             })),
                                     )
                                     .child(
-                                        modal_button("Save as new", false, colors)
-                                            .id("save-new-view")
+                                        modal_button("save-new-view", "Save as new", false, colors)
                                             .on_click(cx.listener(|root, _, window, cx| {
                                                 if let Root::Review(this) = root {
                                                     this.commit_view_editor(true, window, cx);
@@ -21185,13 +21315,19 @@ impl ReviewWorkspace {
                                             })),
                                     )
                                     .child(
-                                        modal_button("Apply  ⌘S", true, colors)
-                                            .id("apply-view-editor")
-                                            .on_click(cx.listener(|root, _, window, cx| {
+                                        modal_button(
+                                            "apply-view-editor",
+                                            "Apply  ⌘S",
+                                            true,
+                                            colors,
+                                        )
+                                        .on_click(
+                                            cx.listener(|root, _, window, cx| {
                                                 if let Root::Review(this) = root {
                                                     this.commit_view_editor(false, window, cx);
                                                 }
-                                            })),
+                                            }),
+                                        ),
                                     ),
                             ),
                     ),
@@ -21287,25 +21423,22 @@ impl ReviewWorkspace {
             .p(px(ui::PANEL_GUTTER))
             .child(
                 div()
-                    .w(px(560.))
+                    .w(px(SETUP_CARD_WIDTH))
+                    .max_w_full()
                     .p(px(ui::PANEL_GUTTER))
                     .rounded(px(ui::WINDOW_RADIUS))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.surface)
-                    .child(
-                        div()
-                            .ui_text(TextRole::Title)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Add a repository"),
-                    )
+                    .child(div().ui_text(TextRole::Title).child("Add a repository"))
                     .child(
                         div()
                             .mt_1()
+                            .ui_text(TextRole::Body)
                             .text_color(colors.muted)
                             .child("Review without cloning. Existing local folders work too."),
                     )
-                    .child(field_label("REPOSITORY", colors).mt(px(ui::GAP_PAGE)))
+                    .child(field_label("Repository", colors).mt(px(ui::GAP_PAGE)))
                     .child(input_box(&self.repository_input, colors))
                     .child(
                         Button::new("browse-repository")
@@ -21316,6 +21449,7 @@ impl ReviewWorkspace {
                             .py_0()
                             .rounded(px(ui::CONTROL_RADIUS))
                             .bg(colors.elevated)
+                            .disabled_presentation()
                             .disabled(
                                 self.repository_picker_open
                                     || matches!(self.repository_setup_state, LoadState::Loading(_)),
@@ -21328,7 +21462,7 @@ impl ReviewWorkspace {
                                 }
                             })),
                     )
-                    .child(field_label("GITHUB ACCOUNT", colors).mt(px(ui::GAP_PAGE)))
+                    .child(field_label("GitHub account", colors).mt(px(ui::GAP_PAGE)))
                     .child(
                         div()
                             .mt_2()
@@ -21348,8 +21482,8 @@ impl ReviewWorkspace {
                         Button::new("refresh-repository-accounts")
                             .control()
                             .mt_2()
-                            .control()
                             .bg(colors.elevated)
+                            .disabled_presentation()
                             .disabled(
                                 matches!(self.accounts_state, LoadState::Loading(_))
                                     || matches!(self.repository_setup_state, LoadState::Loading(_)),
@@ -21365,7 +21499,7 @@ impl ReviewWorkspace {
                                 }
                             })),
                     )
-                    .child(field_label("OPEN PR NUMBER (OPTIONAL)", colors).mt(px(ui::GAP_PAGE)))
+                    .child(field_label("Open PR number · optional", colors).mt(px(ui::GAP_PAGE)))
                     .child(div().w(px(160.)).child(input_box(&self.pr_input, colors)))
                     .when_some(self.repository_setup_state.notice(), |card, notice| {
                         card.child(
@@ -21408,6 +21542,7 @@ impl ReviewWorkspace {
                                 Button::new("confirm-add-repository")
                                     .control()
                                     .debug_selector(|| "confirm-add-repository".into())
+                                    .disabled_presentation()
                                     .disabled(
                                         self.repository_picker_open
                                             || matches!(
@@ -23492,7 +23627,7 @@ impl ReviewWorkspace {
             .border_color(colors.border)
             .child(
                 div()
-                    .font_weight(FontWeight::MEDIUM)
+                    .ui_text(TextRole::Subtitle)
                     .child("Pull request"),
             )
             .child(
@@ -23966,11 +24101,7 @@ impl ReviewWorkspace {
                 .rounded(px(ui::CONTROL_RADIUS))
                 .border_1()
                 .border_color(colors.accent)
-                .child(
-                    div()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child("Confirm change"),
-                )
+                .child(div().ui_text(TextRole::Subtitle).child("Confirm change"))
                 .child(render_lifecycle_change(frozen, colors))
                 .child(
                     div()
@@ -24674,7 +24805,7 @@ impl ReviewWorkspace {
                         .p_3()
                         .rounded(px(ui::CONTROL_RADIUS))
                         .bg(colors.elevated)
-                        .child(div().font_weight(FontWeight::MEDIUM).child("Discussion"))
+                        .child(div().ui_text(TextRole::Subtitle).child("Discussion"))
                         .child(
                             div()
                                 .mt_1()
@@ -26859,7 +26990,7 @@ impl ReviewWorkspace {
                         .border_color(colors.accent)
                         .child(
                             div()
-                                .font_weight(FontWeight::MEDIUM)
+                                .ui_text(TextRole::Subtitle)
                                 .child("Submit review?"),
                         )
                         .child(
@@ -26948,7 +27079,7 @@ impl ReviewWorkspace {
                         .border_color(colors.accent)
                         .child(
                             div()
-                                .font_weight(FontWeight::MEDIUM)
+                                .ui_text(TextRole::Subtitle)
                                 .child("Edit submitted review summary?"),
                         )
                         .child(
@@ -27041,7 +27172,7 @@ impl ReviewWorkspace {
                         .border_color(colors.amber)
                         .child(
                             div()
-                                .font_weight(FontWeight::MEDIUM)
+                                .ui_text(TextRole::Subtitle)
                                 .child("Dismiss submitted review?"),
                         )
                         .child(
@@ -27192,7 +27323,7 @@ impl ReviewWorkspace {
                         .border_color(colors.green)
                         .child(
                             div()
-                                .font_weight(FontWeight::MEDIUM)
+                                .ui_text(TextRole::Subtitle)
                                 .child("Add a file-level comment to your pending review?"),
                         )
                         .child(
@@ -27298,7 +27429,7 @@ impl ReviewWorkspace {
                         .border_1()
                         .border_color(colors.amber)
                         .child(
-                            div().font_weight(FontWeight::MEDIUM).child(if review_id.is_some() {
+                            div().ui_text(TextRole::Subtitle).child(if review_id.is_some() {
                                 "Continue adding this whole-file comment?"
                             } else {
                                 "Create a pending review and add this whole-file comment?"
@@ -27472,7 +27603,7 @@ impl ReviewWorkspace {
                         .border_color(colors.green)
                         .child(
                             div()
-                                .font_weight(FontWeight::MEDIUM)
+                                .ui_text(TextRole::Subtitle)
                                 .child("Confirm guarded merge action"),
                         )
                         .child(
@@ -27967,6 +28098,31 @@ impl ReviewWorkspace {
     }
 }
 
+/// The pinned `gpui_base::Button` is documented as unstyled: it owns focus,
+/// keyboard activation and accessibility, and resolves only `selected` and
+/// `disabled` styles, so a disabled or keyboard-focused button paints exactly
+/// like an idle one unless the application says otherwise. Every control routes
+/// both treatments through this trait so they cannot drift apart per surface.
+trait ControlPresentation: Sized {
+    fn disabled_presentation(self) -> Self;
+    fn focus_ring(self, accent: Rgba, fill: Rgba) -> Self;
+}
+
+impl ControlPresentation for Button {
+    fn disabled_presentation(self) -> Self {
+        // Uniform dimming works against any background this app gives a button,
+        // including the filled primary action, without inverting its contrast.
+        self.styles(|styles| styles.disabled(|style| style.opacity(DISABLED_OPACITY)))
+    }
+
+    fn focus_ring(self, accent: Rgba, fill: Rgba) -> Self {
+        // `focus_visible` is keyboard-only, so a pointer user never sees a ring
+        // after clicking. The ring recolors an existing 1px border and adds the
+        // selection fill, which changes no geometry and so cannot reflow a row.
+        self.focus_visible(move |style| style.border_color(accent).bg(fill))
+    }
+}
+
 fn field_label(label: &str, colors: Palette) -> Div {
     div()
         .ui_text(TextRole::Label)
@@ -28005,23 +28161,40 @@ fn section_label(label: &str, colors: Palette) -> Div {
         .text_color(colors.faint)
 }
 
-fn small_action(label: &str, colors: Palette) -> Div {
-    div()
+/// `announced` carries the control's name for accessibility clients, which
+/// matters for the glyph-only reorder controls whose visible label is an arrow.
+fn small_action(
+    id: impl Into<SharedString>,
+    label: &str,
+    announced: &str,
+    colors: Palette,
+) -> Button {
+    Button::new(id.into())
         .control()
+        .flex_none()
+        // A transparent border reserves the ring's width up front so gaining
+        // focus recolors it instead of resizing the control.
+        .border_1()
+        .border_color(rgba(0x00000000))
         .ui_text(TextRole::Label)
         .text_color(colors.accent)
         .cursor_pointer()
         .hover(|button| button.bg(colors.selected))
+        .accessibility_label(announced.to_owned())
+        .disabled_presentation()
+        .focus_ring(colors.accent, colors.selected)
         .child(label.to_owned())
 }
 
-fn modal_button(label: &str, primary: bool, colors: Palette) -> Div {
-    div()
+fn modal_button(
+    id: impl Into<SharedString>,
+    label: &str,
+    primary: bool,
+    colors: Palette,
+) -> Button {
+    Button::new(id.into())
         .control()
-        .h(px(ui::CONTROL_HEIGHT))
-        .px(px(ui::CONTROL_INSET))
-        .flex()
-        .items_center()
+        .flex_none()
         .rounded(px(ui::CONTROL_RADIUS))
         .border_1()
         .border_color(if primary {
@@ -28037,6 +28210,9 @@ fn modal_button(label: &str, primary: bool, colors: Palette) -> Div {
         .text_color(if primary { colors.accent } else { colors.text })
         .cursor_pointer()
         .hover(|button| button.bg(colors.selected))
+        .accessibility_label(label.to_owned())
+        .disabled_presentation()
+        .focus_ring(colors.accent, colors.selected)
         .child(label.to_owned())
 }
 
@@ -28146,6 +28322,12 @@ fn sidebar_icon_button(id: &'static str, label: &str, icon: &str, colors: Palett
         .items_center()
         .justify_center()
         .accessibility_label(label.to_owned())
+        // The painted control is 28px inside a 40px target, so the ring is drawn
+        // on the target: a focus ring sits outside the control it marks.
+        .rounded(px(ui::CONTROL_RADIUS))
+        .border_1()
+        .border_color(rgba(0x00000000))
+        .focus_ring(colors.accent, colors.selected)
         .child(
             div()
                 .debug_selector(move || format!("{id}-visual"))
@@ -28175,6 +28357,9 @@ fn sidebar_nav_button(id: String, label: &str, selected: bool, colors: Palette) 
         .h(px(ui::CONTROL_HEIGHT))
         .px(px(ui::CELL_INSET))
         .rounded(px(ui::CONTROL_RADIUS))
+        .border_1()
+        .border_color(rgba(0x00000000))
+        .focus_ring(colors.accent, colors.selected)
         .flex()
         .items_center()
         .gap(px(ui::GAP_ICON))
@@ -28201,28 +28386,47 @@ fn sidebar_nav_button(id: String, label: &str, selected: bool, colors: Palette) 
 fn side_control(label: &str, selected: bool, colors: Palette) -> Div {
     div()
         .control()
+        .flex_none()
+        .max_w(px(CHOICE_MAX_WIDTH))
         .cursor_pointer()
         .ui_text(TextRole::Label)
         .when(selected, |item| {
             item.bg(colors.selected).text_color(colors.text)
         })
         .when(!selected, |item| item.text_color(colors.muted))
-        .child(label.to_owned())
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(label.to_owned()),
+        )
 }
 
-fn action_link(label: &'static str, colors: Palette) -> Stateful<Div> {
+fn action_link(label: &'static str, colors: Palette) -> Button {
     action_link_with_id(format!("action-{label}"), label, colors)
 }
 
-fn action_link_with_id(id: String, label: &'static str, colors: Palette) -> Stateful<Div> {
-    div()
-        .id(SharedString::from(id))
+/// A native Button rather than a clickable div: these carry the page's real
+/// actions, so they must be reachable with Tab, activate on Enter and Space,
+/// and announce themselves as buttons.
+fn action_link_with_id(id: String, label: &'static str, colors: Palette) -> Button {
+    Button::new(SharedString::from(id))
         .control()
+        .flex_none()
         .border_1()
         .border_color(colors.border)
         .cursor_pointer()
         .text_color(colors.accent)
         .hover(|button| button.bg(colors.selected))
+        .disabled_presentation()
+        .focus_ring(colors.accent, colors.selected)
+        // A few callers pass an empty label and supply their own children; an
+        // empty announced name would be worse than letting the children speak.
+        .when(!label.is_empty(), |button| {
+            button.accessibility_label(label)
+        })
         .child(label)
 }
 
@@ -28276,6 +28480,8 @@ fn checks_page_button(
         } else {
             colors.accent
         })
+        .disabled_presentation()
+        .focus_ring(colors.accent, colors.selected)
         .disabled(disabled)
         .accessibility_label(accessibility_label)
         .when(!disabled, |button| {
@@ -28716,26 +28922,27 @@ fn render_lifecycle_change(frozen: &FrozenMutation, colors: Palette) -> Div {
             )
     };
     match frozen {
-        FrozenMutation::Lifecycle { request, .. } => {
-            match &request.action {
-                PullRequestLifecycleAction::UpdateTitle { observed, value }
-                | PullRequestLifecycleAction::UpdateBody { observed, value }
-                | PullRequestLifecycleAction::UpdateBaseBranch { observed, value } => div()
-                    .child(div().mt_2().font_weight(FontWeight::MEDIUM).child(
-                        match &request.action {
+        FrozenMutation::Lifecycle { request, .. } => match &request.action {
+            PullRequestLifecycleAction::UpdateTitle { observed, value }
+            | PullRequestLifecycleAction::UpdateBody { observed, value }
+            | PullRequestLifecycleAction::UpdateBaseBranch { observed, value } => div()
+                .child(
+                    div()
+                        .mt_2()
+                        .ui_text(TextRole::Label)
+                        .child(match &request.action {
                             PullRequestLifecycleAction::UpdateTitle { .. } => "Title",
                             PullRequestLifecycleAction::UpdateBody { .. } => "Description",
                             _ => "Base branch",
-                        },
-                    ))
-                    .child(text("Current", observed))
-                    .child(text("Replace with", value)),
-                _ => div()
-                    .mt_2()
-                    .ui_text(TextRole::Caption)
-                    .child(frozen.summary().to_owned()),
-            }
-        }
+                        }),
+                )
+                .child(text("Current", observed))
+                .child(text("Replace with", value)),
+            _ => div()
+                .mt_2()
+                .ui_text(TextRole::Caption)
+                .child(frozen.summary().to_owned()),
+        },
         FrozenMutation::Discussion { request, .. } => match &request.action {
             PullRequestDiscussionAction::Create { body } => div().child(text("Post comment", body)),
             PullRequestDiscussionAction::Edit {
@@ -30330,7 +30537,7 @@ mod layout_tests {
                             .debug_selector(|| "density-input".into()),
                     )
                     .child(
-                        super::modal_button("Add repository", true, colors)
+                        super::modal_button("density-button", "Add repository", true, colors)
                             .debug_selector(|| "density-button".into()),
                     )
                     .child(
@@ -34792,6 +34999,162 @@ mod layout_tests {
         cx.simulate_click(point(px(10.), px(10.)), Modifiers::default());
         cx.simulate_keystrokes("enter space");
         assert_eq!(activations.get(), 3);
+    }
+
+    /// The shared action helpers became native Buttons. This pins the three
+    /// things that conversion could have broken: a control still activates
+    /// exactly once from the pointer and once per Enter/Space, a disabled
+    /// control activates from neither and does not leak its press to the row
+    /// beneath it, and the control is still exactly one 28px data row high.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn converted_action_controls_fire_once_keep_row_height_and_block_disabled_activation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{
+            Context, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, Render, div, point,
+            prelude::*, px,
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        struct Harness {
+            disabled: bool,
+            action: Rc<Cell<usize>>,
+            row: Rc<Cell<usize>>,
+        }
+
+        impl Render for Harness {
+            fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+                let colors = super::palette(false);
+                let action = self.action.clone();
+                let row = self.row.clone();
+                // The action sits inside a clickable row, which is how these
+                // controls appear on the PR page.
+                div()
+                    .id("converted-action-row")
+                    .tab_group()
+                    .size(px(200.))
+                    .on_click(move |_, _, _| row.set(row.get() + 1))
+                    .child(
+                        super::action_link_with_id(
+                            "converted-action".into(),
+                            "Review change…",
+                            colors,
+                        )
+                        .debug_selector(|| "converted-action".into())
+                        .disabled(self.disabled)
+                        .on_click(move |_, _, _| action.set(action.get() + 1)),
+                    )
+            }
+        }
+
+        cx.update(gpui_base::init);
+        let action = Rc::new(Cell::new(0));
+        let row = Rc::new(Cell::new(0));
+        let (harness, cx) = cx.add_window_view({
+            let action = action.clone();
+            let row = row.clone();
+            move |_, _| Harness {
+                disabled: false,
+                action,
+                row,
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let bounds = cx.debug_bounds("converted-action").unwrap();
+        assert_eq!(
+            bounds.size.height,
+            px(cibergit::ui::CONTROL_HEIGHT),
+            "a converted action must stay one 28px data row high"
+        );
+
+        // Tab first, with no pointer anywhere near the control. Reaching it by
+        // pointer would prove nothing about tab-stop membership, and the ring is
+        // keyboard-modality-only, so keyboard has to be the way in.
+        let press = |cx: &mut gpui::VisualTestContext, key: &str| {
+            let keystroke = Keystroke::parse(key).unwrap();
+            cx.simulate_event(KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(KeyUpEvent { keystroke });
+        };
+        press(cx, "tab");
+        cx.update(|window, cx| {
+            window.focus_next(cx);
+            assert!(
+                window.last_input_was_keyboard(),
+                "a keystroke must put the window in keyboard modality, which is \
+                 the only state in which focus-visible styling resolves"
+            );
+            assert!(
+                window.focused(cx).is_some(),
+                "the converted control must be a reachable tab stop"
+            );
+        });
+        press(cx, "enter");
+        press(cx, "space");
+        assert_eq!(
+            action.get(),
+            2,
+            "a control reached by Tab activates on Enter and on Space"
+        );
+
+        // Assert the ring on actual painted output. Asserting only that focus
+        // exists cannot fail in a useful way: a control can hold focus and paint
+        // no ring at all, which is exactly the defect this pins.
+        let accent: gpui::Hsla = super::palette(false).accent.into();
+        let ring_quads = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, _| {
+                window
+                    .painted_quads()
+                    .into_iter()
+                    .filter(|quad| {
+                        quad.border_color == accent
+                            && quad.border_widths.top > gpui::ScaledPixels(0.)
+                    })
+                    .count()
+            })
+        };
+        assert!(
+            ring_quads(cx) > 0,
+            "a keyboard-focused control must paint an accent ring"
+        );
+
+        // The ring is keyboard-only: the same press that activates by pointer
+        // must also take the ring away.
+        let inside = bounds.origin + point(px(4.), px(4.));
+        cx.simulate_click(inside, Modifiers::default());
+        assert_eq!(action.get(), 3, "one pointer press is one activation");
+        cx.update(|window, cx| {
+            assert!(
+                !window.last_input_was_keyboard(),
+                "a pointer press must leave keyboard modality"
+            );
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            ring_quads(cx),
+            0,
+            "the ring must not follow a pointer press"
+        );
+
+        let row_activations_while_enabled = row.get();
+        harness.update(cx, |harness, cx| {
+            harness.disabled = true;
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_click(inside, Modifiers::default());
+        cx.simulate_keystrokes("enter space");
+        assert_eq!(action.get(), 3, "a disabled action is inert");
+        assert_eq!(
+            row.get(),
+            row_activations_while_enabled,
+            "a press on a disabled action must not fall through to the row"
+        );
     }
 
     #[test]

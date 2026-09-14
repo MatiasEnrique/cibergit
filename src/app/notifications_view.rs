@@ -1,3 +1,4 @@
+use super::ControlPresentation;
 use super::{Palette, Root};
 use anyhow::{Context as _, Result, ensure};
 use cibergit::ui::{self, Density, TextRole};
@@ -10,14 +11,16 @@ use cibergit::{
     providers::{
         GithubProvider,
         notifications::{
-            IncompleteNotificationCandidate, NotificationAlertKind, NotificationConditionalCache,
-            NotificationDelay, NotificationPollDirective, NotificationPullRequest,
-            NotificationReadLimits, NotificationRepositoryScope, ProviderNotificationBatch,
-            ProviderNotificationEvent, RepositoryNotificationCompleteness,
+            IncompleteCandidateKind, IncompleteNotificationCandidate, NotificationAlertKind,
+            NotificationConditionalCache, NotificationDelay, NotificationPollDirective,
+            NotificationPullRequest, NotificationReadLimits, NotificationRepositoryScope,
+            ProviderNotificationBatch, ProviderNotificationEvent,
+            RepositoryNotificationCompleteness,
         },
     },
 };
-use gpui::{Context, Div, SharedString, Stateful, SystemNotification, div, prelude::*, px};
+use gpui::{Context, Div, SharedString, SystemNotification, div, prelude::*, px};
+use gpui_base::Button;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -38,6 +41,11 @@ use std::{
 };
 
 const PAGE_SIZE: usize = 40;
+/// Title-bar height for the slide-over panel: a 28px control plus the 8px
+/// above/below an action row, so the Close control is optically centered.
+const PANEL_TITLE_BAR: f32 = ui::CONTROL_HEIGHT + 2. * ui::GAP_GROUP;
+/// Width of the slide-over notification panel.
+const PANEL_WIDTH: f32 = 520.;
 const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
 const MAX_RETAINED_TAGS: usize = 2_048;
 const MAX_RETAINED_ROUTES: usize = 512;
@@ -1029,6 +1037,7 @@ impl NotificationController {
             let account = state.account.clone()?;
             let snapshot = state.snapshot.as_ref();
             let event_count = snapshot.map(unread_count).unwrap_or(0);
+            let last_page = max_page(snapshot);
             let incomplete_count = snapshot.map(|value| value.incomplete_candidates.len()).unwrap_or(0);
             let account_for_mark = account.clone();
             let account_for_previous = account.clone();
@@ -1060,16 +1069,23 @@ impl NotificationController {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(format!(
-                                "{} · {} unread",
-                                account.login, event_count
-                            )))
+                            .gap(px(ui::GAP_GROUP))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .ui_text(TextRole::Subtitle)
+                                    .child(format!("{} · {} unread", account.login, event_count)),
+                            )
                             .child(
                                 div()
                                     .id(SharedString::from(format!("notification-consent-{}", account.login)))
                                     .control()
+                                    .flex_none()
                                     .cursor_pointer()
-                                    .ui_text(TextRole::Caption)
+                                    .ui_text(TextRole::Label)
                                     .text_color(colors.accent)
                                     .child(if state.consent_transition {
                                         "Saving macOS preference…"
@@ -1105,7 +1121,7 @@ impl NotificationController {
                     })
                     .when(incomplete_count > 0, |section| {
                         section
-                            .child(div().mt(px(ui::GAP_PAGE)).ui_text(TextRole::Caption).font_weight(gpui::FontWeight::SEMIBOLD).text_color(colors.amber).child(format!("INCOMPLETE CANDIDATES · {incomplete_count} (not counted unread)")))
+                            .child(ui::kicker(&format!("Incomplete candidates · {incomplete_count} · not counted unread")).mt(px(ui::GAP_PAGE)).text_color(colors.amber))
                             .children(incomplete_rows)
                     })
                     .child(
@@ -1113,14 +1129,17 @@ impl NotificationController {
                             .mt_3()
                             .flex()
                             .gap(px(ui::GAP_COLUMNS))
-                            .child(panel_action("Previous", colors).on_click(cx.listener(move |root, _, _, cx| {
+                            .items_center()
+                            .child(enabled_panel_action("Previous", state.page > 0, colors).on_click(cx.listener(move |root, _, _, cx| {
                                 if let Root::Review(this) = root {
                                     this.notifications.previous_page(&account_for_previous);
                                     cx.notify();
                                 }
                             })))
-                            .child(div().py_1().ui_text(TextRole::Caption).text_color(colors.faint).child(format!("Page {}", state.page + 1)))
-                            .child(panel_action("Next", colors).on_click(cx.listener(move |root, _, _, cx| {
+                            // The total answers "how much is left" without a second trip
+                            // through the pager.
+                            .child(div().h(px(ui::CONTROL_HEIGHT)).flex().items_center().ui_text(TextRole::Caption).text_color(colors.faint).child(format!("Page {} of {}", state.page + 1, last_page + 1)))
+                            .child(enabled_panel_action("Next", state.page < last_page, colors).on_click(cx.listener(move |root, _, _, cx| {
                                 if let Root::Review(this) = root {
                                     this.notifications.next_page(&account_for_next);
                                     cx.notify();
@@ -1144,7 +1163,8 @@ impl NotificationController {
             .child(
                 div()
                     .id("notifications-panel")
-                    .w(px(520.))
+                    .w(px(PANEL_WIDTH))
+                    .max_w_full()
                     .h_full()
                     .flex()
                     .flex_col()
@@ -1154,16 +1174,22 @@ impl NotificationController {
                     .shadow_lg()
                     .child(
                         div()
-                            .h(px(48.))
+                            .h(px(PANEL_TITLE_BAR))
+                            .flex_none()
                             .px(px(ui::PANEL_GUTTER))
                             .flex()
                             .items_center()
                             .justify_between()
+                            .gap(px(ui::GAP_GROUP))
                             .border_b_1()
                             .border_color(colors.border)
                             .child(
                                 div()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .ui_text(TextRole::Title)
                                     .child("Unread notifications"),
                             )
                             .child(panel_action("Close", colors).on_click(cx.listener(
@@ -1374,63 +1400,93 @@ fn render_event(
     event: &ProviderNotificationEvent,
     colors: Palette,
     cx: &mut Context<Root>,
-) -> Stateful<Div> {
+) -> Button {
     let target = event.identity.target.clone();
     let label = alert_label(&event.alert_kind);
-    div()
-        .id(SharedString::from(format!(
-            "notification-event-{}",
-            stable_event_tag(
-                &Account {
-                    host: target.host.clone(),
-                    login: target.account.clone()
-                },
-                event
+    // The row is the primary way into a notification, so it is a real button:
+    // reachable by Tab, activated by Enter or Space, and announced with the
+    // pull request it opens.
+    let announcement = format!(
+        "{label}. {} {}/{} #{}",
+        target.account, target.owner, target.repository, target.pull_request
+    );
+    Button::new(SharedString::from(format!(
+        "notification-event-{}",
+        stable_event_tag(
+            &Account {
+                host: target.host.clone(),
+                login: target.account.clone()
+            },
+            event
+        )
+    )))
+    .accessibility_label(announcement)
+    .focus_ring(colors.accent, colors.selected)
+    .flex_col()
+    .items_stretch()
+    .justify_start()
+    .text_left()
+    .mb_2()
+    .p(px(ui::CELL_INSET))
+    .rounded(px(ui::CONTROL_RADIUS))
+    .border_1()
+    .border_color(colors.border)
+    .cursor_pointer()
+    .hover(|row| row.bg(colors.selected))
+    .child(
+        div()
+            .flex()
+            .items_baseline()
+            .justify_between()
+            .gap(px(ui::GAP_GROUP))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .ui_text(TextRole::Label)
+                    .child(label),
             )
-        )))
-        .mb_2()
-        .p_3()
-        .rounded(px(ui::CONTROL_RADIUS))
-        .border_1()
-        .border_color(colors.border)
-        .cursor_pointer()
-        .hover(|row| row.bg(colors.selected))
-        .child(
-            div()
-                .flex()
-                .justify_between()
-                .child(div().font_weight(gpui::FontWeight::MEDIUM).child(label))
-                .child(
-                    div()
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.faint)
-                        .child(event.occurred_at.clone()),
-                ),
-        )
-        .child(div().mt_1().child(event.summary.clone()))
-        .child(
-            div()
-                .mt_1()
-                .ui_text(TextRole::Caption)
-                .text_color(colors.muted)
-                .child(format!(
-                    "{} · {}/{} #{}{}",
-                    target.account,
-                    target.owner,
-                    target.repository,
-                    target.pull_request,
-                    event
-                        .actor
-                        .as_ref()
-                        .map(|actor| format!(" · {actor}"))
-                        .unwrap_or_default()
-                )),
-        )
-        .on_click(cx.listener(move |root, _, _, cx| {
-            if let Root::Review(this) = root {
-                this.open_notification_target(&target, cx);
-            }
-        }))
+            // The timestamp is the row's anchor in time; it keeps its full
+            // width and the alert label yields instead.
+            .child(
+                div()
+                    .flex_none()
+                    .ui_text(TextRole::Caption)
+                    .text_color(colors.faint)
+                    .child(event.occurred_at.clone()),
+            ),
+    )
+    .child(
+        div()
+            .mt_1()
+            .ui_text(TextRole::Body)
+            .child(event.summary.clone()),
+    )
+    .child(
+        div()
+            .mt_1()
+            .ui_text(TextRole::Caption)
+            .text_color(colors.muted)
+            .child(format!(
+                "{} · {}/{} #{}{}",
+                target.account,
+                target.owner,
+                target.repository,
+                target.pull_request,
+                event
+                    .actor
+                    .as_ref()
+                    .map(|actor| format!(" · {actor}"))
+                    .unwrap_or_default()
+            )),
+    )
+    .on_click(cx.listener(move |root, _, _, cx| {
+        if let Root::Review(this) = root {
+            this.open_notification_target(&target, cx);
+        }
+    }))
 }
 
 fn render_incomplete(candidate: &IncompleteNotificationCandidate, colors: Palette) -> Div {
@@ -1446,17 +1502,32 @@ fn render_incomplete(candidate: &IncompleteNotificationCandidate, colors: Palett
         .unwrap_or_else(|| "Unresolved pull request".into());
     div()
         .mt_2()
-        .p_2()
+        .p(px(ui::CELL_INSET))
         .rounded(px(ui::CONTROL_RADIUS))
         .bg(colors.elevated)
         .ui_text(TextRole::Caption)
-        .child(format!("{target} · {:?}", candidate.kind))
+        .child(format!(
+            "{target} · {}",
+            incomplete_kind_label(&candidate.kind)
+        ))
         .child(
             div()
                 .mt_1()
                 .text_color(colors.muted)
                 .child(candidate.reason.clone()),
         )
+}
+
+/// Candidate kinds reach the panel as provider vocabulary; the reader sees the
+/// same words the rest of the interface uses rather than a Rust variant name.
+fn incomplete_kind_label(kind: &IncompleteCandidateKind) -> &'static str {
+    match kind {
+        IncompleteCandidateKind::ReviewRequest => "review request",
+        IncompleteCandidateKind::Mention => "mention",
+        IncompleteCandidateKind::Reply => "reply",
+        IncompleteCandidateKind::FailedCheckOwnPullRequest => "failed check on your pull request",
+        IncompleteCandidateKind::PullRequestNotification => "pull request notification",
+    }
 }
 
 fn render_completeness(repository: &RepositoryNotificationCompleteness, colors: Palette) -> Div {
@@ -1483,14 +1554,29 @@ fn render_completeness(repository: &RepositoryNotificationCompleteness, colors: 
         })
 }
 
-fn panel_action(label: &'static str, colors: Palette) -> gpui::Stateful<Div> {
-    div()
-        .id(SharedString::from(format!("notification-action-{label}")))
+fn panel_action(label: &'static str, colors: Palette) -> Button {
+    enabled_panel_action(label, true, colors)
+}
+
+/// A disabled action states plainly that it leads nowhere: no pointer cursor, no
+/// hover response, and faint text. An enabled-looking control that does nothing
+/// reads as a broken app rather than an exhausted range.
+fn enabled_panel_action(label: &'static str, enabled: bool, colors: Palette) -> Button {
+    Button::new(SharedString::from(format!("notification-action-{label}")))
         .control()
-        .cursor_pointer()
-        .ui_text(TextRole::Caption)
-        .text_color(colors.accent)
-        .hover(|button| button.bg(colors.selected))
+        .flex_none()
+        // Caption is for help and metadata; a control label uses Label.
+        .ui_text(TextRole::Label)
+        .disabled(!enabled)
+        .disabled_presentation()
+        .focus_ring(colors.accent, colors.selected)
+        .accessibility_label(label)
+        .text_color(if enabled { colors.accent } else { colors.faint })
+        .when(enabled, |button| {
+            button
+                .cursor_pointer()
+                .hover(|button| button.bg(colors.selected))
+        })
         .child(label)
 }
 

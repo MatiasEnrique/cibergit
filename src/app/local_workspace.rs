@@ -32,9 +32,10 @@ use cibergit::{
 };
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, EventEmitter, FontWeight,
-    HighlightStyle, KeyDownEvent, Render, Rgba, SharedString, Stateful, Subscription, Window,
+    HighlightStyle, KeyDownEvent, Render, Rgba, SharedString, Subscription, Window,
     WindowAppearance, actions, div, prelude::*, px, rgba,
 };
+use gpui_base::Button;
 use gpui_base::input::{
     Editor, EditorState, FoldRange, HighlightStyleResolver, Input, InputEditorStyle, InputEvent,
     InputHighlighter, InputHighlighterFactory, InputState, Rope,
@@ -61,6 +62,12 @@ use std::{
 
 const UI_FONT: &str = "IBM Plex Sans";
 const CODE_FONT: &str = "Menlo";
+/// Width of the file browser's entry-kind glyph column. Fixed so names align
+/// whether or not an entry carries a marker.
+const BROWSER_ICON_COLUMN: f32 = 12.;
+/// Width of the Local Changes status column. Fixed so every path in the list
+/// starts on the same x position; sized for the longest status word.
+const CHANGE_STATUS_COLUMN: f32 = 70.;
 const DEFAULT_FILE_LIMIT: usize = 20_000;
 const DEFAULT_DEPTH_LIMIT: usize = 64;
 const DEFAULT_PATH_BYTES_LIMIT: usize = 4 * 1024 * 1024;
@@ -3452,11 +3459,14 @@ impl Render for LocalWorkspace {
                             };
                         }
                     }))
-                    .child(div().w(px(12.)).child(icon))
+                    .child(div().w(px(BROWSER_ICON_COLUMN)).flex_none().child(icon))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
+                            .text_ellipsis()
                             .child(entry.display),
                     ),
             );
@@ -3900,14 +3910,22 @@ impl LocalWorkspace {
             }
             HeadState::Detached { .. } => None,
         };
+        // Rows own their horizontal inset so a selected row's background reaches
+        // the panel edges instead of floating inside a padded column.
         let mut entries = div()
             .id("local-changes-entries")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .px(px(ui::CONTROL_INSET))
-            .py_2();
+            .px(px(ui::GAP_ICON))
+            .py(px(ui::GAP_GROUP));
         for (label, path, target) in local_change_rows(&snapshot) {
+            // The selected row is identified by the diff already loaded into the
+            // panel, so selection presentation never diverges from the content.
+            let selected = self
+                .selected_diff
+                .as_ref()
+                .is_some_and(|diff| diff.path == path && diff.target == target);
             let diff_path = path.clone();
             entries = entries.child(
                 div()
@@ -3915,15 +3933,35 @@ impl LocalWorkspace {
                         format!("change-{label}-{}", path.display).into(),
                     ))
                     .h(px(ui::CONTROL_HEIGHT))
+                    .px(px(ui::CELL_INSET))
                     .flex()
                     .items_center()
                     .gap(px(ui::GAP_GROUP))
+                    .rounded(px(ui::CONTROL_RADIUS))
+                    .ui_text(TextRole::Body)
+                    .when(selected, |row| row.bg(colors.selected))
+                    .hover(|row| row.bg(colors.selected))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_local_diff(diff_path.clone(), target, cx)
                     }))
-                    .child(div().w(px(70.)).text_color(colors.muted).child(label))
-                    .child(path.display),
+                    // The status column stays a fixed width so the paths below it
+                    // align into a single readable column.
+                    .child(
+                        div()
+                            .w(px(CHANGE_STATUS_COLUMN))
+                            .flex_none()
+                            .text_color(colors.muted)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(path.display),
+                    ),
             );
         }
         let diff = self.selected_diff.as_ref().map(|diff| match &diff.content {
@@ -3945,11 +3983,11 @@ impl LocalWorkspace {
             .border_color(colors.border)
             .child(
                 div()
-                    .px(px(ui::CONTROL_INSET))
-                    .py_3()
+                    .px(px(ui::CELL_INSET))
+                    .py(px(ui::GAP_GROUP))
                     .border_b_1()
                     .border_color(colors.border)
-                    .child(div().font_weight(FontWeight::MEDIUM).child("LOCAL CHANGES"))
+                    .child(ui::kicker("Local changes").text_color(colors.muted))
                     .child(
                         div()
                             .mt_2()
@@ -4357,21 +4395,30 @@ impl LocalWorkspace {
     }
 }
 
+/// A native Button rather than a clickable div: local actions are the panel's
+/// real work, so they are reachable with Tab and activate on Enter and Space.
 fn action_button(
     label: impl Into<SharedString>,
     colors: LocalPalette,
     listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
+) -> Button {
     let label = label.into();
-    div()
-        .id(ElementId::Name(format!("action-{}", label).into()))
+    // This module is also compiled standalone by examples/local_workspace_demo,
+    // so it cannot reach the review window's shared presentation trait. The ring
+    // is spelled out here and must stay in step with `ControlPresentation` in
+    // app.rs: keyboard-only, recoloring the border the control already reserves.
+    Button::new(ElementId::Name(format!("action-{}", label).into()))
+        .accessibility_label(label.clone())
         .control()
+        .focus_visible(move |style| style.border_color(colors.accent).bg(colors.selected))
         .border_1()
         .border_color(colors.border)
         .bg(colors.elevated)
         .hover(|button| button.bg(colors.selected))
         .cursor_pointer()
-        .ui_text(TextRole::Caption)
+        // Caption is for help and metadata; a control label uses Label.
+        .ui_text(TextRole::Label)
+        .flex_none()
         .on_click(listener)
         .child(label)
 }
