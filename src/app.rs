@@ -2474,47 +2474,6 @@ impl ReviewWorkspace {
         self.reconcile_actions_control_confirmation(index);
     }
 
-    /// A moved check selection or a changed exact run must never leave a frozen
-    /// control confirmation on screen. Only the prepared request is discarded:
-    /// every text draft, pinned selection, and recovery record is untouched.
-    ///
-    /// An already dispatched control is never fenced here. Its outcome must
-    /// still reach the completion path so an unresolved attempt is reported
-    /// rather than silently dropped.
-    fn reconcile_actions_control_confirmation(&mut self, index: usize) {
-        if self.tabs[index].write_in_flight {
-            return;
-        }
-        let Some(target) = self.tabs[index]
-            .confirmation
-            .as_ref()
-            .and_then(|confirmation| match confirmation {
-                NativeConfirmation::ActionsRunControl { request, .. } => {
-                    Some(request.preparation.observation.target.clone())
-                }
-                _ => None,
-            })
-        else {
-            return;
-        };
-        let still_current =
-            self.selected_actions_locator(index)
-                .ok()
-                .is_some_and(|(_, locator, _, _)| {
-                    locator.check_node_id == target.check_node_id
-                        && locator.check_database_id == target.check_database_id
-                        && locator.workflow_run.node_id == target.run_node_id
-                        && locator.workflow_run.database_id == target.run_database_id
-                        && locator.workflow_run.run_attempt == target.run_attempt
-                });
-        if !still_current {
-            self.invalidate_actions_control_confirmation(
-                index,
-                "The selected check or exact run attempt changed; the prepared Actions control was discarded. Zero writes sent.",
-            );
-        }
-    }
-
     fn ci_completion_index(&self, token: &CiCompletionToken) -> Option<usize> {
         if self.workspace_instance != token.workspace_instance {
             return None;
@@ -31890,31 +31849,29 @@ mod layout_tests {
         same_review_coordinates,
     };
     use super::{
-        ActionJournalCompletionToken, ActionsControlConfirmationToken, ActionsRunControlAction,
-        COLLAPSED_PANEL_WIDTH, CollaborationReadToken, DEFAULT_SIDEBAR_WIDTH, DiffLine,
-        DiffLineKind, DiffMode, DiffRow, EXCEPTIONAL_LINE_CHUNK_BYTES,
-        FileCommentConfirmationToken, JournalOperation, JournalRequest, JournalStatus,
-        MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH, MIN_SIDEBAR_WIDTH,
-        MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
-        PendingReviewStartConfirmationMode, PendingReviewStartConfirmationToken, RUN_CONTROLS,
-        ReactionCompletionToken, ReviewWorkspace, SubmittedConfirmationToken,
-        SubmittedDraftCallbackToken, SubmittedDraftCloseDisposition, SubmittedDraftLoadState,
-        SubmittedSummaryEditor, active_review_composer_body, active_review_composer_needs_save,
-        activity_thread_visible, apply_submitted_draft_save_if_current, available_diff_width_for,
-        bounded_log_render_range, bounded_page, collaboration_completion_matches,
-        diff_content_width, display_columns, file_confirmation_matches_visible_body,
-        journal_operation_description, journal_operation_summary, line_text_chunks,
-        media_free_markdown, observe_auxiliary,
+        ActionJournalCompletionToken, COLLAPSED_PANEL_WIDTH, CollaborationReadToken,
+        DEFAULT_SIDEBAR_WIDTH, DiffLine, DiffLineKind, DiffMode, DiffRow,
+        EXCEPTIONAL_LINE_CHUNK_BYTES, FileCommentConfirmationToken, JournalOperation,
+        JournalRequest, JournalStatus, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
+        MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
+        PendingReviewStartConfirmationMode, PendingReviewStartConfirmationToken,
+        ReactionCompletionToken, SubmittedConfirmationToken, SubmittedDraftCallbackToken,
+        SubmittedDraftCloseDisposition, SubmittedDraftLoadState, SubmittedSummaryEditor,
+        active_review_composer_body, active_review_composer_needs_save, activity_thread_visible,
+        apply_submitted_draft_save_if_current, available_diff_width_for, bounded_log_render_range,
+        bounded_page, collaboration_completion_matches, diff_content_width, display_columns,
+        file_confirmation_matches_visible_body, journal_operation_description,
+        journal_operation_summary, line_text_chunks, media_free_markdown, observe_auxiliary,
         pending_review_start_confirmation_matches_visible_body, resolved_panel_widths_for,
         review_subject_allows_actions, submitted_review_edit_action,
     };
     #[cfg(feature = "ui-smoke")]
     use super::{
-        ActionsReadError, ActionsReadErrorCategory, ActionsReadFixture, CiCompletionToken, CiPane,
-        DismissalConfirmationToken, DismissalPreparationToken, InspectorSection, InstallTabOptions,
-        InteractionState, LoadState, NextCheck, NextCheckPage, OpenChecks, OpenSelectedCheckJobs,
-        RepoRuntime, Root, Startup, ToggleCheckIdentity, check_identity_button, checks_page_button,
-        palette,
+        ActionsReadError, ActionsReadErrorCategory, ActionsReadFixture, ActionsRunControlAction,
+        CiCompletionToken, CiPane, DismissalConfirmationToken, DismissalPreparationToken,
+        InspectorSection, InstallTabOptions, InteractionState, LoadState, NextCheck, NextCheckPage,
+        OpenChecks, OpenSelectedCheckJobs, RUN_CONTROLS, RepoRuntime, ReviewWorkspace, Root,
+        Startup, ToggleCheckIdentity, check_identity_button, checks_page_button, palette,
     };
     use cibergit::domain::{
         Account, MergeEligibility, PendingFileCommentSource, PendingFileReviewAbsence,

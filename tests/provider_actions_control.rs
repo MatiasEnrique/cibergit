@@ -202,6 +202,7 @@ if step.get('fail_process'):
 sys.stdout.write(step['stdout'])
 sys.stdout.flush()
 if step.get('hang_seconds'):
+    (root / 'emitted').write_text('1')
     time.sleep(step['hang_seconds'])
 if step.get('overflow_bytes'):
     sys.stdout.write('y' * step['overflow_bytes'])
@@ -684,14 +685,20 @@ sys.exit(step.get('exit', 0))
 
         const RATE_HEADERS: &str = "HTTP/2.0 429 Too Many Requests\r\nretry-after: 120\r\n\r\n";
 
-        fn rate_floor_case(post: Value, timeout: Duration, output_limit: usize) -> ActionsRunControlDispatch {
+        fn rate_floor_case(
+            post: Value,
+            timeout: Duration,
+            output_limit: usize,
+        ) -> (TempDir, ActionsRunControlDispatch) {
             let mut steps = observation_steps(true, 2, "completed", Some("failure"));
             steps.extend(observation_steps(true, 2, "completed", Some("failure")));
             steps.push(post);
-            let (_directory, provider) = control_fixture_with(steps, timeout, output_limit);
+            let (directory, provider) = control_fixture_with(steps, timeout, output_limit);
             let request = prepared(&provider, ActionsRunControlAction::RerunAllJobs).unwrap();
             let mut admission = control_admission();
-            provider.execute_actions_run_control(&control_repo(), &request, &mut admission)
+            let dispatch =
+                provider.execute_actions_run_control(&control_repo(), &request, &mut admission);
+            (directory, dispatch)
         }
 
         /// A transport that starts, sends complete leading headers, then never
@@ -700,7 +707,13 @@ sys.exit(step.get('exit', 0))
         fn complete_leading_headers_survive_a_transport_timeout() {
             let mut post = post_step("rerun", RATE_HEADERS, 0);
             post["hang_seconds"] = json!(30);
-            let dispatch = rate_floor_case(post, Duration::from_millis(150), 16 * 1024 * 1024);
+            // The one genuinely time-based case. The budget is far longer than
+            // any child startup under parallel load, and the witness proves the
+            // headers were emitted before it elapsed, so an empty prefix can
+            // never be mistaken for product evidence.
+            let (directory, dispatch) =
+                rate_floor_case(post, Duration::from_secs(10), 16 * 1024 * 1024);
+            assert_headers_were_emitted(&directory);
             assert!(
                 matches!(dispatch.outcome, ProviderMutationOutcome::Uncertain { .. }),
                 "a started transport must stay uncertain: {:?}",
@@ -719,7 +732,7 @@ sys.exit(step.get('exit', 0))
         fn complete_leading_headers_survive_an_output_overflow() {
             let mut post = post_step("rerun", RATE_HEADERS, 0);
             post["overflow_bytes"] = json!(64 * 1024);
-            let dispatch = rate_floor_case(post, Duration::from_secs(10), 4 * 1024);
+            let (_directory, dispatch) = rate_floor_case(post, Duration::from_secs(10), 4 * 1024);
             assert!(
                 matches!(dispatch.outcome, ProviderMutationOutcome::Uncertain { .. }),
                 "an overflowing transport must stay uncertain: {:?}",
@@ -738,7 +751,7 @@ sys.exit(step.get('exit', 0))
         fn a_stderr_header_lookalike_never_installs_a_floor() {
             let mut post = post_step("rerun", "", 1);
             post["stderr_headers"] = json!(RATE_HEADERS);
-            let dispatch = rate_floor_case(post, Duration::from_secs(10), 16 * 1024 * 1024);
+            let (_directory, dispatch) = rate_floor_case(post, Duration::from_secs(10), 16 * 1024 * 1024);
             assert!(
                 matches!(dispatch.outcome, ProviderMutationOutcome::Uncertain { .. }),
                 "expected an uncertain outcome: {:?}",
@@ -754,34 +767,54 @@ sys.exit(step.get('exit', 0))
         /// The prefix capture is exercised directly, because wrapping a whole
         /// dispatch in a tracker scope would also divert its preflight reads
         /// onto the conditional entrypoint and prove nothing about capture.
-        fn hanging_header_child(headers: &str, to_stderr: bool) -> (TempDir, Runner) {
+        /// A child that emits headers and then fails in a way the runner must
+        /// detect. Overflow is used wherever possible because it is caused by
+        /// the child's own output rather than by wall-clock time, so it cannot
+        /// race child startup under parallel test load.
+        fn overflowing_header_child(headers: &str, to_stderr: bool) -> (TempDir, Runner) {
             let directory = tempfile::tempdir().unwrap();
             let executable = directory.path().join("child");
             let stream = if to_stderr { "stderr" } else { "stdout" };
+            let witness = directory.path().join("emitted");
+            // The witness is written only after the headers are flushed, so a
+            // test can prove the child reached that point instead of assuming a
+            // startup budget. An empty prefix with no witness is a harness
+            // failure, not evidence about the product.
             fs::write(
                 &executable,
                 format!(
-                    "#!/usr/bin/python3\nimport sys, time\nsys.{stream}.write({headers:?})\nsys.{stream}.flush()\ntime.sleep(30)\n"
+                    "#!/usr/bin/python3\nimport sys\nsys.{stream}.write({headers:?})\nsys.{stream}.flush()\nopen({witness:?}, 'w').write('1')\nsys.stdout.write('y' * 65536)\nsys.stdout.flush()\n",
+                    witness = witness.to_str().unwrap()
                 ),
             )
             .unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
             let runner = Runner {
                 gh: executable,
-                timeout: Duration::from_millis(150),
+                timeout: Duration::from_secs(30),
+                output_limit: 1024,
                 ..Runner::default()
             };
             (directory, runner)
         }
 
+        fn assert_headers_were_emitted(directory: &TempDir) {
+            assert!(
+                directory.path().join("emitted").exists(),
+                "the fixture child never flushed its headers, so this run proves nothing"
+            );
+        }
+
         #[test]
         fn mutation_prefix_capture_never_touches_an_active_general_collector() {
-            let (_directory, runner) = hanging_header_child(RATE_HEADERS, false);
+            let (directory, runner) = overflowing_header_child(RATE_HEADERS, false);
             let command = std::process::Command::new(&runner.gh);
             let (result, collector, failure) = conditional::with_general_read_tracker(|| {
                 runner.run_mutation_with_input(command, b"{}")
             });
-            let failure_output = result.err().expect("the hanging child must time out");
+            let failure_output = result.err().expect("the overflowing child must fail");
+            assert_eq!(failure_output.kind, RunnerFailureKind::OutputLimit);
+            assert_headers_were_emitted(&directory);
             // The caller receives the server's own floor.
             assert_eq!(
                 conditional::parse_mutation_response(&failure_output.header_prefix)
@@ -797,7 +830,7 @@ sys.exit(step.get('exit', 0))
         /// The conditional read path must keep recording into the collector.
         #[test]
         fn conditional_prefix_capture_still_records_into_the_general_collector() {
-            let (_directory, runner) = hanging_header_child(RATE_HEADERS, false);
+            let (directory, runner) = overflowing_header_child(RATE_HEADERS, false);
             let mut command = std::process::Command::new(&runner.gh);
             let (result, collector, _) = conditional::with_general_read_tracker(|| {
                 runner.run_inner_maybe_cancelled(
@@ -809,6 +842,7 @@ sys.exit(step.get('exit', 0))
                 )
             });
             assert!(result.is_err());
+            assert_headers_were_emitted(&directory);
             assert_eq!(
                 collector.rate_limit,
                 Some(GeneralReadDelay::Seconds(120)),
@@ -820,15 +854,25 @@ sys.exit(step.get('exit', 0))
         /// either, so no prefix is retained from it at all.
         #[test]
         fn mutation_prefix_capture_retains_nothing_from_child_stderr() {
-            let (_directory, runner) = hanging_header_child(RATE_HEADERS, true);
+            let (directory, runner) = overflowing_header_child(RATE_HEADERS, true);
             let command = std::process::Command::new(&runner.gh);
             let failure = runner
                 .run_mutation_with_input(command, b"{}")
                 .err()
-                .expect("the hanging child must time out");
+                .expect("the overflowing child must fail");
+            assert_headers_were_emitted(&directory);
+            // The child does write to stdout, so a prefix legitimately exists.
+            // What must never happen is stderr becoming scheduling evidence.
             assert!(
-                failure.header_prefix.is_empty(),
-                "child stderr was retained as a header prefix"
+                !failure.header_prefix.windows(11).any(|w| w == b"retry-after"),
+                "child stderr leaked into the retained prefix"
+            );
+            assert_eq!(
+                conditional::parse_mutation_response(&failure.header_prefix)
+                    .poll
+                    .rate_limit,
+                None,
+                "child stderr installed an account floor"
             );
         }
 
