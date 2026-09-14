@@ -287,6 +287,7 @@ impl DraftRecord {
                     commit_sha: draft.source.commit_sha,
                     // Durable source history never grants fresh viewer authority.
                     edit_summary_capability: None,
+                    dismissal_capability: None,
                     url: String::new(),
                 };
                 SubmittedSummaryDraft {
@@ -1216,6 +1217,7 @@ mod tests {
                     viewer_can_update: true,
                     viewer_cannot_update_reasons: Vec::new(),
                 }),
+                dismissal_capability: None,
                 url: "https://example.invalid/review".into(),
             },
             body: body.into(),

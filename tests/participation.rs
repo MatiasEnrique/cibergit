@@ -111,6 +111,7 @@ fn details(
             submitted_at: None,
             commit_sha: Some("head".into()),
             edit_summary_capability: None,
+            dismissal_capability: None,
             url: String::new(),
         })
         .into_iter()
@@ -918,6 +919,7 @@ fn pending_file_freshness_witness_never_survives_snapshot_serialization() {
             submitted_at: None,
             commit_sha: Some("head".into()),
             edit_summary_capability: None,
+            dismissal_capability: None,
             url: String::new(),
         },
         comments: Vec::new(),

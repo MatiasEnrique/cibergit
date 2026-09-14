@@ -378,6 +378,7 @@ fn review(
         submitted_at: submitted.map(str::to_owned),
         commit_sha: sha.map(str::to_owned),
         edit_summary_capability: None,
+        dismissal_capability: None,
         url: String::new(),
     }
 }

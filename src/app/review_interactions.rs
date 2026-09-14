@@ -5,6 +5,7 @@ use cibergit::{
         ProviderCoordinates, ProviderMutationOutcome, PullRequestDetails,
         PullRequestDiscussionRequest, PullRequestLifecycleRequest, ReactionRequest, Repository,
         ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryRequest, ReviewComment, ReviewThread,
+        SubmittedReviewDismissalRequest,
     },
     participation::{
         CanonicalPublishedPatch, DraftCoordinate, DraftStore, LineSelection, LoadOutcome,
@@ -1758,6 +1759,7 @@ pub enum JournalRequest {
     Lifecycle(Box<PullRequestLifecycleRequest>),
     Discussion(Box<PullRequestDiscussionRequest>),
     Reaction(Box<ReactionRequest>),
+    Dismissal(Box<SubmittedReviewDismissalRequest>),
 }
 
 impl JournalRequest {
@@ -1768,6 +1770,7 @@ impl JournalRequest {
             Self::Lifecycle(request) => (&request.operation_id, &request.attempt_id),
             Self::Discussion(request) => (&request.operation_id, &request.attempt_id),
             Self::Reaction(request) => (&request.operation_id, &request.attempt_id),
+            Self::Dismissal(request) => (&request.operation_id, &request.attempt_id),
         }
     }
 
@@ -1844,6 +1847,7 @@ impl JournalRequest {
                 cibergit::domain::ReactionAction::Add => "add-reaction",
                 cibergit::domain::ReactionAction::Remove { .. } => "remove-reaction",
             },
+            Self::Dismissal(_) => "dismiss submitted review",
         };
         let payload = match self {
             Self::Lifecycle(request) => serde_json::json!({
@@ -1855,6 +1859,10 @@ impl JournalRequest {
                 "dispatch": {"transport": "journal-context"},
             }),
             Self::Reaction(request) => serde_json::json!({
+                "request": request,
+                "dispatch": {"transport": "journal-context"},
+            }),
+            Self::Dismissal(request) => serde_json::json!({
                 "request": request,
                 "dispatch": {"transport": "journal-context"},
             }),
@@ -2575,10 +2583,11 @@ fn short_sha(sha: &str) -> &str {
 mod tests {
     use super::*;
     use cibergit::domain::{
-        Account, ChangedFile, Comparison, LinkedReviewComment, MergeEligibility,
-        PendingFileCommentSource, ProviderCoordinates, PullRequestLifecycleAction,
-        PullRequestMutationTarget, PullRequestReview, ReactableKind, ReactionAction,
-        ReactionContent, ReactionRequest, ReactionTarget, ReviewComment, Revision, SelectedViewer,
+        Account, ChangedFile, Comparison, DismissalAuthority, LinkedReviewComment,
+        MergeEligibility, PendingFileCommentSource, ProviderCoordinates,
+        PullRequestLifecycleAction, PullRequestMutationTarget, PullRequestReview, ReactableKind,
+        ReactionAction, ReactionContent, ReactionRequest, ReactionTarget, ReviewComment, Revision,
+        SelectedViewer, SubmittedReviewDismissalRequest, SubmittedReviewDismissalTarget,
     };
     use cibergit::participation::{
         DiffSide, RemoteDraftIds, ReviewCommentTarget, ReviewOperationStatus,
@@ -2853,6 +2862,76 @@ mod tests {
         }
     }
 
+    fn dismissal_request(operation_id: &str, attempt_id: &str) -> SubmittedReviewDismissalRequest {
+        SubmittedReviewDismissalRequest {
+            operation_id: operation_id.into(),
+            attempt_id: attempt_id.into(),
+            target: SubmittedReviewDismissalTarget {
+                repository: repository(),
+                pull_request: coordinates("PR_7"),
+                review: coordinates("REVIEW_7"),
+                review_state: "CHANGES_REQUESTED".into(),
+                review_body: "Exact frozen review body".into(),
+                submitted_at: "2026-09-12T09:00:00Z".into(),
+                review_author: None,
+                review_commit_sha: Some("1".repeat(40)),
+            },
+            viewer: SelectedViewer {
+                node_id: "USER_reader".into(),
+                login: "reader".into(),
+            },
+            authority: DismissalAuthority::Unknown {
+                reason: "GitHub decides authorization for the selected account.".into(),
+            },
+            reason: "Superseded by the later review.".into(),
+        }
+    }
+
+    #[test]
+    fn dismissal_journal_freezes_reason_and_restart_never_replays() {
+        let directory = tempdir().unwrap();
+        let mut journal = ActionJournal::open(directory.path(), review_key()).unwrap();
+        let request = dismissal_request("dismiss-1", "dismiss-attempt-1");
+        let frozen = JournalRequest::Dismissal(Box::new(request.clone()));
+        let context = frozen.mutation_context();
+        assert_eq!(context.action, "dismiss submitted review");
+        assert_eq!(
+            context.payload["request"],
+            serde_json::to_value(&request).unwrap()
+        );
+        assert_eq!(context.payload["request"]["reason"], request.reason);
+        assert_eq!(
+            context.payload["request"]["target"]["review_body"],
+            request.target.review_body
+        );
+
+        {
+            let mut admission = journal.admission(frozen.clone());
+            let mut held = admission.admit(&context).unwrap();
+            held.record_terminal(&MutationTerminalRecord::Uncertain {
+                reason: "synthetic lost acknowledgement".into(),
+            })
+            .unwrap();
+        }
+        let restarted = ActionJournal::open(directory.path(), review_key()).unwrap();
+        assert_eq!(restarted.operations().unwrap()[0].request, frozen);
+        let calls = AtomicUsize::new(0);
+        let second = dismissal_request("dismiss-2", "dismiss-attempt-2");
+        let blocked = restarted.dispatch(
+            JournalRequest::Dismissal(Box::new(second)),
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ProviderMutationOutcome::Acknowledged(())
+            },
+            |_| (true, true, "unexpected".into()),
+        );
+        assert!(matches!(
+            blocked,
+            ProviderMutationOutcome::PreflightRejected { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn reaction_journal_freezes_exact_request_and_preserves_v1_shared_barrier() {
         let directory = tempdir().unwrap();
@@ -3035,6 +3114,7 @@ mod tests {
                 submitted_at: None,
                 commit_sha: Some("2222222".into()),
                 edit_summary_capability: None,
+                dismissal_capability: None,
                 url: String::new(),
             },
             comments: vec![LinkedReviewComment {
@@ -3199,6 +3279,7 @@ mod tests {
             submitted_at: Some("now".into()),
             commit_sha: Some("2222222".into()),
             edit_summary_capability: None,
+            dismissal_capability: None,
             url: String::new(),
         }
     }
@@ -4518,6 +4599,7 @@ mod tests {
                 submitted_at: None,
                 commit_sha: Some("2222222".into()),
                 edit_summary_capability: None,
+                dismissal_capability: None,
                 url: String::new(),
             }],
             review_threads: Vec::new(),

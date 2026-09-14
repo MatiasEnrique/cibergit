@@ -12,14 +12,15 @@ use crate::comparisons::{
 };
 use crate::domain::{
     Account, BranchDeletionAcknowledgement, BranchDeletionRequest, ChangedFile, CheckKind,
-    Comparison, FreshReactionCapability, IssueComment, LinkedReviewComment, MergeAcknowledgement,
-    MergeAction, MergeEligibility, MergeExecutionRequest, MergeMethod, MergePreparation,
-    MutationContext, PendingFileCommentSource, PendingReviewSnapshot, ProviderCoordinates,
-    ProviderMutationOutcome, PullRequest, PullRequestCheck, PullRequestCheckoutSource,
-    PullRequestDetails, PullRequestReview, ReactableKind, ReactionContent, ReactionGroupSnapshot,
-    ReactionSnapshot, ReactionSubjectSnapshot, Repository, ReviewAuxiliaryAcknowledgement,
-    ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewComment, ReviewSubject, ReviewThread,
-    ReviewWriteAcknowledgement, Revision, SelectedViewer, SubmittedReviewEditCapability,
+    Comparison, DismissalAuthority, FreshReactionCapability, FreshReviewDismissalCapability,
+    IssueComment, LinkedReviewComment, MergeAcknowledgement, MergeAction, MergeEligibility,
+    MergeExecutionRequest, MergeMethod, MergePreparation, MutationContext,
+    PendingFileCommentSource, PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome,
+    PullRequest, PullRequestCheck, PullRequestCheckoutSource, PullRequestDetails,
+    PullRequestReview, ReactableKind, ReactionContent, ReactionGroupSnapshot, ReactionSnapshot,
+    ReactionSubjectSnapshot, Repository, ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryAction,
+    ReviewAuxiliaryRequest, ReviewComment, ReviewSubject, ReviewThread, ReviewWriteAcknowledgement,
+    Revision, SelectedViewer, SubmittedReviewEditCapability,
 };
 use crate::participation::{
     DraftStore, PendingCommentIntent, PendingFileCommentIntent, ReviewCommentTarget,
@@ -45,6 +46,7 @@ mod general_sync;
 pub mod notifications;
 mod pr_lifecycle;
 mod reactions;
+mod review_dismissal;
 mod stacks;
 #[cfg(feature = "ui-smoke")]
 pub use general_sync::synthetic_exact_304_smoke_fixture;
@@ -2299,11 +2301,19 @@ impl<'a> Session<'a> {
                     .eq_ignore_ascii_case(&repo.full_name()),
                 "GitHub details repository mismatch"
             );
+            let viewer_can_administer = repository.viewer_can_administer;
             let pull = repository
                 .pull_request
                 .context("PR details are unavailable or inaccessible")?;
             pull.validate(repo, number)?;
-            let next = builder.absorb(repo, pull, viewer, response.partial, page == 0)?;
+            let next = builder.absorb(
+                repo,
+                pull,
+                viewer,
+                viewer_can_administer,
+                response.partial,
+                page == 0,
+            )?;
             if next.done() {
                 return builder.finish(number);
             }
@@ -2457,6 +2467,7 @@ impl<'a> Session<'a> {
                 submitted_at: review.submitted_at,
                 commit_sha: review.commit.map(|commit| commit.oid),
                 edit_summary_capability: None,
+                dismissal_capability: None,
                 url: review.url,
             },
             comments,
@@ -4830,7 +4841,7 @@ const DETAILS_QUERY: &str = r#"query PullRequestDetails(
 ) {
   viewer { id login }
   repository(owner: $owner, name: $name) {
-    nameWithOwner
+    nameWithOwner viewerCanAdminister
     pullRequest(number: $number) {
       id number url headRefOid body state isDraft maintainerCanModify canBeRebased viewerCanReact
       reactionGroups { content viewerHasReacted users { totalCount } }
@@ -4971,6 +4982,7 @@ struct DetailsViewer {
 #[serde(rename_all = "camelCase")]
 struct DetailsRepository {
     name_with_owner: String,
+    viewer_can_administer: bool,
     pull_request: Option<DetailsPull>,
 }
 
@@ -5251,6 +5263,7 @@ struct DetailsBuilder {
     head_oid: Option<String>,
     viewer: Option<SelectedViewer>,
     pull_request: Option<ProviderCoordinates>,
+    viewer_can_administer: Option<bool>,
     overview: Option<DetailsOverview>,
     issue_comments: Vec<IssueComment>,
     reviews: Vec<PullRequestReview>,
@@ -5263,6 +5276,7 @@ struct DetailsBuilder {
     activity_complete: bool,
     checks_complete: bool,
     reaction_authority_complete: bool,
+    dismissal_authority_complete: bool,
     notices: Vec<String>,
 }
 
@@ -5272,6 +5286,7 @@ impl Default for DetailsBuilder {
             head_oid: None,
             viewer: None,
             pull_request: None,
+            viewer_can_administer: None,
             overview: None,
             issue_comments: Vec::new(),
             reviews: Vec::new(),
@@ -5284,6 +5299,7 @@ impl Default for DetailsBuilder {
             activity_complete: true,
             checks_complete: true,
             reaction_authority_complete: true,
+            dismissal_authority_complete: true,
             notices: Vec::new(),
         }
     }
@@ -5295,6 +5311,7 @@ impl DetailsBuilder {
         repo: &Repository,
         pull: DetailsPull,
         viewer: DetailsViewer,
+        viewer_can_administer: bool,
         partial: bool,
         first: bool,
     ) -> Result<DetailsCursors> {
@@ -5315,6 +5332,14 @@ impl DetailsBuilder {
             );
         } else {
             self.viewer = Some(selected_viewer.clone());
+        }
+        if let Some(prior) = self.viewer_can_administer {
+            ensure!(
+                prior == viewer_can_administer,
+                "repository administration capability changed during collaboration pagination"
+            );
+        } else {
+            self.viewer_can_administer = Some(viewer_can_administer);
         }
         validate_node_id(&pull.id)?;
         let pull_request = coordinates(repo, number, pull.id.clone());
@@ -5340,6 +5365,7 @@ impl DetailsBuilder {
             self.checks_complete = false;
             self.notice("GitHub returned partial collaboration data; unavailable fields were not treated as complete.");
             self.reaction_authority_complete = false;
+            self.dismissal_authority_complete = false;
         }
         if first {
             self.reactions.push(reaction_subject_snapshot(
@@ -5476,8 +5502,13 @@ impl DetailsBuilder {
                     &selected_viewer,
                     !partial,
                 ));
+                let dismissal_capability = (!partial).then(|| FreshReviewDismissalCapability {
+                    viewer: selected_viewer.clone(),
+                    pull_request: pull_request.clone(),
+                    authority: dismissal_authority(&review.state, viewer_can_administer),
+                });
                 self.reviews
-                    .push(review.into_domain(repo, number, !partial));
+                    .push(review.into_domain(repo, number, !partial, dismissal_capability));
             }
         }
         if let Some(connection) = pull.review_threads {
@@ -5564,6 +5595,11 @@ impl DetailsBuilder {
                 reaction.fresh_capability = None;
             }
         }
+        if !self.dismissal_authority_complete {
+            for review in &mut self.reviews {
+                review.dismissal_capability = None;
+            }
+        }
         Ok(PullRequestDetails {
             number,
             body: overview.body,
@@ -5628,6 +5664,7 @@ impl DetailsReview {
         repo: &Repository,
         number: u64,
         capabilities_complete: bool,
+        dismissal_capability: Option<FreshReviewDismissalCapability>,
     ) -> PullRequestReview {
         PullRequestReview {
             coordinates: coordinates(repo, number, self.id),
@@ -5643,7 +5680,24 @@ impl DetailsReview {
                     viewer_cannot_update_reasons: self.viewer_cannot_update_reasons,
                 },
             ),
+            dismissal_capability,
             url: self.url,
+        }
+    }
+}
+
+fn dismissal_authority(state: &str, viewer_can_administer: bool) -> DismissalAuthority {
+    if !matches!(state, "APPROVED" | "CHANGES_REQUESTED") {
+        return DismissalAuthority::Unavailable {
+            reason: "Only approved or changes-requested submitted reviews can be dismissed.".into(),
+        };
+    }
+    if viewer_can_administer {
+        DismissalAuthority::Available
+    } else {
+        DismissalAuthority::Unknown {
+            reason: "GitHub exposes no per-review dismissal capability. Authorization is unknown; GitHub will decide when the confirmed request is sent."
+                .into(),
         }
     }
 }
@@ -6579,7 +6633,11 @@ else:
         json!({
             "data": {
                 "viewer": {"id": "U-alice", "login": "alice"},
-                "repository": {"nameWithOwner": "owner/repo", "pullRequest": pull}
+                "repository": {
+                    "nameWithOwner": "owner/repo",
+                    "viewerCanAdminister": false,
+                    "pullRequest": pull
+                }
             }
         })
     }
@@ -7708,4 +7766,13 @@ mod provider_reactions_fixture;
 #[cfg(test)]
 mod provider_reaction_tests {
     crate::provider_reaction_tests!();
+}
+
+#[cfg(test)]
+#[path = "../tests/provider_review_dismissal.rs"]
+mod provider_review_dismissal_fixture;
+
+#[cfg(test)]
+mod provider_review_dismissal_tests {
+    crate::provider_review_dismissal_tests!();
 }

@@ -933,6 +933,7 @@ mod tests {
                 submitted_at: Some("2026-09-13T12:01:00Z".into()),
                 commit_sha: Some("a".repeat(40)),
                 edit_summary_capability: None,
+                dismissal_capability: None,
                 url: "https://example.test/review-1".into(),
             }],
             review_threads: vec![ReviewThread {

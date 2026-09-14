@@ -316,6 +316,11 @@ pub struct PullRequestReview {
     /// remain read-only.
     #[serde(default, skip_serializing)]
     pub edit_summary_capability: Option<SubmittedReviewEditCapability>,
+    /// Fresh selected-viewer evidence for dismissing this exact submitted
+    /// review. This is deliberately neither serialized nor deserialized, so a
+    /// cache record can never manufacture dismissal authority.
+    #[serde(skip)]
+    pub dismissal_capability: Option<FreshReviewDismissalCapability>,
     pub url: String,
 }
 
@@ -325,6 +330,73 @@ pub struct SubmittedReviewEditCapability {
     pub viewer_can_update: bool,
     #[serde(default)]
     pub viewer_cannot_update_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DismissalAuthority {
+    Available,
+    Unknown { reason: String },
+    Unavailable { reason: String },
+}
+
+impl DismissalAuthority {
+    pub fn permits_attempt(&self) -> bool {
+        matches!(self, Self::Available | Self::Unknown { .. })
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Available => None,
+            Self::Unknown { reason } | Self::Unavailable { reason } => Some(reason),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshReviewDismissalCapability {
+    pub viewer: SelectedViewer,
+    pub pull_request: ProviderCoordinates,
+    pub authority: DismissalAuthority,
+}
+
+/// Exact immutable submitted-review tuple frozen by a fresh targeted read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmittedReviewDismissalTarget {
+    pub repository: Repository,
+    pub pull_request: ProviderCoordinates,
+    pub review: ProviderCoordinates,
+    pub review_state: String,
+    pub review_body: String,
+    pub submitted_at: String,
+    pub review_author: Option<String>,
+    pub review_commit_sha: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmittedReviewDismissalRequest {
+    pub operation_id: String,
+    pub attempt_id: String,
+    pub target: SubmittedReviewDismissalTarget,
+    pub viewer: SelectedViewer,
+    pub authority: DismissalAuthority,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmittedReviewDismissalAcknowledgement {
+    pub operation_id: String,
+    pub target: SubmittedReviewDismissalTarget,
+    pub viewer: SelectedViewer,
+    pub final_state: String,
+}
+
+/// Current known-ID state used only for explicit read-only reconciliation.
+/// It never proves which actor caused the state or which message was recorded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmittedReviewDismissalObservation {
+    pub target: SubmittedReviewDismissalTarget,
+    pub viewer: SelectedViewer,
+    pub authority: DismissalAuthority,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

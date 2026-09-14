@@ -34,11 +34,12 @@ use cibergit::{
         select_github_comparison, select_local_comparison,
     },
     domain::{
-        MergeAction, MergeExecutionRequest, MergeMethod, MergePreparation, PendingReviewSnapshot,
-        ProviderMutationOutcome, ProviderReadEvidence, PullRequest, PullRequestDetails,
-        PullRequestDiscussionAction, PullRequestLifecycleAction, ReactableKind, ReactionAction,
-        ReactionContent, ReactionIntent, ReactionSubjectSnapshot, Repository,
-        ReviewAuxiliaryAction, ReviewAuxiliaryRequest, Revision,
+        DismissalAuthority, MergeAction, MergeExecutionRequest, MergeMethod, MergePreparation,
+        PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome, ProviderReadEvidence,
+        PullRequest, PullRequestDetails, PullRequestDiscussionAction, PullRequestLifecycleAction,
+        ReactableKind, ReactionAction, ReactionContent, ReactionIntent, ReactionSubjectSnapshot,
+        Repository, ReviewAuxiliaryAction, ReviewAuxiliaryRequest, Revision,
+        SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
     },
     participation::{DiffSide, LineSelection, ReviewEvent, ReviewKey},
     providers::{GeneralReadFailureKind, GithubProvider},
@@ -850,6 +851,162 @@ struct ReactionCompletionToken {
     generation: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DismissalReasonDraft {
+    review: ProviderCoordinates,
+    reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DismissalReasonInputOwner {
+    workspace_instance: u64,
+    tab_instance: u64,
+    repository_key: String,
+    pull_request: u64,
+    review: Option<ProviderCoordinates>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DismissalReasonChangeGuard {
+    owner: DismissalReasonInputOwner,
+    stale_value: String,
+}
+
+impl DismissalReasonInputOwner {
+    fn for_tab(workspace_instance: u64, tab: &ReviewTab) -> Self {
+        Self {
+            workspace_instance,
+            tab_instance: tab.instance_generation,
+            repository_key: tab.repository.cache_key(),
+            pull_request: tab.pull_request.number,
+            review: tab.dismissal_editor.active_review.clone(),
+        }
+    }
+
+    fn matches(&self, workspace_instance: u64, tab: &ReviewTab) -> bool {
+        self.workspace_instance == workspace_instance
+            && self.tab_instance == tab.instance_generation
+            && self.repository_key == tab.repository.cache_key()
+            && self.pull_request == tab.pull_request.number
+            && self.review == tab.dismissal_editor.active_review
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct DismissalEditor {
+    active_review: Option<ProviderCoordinates>,
+    drafts: Vec<DismissalReasonDraft>,
+    generation: u64,
+}
+
+impl DismissalEditor {
+    fn active_reason(&self) -> &str {
+        self.active_review
+            .as_ref()
+            .and_then(|active| {
+                self.drafts
+                    .iter()
+                    .find(|draft| same_review_coordinates(&draft.review, active))
+            })
+            .map(|draft| draft.reason.as_str())
+            .unwrap_or_default()
+    }
+
+    fn begin(&mut self, review: ProviderCoordinates) -> String {
+        if !self
+            .drafts
+            .iter()
+            .any(|draft| same_review_coordinates(&draft.review, &review))
+        {
+            self.drafts.push(DismissalReasonDraft {
+                review: review.clone(),
+                reason: String::new(),
+            });
+        }
+        self.active_review = Some(review);
+        self.generation = self.generation.saturating_add(1);
+        self.active_reason().to_owned()
+    }
+
+    fn store_active_reason(&mut self, reason: String) -> bool {
+        let Some(active) = self.active_review.as_ref() else {
+            return false;
+        };
+        let Some(draft) = self
+            .drafts
+            .iter_mut()
+            .find(|draft| same_review_coordinates(&draft.review, active))
+        else {
+            return false;
+        };
+        if draft.reason == reason {
+            return false;
+        }
+        draft.reason = reason;
+        self.generation = self.generation.saturating_add(1);
+        true
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DismissalPreparationToken {
+    workspace_instance: u64,
+    tab_instance: u64,
+    repository_key: String,
+    pull_request: u64,
+    review: ProviderCoordinates,
+    reason: String,
+    editor_generation: u64,
+    operation_id: String,
+    attempt_id: String,
+    action_generation: u64,
+}
+
+impl DismissalPreparationToken {
+    fn matches_values(&self, workspace_instance: u64, tab: &ReviewTab) -> bool {
+        self.workspace_instance == workspace_instance
+            && self.tab_instance == tab.instance_generation
+            && self.repository_key == tab.repository.cache_key()
+            && self.pull_request == tab.pull_request.number
+            && tab.write_in_flight
+            && tab.dismissal_editor.generation == self.editor_generation
+            && tab.dismissal_confirmation_generation == self.action_generation
+            && tab.dismissal_editor.active_review.as_ref() == Some(&self.review)
+            && tab.dismissal_editor.active_reason() == self.reason
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DismissalConfirmationToken {
+    workspace_instance: u64,
+    tab_instance: u64,
+    repository_key: String,
+    pull_request: u64,
+    generation: u64,
+    request: SubmittedReviewDismissalRequest,
+}
+
+impl DismissalConfirmationToken {
+    fn matches_values(
+        &self,
+        workspace_instance: u64,
+        tab: &ReviewTab,
+        require_in_flight: bool,
+    ) -> bool {
+        self.workspace_instance == workspace_instance
+            && self.tab_instance == tab.instance_generation
+            && self.repository_key == tab.repository.cache_key()
+            && self.pull_request == tab.pull_request.number
+            && tab.dismissal_confirmation_generation == self.generation
+            && (!require_in_flight || tab.write_in_flight)
+            && matches!(
+                tab.confirmation.as_ref(),
+                Some(NativeConfirmation::DismissSubmittedReview { generation, request })
+                    if *generation == self.generation && request.as_ref() == &self.request
+            )
+    }
+}
+
 impl ReactionCompletionToken {
     fn matches_values(&self, workspace_instance: u64, tab: &ReviewTab) -> bool {
         self.matches_fence(
@@ -1084,10 +1241,12 @@ struct ReviewTab {
     confirmation: Option<NativeConfirmation>,
     write_in_flight: bool,
     reaction_in_flight: Option<ReactionCompletionToken>,
+    dismissal_editor: DismissalEditor,
     reply_thread: Option<cibergit::domain::ProviderCoordinates>,
     editing_pending_summary: bool,
     submitted_summary_editor: SubmittedSummaryEditor,
     submitted_confirmation_generation: u64,
+    dismissal_confirmation_generation: u64,
     file_confirmation_generation: u64,
     recovery_details_expanded: bool,
     lifecycle_details_expanded: bool,
@@ -1145,6 +1304,10 @@ enum NativeConfirmation {
     UpdateSubmittedSummary {
         generation: u64,
         action: Box<ReviewAuxiliaryAction>,
+    },
+    DismissSubmittedReview {
+        generation: u64,
+        request: Box<SubmittedReviewDismissalRequest>,
     },
     PendingFileComment {
         generation: u64,
@@ -1670,6 +1833,8 @@ pub struct ReviewWorkspace {
     tabs: Vec<ReviewTab>,
     active_tab: Option<usize>,
     active_tab_input_restore: Option<ActiveTabInputRestoreToken>,
+    dismissal_reason_input_owner: Option<DismissalReasonInputOwner>,
+    dismissal_reason_change_guard: Option<DismissalReasonChangeGuard>,
     setup_open: bool,
     command_palette: bool,
     creation_dialog: Option<Entity<pr_creation::PrCreationDialog>>,
@@ -1687,6 +1852,7 @@ pub struct ReviewWorkspace {
     composer_input: Entity<TextareaState>,
     review_summary_input: Entity<TextareaState>,
     submitted_summary_input: Entity<TextareaState>,
+    dismissal_reason_input: Entity<TextareaState>,
     merge_title_input: Entity<InputState>,
     merge_body_input: Entity<TextareaState>,
     reply_input: Entity<TextareaState>,
@@ -1880,6 +2046,12 @@ impl ReviewWorkspace {
         let review_summary_input = new_textarea("", "Review summary (optional)", window, cx);
         let submitted_summary_input =
             new_textarea("", "Edit this submitted review summary…", window, cx);
+        let dismissal_reason_input = new_textarea(
+            "",
+            "Required reason for dismissing this review…",
+            window,
+            cx,
+        );
         let merge_title_input = new_input("", "Merge headline", window, cx);
         let merge_body_input = new_textarea("", "Merge message", window, cx);
         let reply_input = new_textarea("", "Reply to this review thread…", window, cx);
@@ -1947,6 +2119,8 @@ impl ReviewWorkspace {
             tabs: Vec::new(),
             active_tab: None,
             active_tab_input_restore: None,
+            dismissal_reason_input_owner: None,
+            dismissal_reason_change_guard: None,
             setup_open: startup.repository.is_none() && !startup_restore_pending,
             command_palette: false,
             creation_dialog: None,
@@ -1964,6 +2138,7 @@ impl ReviewWorkspace {
             composer_input,
             review_summary_input,
             submitted_summary_input,
+            dismissal_reason_input,
             merge_title_input,
             merge_body_input,
             reply_input,
@@ -2033,6 +2208,7 @@ impl ReviewWorkspace {
                 &this.composer_input,
                 &this.review_summary_input,
                 &this.submitted_summary_input,
+                &this.dismissal_reason_input,
                 &this.merge_body_input,
                 &this.reply_input,
                 &this.metadata_body_input,
@@ -2126,6 +2302,15 @@ impl ReviewWorkspace {
                 if matches!(event, InputEvent::Change)
                     && let Root::Review(this) = root
                     && let Some(index) = this.active_tab
+                    && this.active_tab_input_restore.is_none()
+                    && this
+                        .dismissal_reason_input_owner
+                        .as_ref()
+                        .is_some_and(|owner| {
+                            this.tabs
+                                .get(index)
+                                .is_some_and(|tab| owner.matches(this.workspace_instance, tab))
+                        })
                 {
                     let body = this.discussion_input.read(cx).value().to_string();
                     this.tabs[index].lifecycle.stage_discussion_body(body);
@@ -2148,6 +2333,68 @@ impl ReviewWorkspace {
                 }
             },
         );
+        let dismissal_reason_changes = cx.subscribe(
+            &this.dismissal_reason_input,
+            |root, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Root::Review(this) = root
+                    && let Some(index) = this.active_tab
+                    && this.active_tab_input_restore.is_none()
+                    && this.dismissal_reason_input_owner.as_ref().is_some_and(|owner| {
+                        this.tabs
+                            .get(index)
+                            .is_some_and(|tab| owner.matches(this.workspace_instance, tab))
+                    })
+                {
+                    let reason = this.dismissal_reason_input.read(cx).value().to_string();
+                    let guarded_owner = this
+                        .dismissal_reason_change_guard
+                        .as_ref()
+                        .is_some_and(|guard| {
+                            this.dismissal_reason_input_owner.as_ref() == Some(&guard.owner)
+                        });
+                    if guarded_owner {
+                        let stale_value = this
+                            .dismissal_reason_change_guard
+                            .take()
+                            .map(|guard| guard.stale_value)
+                            .unwrap_or_default();
+                        let expected = this.tabs[index]
+                            .dismissal_editor
+                            .active_reason()
+                            .to_owned();
+                        if reason == stale_value && reason != expected {
+                            let owner = DismissalReasonInputOwner::for_tab(
+                                this.workspace_instance,
+                                &this.tabs[index],
+                            );
+                            let root_entity = cx.entity_id();
+                            let input = this.dismissal_reason_input.clone();
+                            let _ = cx.with_window(root_entity, |window, cx| {
+                                input.update(cx, |input, cx| {
+                                    input.set_value(expected, window, cx)
+                                });
+                            });
+                            this.dismissal_reason_input_owner = Some(owner);
+                            this.status = "Ignored a queued dismissal-reason event from the previous tab; the active tab text was restored."
+                                .into();
+                            cx.notify();
+                            return;
+                        }
+                    }
+                    let changed = this.tabs[index]
+                        .dismissal_editor
+                        .store_active_reason(reason);
+                    if changed {
+                        this.invalidate_dismissal_confirmation(
+                            index,
+                            "Dismissal reason changed; review the newly frozen reason before confirming.",
+                        );
+                        cx.notify();
+                    }
+                }
+            },
+        );
         this._subscriptions.extend([
             activation,
             appearance,
@@ -2158,6 +2405,7 @@ impl ReviewWorkspace {
             lifecycle_base_changes,
             discussion_changes,
             submitted_summary_changes,
+            dismissal_reason_changes,
         ]);
         this.start_workspace_restore(cx);
         this.start_notifications(cx);
@@ -4024,6 +4272,7 @@ impl ReviewWorkspace {
                 submitted_at: Some("2026-09-13T12:00:00Z".into()),
                 commit_sha: Some(canonical.revision().head_sha.clone()),
                 edit_summary_capability: None,
+                dismissal_capability: None,
                 url: String::new(),
             });
         {
@@ -4343,6 +4592,7 @@ impl ReviewWorkspace {
                                         submitted_at: None,
                                         commit_sha: Some(target.commit_sha.clone()),
                                         edit_summary_capability: None,
+                                        dismissal_capability: None,
                                         url: String::new(),
                                     },
                                     comments: Vec::new(),
@@ -4844,6 +5094,7 @@ impl ReviewWorkspace {
                                 submitted_at: Some("2026-09-13T12:01:00Z".into()),
                                 commit_sha: None,
                                 edit_summary_capability: None,
+                                dismissal_capability: None,
                                 url: "https://example.invalid/synthetic-review".into(),
                             };
                             details.reviews.push(synthetic_review.clone());
@@ -6866,6 +7117,7 @@ impl ReviewWorkspace {
                 submitted_at: None,
                 commit_sha: Some(intent.position.commit_sha.clone()),
                 edit_summary_capability: None,
+                dismissal_capability: None,
                 url: String::new(),
             },
             comments: vec![cibergit::domain::LinkedReviewComment {
@@ -8063,6 +8315,7 @@ impl ReviewWorkspace {
                                         viewer_cannot_update_reasons: Vec::new(),
                                     },
                                 ),
+                                dismissal_capability: None,
                                 url: String::new(),
                             };
                             let mut second_review = review.clone();
@@ -10171,6 +10424,7 @@ impl ReviewWorkspace {
         record_navigation: bool,
         cx: &mut Context<Root>,
     ) {
+        let stale_dismissal_value = self.dismissal_reason_input.read(cx).value().to_string();
         if self.begin_active_tab_transition(index, record_navigation, cx) {
             let tab = &self.tabs[index];
             let token = ActiveTabInputRestoreToken {
@@ -10179,10 +10433,18 @@ impl ReviewWorkspace {
                 repository_key: tab.repository.cache_key(),
                 pull_request: tab.pull_request.number,
             };
+            let dismissal_owner = DismissalReasonInputOwner::for_tab(self.workspace_instance, tab);
             self.active_tab_input_restore = Some(token.clone());
+            self.dismissal_reason_input_owner = None;
+            self.dismissal_reason_change_guard = Some(DismissalReasonChangeGuard {
+                owner: dismissal_owner,
+                stale_value: stale_dismissal_value,
+            });
             self.composer_input
                 .update(cx, |input, cx| input.set_disabled(true, cx));
             self.submitted_summary_input
+                .update(cx, |input, cx| input.set_disabled(true, cx));
+            self.dismissal_reason_input
                 .update(cx, |input, cx| input.set_disabled(true, cx));
             self.defer_active_tab_input_restore(token, 0, cx);
         }
@@ -10216,6 +10478,10 @@ impl ReviewWorkspace {
                     self.tabs[previous]
                         .submitted_summary_editor
                         .store_active_body(submitted_body);
+                    let dismissal_reason = self.dismissal_reason_input.read(cx).value().to_string();
+                    self.tabs[previous]
+                        .dismissal_editor
+                        .store_active_reason(dismissal_reason);
                 }
                 if let Some(previous) = self.active_tab {
                     self.capture_scroll(previous);
@@ -10312,6 +10578,8 @@ impl ReviewWorkspace {
             .active_draft()
             .map(|draft| draft.body.clone())
             .unwrap_or_default();
+        let dismissal_reason = tab.dismissal_editor.active_reason().to_owned();
+        let dismissal_owner = DismissalReasonInputOwner::for_tab(self.workspace_instance, tab);
         let mutation_disabled =
             tab.write_in_flight || tab.submitted_summary_editor.close_after_save;
         let submitted_disabled = mutation_disabled
@@ -10339,6 +10607,11 @@ impl ReviewWorkspace {
             window,
             cx,
         );
+        self.dismissal_reason_input.update(cx, |input, cx| {
+            input.set_value(dismissal_reason, window, cx);
+            input.set_disabled(mutation_disabled, cx);
+        });
+        self.dismissal_reason_input_owner = Some(dismissal_owner);
         if let Some(form) = metadata_form {
             self.metadata_title_input
                 .update(cx, |input, cx| input.set_value(form.title, window, cx));
@@ -10572,10 +10845,12 @@ impl ReviewWorkspace {
             confirmation: None,
             write_in_flight: false,
             reaction_in_flight: None,
+            dismissal_editor: DismissalEditor::default(),
             reply_thread: None,
             editing_pending_summary: false,
             submitted_summary_editor: SubmittedSummaryEditor::default(),
             submitted_confirmation_generation: 0,
+            dismissal_confirmation_generation: 0,
             file_confirmation_generation: 0,
             recovery_details_expanded: false,
             lifecycle_details_expanded: false,
@@ -12216,6 +12491,451 @@ impl ReviewWorkspace {
         cx.notify();
     }
 
+    fn begin_review_dismissal(
+        &mut self,
+        review: cibergit::domain::PullRequestReview,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.active_tab else { return };
+        if !self.restore_pending_active_tab_input_in_window(window, cx)
+            || !self.shared_composer_admitted(index)
+        {
+            self.status =
+                "Wait for this tab's exact editor restoration before choosing a dismissal target."
+                    .into();
+            cx.notify();
+            return;
+        }
+        if self.persist_active_composer_before_transition(
+            index,
+            "Saved the current LINE/FILE review draft first. Choose Dismiss again after it settles.",
+            cx,
+        ) {
+            return;
+        }
+        let submitted_body = self.submitted_summary_input.read(cx).value().to_string();
+        if self.tabs[index]
+            .submitted_summary_editor
+            .store_active_body(submitted_body)
+        {
+            self.schedule_submitted_draft_save(index, cx);
+        }
+        let current = self.tabs[index]
+            .details
+            .as_ref()
+            .and_then(|details| {
+                details
+                    .reviews
+                    .iter()
+                    .find(|candidate| candidate.coordinates == review.coordinates)
+            })
+            .cloned();
+        let Some(current) = current else {
+            self.status = "Dismissal target is stale or cached; refresh Activity first.".into();
+            cx.notify();
+            return;
+        };
+        let Some(capability) = current.dismissal_capability.as_ref() else {
+            self.status =
+                "Dismissal authority is cached or partial; refresh Activity first.".into();
+            cx.notify();
+            return;
+        };
+        if !capability.authority.permits_attempt()
+            || !matches!(current.state.as_str(), "APPROVED" | "CHANGES_REQUESTED")
+        {
+            self.status = format!(
+                "Dismissal unavailable: {}",
+                capability
+                    .authority
+                    .reason()
+                    .unwrap_or("this review state is ineligible")
+            );
+            cx.notify();
+            return;
+        }
+        if self
+            .dismissal_reason_input_owner
+            .as_ref()
+            .is_some_and(|owner| owner.matches(self.workspace_instance, &self.tabs[index]))
+        {
+            let visible_reason = self.dismissal_reason_input.read(cx).value().to_string();
+            self.tabs[index]
+                .dismissal_editor
+                .store_active_reason(visible_reason);
+        }
+        self.invalidate_dismissal_confirmation(
+            index,
+            "Dismissal target changed; review the new target and reason before confirming.",
+        );
+        let reason = self.tabs[index]
+            .dismissal_editor
+            .begin(current.coordinates.clone());
+        let dismissal_owner =
+            DismissalReasonInputOwner::for_tab(self.workspace_instance, &self.tabs[index]);
+        self.dismissal_reason_input.update(cx, |input, cx| {
+            input.set_value(reason, window, cx);
+            input.set_disabled(false, cx);
+            input.focus(window, cx);
+        });
+        self.dismissal_reason_input_owner = Some(dismissal_owner);
+        self.status = match &capability.authority {
+            DismissalAuthority::Available => {
+                "Fresh direct repository-admin evidence is available. Enter a required dismissal reason."
+                    .into()
+            }
+            DismissalAuthority::Unknown { .. } => {
+                "Dismissal authority is unknown. Enter a reason; the confirmation will state that GitHub decides authorization."
+                    .into()
+            }
+            DismissalAuthority::Unavailable { .. } => unreachable!("checked above"),
+        };
+        cx.notify();
+    }
+
+    fn invalidate_dismissal_confirmation(&mut self, index: usize, status: &str) -> bool {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return false;
+        };
+        if !matches!(
+            tab.confirmation.as_ref(),
+            Some(NativeConfirmation::DismissSubmittedReview { .. })
+        ) {
+            return false;
+        }
+        tab.confirmation = None;
+        tab.dismissal_confirmation_generation = tab
+            .dismissal_confirmation_generation
+            .checked_add(1)
+            .expect("dismissal confirmation generation overflow");
+        self.status = status.into();
+        true
+    }
+
+    fn prepare_review_dismissal_confirmation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.active_tab else { return };
+        if !self.restore_pending_active_tab_input_in_window(window, cx)
+            || !self.shared_composer_admitted(index)
+        {
+            self.status = "Wait for exact editor restoration before preparing dismissal.".into();
+            cx.notify();
+            return;
+        }
+        if self.persist_active_composer_before_transition(
+            index,
+            "Saved the current LINE/FILE review draft first. Review dismissal again after it settles.",
+            cx,
+        ) {
+            return;
+        }
+        let submitted_body = self.submitted_summary_input.read(cx).value().to_string();
+        if self.tabs[index]
+            .submitted_summary_editor
+            .store_active_body(submitted_body)
+        {
+            self.schedule_submitted_draft_save(index, cx);
+        }
+        let reason = self.dismissal_reason_input.read(cx).value().to_string();
+        self.tabs[index]
+            .dismissal_editor
+            .store_active_reason(reason.clone());
+        if reason.trim().is_empty() || reason.len() > 64 * 1024 || reason.contains('\0') {
+            self.status = "A nonblank dismissal reason of at most 64 KiB is required.".into();
+            cx.notify();
+            return;
+        }
+        let Some(review_coordinates) = self.tabs[index].dismissal_editor.active_review.clone()
+        else {
+            self.status = "Choose an eligible submitted review first.".into();
+            cx.notify();
+            return;
+        };
+        let review = self.tabs[index]
+            .details
+            .as_ref()
+            .and_then(|details| {
+                details
+                    .reviews
+                    .iter()
+                    .find(|review| review.coordinates == review_coordinates)
+            })
+            .cloned();
+        let Some(review) = review else {
+            self.status = "Fresh dismissal target disappeared; reason text was retained.".into();
+            cx.notify();
+            return;
+        };
+        if review.dismissal_capability.is_none() {
+            self.status = "Dismissal target is cached or partial; refresh Activity. Reason text was retained."
+                .into();
+            cx.notify();
+            return;
+        }
+        self.tabs[index].dismissal_confirmation_generation = self.tabs[index]
+            .dismissal_confirmation_generation
+            .checked_add(1)
+            .expect("dismissal confirmation generation overflow");
+        let action_generation = self.tabs[index].dismissal_confirmation_generation;
+        let operation_id = next_attempt_id("dismiss-review");
+        let attempt_id = next_attempt_id(&operation_id);
+        let repository = self.tabs[index].repository.clone();
+        let number = self.tabs[index].pull_request.number;
+        let token = DismissalPreparationToken {
+            workspace_instance: self.workspace_instance,
+            tab_instance: self.tabs[index].instance_generation,
+            repository_key: repository.cache_key(),
+            pull_request: number,
+            review: review.coordinates.clone(),
+            reason: reason.clone(),
+            editor_generation: self.tabs[index].dismissal_editor.generation,
+            operation_id: operation_id.clone(),
+            attempt_id: attempt_id.clone(),
+            action_generation,
+        };
+        self.tabs[index].confirmation = None;
+        self.tabs[index].write_in_flight = true;
+        self.update_shared_composer_disabled(cx);
+        self.dismissal_reason_input
+            .update(cx, |input, cx| input.set_disabled(true, cx));
+        self.status = "Reading the exact dismissal target and selected viewer…".into();
+        let task = cx.background_spawn(async move {
+            GithubProvider::new(repository.account.clone()).prepare_review_dismissal(
+                &repository,
+                number,
+                &review,
+                reason,
+                operation_id,
+                attempt_id,
+            )
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(index) = this.apply_dismissal_preparation(&token, result) else {
+                    return;
+                };
+                this.update_shared_composer_disabled(cx);
+                if this.active_tab == Some(index) {
+                    this.dismissal_reason_input
+                        .update(cx, |input, cx| input.set_disabled(false, cx));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_dismissal_preparation(
+        &mut self,
+        token: &DismissalPreparationToken,
+        result: Result<SubmittedReviewDismissalRequest, String>,
+    ) -> Option<usize> {
+        let index = self
+            .tabs
+            .iter()
+            .position(|tab| token.matches_values(self.workspace_instance, tab))?;
+        self.tabs[index].write_in_flight = false;
+        match result {
+            Ok(request)
+                if request.operation_id == token.operation_id
+                    && request.attempt_id == token.attempt_id
+                    && request.target.review == token.review
+                    && request.reason == token.reason =>
+            {
+                let unknown = matches!(&request.authority, DismissalAuthority::Unknown { .. });
+                self.tabs[index].confirmation = Some(NativeConfirmation::DismissSubmittedReview {
+                    generation: token.action_generation,
+                    request: Box::new(request),
+                });
+                self.inspector_open = true;
+                self.status = if unknown {
+                    "Exact review frozen. Authority remains unknown; confirmation states that GitHub decides authorization."
+                        .into()
+                } else {
+                    "Exact review and direct admin authority frozen; explicit confirmation is required."
+                        .into()
+                };
+            }
+            Ok(_) => {
+                self.status =
+                    "Dismissal preparation returned a different frozen request; zero writes sent."
+                        .into();
+            }
+            Err(reason) => {
+                self.status = format!(
+                    "Dismissal was not prepared; zero writes sent and reason retained: {reason}"
+                );
+            }
+        }
+        Some(index)
+    }
+
+    fn cancel_review_dismissal_confirmation(
+        &mut self,
+        token: &DismissalConfirmationToken,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| token.matches_values(self.workspace_instance, tab, false))
+        else {
+            return;
+        };
+        if self.tabs[index].write_in_flight {
+            return;
+        }
+        self.tabs[index].confirmation = None;
+        self.status =
+            "Dismissal cancelled; exact reason retained in this tab, zero writes sent.".into();
+        cx.notify();
+    }
+
+    fn confirm_review_dismissal(
+        &mut self,
+        token: DismissalConfirmationToken,
+        _window: &mut Window,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| token.matches_values(self.workspace_instance, tab, false))
+        else {
+            return;
+        };
+        if self.active_tab != Some(index)
+            || self.active_tab_input_restore.is_some()
+            || !self.shared_composer_admitted(index)
+            || !self
+                .dismissal_reason_input_owner
+                .as_ref()
+                .is_some_and(|owner| {
+                    owner.matches(self.workspace_instance, &self.tabs[index])
+                        && owner.review.as_ref() == Some(&token.request.target.review)
+                })
+        {
+            self.status =
+                "Dismissal confirmation no longer owns the visible active input; zero writes sent."
+                    .into();
+            cx.notify();
+            return;
+        }
+        let visible_reason = self.dismissal_reason_input.read(cx).value().to_string();
+        let reason_changed = self.tabs[index]
+            .dismissal_editor
+            .store_active_reason(visible_reason.clone());
+        let current_review = self.tabs[index].details.as_ref().and_then(|details| {
+            details
+                .reviews
+                .iter()
+                .find(|review| review.coordinates == token.request.target.review)
+        });
+        let frozen_review_still_visible = current_review.is_some_and(|review| {
+            review.coordinates == token.request.target.review
+                && review.state == token.request.target.review_state
+                && review.body == token.request.target.review_body
+                && review.submitted_at.as_deref()
+                    == Some(token.request.target.submitted_at.as_str())
+                && review.author == token.request.target.review_author
+                && review.commit_sha == token.request.target.review_commit_sha
+                && review.dismissal_capability.is_some()
+        });
+        if reason_changed
+            || visible_reason != token.request.reason
+            || self.tabs[index].dismissal_editor.active_review.as_ref()
+                != Some(&token.request.target.review)
+            || !frozen_review_still_visible
+        {
+            self.invalidate_dismissal_confirmation(
+                index,
+                "Dismissal target or reason changed; the new text was retained. Reprepare before confirming; zero writes sent.",
+            );
+            cx.notify();
+            return;
+        }
+        let repository = self.tabs[index].repository.clone();
+        let number = self.tabs[index].pull_request.number;
+        let request = token.request.clone();
+        let journal_root = self.interaction_root.clone();
+        self.tabs[index].write_in_flight = true;
+        self.update_shared_composer_disabled(cx);
+        self.dismissal_reason_input
+            .update(cx, |input, cx| input.set_disabled(true, cx));
+        self.status = "Durably admitting one exact dismissal request…".into();
+        let task = cx.background_spawn(async move {
+            let key = ReviewKey::for_repository("github", &repository, number).map_err(|error| {
+                ProviderMutationOutcome::<SubmittedReviewDismissalAcknowledgement>::PreflightRejected {
+                    reason: error.to_string(),
+                }
+            })?;
+            let mut journal = ActionJournal::open(&journal_root, key).map_err(|reason| {
+                ProviderMutationOutcome::<SubmittedReviewDismissalAcknowledgement>::PreflightRejected {
+                    reason: format!("Cannot open caller journal; zero writes sent: {reason}"),
+                }
+            })?;
+            let provider = GithubProvider::new(repository.account.clone());
+            let mut admission =
+                journal.admission(JournalRequest::Dismissal(Box::new(request.clone())));
+            Ok::<_, ProviderMutationOutcome<SubmittedReviewDismissalAcknowledgement>>(
+                provider.execute_review_dismissal(&repository, &request, &mut admission),
+            )
+        });
+        cx.spawn(async move |root, cx| {
+            let outcome = match task.await {
+                Ok(outcome) | Err(outcome) => outcome,
+            };
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(index) = this.apply_dismissal_completion(&token, outcome) else {
+                    return;
+                };
+                this.update_shared_composer_disabled(cx);
+                if this.active_tab == Some(index) {
+                    this.dismissal_reason_input
+                        .update(cx, |input, cx| input.set_disabled(false, cx));
+                }
+                this.refresh_details(index, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_dismissal_completion(
+        &mut self,
+        token: &DismissalConfirmationToken,
+        outcome: ProviderMutationOutcome<SubmittedReviewDismissalAcknowledgement>,
+    ) -> Option<usize> {
+        let index = self
+            .tabs
+            .iter()
+            .position(|tab| token.matches_values(self.workspace_instance, tab, true))?;
+        self.tabs[index].write_in_flight = false;
+        self.tabs[index].confirmation = None;
+        self.status = match outcome {
+            ProviderMutationOutcome::Acknowledged(ack) => format!(
+                "Dismissal acknowledged exactly for review {}; GitHub accepted the required message in that response. Refreshing Activity.",
+                ack.target.review.remote_id
+            ),
+            ProviderMutationOutcome::PreflightRejected { reason } => {
+                format!("Dismissal was not sent; exact reason retained: {reason}")
+            }
+            ProviderMutationOutcome::Uncertain { reason, .. } => format!(
+                "Dismissal outcome is uncertain and frozen against replay. Later DISMISSED state alone cannot prove the exact reason: {reason}"
+            ),
+        };
+        Some(index)
+    }
+
     fn prepare_submitted_summary_confirmation(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         if self.active_tab_input_restore.is_some() {
@@ -13103,6 +13823,12 @@ impl ReviewWorkspace {
                         },
                         ProviderReadEvidence::Inconclusive { .. } => None,
                     },
+                    JournalRequest::Dismissal(request) => {
+                        // Exact DISMISSED state is convergence only; it does
+                        // not prove the frozen reason or local causation.
+                        let _ = provider.reconcile_review_dismissal(&repository, request);
+                        None
+                    }
                 };
                 match observation {
                     Some((true, completed, evidence)) => {
@@ -13133,6 +13859,9 @@ impl ReviewWorkspace {
                                 if matches!(request.action, ReactionAction::Remove { .. }) =>
                             {
                                 "The fresh exact state did not show bounded absence. A different current reaction ID is never removed or adopted automatically."
+                            }
+                            JournalRequest::Dismissal(_) => {
+                                "A later exact DISMISSED review can show state convergence only. No exact dismissal event with the frozen review, parent, selected actor, previous state, and message was recorded, so reason and causation remain unresolved."
                             }
                             _ => {
                                 "The fresh read did not provide complete exact identity and payload evidence for this request."
@@ -20176,6 +20905,158 @@ impl ReviewWorkspace {
                             colors,
                             &root,
                         ));
+                        let dismissible_state =
+                            matches!(review.state.as_str(), "APPROVED" | "CHANGES_REQUESTED")
+                                && review
+                                    .submitted_at
+                                    .as_deref()
+                                    .is_some_and(|value| !value.is_empty());
+                        if dismissible_state {
+                            match review.dismissal_capability.as_ref() {
+                                Some(capability) if capability.authority.permits_attempt() => {
+                                    let unknown = matches!(
+                                        &capability.authority,
+                                        DismissalAuthority::Unknown { .. }
+                                    );
+                                    let root = cx.entity();
+                                    let selected_review = review.clone();
+                                    card = card
+                                        .child(
+                                            div()
+                                                .mt_2()
+                                                .text_xs()
+                                                .text_color(if unknown {
+                                                    colors.amber
+                                                } else {
+                                                    colors.muted
+                                                })
+                                                .child(if unknown {
+                                                    "Dismissal authority unknown: GitHub will decide authorization after exact confirmation."
+                                                } else {
+                                                    "Fresh direct repository-admin dismissal evidence."
+                                                }),
+                                        )
+                                        .child(
+                                            div().mt_2().child(
+                                                Button::new(format!(
+                                                    "dismiss-review-{}",
+                                                    review.coordinates.remote_id
+                                                ))
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(colors.border)
+                                                .text_color(if tab.write_in_flight {
+                                                    colors.faint
+                                                } else {
+                                                    colors.amber
+                                                })
+                                                .disabled(tab.write_in_flight)
+                                                .accessibility_label(format!(
+                                                    "Dismiss submitted review {}",
+                                                    review.coordinates.remote_id
+                                                ))
+                                                .on_click(move |_, window, cx| {
+                                                    root.update(cx, |root, cx| {
+                                                        if let Root::Review(this) = root {
+                                                            this.begin_review_dismissal(
+                                                                selected_review.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }
+                                                    });
+                                                })
+                                                .child("Dismiss review…"),
+                                            ),
+                                        );
+                                }
+                                Some(capability) => {
+                                    card = card.child(
+                                        div().mt_1().text_xs().text_color(colors.amber).child(
+                                            format!(
+                                                "Dismiss unavailable: {}",
+                                                capability
+                                                    .authority
+                                                    .reason()
+                                                    .unwrap_or("fresh target is ineligible")
+                                            ),
+                                        ),
+                                    );
+                                }
+                                None => {
+                                    card = card.child(
+                                        div()
+                                            .mt_1()
+                                            .text_xs()
+                                            .text_color(colors.amber)
+                                            .child("Dismiss unavailable: cached, partial, or stale activity cannot authorize an attempt."),
+                                    );
+                                }
+                            }
+                            if tab
+                                .dismissal_editor
+                                .active_review
+                                .as_ref()
+                                .is_some_and(|active| {
+                                    same_review_coordinates(active, &review.coordinates)
+                                })
+                            {
+                                let root = cx.entity();
+                                card = card
+                                    .child(
+                                        div()
+                                            .mt_2()
+                                            .h(px(84.))
+                                            .border_1()
+                                            .border_color(colors.border)
+                                            .rounded_md()
+                                            .overflow_hidden()
+                                            .child(Textarea::new(&self.dismissal_reason_input)),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt_1()
+                                            .text_xs()
+                                            .text_color(colors.faint)
+                                            .child("Reason is retained across cancellation and in-process tab/target switches, but is not persisted before dispatch; an abrupt restart can lose it."),
+                                    )
+                                    .child(
+                                        div().mt_2().child(
+                                            Button::new(format!(
+                                                "review-dismissal-{}",
+                                                review.coordinates.remote_id
+                                            ))
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(colors.border)
+                                            .text_color(if tab.write_in_flight {
+                                                colors.faint
+                                            } else {
+                                                colors.accent
+                                            })
+                                            .disabled(tab.write_in_flight)
+                                            .accessibility_label(format!(
+                                                "Review exact dismissal for submitted review {}",
+                                                review.coordinates.remote_id
+                                            ))
+                                            .on_click(move |_, window, cx| {
+                                                root.update(cx, |root, cx| {
+                                                    if let Root::Review(this) = root {
+                                                        this.prepare_review_dismissal_confirmation(
+                                                            window, cx,
+                                                        );
+                                                    }
+                                                });
+                                            })
+                                            .child("Review exact dismissal…"),
+                                        ),
+                                    );
+                            }
+                        }
                         let selected_author = review.author.as_deref().is_some_and(|author| {
                             author.eq_ignore_ascii_case(&tab.repository.account.login)
                         });
@@ -20815,6 +21696,164 @@ impl ReviewWorkspace {
                                 .child("GitHub rechecks this exact review before saving, but another edit could happen between that check and the save. The review may refer to an older commit; this action does not change the displayed comparison."),
                         )
                         .child(self.submitted_summary_confirmation_controls(token, colors, cx))
+                        .into_any_element(),
+                )
+            }
+            NativeConfirmation::DismissSubmittedReview {
+                generation,
+                request,
+            } => {
+                let token = DismissalConfirmationToken {
+                    workspace_instance: self.workspace_instance,
+                    tab_instance: tab.instance_generation,
+                    repository_key: tab.repository.cache_key(),
+                    pull_request: tab.pull_request.number,
+                    generation: *generation,
+                    request: request.as_ref().clone(),
+                };
+                let confirm_root = cx.entity();
+                let cancel_root = confirm_root.clone();
+                let confirm_token = token.clone();
+                let authority = match &request.authority {
+                    DismissalAuthority::Available => {
+                        "Available: fresh direct repository-admin evidence."
+                    }
+                    DismissalAuthority::Unknown { reason } => reason.as_str(),
+                    DismissalAuthority::Unavailable { reason } => reason.as_str(),
+                };
+                Some(
+                    div()
+                        .mb_5()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.amber)
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Dismiss submitted review?"),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child(format!(
+                                    "{} · #{} · selected account {} ({})",
+                                    request.target.repository.full_name(),
+                                    request.target.pull_request.pull_request,
+                                    request.viewer.login,
+                                    request.viewer.node_id
+                                )),
+                        )
+                        .child(
+                            div().mt_1().text_xs().child(format!(
+                                "Review {} · author {} · state {} · submitted {} · commit {}",
+                                request.target.review.remote_id,
+                                request.target.review_author.as_deref().unwrap_or("null"),
+                                request.target.review_state,
+                                request.target.submitted_at,
+                                request
+                                    .target
+                                    .review_commit_sha
+                                    .as_deref()
+                                    .unwrap_or("null")
+                            )),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.faint)
+                                .child("Frozen previous body (exact quoted text)"),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .font_family(CODE_FONT)
+                                .child(format!("{:?}", request.target.review_body)),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.faint)
+                                .child("Required dismissal reason (exact quoted text)"),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .font_family(CODE_FONT)
+                                .child(format!("{:?}", request.reason)),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.amber)
+                                .child(format!("Authority: {authority}")),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.amber)
+                                .child("Confirm durably records this exact request, repeats the exact preflight, then sends one GraphQL mutation. GitHub offers no atomic expected-state/body/commit condition, so the review can still race after that read. A later DISMISSED state alone cannot prove this exact reason."),
+                        )
+                        .child(
+                            div()
+                                .mt_3()
+                                .flex()
+                                .flex_wrap()
+                                .gap_3()
+                                .child(
+                                    Button::new("confirm-review-dismissal")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(colors.border)
+                                        .text_color(colors.amber)
+                                        .accessibility_label("Confirm exact submitted review dismissal")
+                                        .on_click(move |_, window, cx| {
+                                            confirm_root.update(cx, |root, cx| {
+                                                if let Root::Review(this) = root {
+                                                    this.confirm_review_dismissal(
+                                                        confirm_token.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }
+                                            });
+                                        })
+                                        .child("Confirm one dismissal"),
+                                )
+                                .child(
+                                    Button::new("cancel-review-dismissal")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(colors.border)
+                                        .text_color(colors.accent)
+                                        .accessibility_label(
+                                            "Cancel submitted review dismissal and retain reason",
+                                        )
+                                        .on_click(move |_, _, cx| {
+                                            let token = token.clone();
+                                            cancel_root.update(cx, |root, cx| {
+                                                if let Root::Review(this) = root {
+                                                    this.cancel_review_dismissal_confirmation(
+                                                        &token, cx,
+                                                    );
+                                                }
+                                            });
+                                        })
+                                        .child("Cancel"),
+                                ),
+                        )
                         .into_any_element(),
                 )
             }
@@ -21608,6 +22647,7 @@ fn journal_identity(request: &JournalRequest) -> (&str, &str) {
         JournalRequest::Lifecycle(request) => (&request.operation_id, &request.attempt_id),
         JournalRequest::Discussion(request) => (&request.operation_id, &request.attempt_id),
         JournalRequest::Reaction(request) => (&request.operation_id, &request.attempt_id),
+        JournalRequest::Dismissal(request) => (&request.operation_id, &request.attempt_id),
     }
 }
 
@@ -21705,6 +22745,7 @@ fn journal_operation_summary(operation: &JournalOperation) -> String {
             ReactionAction::Add => "Add reaction",
             ReactionAction::Remove { .. } => "Remove reaction",
         },
+        JournalRequest::Dismissal(_) => "Dismiss submitted review",
     };
     let reason = match &operation.request {
         JournalRequest::Auxiliary(request)
@@ -21729,6 +22770,9 @@ fn journal_operation_summary(operation: &JournalOperation) -> String {
             if matches!(request.action, ReactionAction::Remove { .. }) =>
         {
             "Outcome unknown; read-only reconciliation may record exact absence but never causation."
+        }
+        JournalRequest::Dismissal(_) => {
+            "Outcome unknown; current DISMISSED state alone cannot prove the frozen reason or causation."
         }
         _ => "Outcome unknown; use read-only reconciliation before retry.",
     };
@@ -21826,6 +22870,21 @@ fn journal_operation_description(operation: &JournalOperation) -> String {
             request.viewer.node_id,
             request.content.graphql_name(),
             request.target.content,
+        ),
+        JournalRequest::Dismissal(request) => format!(
+            "dismiss submitted review {} · parent PR {} · repository {} · viewer {} ({}) · state {} · submitted {} · author {:?} · commit {:?} · body {:?} · reason {:?} · authority {:?}",
+            request.target.review.remote_id,
+            request.target.pull_request.remote_id,
+            request.target.repository.full_name(),
+            request.viewer.login,
+            request.viewer.node_id,
+            request.target.review_state,
+            request.target.submitted_at,
+            request.target.review_author,
+            request.target.review_commit_sha,
+            request.target.review_body,
+            request.reason,
+            request.authority,
         ),
     };
     let status = match &operation.status {
@@ -23500,14 +24559,20 @@ mod layout_tests {
         resolved_panel_widths_for, review_subject_allows_actions, submitted_review_edit_action,
     };
     #[cfg(feature = "ui-smoke")]
-    use super::{InstallTabOptions, LoadState, RepoRuntime, Root, Startup};
-    #[cfg(feature = "ui-smoke")]
-    use cibergit::domain::PullRequest;
+    use super::{
+        DismissalConfirmationToken, DismissalPreparationToken, InstallTabOptions, LoadState,
+        RepoRuntime, Root, Startup,
+    };
     use cibergit::domain::{
         Account, MergeEligibility, PendingFileCommentSource, ProviderCoordinates,
         PullRequestDetails, PullRequestReview, ReactionContent, ReactionIntent, Repository,
         ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewSubject,
         SubmittedReviewEditCapability,
+    };
+    #[cfg(feature = "ui-smoke")]
+    use cibergit::domain::{
+        DismissalAuthority, FreshReviewDismissalCapability, PullRequest, SelectedViewer,
+        SubmittedReviewDismissalRequest, SubmittedReviewDismissalTarget,
     };
     use cibergit::participation::PublishedFile;
     use cibergit::providers::{GeneralReadDelay, GeneralReadDirective};
@@ -23545,9 +24610,69 @@ mod layout_tests {
                 viewer_can_update: true,
                 viewer_cannot_update_reasons: Vec::new(),
             }),
+            dismissal_capability: None,
             url: String::new(),
         };
         (repository, review)
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn dismissal_review_fixture(number: u64, review_id: &str) -> (Repository, PullRequestReview) {
+        let (repository, mut review) = submitted_review_fixture();
+        review.coordinates.pull_request = number;
+        review.coordinates.remote_id = review_id.into();
+        review.author = None;
+        review.body = format!("Frozen dismissal body {number}");
+        review.state = "APPROVED".into();
+        review.submitted_at = Some("2026-09-12T09:00:00Z".into());
+        review.commit_sha = Some("1".repeat(40));
+        review.edit_summary_capability = None;
+        review.dismissal_capability = Some(FreshReviewDismissalCapability {
+            viewer: SelectedViewer {
+                node_id: "USER_alice".into(),
+                login: "alice".into(),
+            },
+            pull_request: ProviderCoordinates {
+                provider: "github".into(),
+                host: "github.com".into(),
+                owner: "octo".into(),
+                repository: "repo".into(),
+                pull_request: number,
+                remote_id: format!("PR_{number}"),
+            },
+            authority: DismissalAuthority::Unknown {
+                reason: "GitHub decides authorization for this selected account.".into(),
+            },
+        });
+        (repository, review)
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn dismissal_request(
+        repository: &Repository,
+        review: &PullRequestReview,
+        reason: &str,
+        operation_id: &str,
+        attempt_id: &str,
+    ) -> SubmittedReviewDismissalRequest {
+        let capability = review.dismissal_capability.as_ref().unwrap();
+        SubmittedReviewDismissalRequest {
+            operation_id: operation_id.into(),
+            attempt_id: attempt_id.into(),
+            target: SubmittedReviewDismissalTarget {
+                repository: repository.clone(),
+                pull_request: capability.pull_request.clone(),
+                review: review.coordinates.clone(),
+                review_state: review.state.clone(),
+                review_body: review.body.clone(),
+                submitted_at: review.submitted_at.clone().unwrap(),
+                review_author: review.author.clone(),
+                review_commit_sha: review.commit_sha.clone(),
+            },
+            viewer: capability.viewer.clone(),
+            authority: capability.authority.clone(),
+            reason: reason.into(),
+        }
     }
 
     #[cfg(feature = "ui-smoke")]
@@ -23629,8 +24754,12 @@ mod layout_tests {
     }
 
     fn details_with_reviews(reviews: Vec<PullRequestReview>) -> PullRequestDetails {
+        let number = reviews
+            .first()
+            .map(|review| review.coordinates.pull_request)
+            .unwrap_or(7);
         PullRequestDetails {
-            number: 7,
+            number,
             body: String::new(),
             requested_reviewers: Vec::new(),
             labels: Vec::new(),
@@ -24076,6 +25205,306 @@ mod layout_tests {
         assert_eq!(active_pull, 8);
         assert_eq!(active_review, "REVIEW_B");
         assert_eq!(stored_body, "distinct draft B");
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn dismissal_reason_change_cannot_cross_context_only_tab_restore(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    ..Default::default()
+                },
+            )
+        });
+        let (repository, review_a) = dismissal_review_fixture(7, "REVIEW_A");
+        let (_, review_b) = dismissal_review_fixture(8, "REVIEW_B");
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                for (pull, review, reason) in [
+                    (transition_pull_request(7), review_a.clone(), "reason A"),
+                    (transition_pull_request(8), review_b.clone(), "reason B"),
+                ] {
+                    this.install_tab_with_restore(
+                        repository.clone(),
+                        pull,
+                        None,
+                        InstallTabOptions {
+                            activate: false,
+                            window: None,
+                            start_background_work: false,
+                        },
+                        cx,
+                    );
+                    let index = this.tabs.len() - 1;
+                    this.tabs[index].details = Some(details_with_reviews(vec![review.clone()]));
+                    this.tabs[index]
+                        .dismissal_editor
+                        .begin(review.coordinates.clone());
+                    this.tabs[index]
+                        .dismissal_editor
+                        .store_active_reason(reason.into());
+                }
+                this.activate_tab_in_window(0, false, window, cx);
+                assert_eq!(this.dismissal_reason_input.read(cx).value(), "reason A");
+                assert!(
+                    this.dismissal_reason_input_owner
+                        .as_ref()
+                        .is_some_and(|owner| {
+                            owner.review.as_ref() == Some(&review_a.coordinates)
+                        })
+                );
+
+                this.dismissal_reason_input.update(cx, |input, cx| {
+                    input.set_value("late queued A text", window, cx);
+                    cx.emit(gpui_base::input::InputEvent::Change);
+                });
+                this.activate_tab_context(1, false, cx);
+                assert!(this.active_tab_input_restore.is_some());
+                assert!(this.dismissal_reason_input_owner.is_none());
+                assert_eq!(this.tabs[1].dismissal_editor.active_reason(), "reason B");
+            });
+        });
+        cx.update(|_, _| {});
+        cx.read(|cx| {
+            let Root::Review(this) = root.read(cx) else {
+                unreachable!()
+            };
+            assert_eq!(
+                this.tabs[0].dismissal_editor.active_reason(),
+                "late queued A text"
+            );
+            assert_eq!(this.tabs[1].dismissal_editor.active_reason(), "reason B");
+            assert_eq!(this.dismissal_reason_input.read(cx).value(), "reason B");
+            assert!(this.active_tab_input_restore.is_none());
+            assert!(
+                this.dismissal_reason_input_owner
+                    .as_ref()
+                    .is_some_and(|owner| { owner.review.as_ref() == Some(&review_b.coordinates) })
+            );
+        });
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn dismissal_actual_confirm_handler_rejects_edited_reason_and_target_switch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    ..Default::default()
+                },
+            )
+        });
+        let (repository, review_a) = dismissal_review_fixture(7, "REVIEW_A");
+        let (_, mut review_b) = dismissal_review_fixture(7, "REVIEW_B");
+        review_b.body = "Second exact frozen body".into();
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.install_tab_with_restore(
+                    repository.clone(),
+                    transition_pull_request(7),
+                    None,
+                    InstallTabOptions {
+                        activate: false,
+                        window: None,
+                        start_background_work: false,
+                    },
+                    cx,
+                );
+                this.tabs[0].details = Some(details_with_reviews(vec![
+                    review_a.clone(),
+                    review_b.clone(),
+                ]));
+                this.tabs[0]
+                    .dismissal_editor
+                    .begin(review_a.coordinates.clone());
+                this.tabs[0]
+                    .dismissal_editor
+                    .store_active_reason("frozen reason A".into());
+                this.activate_tab_in_window(0, false, window, cx);
+                this.tabs[0].dismissal_confirmation_generation = 10;
+                let request = dismissal_request(
+                    &repository,
+                    &review_a,
+                    "frozen reason A",
+                    "dismiss-ui-A",
+                    "attempt-ui-A",
+                );
+                this.tabs[0].confirmation = Some(NativeConfirmation::DismissSubmittedReview {
+                    generation: 10,
+                    request: Box::new(request.clone()),
+                });
+                let token = DismissalConfirmationToken {
+                    workspace_instance: this.workspace_instance,
+                    tab_instance: this.tabs[0].instance_generation,
+                    repository_key: repository.cache_key(),
+                    pull_request: 7,
+                    generation: 10,
+                    request,
+                };
+                this.dismissal_reason_input.update(cx, |input, cx| {
+                    input.set_value("newly edited reason", window, cx)
+                });
+                this.confirm_review_dismissal(token, window, cx);
+                assert!(!this.tabs[0].write_in_flight);
+                assert!(this.tabs[0].confirmation.is_none());
+                assert_eq!(
+                    this.tabs[0].dismissal_editor.active_reason(),
+                    "newly edited reason"
+                );
+
+                this.tabs[0].dismissal_confirmation_generation = 20;
+                let request = dismissal_request(
+                    &repository,
+                    &review_a,
+                    "newly edited reason",
+                    "dismiss-ui-switch",
+                    "attempt-ui-switch",
+                );
+                this.tabs[0].confirmation = Some(NativeConfirmation::DismissSubmittedReview {
+                    generation: 20,
+                    request: Box::new(request),
+                });
+                this.begin_review_dismissal(review_b.clone(), window, cx);
+                assert!(this.tabs[0].confirmation.is_none());
+                assert_eq!(
+                    this.tabs[0].dismissal_editor.active_review.as_ref(),
+                    Some(&review_b.coordinates)
+                );
+                assert_eq!(
+                    this.tabs[0]
+                        .dismissal_editor
+                        .drafts
+                        .iter()
+                        .find(|draft| draft.review == review_a.coordinates)
+                        .map(|draft| draft.reason.as_str()),
+                    Some("newly edited reason")
+                );
+            });
+        });
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn dismissal_preparation_actual_ok_err_and_aba_callbacks_are_fenced(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    ..Default::default()
+                },
+            )
+        });
+        let (repository, review) = dismissal_review_fixture(7, "REVIEW_A");
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.install_tab_with_restore(
+                    repository.clone(),
+                    transition_pull_request(7),
+                    None,
+                    InstallTabOptions {
+                        activate: false,
+                        window: None,
+                        start_background_work: false,
+                    },
+                    cx,
+                );
+                this.tabs[0].details = Some(details_with_reviews(vec![review.clone()]));
+                this.tabs[0]
+                    .dismissal_editor
+                    .begin(review.coordinates.clone());
+                this.tabs[0]
+                    .dismissal_editor
+                    .store_active_reason("exact reason".into());
+                this.activate_tab_in_window(0, false, window, cx);
+                this.tabs[0].dismissal_confirmation_generation = 30;
+                this.tabs[0].write_in_flight = true;
+                let token = DismissalPreparationToken {
+                    workspace_instance: this.workspace_instance,
+                    tab_instance: this.tabs[0].instance_generation,
+                    repository_key: repository.cache_key(),
+                    pull_request: 7,
+                    review: review.coordinates.clone(),
+                    reason: "exact reason".into(),
+                    editor_generation: this.tabs[0].dismissal_editor.generation,
+                    operation_id: "dismiss-prep".into(),
+                    attempt_id: "attempt-prep".into(),
+                    action_generation: 30,
+                };
+                assert_eq!(
+                    this.apply_dismissal_preparation(&token, Err("controlled read error".into())),
+                    Some(0)
+                );
+                assert!(!this.tabs[0].write_in_flight);
+                assert!(this.tabs[0].confirmation.is_none());
+
+                this.tabs[0].write_in_flight = true;
+                let request = dismissal_request(
+                    &repository,
+                    &review,
+                    "exact reason",
+                    "dismiss-prep",
+                    "attempt-prep",
+                );
+                assert_eq!(
+                    this.apply_dismissal_preparation(&token, Ok(request.clone())),
+                    Some(0)
+                );
+                assert!(matches!(
+                    this.tabs[0].confirmation.as_ref(),
+                    Some(NativeConfirmation::DismissSubmittedReview { generation: 30, .. })
+                ));
+
+                assert!(this.invalidate_dismissal_confirmation(0, "controlled edit"));
+                this.tabs[0]
+                    .dismissal_editor
+                    .store_active_reason("ABA changed".into());
+                this.tabs[0]
+                    .dismissal_editor
+                    .store_active_reason("exact reason".into());
+                this.tabs[0].write_in_flight = true;
+                assert_eq!(
+                    this.apply_dismissal_preparation(&token, Ok(request)),
+                    None,
+                    "old preparation must not apply after reason ABA"
+                );
+                assert!(this.tabs[0].write_in_flight);
+                assert!(this.tabs[0].confirmation.is_none());
+                this.tabs[0].write_in_flight = false;
+            });
+        });
     }
 
     #[test]
