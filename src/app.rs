@@ -2086,9 +2086,17 @@ impl ReviewWorkspace {
         tab.checks_selection.reconcile(checks);
         self.scroll_selected_check_into_view(index);
         self.refresh_auto_layout(window);
-        self.checks_focus.focus(window, cx);
+        self.focus_current_ci_pane(index, window, cx);
         self.command_palette = false;
         cx.notify();
+    }
+
+    fn focus_current_ci_pane(&self, index: usize, window: &mut Window, cx: &mut Context<Root>) {
+        match self.tabs[index].ci_read.pane {
+            CiPane::Checks => self.checks_focus.focus(window, cx),
+            CiPane::Jobs => self.jobs_focus.focus(window, cx),
+            CiPane::Log => self.log_focus.focus(window, cx),
+        }
     }
 
     fn move_check_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Root>) {
@@ -2301,12 +2309,12 @@ impl ReviewWorkspace {
         true
     }
 
-    fn start_actions_jobs(&mut self, index: usize, cx: &mut Context<Root>) {
+    fn start_actions_jobs(&mut self, index: usize, cx: &mut Context<Root>) -> bool {
         if !general_read_tab_can_start(self.tabs[index].submitted_summary_editor.close_after_save) {
             self.status =
                 "Finish the pending local draft save before starting an Actions read.".into();
             cx.notify();
-            return;
+            return false;
         }
         let (repository, locator, current_head, selected_check_id) =
             match self.selected_actions_locator(index) {
@@ -2314,7 +2322,7 @@ impl ReviewWorkspace {
                 Err(error) => {
                     self.status = error;
                     cx.notify();
-                    return;
+                    return false;
                 }
             };
         let admission = match self.general_reads.begin(&repository.account) {
@@ -2324,12 +2332,12 @@ impl ReviewWorkspace {
                 self.status =
                     "Cancelling the prior account read; load jobs again after it releases.".into();
                 cx.notify();
-                return;
+                return false;
             }
             Err(read_sync::ReadDeferral::Server(notice)) => {
                 self.status = notice.into();
                 cx.notify();
-                return;
+                return false;
             }
         };
         let operation = self.tabs[index].ci_read.begin_jobs(locator.clone());
@@ -2392,19 +2400,20 @@ impl ReviewWorkspace {
         })
         .detach();
         cx.notify();
+        true
     }
 
-    fn start_actions_log(&mut self, index: usize, cx: &mut Context<Root>) {
+    fn start_actions_log(&mut self, index: usize, cx: &mut Context<Root>) -> bool {
         if !general_read_tab_can_start(self.tabs[index].submitted_summary_editor.close_after_save) {
             self.status =
                 "Finish the pending local draft save before starting an Actions read.".into();
             cx.notify();
-            return;
+            return false;
         }
         if self.tabs[index].ci_read.log_target().is_none() {
             self.status = "Select a fresh exact job before loading its log.".into();
             cx.notify();
-            return;
+            return false;
         }
         let repository = self.tabs[index].repository.clone();
         let admission = match self.general_reads.begin(&repository.account) {
@@ -2415,12 +2424,12 @@ impl ReviewWorkspace {
                     "Cancelling the prior account read; load the log again after it releases."
                         .into();
                 cx.notify();
-                return;
+                return false;
             }
             Err(read_sync::ReadDeferral::Server(notice)) => {
                 self.status = notice.into();
                 cx.notify();
-                return;
+                return false;
             }
         };
         let Some((operation, snapshot, selected_job_id)) = self.tabs[index].ci_read.begin_log()
@@ -2433,7 +2442,7 @@ impl ReviewWorkspace {
                 false,
             );
             self.resume_general_read_followups(cx);
-            return;
+            return false;
         };
         let token = CiCompletionToken {
             workspace_instance: self.workspace_instance,
@@ -2493,6 +2502,7 @@ impl ReviewWorkspace {
         })
         .detach();
         cx.notify();
+        true
     }
 
     fn move_job_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Root>) {
@@ -17640,18 +17650,18 @@ impl ReviewWorkspace {
             .on_action(cx.listener(|root, _: &OpenSelectedCheckJobs, window, cx| {
                 if let Root::Review(this) = root
                     && let Some(index) = this.active_tab
+                    && this.start_actions_jobs(index, cx)
                 {
-                    this.start_actions_jobs(index, cx);
-                    this.jobs_focus.focus(window, cx);
+                    this.focus_current_ci_pane(index, window, cx);
                 }
             }))
             .on_action(
                 cx.listener(|root, _: &RefreshSelectedCheckJobs, window, cx| {
                     if let Root::Review(this) = root
                         && let Some(index) = this.active_tab
+                        && this.start_actions_jobs(index, cx)
                     {
-                        this.start_actions_jobs(index, cx);
-                        this.jobs_focus.focus(window, cx);
+                        this.focus_current_ci_pane(index, window, cx);
                     }
                 }),
             )
@@ -17678,9 +17688,9 @@ impl ReviewWorkspace {
             .on_action(cx.listener(|root, _: &LoadSelectedJobLog, window, cx| {
                 if let Root::Review(this) = root
                     && let Some(index) = this.active_tab
+                    && this.start_actions_log(index, cx)
                 {
-                    this.start_actions_log(index, cx);
-                    this.log_focus.focus(window, cx);
+                    this.focus_current_ci_pane(index, window, cx);
                 }
             }))
             .on_action(cx.listener(|root, _: &ReturnToChecks, window, cx| {
@@ -17688,7 +17698,7 @@ impl ReviewWorkspace {
                     && let Some(index) = this.active_tab
                 {
                     this.tabs[index].ci_read.pane = CiPane::Checks;
-                    this.checks_focus.focus(window, cx);
+                    this.focus_current_ci_pane(index, window, cx);
                     cx.notify();
                 }
             }))
@@ -17697,7 +17707,7 @@ impl ReviewWorkspace {
                     && let Some(index) = this.active_tab
                 {
                     this.tabs[index].ci_read.pane = CiPane::Jobs;
-                    this.jobs_focus.focus(window, cx);
+                    this.focus_current_ci_pane(index, window, cx);
                     cx.notify();
                 }
             }))
@@ -21485,7 +21495,7 @@ impl ReviewWorkspace {
                             back_root.update(cx, |root, cx| {
                                 if let Root::Review(this) = root {
                                     this.tabs[index].ci_read.pane = CiPane::Checks;
-                                    this.checks_focus.focus(window, cx);
+                                    this.focus_current_ci_pane(index, window, cx);
                                     cx.notify();
                                 }
                             });
@@ -21696,6 +21706,7 @@ impl ReviewWorkspace {
                 )
                 .child(
                     Button::new("actions-load-selected-log")
+                        .debug_selector(|| "actions-load-selected-log".into())
                         .px_2()
                         .py_1()
                         .rounded_md()
@@ -21709,8 +21720,9 @@ impl ReviewWorkspace {
                         .on_click(move |_, window, cx| {
                             log_root.update(cx, |root, cx| {
                                 if let Root::Review(this) = root {
-                                    this.start_actions_log(index, cx);
-                                    this.log_focus.focus(window, cx);
+                                    if this.start_actions_log(index, cx) {
+                                        this.focus_current_ci_pane(index, window, cx);
+                                    }
                                 }
                             });
                         }),
@@ -21735,7 +21747,7 @@ impl ReviewWorkspace {
                     back_root.update(cx, |root, cx| {
                         if let Root::Review(this) = root {
                             this.tabs[index].ci_read.pane = CiPane::Jobs;
-                            this.jobs_focus.focus(window, cx);
+                            this.focus_current_ci_pane(index, window, cx);
                             cx.notify();
                         }
                     });
@@ -21919,12 +21931,11 @@ impl ReviewWorkspace {
         let current = tab.inspector_section;
         let root = cx.entity();
         let section_root = root.clone();
-        let section_checks_focus = self.checks_focus.clone();
         let section = move |name: &'static str, value: InspectorSection| {
             let root = section_root.clone();
-            let checks_focus = section_checks_focus.clone();
             side_control(name, current == value, colors)
                 .id(SharedString::from(format!("inspector-{name}")))
+                .debug_selector(move || format!("inspector-section-{name}"))
                 .on_click(move |_, window, cx| {
                     root.update(cx, |root, cx| {
                         if let Root::Review(this) = root
@@ -21945,13 +21956,11 @@ impl ReviewWorkspace {
                                     .unwrap_or_default();
                                 tab.checks_selection.reconcile(checks);
                                 this.scroll_selected_check_into_view(index);
+                                this.focus_current_ci_pane(index, window, cx);
                             }
                             cx.notify();
                         }
                     });
-                    if value == InspectorSection::Checks {
-                        checks_focus.focus(window, cx);
-                    }
                 })
         };
         let content = match current {
@@ -23586,8 +23595,11 @@ impl ReviewWorkspace {
                                             move |_, window, cx| {
                                                 jobs_root.update(cx, |root, cx| {
                                                     if let Root::Review(this) = root {
-                                                        this.start_actions_jobs(index, cx);
-                                                        this.jobs_focus.focus(window, cx);
+                                                        if this.start_actions_jobs(index, cx) {
+                                                            this.focus_current_ci_pane(
+                                                                index, window, cx,
+                                                            );
+                                                        }
                                                     }
                                                 });
                                             },
@@ -24821,8 +24833,9 @@ impl ReviewWorkspace {
                                     && let Some(index) = this.active_tab
                                 {
                                     this.command_palette = false;
-                                    this.start_actions_jobs(index, cx);
-                                    this.jobs_focus.focus(window, cx);
+                                    if this.start_actions_jobs(index, cx) {
+                                        this.focus_current_ci_pane(index, window, cx);
+                                    }
                                 }
                             })),
                     )
@@ -24836,8 +24849,9 @@ impl ReviewWorkspace {
                                     && let Some(index) = this.active_tab
                                 {
                                     this.command_palette = false;
-                                    this.start_actions_jobs(index, cx);
-                                    this.jobs_focus.focus(window, cx);
+                                    if this.start_actions_jobs(index, cx) {
+                                        this.focus_current_ci_pane(index, window, cx);
+                                    }
                                 }
                             })),
                     )
@@ -24851,8 +24865,9 @@ impl ReviewWorkspace {
                                     && let Some(index) = this.active_tab
                                 {
                                     this.command_palette = false;
-                                    this.start_actions_log(index, cx);
-                                    this.log_focus.focus(window, cx);
+                                    if this.start_actions_log(index, cx) {
+                                        this.focus_current_ci_pane(index, window, cx);
+                                    }
                                 }
                             })),
                     )
@@ -27080,8 +27095,8 @@ mod layout_tests {
     use super::{
         ActionsReadError, ActionsReadErrorCategory, CiCompletionToken, CiPane,
         DismissalConfirmationToken, DismissalPreparationToken, InspectorSection, InstallTabOptions,
-        LoadState, NextCheck, NextCheckPage, OpenChecks, RepoRuntime, Root, Startup,
-        ToggleCheckIdentity, check_identity_button, checks_page_button, palette,
+        LoadState, NextCheck, NextCheckPage, OpenChecks, OpenSelectedCheckJobs, RepoRuntime, Root,
+        Startup, ToggleCheckIdentity, check_identity_button, checks_page_button, palette,
     };
     use cibergit::domain::{
         Account, MergeEligibility, PendingFileCommentSource, ProviderCoordinates,
@@ -27101,7 +27116,7 @@ mod layout_tests {
     use cibergit::participation::PublishedFile;
     use cibergit::providers::{GeneralReadDelay, GeneralReadDirective};
     #[cfg(feature = "ui-smoke")]
-    use gpui::{WindowAppearance, point, px, size};
+    use gpui::{Modifiers, WindowAppearance, point, px, size};
     use std::time::{Duration, Instant, UNIX_EPOCH};
     #[cfg(feature = "ui-smoke")]
     use std::{cell::Cell, fs, path::PathBuf, rc::Rc};
@@ -28019,6 +28034,188 @@ mod layout_tests {
                 MemoryRead::Loading { operation_id, .. }
                     if *operation_id == replacement_operation.operation_id
             ));
+        });
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn actions_focus_tracks_preserved_pane_on_refusal_and_reopen(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    ..Default::default()
+                },
+            )
+        });
+        let (repository, _) = submitted_review_fixture();
+        let pull = transition_pull_request(7);
+        let busy_token = cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.install_tab_with_restore(
+                    repository.clone(),
+                    pull,
+                    None,
+                    InstallTabOptions {
+                        activate: true,
+                        window: Some(window),
+                        start_background_work: false,
+                    },
+                    cx,
+                );
+                let details = actions_details_fixture(&repository);
+                this.tabs[0].checks_selection.reconcile(&details.checks);
+                this.tabs[0].details = Some(details);
+                this.tabs[0].details_state = LoadState::Ready;
+                this.open_checks(window, cx);
+                this.general_reads
+                    .begin(&repository.account)
+                    .unwrap()
+                    .into_parts()
+                    .0
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx.dispatch_action(OpenSelectedCheckJobs);
+        cx.update(|window, cx| {
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert_eq!(this.tabs[0].ci_read.pane, CiPane::Checks);
+                assert!(this.checks_focus.is_focused(window));
+                assert!(!this.jobs_focus.is_focused(window));
+            });
+        });
+
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let disposition = this.general_reads.complete(
+                    &busy_token,
+                    &GeneralReadDirective::default(),
+                    None,
+                    false,
+                );
+                assert!(disposition.matching_operation_released);
+
+                let (_, locator, _, _) = this.selected_actions_locator(0).unwrap();
+                let operation = this.tabs[0].ci_read.begin_jobs(locator.clone());
+                assert!(
+                    this.tabs[0]
+                        .ci_read
+                        .finish_jobs(&operation, Ok(actions_snapshot(&locator, 20, &[11, 12])),)
+                );
+                this.tabs[0].inspector_section = InspectorSection::Overview;
+                this.focus.focus(window, cx);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        cx.dispatch_action(OpenChecks);
+        cx.update(|window, cx| {
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert!(matches!(
+                    this.tabs[0].inspector_section,
+                    InspectorSection::Checks
+                ));
+                assert_eq!(this.tabs[0].ci_read.pane, CiPane::Jobs);
+                assert!(this.jobs_focus.is_focused(window));
+                assert!(!this.checks_focus.is_focused(window));
+            });
+        });
+
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let snapshot = this.tabs[0].ci_read.jobs.visible().unwrap().clone();
+                let (operation, _, selected_job_id) = this.tabs[0].ci_read.begin_log().unwrap();
+                assert!(
+                    this.tabs[0]
+                        .ci_read
+                        .finish_log(&operation, Ok(actions_log(&snapshot, selected_job_id)),)
+                );
+                this.tabs[0].inspector_section = InspectorSection::Overview;
+                this.focus.focus(window, cx);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let checks_section = cx.debug_bounds("inspector-section-Checks").unwrap();
+        cx.simulate_click(checks_section.center(), Modifiers::default());
+        cx.update(|window, cx| {
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert!(matches!(
+                    this.tabs[0].inspector_section,
+                    InspectorSection::Checks
+                ));
+                assert_eq!(this.tabs[0].ci_read.pane, CiPane::Log);
+                assert!(this.log_focus.is_focused(window));
+                assert!(!this.checks_focus.is_focused(window));
+            });
+        });
+
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                let now = Instant::now();
+                let (token, _) = this
+                    .general_reads
+                    .begin_at(&repository.account, now)
+                    .unwrap()
+                    .into_parts();
+                let disposition = this.general_reads.complete_at(
+                    &token,
+                    &GeneralReadDirective {
+                        x_poll_interval: None,
+                        rate_limit: Some(GeneralReadDelay::Suspend),
+                    },
+                    None,
+                    false,
+                    now,
+                    UNIX_EPOCH,
+                );
+                assert!(disposition.matching_operation_released);
+                this.tabs[0].ci_read.pane = CiPane::Jobs;
+                this.focus_current_ci_pane(0, window, cx);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let load_log = cx.debug_bounds("actions-load-selected-log").unwrap();
+        cx.simulate_click(load_log.center(), Modifiers::default());
+        cx.update(|window, cx| {
+            root.read_with(cx, |root, app| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert_eq!(this.tabs[0].ci_read.pane, CiPane::Jobs);
+                assert!(this.jobs_focus.contains_focused(window, app));
+                assert!(!this.log_focus.contains_focused(window, app));
+                assert_eq!(this.status, super::read_sync::RATE_SUSPENDED_NOTICE);
+            });
         });
     }
 
