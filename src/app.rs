@@ -314,6 +314,9 @@ impl Render for Root {
     }
 }
 
+/// Surfaces stay on this app's own neutrals; every colour that carries meaning
+/// comes from GitHub's Primer tokens, so a diff, a branch and a state read the
+/// same here as on the pull request page they came from.
 #[derive(Clone, Copy)]
 struct Palette {
     canvas: Rgba,
@@ -326,9 +329,25 @@ struct Palette {
     border: Rgba,
     selected: Rgba,
     accent: Rgba,
+    /// Primer `bgColor-accent-muted`: branch chips and the hunk header.
+    accent_subtle: Rgba,
     green: Rgba,
     red: Rgba,
     amber: Rgba,
+    /// Primer `bgColor-*-emphasis`: the fill under text on a state pill.
+    /// `done` is GitHub's merged purple.
+    success_emphasis: Rgba,
+    danger_emphasis: Rgba,
+    done_emphasis: Rgba,
+    /// Primer `bgColor-neutral-emphasis`: a draft pull request.
+    neutral: Rgba,
+    /// Primer `diffBlob` line and gutter tints.
+    add_line: Rgba,
+    add_gutter: Rgba,
+    del_line: Rgba,
+    del_gutter: Rgba,
+    /// Primer `diffBlob-emptyLine-bgColor`: a side with no line at all.
+    diff_empty: Rgba,
     dark: bool,
 }
 
@@ -344,10 +363,20 @@ fn palette(dark: bool) -> Palette {
             faint: rgba(0x777b83ff),
             border: rgba(0x36383dff),
             selected: rgba(0xffffff13),
-            accent: rgba(0x8ab4f8ff),
-            green: rgba(0x70c995ff),
-            red: rgba(0xf28b82ff),
-            amber: rgba(0xf7c873ff),
+            accent: rgba(0x4493f8ff),
+            accent_subtle: rgba(0x388bfd1a),
+            green: rgba(0x3fb950ff),
+            red: rgba(0xf85149ff),
+            amber: rgba(0xd29922ff),
+            success_emphasis: rgba(0x238636ff),
+            danger_emphasis: rgba(0xda3633ff),
+            done_emphasis: rgba(0x8957e5ff),
+            neutral: rgba(0x656c76ff),
+            add_line: rgba(0x2ea04326),
+            add_gutter: rgba(0x3fb9504d),
+            del_line: rgba(0xf851491a),
+            del_gutter: rgba(0xf851494d),
+            diff_empty: rgba(0x151b23ff),
             dark,
         }
     } else {
@@ -361,10 +390,20 @@ fn palette(dark: bool) -> Palette {
             faint: rgba(0x8b8e93ff),
             border: rgba(0xdedfdcff),
             selected: rgba(0x0000000a),
-            accent: rgba(0x245eaaff),
-            green: rgba(0x18794eff),
-            red: rgba(0xc2352aff),
-            amber: rgba(0x986a12ff),
+            accent: rgba(0x0969daff),
+            accent_subtle: rgba(0xddf4ffff),
+            green: rgba(0x1a7f37ff),
+            red: rgba(0xd1242fff),
+            amber: rgba(0x9a6700ff),
+            success_emphasis: rgba(0x1f883dff),
+            danger_emphasis: rgba(0xcf222eff),
+            done_emphasis: rgba(0x8250dfff),
+            neutral: rgba(0x59636eff),
+            add_line: rgba(0xdafbe1ff),
+            add_gutter: rgba(0xaceebbff),
+            del_line: rgba(0xffebe9ff),
+            del_gutter: rgba(0xffcecbff),
+            diff_empty: rgba(0xf6f8faff),
             dark,
         }
     }
@@ -699,8 +738,11 @@ struct PanelResizeDrag {
 struct SplitterDragPreview;
 
 impl Render for SplitterDragPreview {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().w(px(2.)).h(px(24.)).bg(rgba(0x6fa8ffff))
+    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(2.))
+            .h(px(24.))
+            .bg(palette(is_dark(window)).accent)
     }
 }
 
@@ -22865,10 +22907,9 @@ impl ReviewWorkspace {
                             .gap(px(ui::GAP_ICON))
                             .ui_text(TextRole::Body)
                             .text_color(colors.muted)
-                            .child(format!(
-                                "{}  →  {}",
-                                tab.pull_request.source_branch, tab.pull_request.target_branch
-                            ))
+                            .child(branch_chip(&tab.pull_request.source_branch, colors))
+                            .child("→")
+                            .child(branch_chip(&tab.pull_request.target_branch, colors))
                             .when(!compare_visible, |row| {
                                 row.child("·").child(format!(
                                     "{} · {revision}",
@@ -25768,7 +25809,12 @@ impl ReviewWorkspace {
             InspectorSection::Overview => {
                 let mut fields = vec![
                     detail("Author", &tab.pull_request.author, colors),
-                    detail("State", &tab.pull_request.state, colors),
+                    detail_element(
+                        "State",
+                        state_pill(&tab.pull_request.state, tab.pull_request.draft, colors)
+                            .into_any_element(),
+                        colors,
+                    ),
                     detail(
                         "Review",
                         empty_unknown(&tab.pull_request.review_status),
@@ -30420,7 +30466,44 @@ fn command_row(label: &str, shortcut: &str, colors: Palette) -> Div {
         .child(div().text_color(colors.muted).child(shortcut.to_owned()))
 }
 
+/// GitHub renders a branch as a monospace chip in the accent tint, which is the
+/// strongest colour cue on its pull request page.
+fn branch_chip(branch: &str, colors: Palette) -> Div {
+    div()
+        .px(px(ui::GAP_FIELD))
+        .rounded(px(ui::BADGE_RADIUS))
+        .bg(colors.accent_subtle)
+        .text_color(colors.accent)
+        .font_family(CODE_FONT)
+        .ui_text(TextRole::Caption)
+        .child(branch.to_owned())
+}
+
+/// GitHub's state colours: open is success, merged is done, closed is danger,
+/// and a draft is neutral. All four are filled, with text on the emphasis fill.
+fn state_pill(state: &str, draft: bool, colors: Palette) -> Div {
+    let (label, fill) = match (draft, state.to_ascii_uppercase().as_str()) {
+        (true, "OPEN") => ("DRAFT".to_owned(), colors.neutral),
+        (_, "MERGED") => ("MERGED".to_owned(), colors.done_emphasis),
+        (_, "CLOSED") => ("CLOSED".to_owned(), colors.danger_emphasis),
+        (_, "OPEN") => ("OPEN".to_owned(), colors.success_emphasis),
+        (_, other) => (other.to_owned(), colors.neutral),
+    };
+    div()
+        .badge()
+        .flex_none()
+        .w_auto()
+        .bg(fill)
+        .text_color(rgba(0xffffffff))
+        .font_weight(FontWeight::MEDIUM)
+        .child(label)
+}
+
 fn detail(label: &str, value: impl Into<String>, colors: Palette) -> Div {
+    detail_element(label, value.into().into_any_element(), colors)
+}
+
+fn detail_element(label: &str, value: AnyElement, colors: Palette) -> Div {
     div()
         .mb(px(ui::GAP_PAGE))
         .child(
@@ -30429,7 +30512,7 @@ fn detail(label: &str, value: impl Into<String>, colors: Palette) -> Div {
                 .text_color(colors.muted)
                 .child(label.to_owned()),
         )
-        .child(div().mt(px(ui::GAP_FIELD)).child(value.into()))
+        .child(div().mt(px(ui::GAP_FIELD)).child(value))
 }
 
 fn render_lifecycle_change(frozen: &FrozenMutation, colors: Palette) -> Div {
@@ -31104,26 +31187,31 @@ fn render_diff_row(row: &DiffRow, colors: Palette) -> AnyElement {
             .px(px(ui::CONTROL_INSET))
             .flex()
             .items_center()
-            .bg(colors.elevated)
-            .text_color(colors.accent)
+            .bg(colors.accent_subtle)
+            .text_color(colors.muted)
             .font_family(CODE_FONT)
             .ui_text(TextRole::Body)
             .child(header.clone())
             .into_any_element(),
         DiffRow::Unified(line) => {
-            let (background, foreground, marker) = line_colors(line.kind, colors);
+            let style = line_style(line.kind, colors);
             div()
                 .h(px(ui::ROW_HEIGHT))
                 .w_full()
                 .flex()
                 .items_center()
-                .bg(background)
+                .bg(style.background)
                 .font_family(CODE_FONT)
                 .ui_text(TextRole::Body)
-                .child(line_number(line.old_line, colors))
-                .child(line_number(line.new_line, colors))
-                .child(div().w(px(18.)).text_color(foreground).child(marker))
-                .child(line_text(&line.text, foreground))
+                .child(line_number(line.old_line, style.gutter, colors))
+                .child(line_number(line.new_line, style.gutter, colors))
+                .child(
+                    div()
+                        .w(px(18.))
+                        .text_color(style.marker_color)
+                        .child(style.marker),
+                )
+                .child(line_text(&line.text, style.foreground))
                 .into_any_element()
         }
         DiffRow::Split(row) => div()
@@ -31148,23 +31236,23 @@ fn render_read_only_diff_row(
     match row {
         DiffRow::Hunk(_) => render_diff_row(row, colors),
         DiffRow::Unified(line) => {
-            let (background, foreground, marker) = line_colors(line.kind, colors);
+            let style = line_style(line.kind, colors);
             div()
                 .h(px(ui::ROW_HEIGHT))
                 .w_full()
                 .flex()
                 .items_center()
-                .bg(background)
+                .bg(style.background)
                 .font_family(CODE_FONT)
                 .ui_text(TextRole::Body)
-                .child(line_number(line.old_line, colors))
-                .child(line_number(line.new_line, colors))
+                .child(line_number(line.old_line, style.gutter, colors))
+                .child(line_number(line.new_line, style.gutter, colors))
                 .child(
                     div()
                         .w(px(18.))
                         .flex_none()
-                        .text_color(foreground)
-                        .child(marker),
+                        .text_color(style.marker_color)
+                        .child(style.marker),
                 )
                 .child(
                     div()
@@ -31175,7 +31263,11 @@ fn render_read_only_diff_row(
                         .overflow_x_scroll()
                         .restrict_scroll_to_axis()
                         .track_scroll(horizontal)
-                        .child(line_text(&line.text, foreground).w(px(text_width)).h_full()),
+                        .child(
+                            line_text(&line.text, style.foreground)
+                                .w(px(text_width))
+                                .h_full(),
+                        ),
                 )
                 .into_any_element()
         }
@@ -31265,7 +31357,7 @@ fn render_unified_scrolled(
     text_width: f32,
     root: &Entity<Root>,
 ) -> AnyElement {
-    let (background, foreground, marker) = line_colors(line.kind, colors);
+    let style = line_style(line.kind, colors);
     let side_and_line = line
         .new_line
         .map(|line| (DiffSide::New, line))
@@ -31275,17 +31367,17 @@ fn render_unified_scrolled(
         .w_full()
         .flex()
         .items_center()
-        .bg(background)
+        .bg(style.background)
         .font_family(CODE_FONT)
         .ui_text(TextRole::Body)
-        .child(line_number(line.old_line, colors))
-        .child(line_number(line.new_line, colors))
+        .child(line_number(line.old_line, style.gutter, colors))
+        .child(line_number(line.new_line, style.gutter, colors))
         .child(
             div()
                 .w(px(18.))
                 .flex_none()
-                .text_color(foreground)
-                .child(marker),
+                .text_color(style.marker_color)
+                .child(style.marker),
         )
         .child(
             div()
@@ -31296,7 +31388,11 @@ fn render_unified_scrolled(
                 .overflow_x_scroll()
                 .restrict_scroll_to_axis()
                 .track_scroll(horizontal)
-                .child(line_text(&line.text, foreground).w(px(text_width)).h_full()),
+                .child(
+                    line_text(&line.text, style.foreground)
+                        .w(px(text_width))
+                        .h_full(),
+                ),
         );
     if let Some((side, line)) = side_and_line {
         let entity = root.clone();
@@ -31806,37 +31902,60 @@ fn diff_horizontal_scrollbar(index: usize, horizontal: &ScrollHandle) -> Div {
         )
 }
 
-fn line_number(number: Option<u64>, colors: Palette) -> Div {
+fn line_number(number: Option<u64>, gutter: Rgba, colors: Palette) -> Div {
     div()
         .w(px(48.))
         .px(px(ui::CELL_INSET))
+        .flex_none()
         .text_right()
+        .bg(gutter)
         .text_color(colors.faint)
         .child(number.map(|number| number.to_string()).unwrap_or_default())
 }
 
-fn line_colors(kind: DiffLineKind, colors: Palette) -> (Rgba, Rgba, &'static str) {
+/// GitHub's diff blob: the line takes a tint, its gutter takes a stronger one,
+/// and the source text keeps the default colour on both sides of a change, so
+/// only the marker carries the semantic colour. Text recoloured green or red
+/// reads as a different language, which is exactly what a diff is not.
+#[derive(Clone, Copy)]
+struct LineStyle {
+    background: Rgba,
+    gutter: Rgba,
+    foreground: Rgba,
+    marker_color: Rgba,
+    marker: &'static str,
+}
+
+fn line_style(kind: DiffLineKind, colors: Palette) -> LineStyle {
     match kind {
-        DiffLineKind::Addition => (
-            if colors.dark {
-                rgba(0x14382588)
-            } else {
-                rgba(0xdff3e7ff)
-            },
-            colors.green,
-            "+",
-        ),
-        DiffLineKind::Deletion => (
-            if colors.dark {
-                rgba(0x411f2188)
-            } else {
-                rgba(0xf9e2e0ff)
-            },
-            colors.red,
-            "−",
-        ),
-        DiffLineKind::Context => (colors.surface, colors.text, " "),
-        DiffLineKind::NoNewline => (colors.elevated, colors.muted, "↳"),
+        DiffLineKind::Addition => LineStyle {
+            background: colors.add_line,
+            gutter: colors.add_gutter,
+            foreground: colors.text,
+            marker_color: colors.green,
+            marker: "+",
+        },
+        DiffLineKind::Deletion => LineStyle {
+            background: colors.del_line,
+            gutter: colors.del_gutter,
+            foreground: colors.text,
+            marker_color: colors.red,
+            marker: "−",
+        },
+        DiffLineKind::Context => LineStyle {
+            background: colors.surface,
+            gutter: colors.surface,
+            foreground: colors.text,
+            marker_color: colors.faint,
+            marker: " ",
+        },
+        DiffLineKind::NoNewline => LineStyle {
+            background: colors.diff_empty,
+            gutter: colors.diff_empty,
+            foreground: colors.muted,
+            marker_color: colors.muted,
+            marker: "↳",
+        },
     }
 }
 
@@ -31845,23 +31964,28 @@ fn split_cell(line: Option<&DiffLine>, old: bool, colors: Palette) -> Div {
         return div()
             .w_1_2()
             .h_full()
-            .bg(colors.elevated)
+            .bg(colors.diff_empty)
             .border_r_1()
             .border_color(colors.border);
     };
-    let (background, foreground, marker) = line_colors(line.kind, colors);
+    let style = line_style(line.kind, colors);
     let number = if old { line.old_line } else { line.new_line };
     div()
         .w_1_2()
         .h_full()
         .flex()
         .items_center()
-        .bg(background)
+        .bg(style.background)
         .border_r_1()
         .border_color(colors.border)
-        .child(line_number(number, colors))
-        .child(div().w(px(18.)).text_color(foreground).child(marker))
-        .child(line_text(&line.text, foreground))
+        .child(line_number(number, style.gutter, colors))
+        .child(
+            div()
+                .w(px(18.))
+                .text_color(style.marker_color)
+                .child(style.marker),
+        )
+        .child(line_text(&line.text, style.foreground))
 }
 
 fn split_cell_scrolled(
@@ -31871,18 +31995,23 @@ fn split_cell_scrolled(
     horizontal: &ScrollHandle,
     text_width: f32,
 ) -> Div {
-    let (background, foreground, marker, number, text) = match line {
-        Some(line) => {
-            let (background, foreground, marker) = line_colors(line.kind, colors);
-            (
-                background,
-                foreground,
-                marker,
-                if old { line.old_line } else { line.new_line },
-                line.text.as_str(),
-            )
-        }
-        None => (colors.elevated, colors.muted, " ", None, ""),
+    let (style, number, text) = match line {
+        Some(line) => (
+            line_style(line.kind, colors),
+            if old { line.old_line } else { line.new_line },
+            line.text.as_str(),
+        ),
+        None => (
+            LineStyle {
+                background: colors.diff_empty,
+                gutter: colors.diff_empty,
+                foreground: colors.muted,
+                marker_color: colors.muted,
+                marker: " ",
+            },
+            None,
+            "",
+        ),
     };
     div()
         .w_1_2()
@@ -31891,16 +32020,16 @@ fn split_cell_scrolled(
         .flex()
         .items_center()
         .overflow_hidden()
-        .bg(background)
+        .bg(style.background)
         .border_r_1()
         .border_color(colors.border)
-        .child(line_number(number, colors))
+        .child(line_number(number, style.gutter, colors))
         .child(
             div()
                 .w(px(18.))
                 .flex_none()
-                .text_color(foreground)
-                .child(marker),
+                .text_color(style.marker_color)
+                .child(style.marker),
         )
         .child(
             div()
@@ -31915,7 +32044,7 @@ fn split_cell_scrolled(
                 .overflow_x_scroll()
                 .restrict_scroll_to_axis()
                 .track_scroll(horizontal)
-                .child(line_text(text, foreground).w(px(text_width)).h_full()),
+                .child(line_text(text, style.foreground).w(px(text_width)).h_full()),
         )
 }
 

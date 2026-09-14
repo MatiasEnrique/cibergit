@@ -2067,9 +2067,9 @@ impl LocalWorkspace {
                         .flex_1()
                         .p_3()
                         .bg(if colors.dark {
-                            rgba(0x411f21ff)
+                            rgba(0xf851491a)
                         } else {
-                            rgba(0xf9e2e0ff)
+                            rgba(0xffebe9ff)
                         })
                         .text_color(colors.red)
                         .child("This file also changed on disk. Reconcile that change in Local Changes before editing or staging the result. Your unsaved text is preserved.")

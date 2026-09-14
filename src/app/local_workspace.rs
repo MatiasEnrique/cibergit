@@ -2945,10 +2945,10 @@ fn palette(dark: bool) -> LocalPalette {
             muted: rgba(0xb8bbc1ff),
             border: rgba(0x36383dff),
             selected: rgba(0xffffff13),
-            accent: rgba(0x8ab4f8ff),
-            green: rgba(0x70c995ff),
-            red: rgba(0xf28b82ff),
-            amber: rgba(0xf7c873ff),
+            accent: rgba(0x4493f8ff),
+            green: rgba(0x3fb950ff),
+            red: rgba(0xf85149ff),
+            amber: rgba(0xd29922ff),
             dark,
         }
     } else {
@@ -2961,10 +2961,10 @@ fn palette(dark: bool) -> LocalPalette {
             muted: rgba(0x56595eff),
             border: rgba(0xdedfdcff),
             selected: rgba(0x0000000a),
-            accent: rgba(0x245eaaff),
-            green: rgba(0x18794eff),
-            red: rgba(0xc2352aff),
-            amber: rgba(0x986a12ff),
+            accent: rgba(0x0969daff),
+            green: rgba(0x1a7f37ff),
+            red: rgba(0xd1242fff),
+            amber: rgba(0x9a6700ff),
             dark,
         }
     }
@@ -3773,7 +3773,11 @@ impl LocalWorkspace {
                     div()
                         .px(px(ui::CONTROL_INSET))
                         .py_2()
-                        .bg(if colors.dark { rgba(0x452f18ff) } else { rgba(0xfff4d6ff) })
+                        .bg(if colors.dark {
+                            rgba(0xbb800926)
+                        } else {
+                            rgba(0xfff8c5ff)
+                        })
                         .text_color(colors.amber)
                         .child(match tab.view.conflict_kind {
                             Some(ConflictKind::Missing) => "The file was removed. Your unsaved text is preserved.",
@@ -4297,9 +4301,9 @@ impl LocalWorkspace {
                 div()
                     .p_3()
                     .bg(if colors.dark {
-                        rgba(0x342b18ff)
+                        rgba(0xbb800926)
                     } else {
-                        rgba(0xfff4d6ff)
+                        rgba(0xfff8c5ff)
                     })
                     .border_t_1()
                     .border_color(colors.amber)
@@ -4336,7 +4340,11 @@ impl LocalWorkspace {
             let publish_attempt = started.pr_publish.clone();
             let mut reconciliation = div()
                     .p_3()
-                    .bg(if colors.dark { rgba(0x411f21ff) } else { rgba(0xf9e2e0ff) })
+                    .bg(if colors.dark {
+                        rgba(0xf851491a)
+                    } else {
+                        rgba(0xffebe9ff)
+                    })
                     .border_t_1()
                     .border_color(colors.red)
                     .child(div().font_weight(FontWeight::MEDIUM).child("Started action needs reconciliation"))
