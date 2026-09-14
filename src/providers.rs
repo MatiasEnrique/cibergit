@@ -2654,17 +2654,6 @@ impl Runner {
         let output = self.run_inner(&mut command, action, None)?;
         ensure_success(output, action)
     }
-    fn run_maybe_cancelled(
-        &self,
-        mut command: Command,
-        action: &'static str,
-        cancellation: Option<&AtomicBool>,
-        deadline: Option<Instant>,
-    ) -> Result<Vec<u8>> {
-        let output =
-            self.run_inner_maybe_cancelled(&mut command, action, None, cancellation, deadline)?;
-        ensure_success(output, action)
-    }
     fn run_with_input(
         &self,
         mut command: Command,
@@ -2967,7 +2956,7 @@ enum RunnerFailureKind {
 
 #[derive(Debug)]
 struct RunnerFailure {
-    kind: RunnerFailureKind,
+    pub(super) kind: RunnerFailureKind,
     action: &'static str,
 }
 

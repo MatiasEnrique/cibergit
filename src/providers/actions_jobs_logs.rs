@@ -3,7 +3,9 @@
 //! Jobs and logs are intentionally memory-only. Signed storage locations and
 //! credentials are ephemeral transport inputs and never enter diagnostics.
 
-use super::{API_VERSION, GithubProvider, Session, conditional, terminate_process_group};
+use super::{
+    API_VERSION, GithubProvider, RunnerFailureKind, Session, conditional, terminate_process_group,
+};
 use crate::domain::{
     ActionsAttemptKey, ActionsAttemptLocator, ActionsHeadRelation, ActionsJob, ActionsJobLog,
     ActionsJobStep, ActionsJobsSnapshot, ActionsLinkage, ActionsLogProvenance,
@@ -1166,19 +1168,31 @@ fn resolve_token(
     ]);
     let output = provider
         .runner
-        .run_maybe_cancelled(
+        .run_with_status_maybe_cancelled(
             command,
             "resolve selected GitHub credential",
             Some(&cancellation.0),
             Some(deadline),
         )
-        .map_err(|_| {
-            if cancellation.is_cancelled() {
-                cancelled("log credential")
-            } else {
-                ActionsReadError::new(ActionsReadErrorCategory::Credential, "log credential")
-            }
+        .map_err(|error| {
+            ActionsReadError::new(
+                match error.kind {
+                    RunnerFailureKind::Cancelled => ActionsReadErrorCategory::Cancelled,
+                    RunnerFailureKind::TimedOut => ActionsReadErrorCategory::TimedOut,
+                    RunnerFailureKind::Start
+                    | RunnerFailureKind::Io
+                    | RunnerFailureKind::OutputLimit => ActionsReadErrorCategory::Credential,
+                },
+                "log credential",
+            )
         })?;
+    if !output.status.success() {
+        return Err(ActionsReadError::new(
+            ActionsReadErrorCategory::Credential,
+            "log credential",
+        ));
+    }
+    let output = output.stdout;
     let start = output
         .iter()
         .position(|byte| !byte.is_ascii_whitespace())
@@ -2373,6 +2387,26 @@ mod tests {
         let text = String::from_utf8(config).unwrap();
         assert!(text.contains("q=\\\\\\\"secret"));
         assert!(text.contains("Bearer tok\\\\\\\"en"));
+    }
+
+    #[test]
+    fn log_credential_child_timeout_remains_typed() {
+        let temp = TempDir::new().unwrap();
+        let gh = temp.path().join("gh");
+        executable(&gh, "#!/bin/sh\n/bin/sleep 5\n");
+        let repo = repository();
+        let provider =
+            GithubProvider::synthetic_with_gh(repo.account, gh, Duration::from_millis(80));
+        assert_eq!(
+            resolve_token(
+                &provider,
+                &ActionsCancellation::new(),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap_err()
+            .category(),
+            ActionsReadErrorCategory::TimedOut
+        );
     }
 
     #[test]
