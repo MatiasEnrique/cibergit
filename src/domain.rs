@@ -1259,6 +1259,10 @@ pub struct ActionsRunControlTarget {
     pub run_event: String,
     pub run_head_sha: String,
     pub run_html_url: String,
+    pub run_api_url: String,
+    pub workflow_url: String,
+    pub head_repository_node_id: String,
+    pub head_repository_name_with_owner: String,
 }
 
 /// Fresh explicit repository-permission evidence. Resolving `/user` proves

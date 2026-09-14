@@ -9,7 +9,7 @@ macro_rules! provider_actions_control_tests {
             MutationTerminalRecord, ProviderMutationOutcome, ProviderReadEvidence, Repository,
             WorkflowRunIdentity,
         };
-        use $crate::providers::{AdmittedMutationAttempt, MutationAdmission};
+        use $crate::providers::{ActionsRunControlDispatch, AdmittedMutationAttempt, MutationAdmission};
         use anyhow::Result;
         use serde_json::{Value, json};
         use std::{
@@ -153,6 +153,14 @@ macro_rules! provider_actions_control_tests {
         }
 
         fn control_fixture(steps: Vec<Value>) -> (TempDir, GithubProvider) {
+            control_fixture_with(steps, Duration::from_secs(30), 16 * 1024 * 1024)
+        }
+
+        fn control_fixture_with(
+            steps: Vec<Value>,
+            timeout: Duration,
+            output_limit: usize,
+        ) -> (TempDir, GithubProvider) {
             let directory = tempfile::tempdir().unwrap();
             fs::write(
                 directory.path().join("plan.json"),
@@ -163,7 +171,7 @@ macro_rules! provider_actions_control_tests {
             fs::write(
                 &executable,
                 r#"#!/usr/bin/python3
-import json, os, pathlib, sys
+import json, os, pathlib, sys, time
 root = pathlib.Path(__file__).parent
 steps = json.loads((root / 'plan.json').read_text())['steps']
 args = sys.argv[1:]
@@ -182,10 +190,23 @@ assert args == step['args'], 'expected %r, got %r' % (step['args'], args)
 if args[4] == 'POST':
     body = sys.stdin.read()
     assert json.loads(body) == {}, body
+if step.get('stderr_headers'):
+    sys.stderr.write(step['stderr_headers'])
+    sys.stderr.flush()
+    sys.stdout.write(step.get('stdout', ''))
+    sys.stdout.flush()
+    sys.exit(1)
 if step.get('fail_process'):
     print('synthetic lost transport', file=sys.stderr)
     sys.exit(2)
 sys.stdout.write(step['stdout'])
+sys.stdout.flush()
+if step.get('hang_seconds'):
+    time.sleep(step['hang_seconds'])
+if step.get('overflow_bytes'):
+    sys.stdout.write('y' * step['overflow_bytes'])
+    sys.stdout.flush()
+    time.sleep(step.get('overflow_hang_seconds', 0))
 sys.exit(step.get('exit', 0))
 "#,
             )
@@ -195,7 +216,8 @@ sys.exit(step.get('exit', 0))
                 account: control_account(),
                 runner: Runner {
                     gh: executable,
-                    timeout: Duration::from_secs(30),
+                    timeout,
+                    output_limit,
                     ..Runner::default()
                 },
             };
@@ -504,6 +526,217 @@ sys.exit(step.get('exit', 0))
                 state.terminal.as_slice(),
                 [MutationTerminalRecord::NotStarted { .. }]
             ));
+        }
+
+        /// One complete observation triple whose run body is mutated by the
+        /// caller, so a second read can differ in exactly one field.
+        fn mutated_observation_steps(mutate: impl FnOnce(&mut Value)) -> Vec<Value> {
+            let mut run = run_body(2, "completed", Some("failure"));
+            mutate(&mut run);
+            vec![
+                get_step("user", viewer_body()),
+                get_step("repos/owner/repo", repository_body(true)),
+                get_step("repos/owner/repo/actions/runs/6", run),
+            ]
+        }
+
+        /// The second read must re-observe every field the run endpoint
+        /// returns. Each case moves exactly one of them.
+        #[test]
+        fn one_moved_second_read_field_at_a_time_dispatches_zero_writes() {
+            let cases: Vec<(&str, Box<dyn FnOnce(&mut Value)>)> = vec![
+                (
+                    "head repository node",
+                    Box::new(|run: &mut Value| {
+                        run["head_repository"]["node_id"] = json!("OTHER_REPO_node")
+                    }),
+                ),
+                (
+                    "head repository name",
+                    Box::new(|run: &mut Value| {
+                        run["head_repository"]["full_name"] = json!("other/fork")
+                    }),
+                ),
+                (
+                    "absent head repository",
+                    Box::new(|run: &mut Value| run["head_repository"] = Value::Null),
+                ),
+                (
+                    "workflow URL",
+                    Box::new(|run: &mut Value| {
+                        run["workflow_url"] =
+                            json!("https://api.github.com/repos/owner/repo/actions/workflows/99")
+                    }),
+                ),
+                (
+                    "run API URL",
+                    Box::new(|run: &mut Value| {
+                        run["url"] = json!("https://api.github.com/repos/owner/repo/actions/runs/99")
+                    }),
+                ),
+                (
+                    "run HTML URL",
+                    Box::new(|run: &mut Value| {
+                        run["html_url"] = json!("https://github.com/owner/repo/actions/runs/99")
+                    }),
+                ),
+                (
+                    "check suite database ID",
+                    Box::new(|run: &mut Value| run["check_suite_id"] = json!(88)),
+                ),
+                (
+                    "check suite node",
+                    Box::new(|run: &mut Value| run["check_suite_node_id"] = json!("OTHER_SUITE")),
+                ),
+                (
+                    "workflow database ID",
+                    Box::new(|run: &mut Value| run["workflow_id"] = json!(44)),
+                ),
+                (
+                    "run number",
+                    Box::new(|run: &mut Value| run["run_number"] = json!(55)),
+                ),
+                (
+                    "run event",
+                    Box::new(|run: &mut Value| run["event"] = json!("push")),
+                ),
+                (
+                    "run node",
+                    Box::new(|run: &mut Value| run["node_id"] = json!("OTHER_RUN_node")),
+                ),
+            ];
+            for (field, mutate) in cases {
+                let mut steps = observation_steps(true, 2, "completed", Some("failure"));
+                steps.extend(mutated_observation_steps(mutate));
+                let (directory, provider) = control_fixture(steps);
+                let request = prepared(&provider, ActionsRunControlAction::RerunAllJobs)
+                    .unwrap_or_else(|error| panic!("{field}: preparation failed: {error}"));
+                let mut admission = control_admission();
+                let state = admission.state.clone();
+                let dispatch =
+                    provider.execute_actions_run_control(&control_repo(), &request, &mut admission);
+                assert!(
+                    matches!(
+                        dispatch.outcome,
+                        ProviderMutationOutcome::PreflightRejected { .. }
+                    ),
+                    "a moved {field} was not refused: {:?}",
+                    dispatch.outcome
+                );
+                // The POST step was never reached.
+                assert_eq!(control_count(&directory), 6, "{field} reached the transport");
+                assert!(matches!(
+                    state.lock().unwrap().terminal.as_slice(),
+                    [MutationTerminalRecord::NotStarted { .. }]
+                ));
+            }
+        }
+
+        /// Scheduling evidence lives in the bounded leading header block, so it
+        /// must survive a response this classifier will not read.
+        #[test]
+        fn an_unclassifiable_response_still_installs_the_server_rate_floor() {
+            for body_bytes in [70 * 1024usize, 200 * 1024] {
+                let mut steps = observation_steps(true, 2, "completed", Some("failure"));
+                steps.extend(observation_steps(true, 2, "completed", Some("failure")));
+                steps.push(post_step(
+                    "rerun",
+                    &format!(
+                        "HTTP/2.0 429 Too Many Requests\r\nretry-after: 120\r\n\r\n{}",
+                        "x".repeat(body_bytes)
+                    ),
+                    1,
+                ));
+                let (_directory, provider) = control_fixture(steps);
+                let request = prepared(&provider, ActionsRunControlAction::RerunAllJobs).unwrap();
+                let mut admission = control_admission();
+                let state = admission.state.clone();
+                let dispatch =
+                    provider.execute_actions_run_control(&control_repo(), &request, &mut admission);
+                assert!(
+                    matches!(dispatch.outcome, ProviderMutationOutcome::Uncertain { .. }),
+                    "{body_bytes} byte body must stay uncertain: {:?}",
+                    dispatch.outcome
+                );
+                assert_eq!(
+                    dispatch.directive.rate_limit,
+                    Some(GeneralReadDelay::Seconds(120)),
+                    "a {body_bytes} byte body suppressed a complete leading rate directive"
+                );
+                assert!(matches!(
+                    state.lock().unwrap().terminal.as_slice(),
+                    [MutationTerminalRecord::Uncertain { .. }]
+                ));
+            }
+        }
+
+        const RATE_HEADERS: &str = "HTTP/2.0 429 Too Many Requests\r\nretry-after: 120\r\n\r\n";
+
+        fn rate_floor_case(post: Value, timeout: Duration, output_limit: usize) -> ActionsRunControlDispatch {
+            let mut steps = observation_steps(true, 2, "completed", Some("failure"));
+            steps.extend(observation_steps(true, 2, "completed", Some("failure")));
+            steps.push(post);
+            let (_directory, provider) = control_fixture_with(steps, timeout, output_limit);
+            let request = prepared(&provider, ActionsRunControlAction::RerunAllJobs).unwrap();
+            let mut admission = control_admission();
+            provider.execute_actions_run_control(&control_repo(), &request, &mut admission)
+        }
+
+        /// A transport that starts, sends complete leading headers, then never
+        /// finishes must still install the floor the server already stated.
+        #[test]
+        fn complete_leading_headers_survive_a_transport_timeout() {
+            let mut post = post_step("rerun", RATE_HEADERS, 0);
+            post["hang_seconds"] = json!(30);
+            let dispatch = rate_floor_case(post, Duration::from_millis(150), 16 * 1024 * 1024);
+            assert!(
+                matches!(dispatch.outcome, ProviderMutationOutcome::Uncertain { .. }),
+                "a started transport must stay uncertain: {:?}",
+                dispatch.outcome
+            );
+            assert_eq!(
+                dispatch.directive.rate_limit,
+                Some(GeneralReadDelay::Seconds(120)),
+                "a timeout discarded complete leading rate headers"
+            );
+        }
+
+        /// The same holds when the child overflows the runner's output bound
+        /// after its headers.
+        #[test]
+        fn complete_leading_headers_survive_an_output_overflow() {
+            let mut post = post_step("rerun", RATE_HEADERS, 0);
+            post["overflow_bytes"] = json!(64 * 1024);
+            let dispatch = rate_floor_case(post, Duration::from_secs(10), 4 * 1024);
+            assert!(
+                matches!(dispatch.outcome, ProviderMutationOutcome::Uncertain { .. }),
+                "an overflowing transport must stay uncertain: {:?}",
+                dispatch.outcome
+            );
+            assert_eq!(
+                dispatch.directive.rate_limit,
+                Some(GeneralReadDelay::Seconds(120)),
+                "an output overflow discarded complete leading rate headers"
+            );
+        }
+
+        /// Child stderr is never scheduling evidence, however convincing it
+        /// looks. Only stdout headers may install a floor.
+        #[test]
+        fn a_stderr_header_lookalike_never_installs_a_floor() {
+            let mut post = post_step("rerun", "", 1);
+            post["stderr_headers"] = json!(RATE_HEADERS);
+            let dispatch = rate_floor_case(post, Duration::from_secs(10), 16 * 1024 * 1024);
+            assert!(
+                matches!(dispatch.outcome, ProviderMutationOutcome::Uncertain { .. }),
+                "expected an uncertain outcome: {:?}",
+                dispatch.outcome
+            );
+            assert_eq!(
+                dispatch.directive.rate_limit, None,
+                "child stderr installed an account floor"
+            );
+            assert_eq!(dispatch.directive.x_poll_interval, None);
         }
 
         #[test]

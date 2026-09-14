@@ -37,9 +37,9 @@ use checks_view::{
     checks_page, identity_fields, kind_label, linkage_label, required_label, sha_label,
 };
 use ci_actions::{
-    ActionsControlConfirmationToken, ActionsControlFence, ActionsControlPreparationToken,
-    CiActionsState, RUN_CONTROLS, authority_summary, completion_status,
-    dispatch_actions_run_control, reconciliation_summary,
+    ActionsControlConfirmationToken, ActionsControlDisplay, ActionsControlOwnership,
+    ActionsControlPreparationToken, CiActionsState, RUN_CONTROLS, authority_summary,
+    completion_status, dispatch_actions_run_control, reconciliation_summary,
 };
 #[cfg(feature = "ui-smoke")]
 use ci_read::MemoryRead;
@@ -5550,6 +5550,70 @@ impl ReviewWorkspace {
         locator
     }
 
+    /// Start one synthetic in-flight preparation and return its exact token
+    /// plus the request the provider would have produced.
+    #[cfg(all(test, feature = "ui-smoke"))]
+    fn install_synthetic_actions_preparation(
+        &mut self,
+        action: ActionsRunControlAction,
+    ) -> (
+        ActionsControlPreparationToken,
+        Box<ActionsRunControlRequest>,
+    ) {
+        let (_, locator, _, _) = self
+            .selected_actions_locator(0)
+            .expect("the synthetic scene has a fully identified run");
+        let request = Self::synthetic_actions_control_request(&locator, action);
+        let generation = self.tabs[0].ci_actions.invalidate();
+        let ownership = self
+            .actions_control_ownership(0, request.operation_id.clone(), request.attempt_id.clone())
+            .expect("the synthetic tab exists");
+        let token = ActionsControlPreparationToken {
+            ownership: ownership.clone(),
+            display: self
+                .actions_control_display(0)
+                .expect("the synthetic tab exists"),
+            generation,
+            action,
+        };
+        self.tabs[0].ci_actions.in_flight = Some(ownership);
+        self.tabs[0].write_in_flight = true;
+        (token, Box::new(request))
+    }
+
+    /// Install one synthetic frozen control confirmation and return the exact
+    /// token the rendered controls would carry.
+    #[cfg(all(test, feature = "ui-smoke"))]
+    fn install_synthetic_actions_confirmation(
+        &mut self,
+        action: ActionsRunControlAction,
+    ) -> ActionsControlConfirmationToken {
+        let (_, locator, _, _) = self
+            .selected_actions_locator(0)
+            .expect("the synthetic scene has a fully identified run");
+        let request = Self::synthetic_actions_control_request(&locator, action);
+        let generation = self.tabs[0].ci_actions.invalidate();
+        let token = ActionsControlConfirmationToken {
+            ownership: self
+                .actions_control_ownership(
+                    0,
+                    request.operation_id.clone(),
+                    request.attempt_id.clone(),
+                )
+                .expect("the synthetic tab exists"),
+            display: self
+                .actions_control_display(0)
+                .expect("the synthetic tab exists"),
+            generation,
+            request: request.clone(),
+        };
+        self.tabs[0].confirmation = Some(NativeConfirmation::ActionsRunControl {
+            generation,
+            request: Box::new(request),
+        });
+        token
+    }
+
     /// A frozen control request for the synthetic scene. It is presentation
     /// input only: no credential, permission, or transport is involved.
     #[cfg(all(test, feature = "ui-smoke"))]
@@ -5584,6 +5648,19 @@ impl ReviewWorkspace {
                         run_event: run.event.clone(),
                         run_head_sha: locator.check_commit_sha.clone(),
                         run_html_url: run.github_url.clone(),
+                        run_api_url: format!(
+                            "https://api.github.com/repos/{}/actions/runs/{}",
+                            locator.base_repository.name_with_owner, run.database_id
+                        ),
+                        workflow_url: format!(
+                            "https://api.github.com/repos/{}/actions/workflows/{}",
+                            locator.base_repository.name_with_owner, run.workflow_database_id
+                        ),
+                        head_repository_node_id: locator.head_repository.node_id.clone(),
+                        head_repository_name_with_owner: locator
+                            .head_repository
+                            .name_with_owner
+                            .clone(),
                     },
                     viewer: cibergit::domain::SelectedViewer {
                         node_id: "SYNTHETIC_VIEWER_NODE".into(),
@@ -16155,25 +16232,61 @@ impl ReviewWorkspace {
         Some(index)
     }
 
-    /// The exact tab identity every prepared or confirmed Actions control is
-    /// bound to. A moved check selection, a new details generation, or a
-    /// different exact run locator all fence a pending control.
-    fn actions_control_fence(&self, index: usize) -> Option<ActionsControlFence> {
+    /// The display state a prepared or confirmed Actions control is bound to.
+    ///
+    /// This gates whether a confirmation may be installed or confirmed. It is
+    /// deliberately not part of operation ownership: a dispatched attempt must
+    /// still be able to release itself and report its outcome after the
+    /// display moves.
+    fn actions_control_display(&self, index: usize) -> Option<ActionsControlDisplay> {
         let tab = self.tabs.get(index)?;
-        Some(ActionsControlFence {
-            workspace_instance: self.workspace_instance,
-            tab_instance: tab.instance_generation,
-            repository_key: tab.repository.cache_key(),
-            pull_request: tab.pull_request.number,
+        Some(ActionsControlDisplay {
             details_generation: tab.details_generation,
             selected_check_id: tab.checks_selection.selected_id.clone(),
             locator: self
                 .selected_actions_locator(index)
                 .ok()
                 .map(|(_, locator, _, _)| locator),
-            generation: tab.ci_actions.confirmation_generation,
-            write_in_flight: tab.write_in_flight,
         })
+    }
+
+    fn actions_control_ownership(
+        &self,
+        index: usize,
+        operation_id: String,
+        attempt_id: String,
+    ) -> Option<ActionsControlOwnership> {
+        let tab = self.tabs.get(index)?;
+        Some(ActionsControlOwnership {
+            workspace_instance: self.workspace_instance,
+            tab_instance: tab.instance_generation,
+            repository_key: tab.repository.cache_key(),
+            pull_request: tab.pull_request.number,
+            operation_id,
+            attempt_id,
+        })
+    }
+
+    /// The tab that still owns this exact operation's busy state, by identity
+    /// alone. A moved selection, refreshed details, or bumped confirmation
+    /// generation never hides an operation from its own completion.
+    fn actions_control_owner(&self, ownership: &ActionsControlOwnership) -> Option<usize> {
+        if self.workspace_instance != ownership.workspace_instance {
+            return None;
+        }
+        self.tabs.iter().position(|tab| {
+            tab.instance_generation == ownership.tab_instance
+                && tab.repository.cache_key() == ownership.repository_key
+                && tab.pull_request.number == ownership.pull_request
+                && tab.ci_actions.in_flight.as_ref() == Some(ownership)
+        })
+    }
+
+    /// Release exactly this operation's busy state and nothing else.
+    fn release_actions_control(&mut self, index: usize, ownership: &ActionsControlOwnership) {
+        if self.tabs[index].ci_actions.release(ownership) {
+            self.tabs[index].write_in_flight = false;
+        }
     }
 
     fn invalidate_actions_control_confirmation(&mut self, index: usize, status: &str) -> bool {
@@ -16190,6 +16303,46 @@ impl ReviewWorkspace {
         tab.ci_actions.invalidate();
         self.status = status.into();
         true
+    }
+
+    /// A moved check selection or a changed exact run must never leave a frozen
+    /// control confirmation on screen. Only the prepared request is discarded:
+    /// every text draft, pinned selection, and recovery record is untouched.
+    ///
+    /// An in-flight control is never fenced here. Its outcome must still reach
+    /// the completion path, which owns its own release.
+    fn reconcile_actions_control_confirmation(&mut self, index: usize) {
+        if self.tabs[index].write_in_flight {
+            return;
+        }
+        let Some(target) = self.tabs[index]
+            .confirmation
+            .as_ref()
+            .and_then(|confirmation| match confirmation {
+                NativeConfirmation::ActionsRunControl { request, .. } => {
+                    Some(request.preparation.observation.target.clone())
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let still_current =
+            self.selected_actions_locator(index)
+                .ok()
+                .is_some_and(|(_, locator, _, _)| {
+                    locator.check_node_id == target.check_node_id
+                        && locator.check_database_id == target.check_database_id
+                        && locator.workflow_run.node_id == target.run_node_id
+                        && locator.workflow_run.database_id == target.run_database_id
+                        && locator.workflow_run.run_attempt == target.run_attempt
+                });
+        if !still_current {
+            self.invalidate_actions_control_confirmation(
+                index,
+                "The selected check or exact run attempt changed; the prepared Actions control was discarded. Zero writes sent.",
+            );
+        }
     }
 
     /// Read the selected viewer, fresh repository permission, and the exact
@@ -16238,18 +16391,24 @@ impl ReviewWorkspace {
             "Preparing a different Actions control; the prior confirmation was discarded.",
         );
         self.tabs[index].confirmation = None;
-        self.tabs[index].ci_actions.invalidate();
-        self.tabs[index].write_in_flight = true;
+        let generation = self.tabs[index].ci_actions.invalidate();
         let operation_id = next_attempt_id(action.journal_action());
         let attempt_id = next_attempt_id(&operation_id);
-        let Some(fence) = self.actions_control_fence(index) else {
+        let Some(ownership) =
+            self.actions_control_ownership(index, operation_id.clone(), attempt_id.clone())
+        else {
             return;
         };
+        let Some(display) = self.actions_control_display(index) else {
+            return;
+        };
+        self.tabs[index].ci_actions.in_flight = Some(ownership.clone());
+        self.tabs[index].write_in_flight = true;
         let token = ActionsControlPreparationToken {
-            fence,
+            ownership,
+            display,
+            generation,
             action,
-            operation_id: operation_id.clone(),
-            attempt_id: attempt_id.clone(),
         };
         self.update_shared_composer_disabled(cx);
         self.status = format!(
@@ -16287,23 +16446,30 @@ impl ReviewWorkspace {
         token: &ActionsControlPreparationToken,
         result: Result<ActionsRunControlRequest, String>,
     ) -> Option<usize> {
-        let index = (0..self.tabs.len()).find(|index| {
-            self.actions_control_fence(*index)
-                .is_some_and(|fence| token.matches(&fence))
-        })?;
-        self.tabs[index].write_in_flight = false;
+        // Ownership is located first so this attempt always releases its own
+        // busy state, even when the display it was prepared against has moved.
+        let index = self.actions_control_owner(&token.ownership)?;
+        self.release_actions_control(index, &token.ownership);
+        let eligible = self.tabs[index].ci_actions.confirmation_generation == token.generation
+            && self.actions_control_display(index).as_ref() == Some(&token.display);
         match result {
             Ok(request)
-                if request.operation_id == token.operation_id
-                    && request.attempt_id == token.attempt_id
+                if request.operation_id == token.ownership.operation_id
+                    && request.attempt_id == token.ownership.attempt_id
                     && request.preparation.action == token.action =>
             {
+                if !eligible {
+                    self.status =
+                        "The selected check or exact run moved while preparing; the prepared Actions control was discarded and zero writes were sent."
+                            .into();
+                    return Some(index);
+                }
                 let unknown = matches!(
                     request.preparation.observation.authority,
                     cibergit::domain::ActionsRunControlAuthority::Unknown { .. }
                 );
                 self.tabs[index].confirmation = Some(NativeConfirmation::ActionsRunControl {
-                    generation: token.fence.generation,
+                    generation: token.generation,
                     request: Box::new(request),
                 });
                 self.inspector_open = true;
@@ -16328,23 +16494,49 @@ impl ReviewWorkspace {
         Some(index)
     }
 
+    /// Cancelling retires the frozen request, so a captured confirmation token
+    /// can never dispatch afterwards.
     fn cancel_actions_control_confirmation(
         &mut self,
         token: &ActionsControlConfirmationToken,
         cx: &mut Context<Root>,
     ) {
-        let Some(index) = (0..self.tabs.len()).find(|index| {
-            self.actions_control_fence(*index)
-                .is_some_and(|fence| token.matches(&fence, false))
-        }) else {
+        let Some(index) = self.actions_control_confirmation_index(token) else {
             return;
         };
         if self.tabs[index].write_in_flight {
             return;
         }
-        self.tabs[index].confirmation = None;
-        self.status = "Actions control cancelled; zero writes sent.".into();
+        self.invalidate_actions_control_confirmation(
+            index,
+            "Actions control cancelled; the prepared request was retired and zero writes sent.",
+        );
         cx.notify();
+    }
+
+    /// The tab whose currently installed confirmation is exactly this token's
+    /// frozen request at this token's generation.
+    fn actions_control_confirmation_index(
+        &self,
+        token: &ActionsControlConfirmationToken,
+    ) -> Option<usize> {
+        if self.workspace_instance != token.ownership.workspace_instance {
+            return None;
+        }
+        self.tabs.iter().position(|tab| {
+            tab.instance_generation == token.ownership.tab_instance
+                && tab.repository.cache_key() == token.ownership.repository_key
+                && tab.pull_request.number == token.ownership.pull_request
+                && tab.ci_actions.confirmation_generation == token.generation
+                && matches!(
+                    tab.confirmation.as_ref(),
+                    Some(NativeConfirmation::ActionsRunControl {
+                        generation,
+                        request,
+                    }) if *generation == token.generation
+                        && request.as_ref() == &token.request
+                )
+        })
     }
 
     /// Durably admit the exact frozen request, repeat the preflight inside the
@@ -16354,10 +16546,7 @@ impl ReviewWorkspace {
         token: ActionsControlConfirmationToken,
         cx: &mut Context<Root>,
     ) {
-        let Some(index) = (0..self.tabs.len()).find(|index| {
-            self.actions_control_fence(*index)
-                .is_some_and(|fence| token.matches(&fence, false))
-        }) else {
+        let Some(index) = self.actions_control_confirmation_index(&token) else {
             return;
         };
         if self.tabs[index].write_in_flight {
@@ -16372,21 +16561,7 @@ impl ReviewWorkspace {
             cx.notify();
             return;
         }
-        // The visible check and exact run attempt must still be the frozen
-        // ones. The provider repeats a complete preflight after admission; this
-        // refuses an obviously stale confirmation before taking any authority.
-        let target = &token.request.preparation.observation.target;
-        let visible_run_unchanged =
-            self.selected_actions_locator(index)
-                .ok()
-                .is_some_and(|(_, locator, _, _)| {
-                    locator.check_node_id == target.check_node_id
-                        && locator.check_database_id == target.check_database_id
-                        && locator.workflow_run.node_id == target.run_node_id
-                        && locator.workflow_run.database_id == target.run_database_id
-                        && locator.workflow_run.run_attempt == target.run_attempt
-                });
-        if !visible_run_unchanged {
+        if self.actions_control_display(index).as_ref() != Some(&token.display) {
             self.invalidate_actions_control_confirmation(
                 index,
                 "The selected check or exact run attempt changed; prepare the control again. Zero writes sent.",
@@ -16406,6 +16581,7 @@ impl ReviewWorkspace {
         let number = self.tabs[index].pull_request.number;
         let request = token.request.clone();
         let journal_root = self.interaction_root.clone();
+        self.tabs[index].ci_actions.in_flight = Some(token.ownership.clone());
         self.tabs[index].write_in_flight = true;
         self.update_shared_composer_disabled(cx);
         self.status = "Durably admitting one exact Actions control request…".into();
@@ -16456,12 +16632,19 @@ impl ReviewWorkspace {
         token: &ActionsControlConfirmationToken,
         outcome: ProviderMutationOutcome<ActionsRunControlAcknowledgement>,
     ) -> Option<usize> {
-        let index = (0..self.tabs.len()).find(|index| {
-            self.actions_control_fence(*index)
-                .is_some_and(|fence| token.matches(&fence, true))
-        })?;
-        self.tabs[index].write_in_flight = false;
-        self.tabs[index].confirmation = None;
+        // A dispatched attempt always releases itself and always reports its
+        // outcome. Hiding an Uncertain result behind a moved display would
+        // leave the tab busy and the attempt silently unresolved.
+        let index = self.actions_control_owner(&token.ownership)?;
+        self.release_actions_control(index, &token.ownership);
+        if matches!(
+            self.tabs[index].confirmation.as_ref(),
+            Some(NativeConfirmation::ActionsRunControl { generation, .. })
+                if *generation == token.generation
+        ) {
+            self.tabs[index].confirmation = None;
+        }
+        self.tabs[index].ci_actions.invalidate();
         self.status = completion_status(token.request.preparation.action, &outcome);
         Some(index)
     }
@@ -28164,22 +28347,24 @@ impl ReviewWorkspace {
                 generation,
                 request,
             } => {
-                let fence = ActionsControlFence {
-                    workspace_instance: self.workspace_instance,
-                    tab_instance: tab.instance_generation,
-                    repository_key: tab.repository.cache_key(),
-                    pull_request: tab.pull_request.number,
-                    details_generation: tab.details_generation,
-                    selected_check_id: tab.checks_selection.selected_id.clone(),
-                    locator: self
-                        .selected_actions_locator(index)
-                        .ok()
-                        .map(|(_, locator, _, _)| locator),
-                    generation: *generation,
-                    write_in_flight: tab.write_in_flight,
-                };
                 let token = ActionsControlConfirmationToken {
-                    fence,
+                    ownership: ActionsControlOwnership {
+                        workspace_instance: self.workspace_instance,
+                        tab_instance: tab.instance_generation,
+                        repository_key: tab.repository.cache_key(),
+                        pull_request: tab.pull_request.number,
+                        operation_id: request.operation_id.clone(),
+                        attempt_id: request.attempt_id.clone(),
+                    },
+                    display: ActionsControlDisplay {
+                        details_generation: tab.details_generation,
+                        selected_check_id: tab.checks_selection.selected_id.clone(),
+                        locator: self
+                            .selected_actions_locator(index)
+                            .ok()
+                            .map(|(_, locator, _, _)| locator),
+                    },
+                    generation: *generation,
                     request: request.as_ref().clone(),
                 };
                 let preparation = &request.preparation;
@@ -34970,27 +35155,27 @@ mod layout_tests {
                 let Root::Review(this) = root else {
                     unreachable!()
                 };
-                let (_, locator, _, _) = this.selected_actions_locator(0).unwrap();
-                let request = ReviewWorkspace::synthetic_actions_control_request(
-                    &locator,
-                    ActionsRunControlAction::CancelRun,
-                );
-                let generation = this.tabs[0].ci_actions.invalidate();
-                let token = ActionsControlConfirmationToken {
-                    fence: this.actions_control_fence(0).unwrap(),
-                    request: request.clone(),
-                };
-                this.tabs[0].confirmation = Some(NativeConfirmation::ActionsRunControl {
-                    generation,
-                    request: Box::new(request),
-                });
+                // A token captured before Cancel must never dispatch after it.
+                let cancelled =
+                    this.install_synthetic_actions_confirmation(ActionsRunControlAction::CancelRun);
+                this.cancel_actions_control_confirmation(&cancelled, cx);
+                assert!(this.tabs[0].confirmation.is_none());
+                assert!(this.status.contains("retired"), "{}", this.status);
+                this.confirm_actions_run_control(cancelled, cx);
+                assert!(this.tabs[0].ci_actions.in_flight.is_none());
+                assert!(!this.tabs[0].write_in_flight);
+                assert!(this.tabs[0].confirmation.is_none());
+
+                // A moved check selection discards a still-visible frozen
+                // request, and that token cannot dispatch either.
+                let moved = this
+                    .install_synthetic_actions_confirmation(ActionsRunControlAction::RerunAllJobs);
                 this.tabs[0].checks_selection.selected_id = None;
                 this.reconcile_ci_selection(0);
                 assert!(this.tabs[0].confirmation.is_none());
                 assert!(this.status.contains("Zero writes sent"), "{}", this.status);
-                // The discarded confirmation never becomes confirmable again.
-                assert!(!token.matches(&this.actions_control_fence(0).unwrap(), false));
-                this.confirm_actions_run_control(token, cx);
+                this.confirm_actions_run_control(moved, cx);
+                assert!(this.tabs[0].ci_actions.in_flight.is_none());
                 assert!(!this.tabs[0].write_in_flight);
                 assert!(this.tabs[0].confirmation.is_none());
             });
@@ -35019,8 +35204,10 @@ mod layout_tests {
             assert!(this.tabs[0].details.is_some());
         });
 
-        // An in-flight control is never fenced by a later selection change:
-        // its outcome must still be able to reach the completion path.
+        // A preparation whose display moved while it was in flight retires by
+        // ownership: it releases its own busy state and refuses to install the
+        // confirmation. This is the no-write path, distinct from the
+        // post-dispatch uncertain case below.
         cx.update(|_, cx| {
             root.update(cx, |root, _| {
                 let Root::Review(this) = root else {
@@ -35028,21 +35215,79 @@ mod layout_tests {
                 };
                 this.tabs[0].checks_selection.selected_id =
                     Some("SYNTHETIC_ACTIONS_CHECK_NODE".into());
-                let (_, locator, _, _) = this.selected_actions_locator(0).unwrap();
-                let request = ReviewWorkspace::synthetic_actions_control_request(
-                    &locator,
-                    ActionsRunControlAction::RerunAllJobs,
+                let (token, request) =
+                    this.install_synthetic_actions_preparation(ActionsRunControlAction::CancelRun);
+                // The display moves while the preparation read is outstanding.
+                this.tabs[0].checks_selection.selected_id = None;
+                this.tabs[0].details_generation += 1;
+
+                let index = this.apply_actions_control_preparation(&token, Ok(*request));
+                assert_eq!(
+                    index,
+                    Some(0),
+                    "a stale preparation lost its own retirement"
                 );
-                let generation = this.tabs[0].ci_actions.invalidate();
-                this.tabs[0].confirmation = Some(NativeConfirmation::ActionsRunControl {
-                    generation,
-                    request: Box::new(request),
-                });
+                assert!(!this.tabs[0].write_in_flight, "busy state leaked");
+                assert!(this.tabs[0].ci_actions.in_flight.is_none());
+                assert!(
+                    this.tabs[0].confirmation.is_none(),
+                    "a stale preparation installed a confirmation"
+                );
+                assert!(
+                    this.status.contains("zero writes were sent"),
+                    "{}",
+                    this.status
+                );
+            });
+            let _ = cx;
+        });
+
+        // A dispatched control releases its own busy state and reports its
+        // outcome even when the display moved while it was in flight.
+        cx.update(|_, cx| {
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.tabs[0].checks_selection.selected_id =
+                    Some("SYNTHETIC_ACTIONS_CHECK_NODE".into());
+                let token = this
+                    .install_synthetic_actions_confirmation(ActionsRunControlAction::RerunAllJobs);
+                this.tabs[0].ci_actions.in_flight = Some(token.ownership.clone());
                 this.tabs[0].write_in_flight = true;
+
+                // An in-flight control is not fenced by a selection change.
                 this.tabs[0].checks_selection.selected_id = None;
                 this.reconcile_ci_selection(0);
                 assert!(this.tabs[0].confirmation.is_some());
-                this.tabs[0].write_in_flight = false;
+                this.tabs[0].details_generation += 1;
+                this.tabs[0].ci_actions.invalidate();
+
+                let index = this.apply_actions_control_completion(
+                    &token,
+                    ProviderMutationOutcome::Uncertain {
+                        context: cibergit::domain::MutationContext {
+                            operation_id: token.ownership.operation_id.clone(),
+                            attempt_id: token.ownership.attempt_id.clone(),
+                            action: "rerun-actions-run-all-jobs".into(),
+                            payload: serde_json::json!({}),
+                        },
+                        reason: "synthetic lost acknowledgement".into(),
+                    },
+                );
+                assert_eq!(
+                    index,
+                    Some(0),
+                    "a dispatched control lost its own completion"
+                );
+                assert!(!this.tabs[0].write_in_flight, "busy state leaked");
+                assert!(this.tabs[0].ci_actions.in_flight.is_none());
+                assert!(
+                    this.status.contains("frozen against replay"),
+                    "an uncertain outcome was dropped: {}",
+                    this.status
+                );
+                let _ = cx;
             });
         });
     }

@@ -294,7 +294,7 @@ impl GithubProvider {
         let run: ApiCurrentRun = session
             .get(&run_path(repo, target.run_database_id))
             .map_err(|error| format!("exact Actions run read failed: {error}"))?;
-        let fresh = target_from_run(repo, target, &repository, &run)?;
+        let fresh = target_from_run(target, &repository, &run)?;
         Ok(ActionsRunControlObservation {
             target: fresh,
             viewer,
@@ -376,47 +376,48 @@ impl GithubProvider {
             "--input",
             "-",
         ]);
-        let output = match self.runner.run_with_input_status(
-            command,
-            "send one GitHub Actions run control",
-            &input,
-        ) {
+        let output = match self.runner.run_mutation_with_input(command, &input) {
             Ok(output) => output,
-            Err(error) => {
-                let kind = error
-                    .downcast_ref::<super::RunnerFailure>()
-                    .map(|failure| failure.kind);
+            Err(failure) => {
+                // A child that failed after starting still disclosed whatever
+                // bounded leading headers the server sent, so its scheduling
+                // floor survives. The prefix never classifies the outcome, and
+                // stderr is never part of it.
+                let directive = conditional::parse_mutation_response(&failure.header_prefix).poll;
                 return SentRunControl {
-                    classification: match kind {
+                    classification: match failure.kind {
                         // The transport never started, so nothing was sent.
-                        Some(RunnerFailureKind::Start) => DispatchClassification::NotSent(
+                        RunnerFailureKind::Start => DispatchClassification::NotSent(
                             "the Actions control transport could not start; zero writes sent"
                                 .into(),
                         ),
                         _ => DispatchClassification::Unresolved(
-                            "the Actions control request was started but no response was read"
+                            "the Actions control request was started but no complete response was read"
                                 .into(),
                         ),
                     },
-                    directive: GeneralReadDirective::default(),
+                    directive,
                 };
             }
         };
+        // Framing is bounded and reads the leading header block first, so the
+        // server's scheduling evidence survives a response this classifier
+        // will not read.
+        let framing = conditional::parse_mutation_response(&output.stdout);
+        let directive = framing.poll.clone();
         if output.stdout.len() > MAX_RESPONSE_BYTES {
             return SentRunControl {
                 classification: DispatchClassification::Unresolved(
                     "the Actions control response exceeded its bound and could not be classified"
                         .into(),
                 ),
-                directive: GeneralReadDirective::default(),
+                directive,
             };
         }
-        let framing = conditional::parse_mutation_response(&output.stdout);
-        let directive = framing.poll.clone();
         let Some(status) = framing.status else {
             return SentRunControl {
                 classification: DispatchClassification::Unresolved(
-                    "the Actions control response could not be framed; its effect is unknown"
+                    "the Actions control response could not be framed or classified within its bounds; its effect is unknown"
                         .into(),
                 ),
                 directive,
@@ -760,63 +761,83 @@ fn validated_target(
         pull_request_node_id: bounded(&locator.pull_request_node_id, "pull request node ID")?,
         check_node_id: bounded(&locator.check_node_id, "check node ID")?,
         check_database_id: locator.check_database_id,
-        check_suite_node_id: bounded(&locator.suite.node_id, "check suite node ID")?,
+        // Everything the run endpoint supplies is frozen from the response,
+        // so the post-admission rebuild compares like with like.
+        check_suite_node_id: bounded(&run.check_suite_node_id, "check suite node ID")?,
         check_suite_database_id: run.check_suite_id,
         workflow_node_id: bounded(&identity.workflow_node_id, "workflow node ID")?,
-        workflow_database_id: identity.workflow_database_id,
+        workflow_database_id: run.workflow_id,
         workflow_name: bounded(&identity.workflow_name, "workflow name")?,
-        run_node_id: bounded(&identity.node_id, "run node ID")?,
-        run_database_id: identity.database_id,
-        run_number: identity.run_number,
+        run_node_id: bounded(&run.node_id, "run node ID")?,
+        run_database_id: run.id,
+        run_number: run.run_number,
         run_attempt: run.run_attempt,
-        run_event: bounded(&identity.event, "run event")?,
+        run_event: bounded(&run.event, "run event")?,
         run_head_sha: run.head_sha.clone(),
-        run_html_url: bounded(&identity.github_url, "run URL")?,
+        run_html_url: bounded(&run.html_url, "run URL")?,
+        run_api_url: bounded(&run.url, "run API URL")?,
+        workflow_url: bounded(&run.workflow_url, "workflow URL")?,
+        head_repository_node_id: bounded(&head_repository.node_id, "head repository node ID")?,
+        head_repository_name_with_owner: bounded(
+            &head_repository.full_name,
+            "head repository name",
+        )?,
     })
 }
 
-/// Rebuild the observed target from a frozen one. Every identity field must
-/// match exactly; the caller then compares the whole observation.
+/// Rebuild the target from the fresh observation alone.
+///
+/// Every value this endpoint returns is taken from the response, so the
+/// caller's whole-observation comparison really does re-observe each field. A
+/// field is carried over from the frozen target only when the run response
+/// cannot supply it, and those are selected-account and Checks identity inputs
+/// rather than observed run state.
 fn target_from_run(
-    repo: &Repository,
     frozen: &ActionsRunControlTarget,
     repository: &ObservedRepository,
     run: &ApiCurrentRun,
 ) -> Result<ActionsRunControlTarget, String> {
-    if repository.node_id != frozen.repository_node_id
-        || repository.full_name != frozen.repository_name_with_owner
-    {
-        return Err("the fresh repository identity differs from the frozen target".into());
-    }
-    if run.id != frozen.run_database_id
-        || run.node_id != frozen.run_node_id
-        || run.run_number != frozen.run_number
-        || run.event != frozen.run_event
-        || run.workflow_id != frozen.workflow_database_id
-        || run.check_suite_node_id != frozen.check_suite_node_id
-        || run.check_suite_id != frozen.check_suite_database_id
-        || run.head_sha != frozen.run_head_sha
-        || run.html_url != frozen.run_html_url
-        || run.url
-            != format!(
-                "https://api.github.com/{}",
-                run_path(repo, frozen.run_database_id)
-            )
-        || run.repository.node_id != frozen.repository_node_id
-        || run.repository.full_name != frozen.repository_name_with_owner
-    {
-        return Err("the exact Actions run identity moved after admission".into());
-    }
+    let Some(head_repository) = run.head_repository.as_ref() else {
+        return Err("the Actions run returned no head repository identity after admission".into());
+    };
     if run.run_attempt != frozen.run_attempt {
         return Err(format!(
             "the run advanced to attempt {} after the frozen attempt {}",
             run.run_attempt, frozen.run_attempt
         ));
     }
-    let mut refreshed = frozen.clone();
-    refreshed.run_attempt = run.run_attempt;
-    refreshed.run_head_sha = run.head_sha.clone();
-    Ok(refreshed)
+    validate_sha(&run.head_sha).map_err(|error| error.to_string())?;
+    Ok(ActionsRunControlTarget {
+        // The selected account and the Checks identity that admitted this
+        // control are inputs, not values this endpoint observes.
+        account: frozen.account.clone(),
+        pull_request_number: frozen.pull_request_number,
+        pull_request_node_id: frozen.pull_request_node_id.clone(),
+        check_node_id: frozen.check_node_id.clone(),
+        check_database_id: frozen.check_database_id,
+        workflow_node_id: frozen.workflow_node_id.clone(),
+        workflow_name: frozen.workflow_name.clone(),
+        // Everything below is re-observed.
+        repository_node_id: repository.node_id.clone(),
+        repository_name_with_owner: repository.full_name.clone(),
+        check_suite_node_id: bounded(&run.check_suite_node_id, "check suite node ID")?,
+        check_suite_database_id: run.check_suite_id,
+        workflow_database_id: run.workflow_id,
+        run_node_id: bounded(&run.node_id, "run node ID")?,
+        run_database_id: run.id,
+        run_number: run.run_number,
+        run_attempt: run.run_attempt,
+        run_event: bounded(&run.event, "run event")?,
+        run_head_sha: run.head_sha.clone(),
+        run_html_url: bounded(&run.html_url, "run URL")?,
+        run_api_url: bounded(&run.url, "run API URL")?,
+        workflow_url: bounded(&run.workflow_url, "workflow URL")?,
+        head_repository_node_id: bounded(&head_repository.node_id, "head repository node ID")?,
+        head_repository_name_with_owner: bounded(
+            &head_repository.full_name,
+            "head repository name",
+        )?,
+    })
 }
 
 fn bounded(value: &str, field: &str) -> Result<String, String> {

@@ -2795,6 +2795,32 @@ impl Runner {
         self.run_inner_maybe_cancelled(command, action, input, None, None)
             .map_err(anyhow::Error::new)
     }
+    /// Run one explicit mutation transport child.
+    ///
+    /// On failure this retains only the bounded leading stdout header prefix,
+    /// so the caller can install the server's own scheduling floor for a
+    /// transport that started. It never retains stderr, never retains a
+    /// response body, and never classifies the outcome.
+    fn run_mutation_with_input(
+        &self,
+        mut command: Command,
+        input: &[u8],
+    ) -> std::result::Result<RunnerOutput, MutationTransportFailure> {
+        MUTATION_HEADER_PREFIX.with(|cell| cell.take());
+        let result = self.run_inner_maybe_cancelled(
+            &mut command,
+            MUTATION_TRANSPORT_ACTION,
+            Some(input),
+            None,
+            None,
+        );
+        let header_prefix = MUTATION_HEADER_PREFIX.with(|cell| cell.take());
+        result.map_err(|failure| MutationTransportFailure {
+            kind: failure.kind,
+            header_prefix,
+        })
+    }
+
     fn run_with_status_maybe_cancelled(
         &self,
         mut command: Command,
@@ -2854,7 +2880,8 @@ impl Runner {
             terminate_process_group(&mut child);
             return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
         };
-        let capture_conditional_prefix = action == "GitHub conditional read request";
+        let capture = HeaderPrefixCapture::for_action(action);
+        let capture_header_prefix = capture.enabled();
         for (is_stdout, mut pipe) in [
             (true, Box::new(stdout) as Box<dyn Read + Send>),
             (false, Box::new(stderr) as Box<dyn Read + Send>),
@@ -2869,7 +2896,7 @@ impl Runner {
                         let mut chunk = [0u8; 8 * 1024];
                         match pipe.read(&mut chunk) {
                             Ok(0) => {
-                                if is_stdout && capture_conditional_prefix && !prefix_complete {
+                                if is_stdout && capture_header_prefix && !prefix_complete {
                                     let _ = tx.send(PipeEvent::ConditionalPrefix(
                                         bytes[..bytes.len().min(64 * 1024)].to_vec(),
                                     ));
@@ -2879,7 +2906,7 @@ impl Runner {
                             Ok(read) => {
                                 let remaining = limit.saturating_add(1).saturating_sub(bytes.len());
                                 bytes.extend_from_slice(&chunk[..read.min(remaining)]);
-                                if is_stdout && capture_conditional_prefix && !prefix_complete {
+                                if is_stdout && capture_header_prefix && !prefix_complete {
                                     let prefix = bytes[..bytes.len().min(64 * 1024)].to_vec();
                                     if conditional_prefix_complete(&prefix)
                                         || prefix.len() == 64 * 1024
@@ -2895,7 +2922,7 @@ impl Runner {
                                 }
                             }
                             Err(error) => {
-                                if is_stdout && capture_conditional_prefix && !prefix_complete {
+                                if is_stdout && capture_header_prefix && !prefix_complete {
                                     let _ = tx.send(PipeEvent::ConditionalPrefix(
                                         bytes[..bytes.len().min(64 * 1024)].to_vec(),
                                     ));
@@ -2917,7 +2944,7 @@ impl Runner {
         let mut stdout_done = false;
         let mut stderr_done = false;
         let mut status = None;
-        let mut conditional_prefix = Vec::new();
+        let mut header_prefix = Vec::new();
         loop {
             loop {
                 match rx.try_recv() {
@@ -2926,8 +2953,8 @@ impl Runner {
                             terminate_runner_with_poll(
                                 &mut child,
                                 &rx,
-                                capture_conditional_prefix,
-                                &mut conditional_prefix,
+                                capture,
+                                &mut header_prefix,
                             );
                             return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
                         }
@@ -2937,15 +2964,14 @@ impl Runner {
                         let bytes = match result {
                             Ok(bytes) if bytes.len() <= limit => bytes,
                             Ok(bytes) => {
-                                if is_stdout && capture_conditional_prefix {
-                                    conditional_prefix =
-                                        bytes[..bytes.len().min(64 * 1024)].to_vec();
+                                if is_stdout && capture_header_prefix {
+                                    header_prefix = bytes[..bytes.len().min(64 * 1024)].to_vec();
                                 }
                                 terminate_runner_with_poll(
                                     &mut child,
                                     &rx,
-                                    capture_conditional_prefix,
-                                    &mut conditional_prefix,
+                                    capture,
+                                    &mut header_prefix,
                                 );
                                 return Err(RunnerFailure::new(
                                     RunnerFailureKind::OutputLimit,
@@ -2956,8 +2982,8 @@ impl Runner {
                                 terminate_runner_with_poll(
                                     &mut child,
                                     &rx,
-                                    capture_conditional_prefix,
-                                    &mut conditional_prefix,
+                                    capture,
+                                    &mut header_prefix,
                                 );
                                 return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
                             }
@@ -2970,18 +2996,18 @@ impl Runner {
                         }
                     }
                     Ok(PipeEvent::ConditionalPrefix(prefix)) => {
-                        conditional_prefix = prefix.clone();
+                        header_prefix = prefix.clone();
                         conditional::record_general_poll_from_included_prefix(&prefix);
                     }
-                    Ok(PipeEvent::ConditionalProgress(prefix)) => conditional_prefix = prefix,
+                    Ok(PipeEvent::ConditionalProgress(prefix)) => header_prefix = prefix,
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         if !input_done || !stdout_done || !stderr_done {
                             terminate_runner_with_poll(
                                 &mut child,
                                 &rx,
-                                capture_conditional_prefix,
-                                &mut conditional_prefix,
+                                capture,
+                                &mut header_prefix,
                             );
                             return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
                         }
@@ -2990,21 +3016,11 @@ impl Runner {
                 }
             }
             if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-                terminate_runner_with_poll(
-                    &mut child,
-                    &rx,
-                    capture_conditional_prefix,
-                    &mut conditional_prefix,
-                );
+                terminate_runner_with_poll(&mut child, &rx, capture, &mut header_prefix);
                 return Err(RunnerFailure::new(RunnerFailureKind::Cancelled, action));
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                terminate_runner_with_poll(
-                    &mut child,
-                    &rx,
-                    capture_conditional_prefix,
-                    &mut conditional_prefix,
-                );
+                terminate_runner_with_poll(&mut child, &rx, capture, &mut header_prefix);
                 return Err(RunnerFailure::new(RunnerFailureKind::TimedOut, action));
             }
             if status.is_none() {
@@ -3012,12 +3028,7 @@ impl Runner {
                     Ok(Some(current)) => status = Some(current),
                     Ok(None) => {}
                     Err(_) => {
-                        terminate_runner_with_poll(
-                            &mut child,
-                            &rx,
-                            capture_conditional_prefix,
-                            &mut conditional_prefix,
-                        );
+                        terminate_runner_with_poll(&mut child, &rx, capture, &mut header_prefix);
                         return Err(RunnerFailure::new(RunnerFailureKind::Io, action));
                     }
                 }
@@ -3033,21 +3044,11 @@ impl Runner {
                 });
             }
             if !input_done && started.elapsed() >= self.input_timeout.unwrap_or(self.timeout) {
-                terminate_runner_with_poll(
-                    &mut child,
-                    &rx,
-                    capture_conditional_prefix,
-                    &mut conditional_prefix,
-                );
+                terminate_runner_with_poll(&mut child, &rx, capture, &mut header_prefix);
                 return Err(RunnerFailure::new(RunnerFailureKind::TimedOut, action));
             }
             if started.elapsed() >= self.timeout {
-                terminate_runner_with_poll(
-                    &mut child,
-                    &rx,
-                    capture_conditional_prefix,
-                    &mut conditional_prefix,
-                );
+                terminate_runner_with_poll(&mut child, &rx, capture, &mut header_prefix);
                 return Err(RunnerFailure::new(RunnerFailureKind::TimedOut, action));
             }
             thread::sleep(Duration::from_millis(5));
@@ -3058,6 +3059,24 @@ impl Runner {
 struct RunnerOutput {
     stdout: Vec<u8>,
     status: std::process::ExitStatus,
+}
+
+/// The one action string that opts a child into mutation-transport prefix
+/// capture. Keeping it a constant makes the capture mode auditable.
+const MUTATION_TRANSPORT_ACTION: &str = "send one GitHub Actions run control";
+
+thread_local! {
+    /// Bounded leading stdout headers of the last failed mutation transport on
+    /// this thread. Taken by `run_mutation_with_input`; never read elsewhere.
+    static MUTATION_HEADER_PREFIX: std::cell::Cell<Vec<u8>> =
+        const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// A mutation transport child that failed after `run_mutation_with_input`
+/// started it, plus whatever bounded leading headers the server already sent.
+struct MutationTransportFailure {
+    kind: RunnerFailureKind,
+    header_prefix: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3134,14 +3153,43 @@ fn conditional_prefix_complete(prefix: &[u8]) -> bool {
         || prefix.windows(2).any(|window| window == b"\n\n")
 }
 
+/// Where the bounded leading stdout header prefix of a failed child goes.
+///
+/// The prefix exists only so a caller can install the server's own scheduling
+/// floor. It is never used to classify an outcome, never contains stderr, and
+/// is bounded to the same 64 KiB the reader threads already enforce.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeaderPrefixCapture {
+    None,
+    /// A conditional read records its own floor directly.
+    ConditionalRead,
+    /// One explicit mutation transport. The prefix is handed back to the
+    /// caller, which records nothing automatically.
+    MutationTransport,
+}
+
+impl HeaderPrefixCapture {
+    fn for_action(action: &'static str) -> Self {
+        match action {
+            "GitHub conditional read request" => Self::ConditionalRead,
+            MUTATION_TRANSPORT_ACTION => Self::MutationTransport,
+            _ => Self::None,
+        }
+    }
+
+    fn enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 fn terminate_runner_with_poll(
     child: &mut Child,
     receiver: &mpsc::Receiver<PipeEvent>,
-    capture_conditional_prefix: bool,
+    capture: HeaderPrefixCapture,
     prefix: &mut Vec<u8>,
 ) {
     terminate_process_group(child);
-    if !capture_conditional_prefix {
+    if !capture.enabled() {
         return;
     }
     let drain_until = Instant::now().checked_add(Duration::from_millis(50));
@@ -3163,7 +3211,15 @@ fn terminate_runner_with_poll(
             Err(mpsc::TryRecvError::Empty) => break,
         }
     }
-    conditional::record_general_poll_from_included_prefix(prefix);
+    match capture {
+        HeaderPrefixCapture::ConditionalRead => {
+            conditional::record_general_poll_from_included_prefix(prefix);
+        }
+        HeaderPrefixCapture::MutationTransport => {
+            MUTATION_HEADER_PREFIX.with(|cell| cell.set(std::mem::take(prefix)));
+        }
+        HeaderPrefixCapture::None => {}
+    }
 }
 
 unsafe extern "C" {
