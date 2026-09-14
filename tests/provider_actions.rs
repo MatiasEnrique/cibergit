@@ -759,6 +759,10 @@ fn pending_file_ack_mismatch_is_uncertain_and_cannot_replay() {
 }
 
 #[test]
+// These semantic fixtures use the ordinary 30-second child budget. A two-second
+// budget expired during fake credential-process startup in the parallel suite,
+// before the provider behavior under test ran. Dedicated deadline tests retain
+// their short injected bounds.
 fn pending_review_start_uses_two_ordered_exact_id_writes() {
     let intent = pending_start_intent();
     let create_variables = json!({
@@ -809,7 +813,7 @@ fn pending_review_start_uses_two_ordered_exact_id_writes() {
                 ),
             ),
         ],
-        Duration::from_secs(2),
+        Duration::from_secs(30),
     );
     let prepared = provider
         .prepare_pending_review_start_create(&repo("alice"), &intent)
@@ -866,7 +870,7 @@ fn pending_review_absence_requires_every_pending_row_to_be_classifiable() {
                 json!({"owner":"owner","name":"repo","number":7}),
                 pending_review_read(nodes),
             )],
-            Duration::from_secs(2),
+            Duration::from_secs(30),
         );
         let observation = provider
             .pending_review_observation(&repo("alice"), 7)
@@ -890,7 +894,7 @@ fn pending_review_absence_requires_every_pending_row_to_be_classifiable() {
                 Value::Null,
             )]),
         )],
-        Duration::from_secs(2),
+        Duration::from_secs(30),
     );
     assert!(
         provider
@@ -909,7 +913,7 @@ fn pending_review_absence_requires_every_pending_row_to_be_classifiable() {
                 json!({"owner":"owner","name":"repo","number":7}),
                 response,
             )],
-            Duration::from_secs(2),
+            Duration::from_secs(30),
         );
         let observation = provider
             .pending_review_observation(&repo("alice"), 7)
@@ -945,7 +949,7 @@ fn pending_review_absence_requires_every_pending_row_to_be_classifiable() {
                 json!({"owner":"owner","name":"repo","number":7}),
                 response,
             )],
-            Duration::from_secs(2),
+            Duration::from_secs(30),
         );
         match provider.pending_review_observation(&repo("alice"), 7) {
             Ok(observation) => assert!(observation.absence.is_none(), "{name}"),
@@ -960,7 +964,7 @@ fn pending_review_absence_requires_every_pending_row_to_be_classifiable() {
 
 #[test]
 fn pending_review_start_rejects_frozen_identity_and_body_before_transport() {
-    let (fixture, provider) = fixture("alice", vec![], Duration::from_secs(2));
+    let (fixture, provider) = fixture("alice", vec![], Duration::from_secs(30));
     let mut wrong_account = pending_start_intent();
     wrong_account.selected_author = "mallory".into();
     assert!(
@@ -1016,7 +1020,7 @@ fn moved_head_between_stages_leaves_exact_created_review_and_sends_one_write() {
                 pending_file_preflight(NEW, "alice", "REVIEW_created"),
             ),
         ],
-        Duration::from_secs(2),
+        Duration::from_secs(30),
     );
     let prepared = provider
         .prepare_pending_review_start_create(&repo("alice"), &intent)
@@ -1157,7 +1161,7 @@ fn pending_review_create_rich_ack_mismatches_are_uncertain_and_never_reach_file_
                     response,
                 ),
             ],
-            Duration::from_secs(2),
+            Duration::from_secs(30),
         );
         let prepared = provider
             .prepare_pending_review_start_create(&repo("alice"), &intent)
