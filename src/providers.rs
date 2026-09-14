@@ -26,7 +26,7 @@ use crate::participation::{
     SubmissionIntent,
 };
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -40,9 +40,14 @@ use std::{
 };
 
 mod conditional;
+mod general_sync;
 pub mod notifications;
 mod pr_lifecycle;
 mod stacks;
+pub use general_sync::{
+    GeneralReadCache, GeneralReadDelay, GeneralReadDirective, GeneralReadFailureKind,
+    GeneralReadOutcome,
+};
 pub use pr_lifecycle::{AdmittedMutationAttempt, MutationAdmission};
 
 const HOST: &str = "github.com";
@@ -1374,6 +1379,7 @@ struct Session<'a> {
     provider: &'a GithubProvider,
     started: Instant,
     bytes: usize,
+    general_read: Option<conditional::GeneralReadTracker>,
 }
 impl<'a> Session<'a> {
     fn new(provider: &'a GithubProvider) -> Self {
@@ -1381,9 +1387,20 @@ impl<'a> Session<'a> {
             provider,
             started: Instant::now(),
             bytes: 0,
+            general_read: conditional::active_general_read_tracker(),
         }
     }
     fn get<T: serde::de::DeserializeOwned>(&mut self, endpoint: &str) -> Result<T> {
+        if self.general_read.is_some() {
+            return match self.get_conditional(endpoint, None) {
+                Ok(conditional::ConditionalGet::Modified { value, .. }) => Ok(value),
+                Ok(conditional::ConditionalGet::NotModified { .. }) => {
+                    self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
+                    bail!("Unexpected not-modified response for an unconditional GitHub read")
+                }
+                Err(error) => Err(anyhow::Error::new(error)),
+            };
+        }
         ensure!(
             self.started.elapsed() < Duration::from_secs(180),
             "GitHub operation time limit reached"
@@ -1437,7 +1454,11 @@ impl<'a> Session<'a> {
     ) -> std::result::Result<conditional::ConditionalGet<T>, conditional::RestReadError> {
         use conditional::{ConditionalGet, RestReadError};
 
+        if let Some(tracker) = &self.general_read {
+            tracker.check_not_halted()?;
+        }
         if self.started.elapsed() >= Duration::from_secs(180) {
+            self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
             return Err(RestReadError::operation_limit());
         }
         let mut token_command = self.provider.runner.gh_command();
@@ -1453,11 +1474,18 @@ impl<'a> Session<'a> {
             .provider
             .runner
             .run(token_command, "resolve selected GitHub credential")
-            .map_err(|_| RestReadError::credential())?;
+            .map_err(|_| {
+                self.record_general_failure(conditional::GeneralReadFailureKind::Unavailable);
+                RestReadError::credential()
+            })?;
         let token = std::str::from_utf8(&token)
-            .map_err(|_| RestReadError::credential())?
+            .map_err(|_| {
+                self.record_general_failure(conditional::GeneralReadFailureKind::Unavailable);
+                RestReadError::credential()
+            })?
             .trim();
         if token.is_empty() || token.len() > 4096 || token.chars().any(char::is_whitespace) {
+            self.record_general_failure(conditional::GeneralReadFailureKind::Unavailable);
             return Err(RestReadError::credential());
         }
         let mut command = self.provider.runner.gh_command();
@@ -1483,19 +1511,34 @@ impl<'a> Session<'a> {
             .provider
             .runner
             .run_with_status(command, "GitHub conditional read request")
-            .map_err(|_| RestReadError::transport())?;
-        self.bytes = self
-            .bytes
-            .checked_add(output.stdout.len())
-            .ok_or_else(RestReadError::operation_limit)?;
+            .map_err(|_| {
+                self.record_general_failure(conditional::GeneralReadFailureKind::Unavailable);
+                RestReadError::transport()
+            })?;
+        let parsed = conditional::parse_included_response(&output.stdout, output.status.success())
+            .inspect_err(|error| {
+                self.record_general_error(error);
+            })?;
+        match &parsed {
+            ConditionalGet::Modified { metadata, .. }
+            | ConditionalGet::NotModified { metadata } => {
+                self.record_general_poll(&metadata.poll);
+            }
+        }
+        self.bytes = self.bytes.checked_add(output.stdout.len()).ok_or_else(|| {
+            self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
+            RestReadError::operation_limit()
+        })?;
         if self.bytes > MAX_OPERATION_BYTES {
+            self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
             return Err(RestReadError::operation_limit());
         }
-        let parsed = conditional::parse_included_response(&output.stdout, output.status.success())?;
         match parsed {
             ConditionalGet::Modified { value, metadata } => {
-                let value = decode(&value)
-                    .map_err(|_| RestReadError::invalid_body(metadata.poll.clone()))?;
+                let value = decode(&value).map_err(|_| {
+                    self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
+                    RestReadError::invalid_body(metadata.poll.clone())
+                })?;
                 Ok(ConditionalGet::Modified { value, metadata })
             }
             ConditionalGet::NotModified { metadata } => {
@@ -1517,6 +1560,9 @@ impl<'a> Session<'a> {
             query.trim_start().starts_with("query ") && !query.contains("mutation"),
             "Only read-only GitHub GraphQL queries are allowed"
         );
+        if self.general_read.is_some() {
+            return self.graphql_included(query, variables);
+        }
         let mut token_command = self.provider.runner.gh_command();
         token_command.args([
             "auth",
@@ -1575,6 +1621,110 @@ impl<'a> Session<'a> {
             data,
             partial: !envelope.errors.is_empty(),
         })
+    }
+
+    fn graphql_included<T: serde::de::DeserializeOwned>(
+        &mut self,
+        query: &str,
+        variables: Value,
+    ) -> Result<GraphqlResult<T>> {
+        use conditional::ConditionalGet;
+
+        if let Some(tracker) = &self.general_read {
+            tracker.check_not_halted().map_err(anyhow::Error::new)?;
+        }
+        let input = serde_json::to_vec(&json!({"query": query, "variables": variables}))
+            .context("Cannot encode GitHub GraphQL read")?;
+        ensure!(
+            input.len() <= 1024 * 1024,
+            "GitHub GraphQL input limit reached"
+        );
+        let token = self.credential().inspect_err(|_| {
+            self.record_general_failure(conditional::GeneralReadFailureKind::Unavailable);
+        })?;
+        let mut command = self.provider.runner.gh_command();
+        command.env("GH_TOKEN", token).args([
+            "api",
+            "--include",
+            "--hostname",
+            HOST,
+            "--method",
+            "POST",
+            "--header",
+            "Accept: application/vnd.github+json",
+            "--header",
+            API_VERSION,
+            "graphql",
+            "--input",
+            "-",
+        ]);
+        let output = self
+            .provider
+            .runner
+            .run_with_input_status(command, "GitHub included GraphQL read", &input)
+            .inspect_err(|_| {
+                self.record_general_failure(conditional::GeneralReadFailureKind::Unavailable);
+            })?;
+        let parsed =
+            conditional::parse_graphql_included_response(&output.stdout, output.status.success())
+                .map_err(|error| {
+                self.record_general_error(&error);
+                anyhow::Error::new(error)
+            })?;
+        let (bytes, metadata) = match parsed {
+            ConditionalGet::Modified { value, metadata } => (value, metadata),
+            ConditionalGet::NotModified { metadata } => {
+                self.record_general_poll(&metadata.poll);
+                self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
+                bail!("Unexpected not-modified response for a GraphQL read")
+            }
+        };
+        self.record_general_poll(&metadata.poll);
+        self.bytes = self
+            .bytes
+            .checked_add(output.stdout.len())
+            .context("GitHub operation output limit reached")?;
+        if self.bytes > MAX_OPERATION_BYTES {
+            self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
+            bail!("GitHub operation output limit reached");
+        }
+        let envelope: GraphqlEnvelope<T> = decode(&bytes).inspect_err(|_| {
+            self.record_general_failure(conditional::GeneralReadFailureKind::Incomplete);
+        })?;
+        if !envelope.errors.is_empty()
+            && let Some(delay) = metadata.graphql_rate_limit
+        {
+            self.record_general_poll(&conditional::RestPollDirective {
+                x_poll_interval: None,
+                rate_limit: Some(delay),
+            });
+            bail!("GitHub GraphQL read was stopped by server rate limiting");
+        }
+        let data = envelope
+            .data
+            .context("GitHub GraphQL read returned no usable data")?;
+        Ok(GraphqlResult {
+            data,
+            partial: !envelope.errors.is_empty(),
+        })
+    }
+
+    fn record_general_poll(&self, poll: &conditional::RestPollDirective) {
+        if let Some(tracker) = &self.general_read {
+            tracker.record_poll(poll);
+        }
+    }
+
+    fn record_general_failure(&self, kind: conditional::GeneralReadFailureKind) {
+        if let Some(tracker) = &self.general_read {
+            tracker.record_failure(kind);
+        }
+    }
+
+    fn record_general_error(&self, error: &conditional::RestReadError) {
+        if let Some(tracker) = &self.general_read {
+            tracker.record_error(error);
+        }
     }
 
     fn graphql_mutation<T: serde::de::DeserializeOwned>(
@@ -2374,6 +2524,14 @@ impl Runner {
     ) -> Result<Vec<u8>> {
         let output = self.run_inner(&mut command, action, Some(input))?;
         ensure_success(output, action)
+    }
+    fn run_with_input_status(
+        &self,
+        mut command: Command,
+        action: &'static str,
+        input: &[u8],
+    ) -> Result<RunnerOutput> {
+        self.run_inner(&mut command, action, Some(input))
     }
     fn run_with_status(&self, mut command: Command, action: &'static str) -> Result<RunnerOutput> {
         self.run_inner(&mut command, action, None)
@@ -5368,31 +5526,31 @@ impl DetailsCheckNode {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ApiUser {
     login: String,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ApiRepository {
     name: String,
     owner: ApiUser,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ApiRef {
     sha: String,
     #[serde(rename = "ref")]
     branch: String,
     repo: Option<ApiRepository>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ApiLabel {
     name: String,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ApiTeam {
     slug: String,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ApiPullRequest {
     number: u64,
     title: String,

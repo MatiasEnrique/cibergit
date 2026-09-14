@@ -3,7 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::RefCell,
     fmt,
+    rc::Rc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,6 +16,98 @@ const MAX_LAST_MODIFIED_BYTES: usize = 128;
 const MAX_LINK_BYTES: usize = 16 * 1024;
 const MAX_DIRECTIVE_BYTES: usize = 32;
 const MAX_DECIMAL_DIGITS: usize = 20;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneralReadFailureKind {
+    Unavailable,
+    RateLimited,
+    Incomplete,
+}
+
+#[derive(Default)]
+struct GeneralReadTrackerState {
+    poll: RestPollDirective,
+    failure: Option<GeneralReadFailureKind>,
+    halted: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct GeneralReadTracker(Rc<RefCell<GeneralReadTrackerState>>);
+
+thread_local! {
+    static GENERAL_READ_STACK: RefCell<Vec<GeneralReadTracker>> = const { RefCell::new(Vec::new()) };
+}
+
+impl GeneralReadTracker {
+    pub(crate) fn new() -> Self {
+        Self(Rc::new(RefCell::new(GeneralReadTrackerState::default())))
+    }
+
+    pub(crate) fn record_poll(&self, poll: &RestPollDirective) {
+        let mut state = self.0.borrow_mut();
+        state.poll.merge(poll);
+        if poll.rate_limit.is_some() {
+            state.failure = Some(GeneralReadFailureKind::RateLimited);
+            state.halted = true;
+        }
+    }
+
+    pub(crate) fn record_failure(&self, kind: GeneralReadFailureKind) {
+        let mut state = self.0.borrow_mut();
+        if state.failure != Some(GeneralReadFailureKind::RateLimited) {
+            state.failure = Some(kind);
+        }
+    }
+
+    pub(crate) fn record_error(&self, error: &RestReadError) {
+        self.record_poll(error.poll());
+        if error.poll().rate_limit.is_none() {
+            self.record_failure(error.general_failure_kind());
+        }
+    }
+
+    pub(crate) fn check_not_halted(&self) -> Result<(), RestReadError> {
+        let state = self.0.borrow();
+        if state.halted {
+            Err(RestReadError::new(
+                RestReadErrorKind::RateDeferred,
+                state.poll.clone(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> (RestPollDirective, Option<GeneralReadFailureKind>) {
+        let state = self.0.borrow();
+        (state.poll.clone(), state.failure)
+    }
+}
+
+pub(crate) fn with_general_read_tracker<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, RestPollDirective, Option<GeneralReadFailureKind>) {
+    struct PopTracker;
+    impl Drop for PopTracker {
+        fn drop(&mut self) {
+            GENERAL_READ_STACK.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+
+    let tracker = GeneralReadTracker::new();
+    GENERAL_READ_STACK.with(|stack| stack.borrow_mut().push(tracker.clone()));
+    let guard = PopTracker;
+    let result = operation();
+    drop(guard);
+    let (poll, failure) = tracker.snapshot();
+    (result, poll, failure)
+}
+
+pub(crate) fn active_general_read_tracker() -> Option<GeneralReadTracker> {
+    GENERAL_READ_STACK.with(|stack| stack.borrow().last().cloned())
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RestValidators {
@@ -98,6 +192,7 @@ pub(crate) struct RestResponseMetadata {
     pub(crate) validators: RestValidators,
     pub(crate) link: Option<String>,
     pub(crate) poll: RestPollDirective,
+    pub(crate) graphql_rate_limit: Option<BoundedDelay>,
     pub(crate) body_bytes: usize,
 }
 
@@ -121,6 +216,7 @@ enum RestReadErrorKind {
     InvalidHeaders,
     InvalidBody,
     HttpFailure,
+    RateDeferred,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +250,18 @@ impl RestReadError {
     pub(crate) fn invalidates_cached_body(&self) -> bool {
         matches!(self.kind, RestReadErrorKind::InvalidBody)
     }
+    fn general_failure_kind(&self) -> GeneralReadFailureKind {
+        if self.poll.rate_limit.is_some() || matches!(self.kind, RestReadErrorKind::RateDeferred) {
+            GeneralReadFailureKind::RateLimited
+        } else if matches!(
+            self.kind,
+            RestReadErrorKind::Credential | RestReadErrorKind::Transport
+        ) {
+            GeneralReadFailureKind::Unavailable
+        } else {
+            GeneralReadFailureKind::Incomplete
+        }
+    }
     fn with_poll(mut self, poll: RestPollDirective) -> Self {
         self.poll = poll;
         self
@@ -170,6 +278,9 @@ impl fmt::Display for RestReadError {
             RestReadErrorKind::InvalidHeaders => "Invalid GitHub response metadata",
             RestReadErrorKind::InvalidBody => "Invalid or incomplete GitHub JSON response",
             RestReadErrorKind::HttpFailure => "GitHub conditional read was rejected",
+            RestReadErrorKind::RateDeferred => {
+                "GitHub read was stopped by a server rate-limit response"
+            }
         };
         formatter.write_str(message)
     }
@@ -181,39 +292,57 @@ pub(crate) fn parse_included_response(
     output: &[u8],
     process_success: bool,
 ) -> Result<ConditionalGet<Vec<u8>>, RestReadError> {
+    parse_included_response_for(output, process_success, false)
+}
+
+pub(crate) fn parse_graphql_included_response(
+    output: &[u8],
+    process_success: bool,
+) -> Result<ConditionalGet<Vec<u8>>, RestReadError> {
+    parse_included_response_for(output, process_success, true)
+}
+
+fn parse_included_response_for(
+    output: &[u8],
+    process_success: bool,
+    graphql: bool,
+) -> Result<ConditionalGet<Vec<u8>>, RestReadError> {
     let Some((header_end, delimiter_len)) = find_header_end(output) else {
-        let poll = rejected_header_poll(&output[..output.len().min(MAX_HEADER_BYTES)]);
+        let poll = rejected_header_poll(&output[..output.len().min(MAX_HEADER_BYTES)], graphql);
         return Err(RestReadError::new(RestReadErrorKind::InvalidFraming, poll));
     };
     if header_end > MAX_HEADER_BYTES {
-        let poll = rejected_header_poll(&output[..MAX_HEADER_BYTES]);
+        let poll = rejected_header_poll(&output[..MAX_HEADER_BYTES], graphql);
         return Err(RestReadError::new(RestReadErrorKind::InvalidHeaders, poll));
     }
     let header = &output[..header_end];
     let collected = collect_header_fields(header)?;
-    let (poll, directive_error) = parse_poll_directive(
+    let (poll, directive_error, graphql_rate_limit) = parse_poll_directive(
         collected.status,
         &collected.fields,
         collected.error.is_some(),
     );
+    let error_poll =
+        promote_graphql_rate_on_error(poll.clone(), graphql, graphql_rate_limit.clone());
     if let Some(error) = collected.error.or(directive_error) {
-        return Err(error.with_poll(poll));
+        return Err(error.with_poll(error_poll));
     }
     let validators =
-        parse_validators(&collected.fields).map_err(|error| error.with_poll(poll.clone()))?;
+        parse_validators(&collected.fields).map_err(|error| error.with_poll(error_poll.clone()))?;
     let link = single(&collected.fields, "link")
         .and_then(|value| {
             value
                 .map(|value| validate_visible(value, MAX_LINK_BYTES))
                 .transpose()
         })
-        .map_err(|error| error.with_poll(poll.clone()))?
+        .map_err(|error| error.with_poll(error_poll.clone()))?
         .map(str::to_owned);
     let body = &output[header_end + delimiter_len..];
     let metadata = RestResponseMetadata {
         validators,
         link,
         poll: poll.clone(),
+        graphql_rate_limit,
         body_bytes: body.len(),
     };
     match collected.status {
@@ -222,8 +351,14 @@ pub(crate) fn parse_included_response(
             metadata,
         }),
         304 if body.is_empty() => Ok(ConditionalGet::NotModified { metadata }),
-        200 | 304 => Err(RestReadError::new(RestReadErrorKind::InvalidFraming, poll)),
-        _ => Err(RestReadError::new(RestReadErrorKind::HttpFailure, poll)),
+        200 | 304 => Err(RestReadError::new(
+            RestReadErrorKind::InvalidFraming,
+            error_poll,
+        )),
+        _ => Err(RestReadError::new(
+            RestReadErrorKind::HttpFailure,
+            error_poll,
+        )),
     }
 }
 
@@ -308,7 +443,7 @@ fn collect_header_fields(header: &[u8]) -> Result<CollectedHeaderFields, RestRea
     })
 }
 
-fn rejected_header_poll(prefix: &[u8]) -> RestPollDirective {
+fn rejected_header_poll(prefix: &[u8], graphql: bool) -> RestPollDirective {
     let Some(last_newline) = prefix.iter().rposition(|byte| *byte == b'\n') else {
         let status = std::str::from_utf8(prefix)
             .ok()
@@ -325,7 +460,9 @@ fn rejected_header_poll(prefix: &[u8]) -> RestPollDirective {
     let Ok(collected) = collect_header_fields(complete) else {
         return RestPollDirective::default();
     };
-    let mut poll = parse_poll_directive(collected.status, &collected.fields, true).0;
+    let (mut poll, _, graphql_rate_limit) =
+        parse_poll_directive(collected.status, &collected.fields, true);
+    poll = promote_graphql_rate_on_error(poll, graphql, graphql_rate_limit);
     let partial_name = partial
         .iter()
         .position(|byte| *byte == b':')
@@ -349,16 +486,43 @@ fn rejected_header_poll(prefix: &[u8]) -> RestPollDirective {
     poll
 }
 
+fn promote_graphql_rate_on_error(
+    mut poll: RestPollDirective,
+    graphql: bool,
+    graphql_rate_limit: Option<BoundedDelay>,
+) -> RestPollDirective {
+    if graphql {
+        poll.rate_limit = merge_delay(poll.rate_limit, graphql_rate_limit);
+    }
+    poll
+}
+
 fn parse_poll_directive(
     status: u16,
     fields: &[(String, String)],
     structural_error: bool,
-) -> (RestPollDirective, Option<RestReadError>) {
+) -> (
+    RestPollDirective,
+    Option<RestReadError>,
+    Option<BoundedDelay>,
+) {
     let (retry_after, retry_error) = capture_decimal(fields, "retry-after");
     let (remaining, remaining_error) = capture_single(fields, "x-ratelimit-remaining");
     let (reset, reset_error) = capture_decimal(fields, "x-ratelimit-reset");
     let (x_poll_interval, x_poll_error) = capture_decimal(fields, "x-poll-interval");
     let rate_limit = rate_limit_delay(
+        status,
+        &ParsedRateHeaders {
+            retry_after: &retry_after,
+            retry_error: retry_error.is_some(),
+            remaining,
+            remaining_error: remaining_error.is_some(),
+            reset: &reset,
+            reset_error: reset_error.is_some(),
+        },
+        structural_error,
+    );
+    let graphql_rate_limit = graphql_rate_limit_delay(
         status,
         &ParsedRateHeaders {
             retry_after: &retry_after,
@@ -381,7 +545,7 @@ fn parse_poll_directive(
         .or(remaining_error)
         .or(reset_error)
         .or(x_poll_error);
-    (poll, error)
+    (poll, error, graphql_rate_limit)
 }
 
 fn find_header_end(output: &[u8]) -> Option<(usize, usize)> {
@@ -552,6 +716,28 @@ fn rate_limit_delay(
         }
         _ => None,
     }
+}
+
+fn graphql_rate_limit_delay(
+    status: u16,
+    rate: &ParsedRateHeaders<'_>,
+    structural_error: bool,
+) -> Option<BoundedDelay> {
+    if status != 200 {
+        return None;
+    }
+    if let Some(delay) = bounded_delay(rate.retry_after) {
+        return Some(delay);
+    }
+    if rate.remaining == Some("0") {
+        return Some(rate_delay(rate.retry_after, rate.remaining, rate.reset));
+    }
+    if rate.retry_error
+        || (structural_error && (rate.remaining_error || rate.reset_error || rate.retry_error))
+    {
+        return Some(BoundedDelay::Suspend);
+    }
+    None
 }
 
 fn rate_delay(

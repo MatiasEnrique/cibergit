@@ -19,6 +19,7 @@ mod local_workspace;
 mod notifications_view;
 mod pr_creation;
 mod pr_lifecycle;
+mod read_sync;
 mod review_interactions;
 mod stack_view;
 mod submitted_review_drafts;
@@ -39,7 +40,7 @@ use cibergit::{
         ReviewAuxiliaryRequest, Revision,
     },
     participation::{DiffSide, LineSelection, ReviewEvent, ReviewKey},
-    providers::GithubProvider,
+    providers::{GeneralReadFailureKind, GithubProvider},
     review::{
         AlignedRow, DiffLine, DiffLineKind, DiffMode, ParsedDiff, PatchStatus, ReviewSession,
         file_key, load_local_file, local_pr_inventory, parse_file,
@@ -589,17 +590,57 @@ impl Render for SplitterDragPreview {
 struct RefreshGate {
     active: bool,
     explicit_pending: bool,
+    automatic_pending: bool,
+}
+
+#[derive(Clone, Copy)]
+enum GeneralReadFollowup {
+    Tab { index: usize, kind: u8 },
+    Repository { index: usize },
+}
+
+fn rotate_general_read_followups<T>(followups: &mut [T], cursor: &mut usize) {
+    if followups.is_empty() {
+        return;
+    }
+    followups.rotate_left(*cursor % followups.len());
+    *cursor = cursor.wrapping_add(1);
 }
 
 impl RefreshGate {
+    #[cfg(test)]
     fn request(&mut self, explicit: bool) -> bool {
+        self.begin_admission(explicit).is_some()
+    }
+
+    /// Begin a server-admitted refresh, carrying one explicit intent that may
+    /// have been deferred before any provider work started.
+    fn begin_admission(&mut self, explicit: bool) -> Option<bool> {
         if self.active {
             self.explicit_pending |= explicit;
-            false
+            None
         } else {
             self.active = true;
-            true
+            self.automatic_pending = false;
+            Some(explicit || std::mem::take(&mut self.explicit_pending))
         }
+    }
+
+    fn defer_admission(&mut self, explicit: bool) {
+        self.active = false;
+        if explicit {
+            self.explicit_pending = true;
+        } else {
+            self.automatic_pending = true;
+        }
+    }
+
+    fn has_deferred(&self) -> bool {
+        !self.active && (self.explicit_pending || self.automatic_pending)
+    }
+
+    fn superseded_by_explicit(&self) -> bool {
+        self.active && self.explicit_pending
     }
 
     /// Call only after matching the callback's repository/tab lifetime.
@@ -768,6 +809,14 @@ fn collaboration_completion_matches(
     current_tab: u64,
 ) -> bool {
     expected_workspace == current_workspace && expected_tab == current_tab
+}
+
+fn general_read_callback_is_current(expected_workspace: u64, current_workspace: u64) -> bool {
+    expected_workspace == current_workspace
+}
+
+fn general_read_tab_can_start(close_after_save: bool) -> bool {
+    !close_after_save
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1560,6 +1609,8 @@ pub struct ReviewWorkspace {
     interaction_root: PathBuf,
     stack_data_root: PathBuf,
     notifications: notifications_view::NotificationController,
+    general_reads: read_sync::GeneralReadController,
+    general_read_followup_cursor: usize,
     workspace: WorkspaceState,
     persistence_error: Option<String>,
     accounts: Vec<cibergit::domain::Account>,
@@ -1835,6 +1886,8 @@ impl ReviewWorkspace {
             interaction_root,
             stack_data_root: data_root,
             notifications,
+            general_reads: read_sync::GeneralReadController::default(),
+            general_read_followup_cursor: 0,
             workspace,
             persistence_error,
             accounts: Vec::new(),
@@ -2356,6 +2409,7 @@ impl ReviewWorkspace {
                     .update(cx, |root, cx| {
                         let Root::Review(this) = root else { return };
                         tick += 1;
+                        this.resume_general_read_followups(cx);
                         let active_due = this.active_tab.is_some_and(|index| {
                             let tab = &this.tabs[index];
                             let key = format!(
@@ -8455,6 +8509,60 @@ impl ReviewWorkspace {
         }
     }
 
+    fn resume_general_read_followups(&mut self, cx: &mut Context<Root>) {
+        let mut followups = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| {
+                general_read_tab_can_start(tab.submitted_summary_editor.close_after_save)
+            })
+            .flat_map(|(index, tab)| {
+                [
+                    tab.metadata_refresh
+                        .has_deferred()
+                        .then_some(GeneralReadFollowup::Tab { index, kind: 0 }),
+                    tab.details_refresh
+                        .has_deferred()
+                        .then_some(GeneralReadFollowup::Tab { index, kind: 1 }),
+                    tab.lifecycle_refresh
+                        .has_deferred()
+                        .then_some(GeneralReadFollowup::Tab { index, kind: 2 }),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        followups.extend(
+            self.repositories
+                .iter()
+                .enumerate()
+                .filter_map(|(index, runtime)| {
+                    runtime
+                        .refresh
+                        .has_deferred()
+                        .then_some(GeneralReadFollowup::Repository { index })
+                }),
+        );
+        rotate_general_read_followups(&mut followups, &mut self.general_read_followup_cursor);
+        for followup in followups {
+            match followup {
+                GeneralReadFollowup::Tab { index, kind: 0 } => {
+                    self.refresh_metadata(index, false, cx)
+                }
+                GeneralReadFollowup::Tab { index, kind: 1 } => {
+                    self.refresh_details_with_intent(index, false, cx)
+                }
+                GeneralReadFollowup::Tab { index, .. } => {
+                    self.refresh_lifecycle_with_intent(index, false, cx)
+                }
+                GeneralReadFollowup::Repository { index } => {
+                    self.refresh_repository_with_intent(index, false, cx)
+                }
+            }
+        }
+    }
+
     fn refresh_repository(&mut self, index: usize, cx: &mut Context<Root>) {
         self.refresh_repository_with_intent(index, true, cx);
     }
@@ -8465,22 +8573,43 @@ impl ReviewWorkspace {
         explicit: bool,
         cx: &mut Context<Root>,
     ) {
-        let Some(runtime) = self.repositories.get_mut(index) else {
+        let Some((repository, effective_explicit)) =
+            self.repositories.get_mut(index).and_then(|runtime| {
+                runtime
+                    .refresh
+                    .begin_admission(explicit)
+                    .map(|effective| (runtime.repository.clone(), effective))
+            })
+        else {
             return;
         };
-        if !runtime.refresh.request(explicit) {
-            return;
-        }
+        let admission = match self.general_reads.begin(&repository.account) {
+            Ok(admission) => admission,
+            Err(read_sync::ReadDeferral::Busy) => {
+                self.repositories[index]
+                    .refresh
+                    .defer_admission(effective_explicit);
+                return;
+            }
+            Err(read_sync::ReadDeferral::Server(notice)) => {
+                self.repositories[index]
+                    .refresh
+                    .defer_admission(effective_explicit);
+                self.status = notice.into();
+                cx.notify();
+                return;
+            }
+        };
         // A removed and re-added repository must not reuse the old read ID.
         let generation = self.issue_request_generation();
         let runtime = &mut self.repositories[index];
         runtime.generation = generation;
-        let repository = runtime.repository.clone();
         let repo_key = repository.cache_key();
         if runtime.pull_requests.is_empty() {
             runtime.state = LoadState::Loading("Loading pull requests…".into());
         }
         let provider = GithubProvider::new(repository.account.clone());
+        let read_workspace_instance = self.workspace_instance;
         let requested_state = {
             let state = self.workspace.view().filter.state;
             if state.is_empty() {
@@ -8489,41 +8618,72 @@ impl ReviewWorkspace {
                 state
             }
         };
+        let (read_token, cache) = admission.into_parts();
         let task = cx.background_spawn(async move {
-            provider.list_pull_requests(&repository, &requested_state)
+            let outcome =
+                provider.list_pull_requests_conditional(&repository, &requested_state, cache);
+            (read_token, outcome)
         });
         cx.spawn(async move |root, cx| {
-            let result = task.await;
+            let (read_token, outcome) = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
-                let Some(index) = this.repositories.iter().position(|runtime| {
+                let (result, cache, directive, failure) = outcome.into_parts();
+                if !general_read_callback_is_current(
+                    read_workspace_instance,
+                    this.workspace_instance,
+                ) {
+                    this.general_reads
+                        .complete(&read_token, &directive, cache, false);
+                    return;
+                }
+                let matching_index = this.repositories.iter().position(|runtime| {
                     runtime.repository.cache_key() == repo_key && runtime.generation == generation
-                }) else {
+                });
+                let superseded = matching_index
+                    .is_some_and(|index| this.repositories[index].refresh.superseded_by_explicit());
+                let accept_payload = matching_index.is_some() && !superseded && result.is_ok();
+                let disposition =
+                    this.general_reads
+                        .complete(&read_token, &directive, cache, accept_payload);
+                if !disposition.matching_operation_released {
                     return;
-                };
-                if this.repositories[index].refresh.complete() {
+                }
+                let follow_up = matching_index
+                    .map(|index| this.repositories[index].refresh.complete())
+                    .unwrap_or(false);
+                if let Some(index) = matching_index
+                    && follow_up
+                {
                     this.refresh_repository(index, cx);
+                    this.resume_general_read_followups(cx);
                     return;
                 }
-                let runtime = &mut this.repositories[index];
-                match result {
-                    Ok(pull_requests) => {
-                        if let Some(store) = &this.store {
-                            let _ = store.save_pull_requests(&runtime.repository, &pull_requests);
+                if let Some(index) = matching_index {
+                    let runtime = &mut this.repositories[index];
+                    match result {
+                        Ok(pull_requests) if disposition.payload_accepted => {
+                            if let Some(store) = &this.store {
+                                let _ =
+                                    store.save_pull_requests(&runtime.repository, &pull_requests);
+                            }
+                            runtime.pull_requests = pull_requests;
+                            runtime.state = LoadState::Ready;
+                            this.schedule.succeeded(&format!("sidebar:{repo_key}"));
                         }
-                        runtime.pull_requests = pull_requests;
-                        runtime.state = LoadState::Ready;
-                        this.schedule.succeeded(&format!("sidebar:{repo_key}"));
-                    }
-                    Err(error) => {
-                        this.schedule.failed(&format!("sidebar:{repo_key}"));
-                        runtime.state = if runtime.pull_requests.is_empty() {
-                            LoadState::Error(format!("Refresh failed: {error:#}"))
-                        } else {
-                            LoadState::Cached(format!("Offline/cache · {error:#}"))
-                        };
+                        Ok(_) => {}
+                        Err(_) => {
+                            this.schedule.failed(&format!("sidebar:{repo_key}"));
+                            let notice = general_read_failure_notice(failure);
+                            runtime.state = if runtime.pull_requests.is_empty() {
+                                LoadState::Error(notice.into())
+                            } else {
+                                LoadState::Cached(notice.into())
+                            };
+                        }
                     }
                 }
+                this.resume_general_read_followups(cx);
                 cx.notify();
             });
         })
@@ -11254,7 +11414,7 @@ impl ReviewWorkspace {
 
     fn dispatch_auxiliary_action(&mut self, action: ReviewAuxiliaryAction, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
-        if self.tabs[index].submitted_summary_editor.close_after_save {
+        if !general_read_tab_can_start(self.tabs[index].submitted_summary_editor.close_after_save) {
             return;
         }
         if self.tabs[index].write_in_flight {
@@ -11820,68 +11980,123 @@ impl ReviewWorkspace {
 
     fn refresh_active_with_intent(&mut self, explicit: bool, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
+        if self.tabs[index].submitted_summary_editor.close_after_save {
+            return;
+        }
         self.refresh_metadata(index, explicit, cx);
         self.refresh_details_with_intent(index, explicit, cx);
         self.refresh_lifecycle_with_intent(index, explicit, cx);
     }
 
     fn refresh_metadata(&mut self, index: usize, explicit: bool, cx: &mut Context<Root>) {
-        let Some(tab) = self.tabs.get_mut(index) else {
+        let Some((repository, number, effective_explicit)) =
+            self.tabs.get_mut(index).and_then(|tab| {
+                if !general_read_tab_can_start(tab.submitted_summary_editor.close_after_save) {
+                    return None;
+                }
+                tab.metadata_refresh
+                    .begin_admission(explicit)
+                    .map(|effective| (tab.repository.clone(), tab.pull_request.number, effective))
+            })
+        else {
             return;
         };
-        if !tab.metadata_refresh.request(explicit) {
-            return;
-        }
+        let admission = match self.general_reads.begin(&repository.account) {
+            Ok(admission) => admission,
+            Err(read_sync::ReadDeferral::Busy) => {
+                self.tabs[index]
+                    .metadata_refresh
+                    .defer_admission(effective_explicit);
+                return;
+            }
+            Err(read_sync::ReadDeferral::Server(notice)) => {
+                self.tabs[index]
+                    .metadata_refresh
+                    .defer_admission(effective_explicit);
+                self.status = notice.into();
+                cx.notify();
+                return;
+            }
+        };
+        let tab = &mut self.tabs[index];
         tab.metadata_generation += 1;
         let read_epoch = TabReadEpoch {
             instance: tab.instance_generation,
             generation: tab.metadata_generation,
         };
-        let repository = tab.repository.clone();
-        let number = tab.pull_request.number;
+        let read_workspace_instance = self.workspace_instance;
         let key = repository.cache_key();
-        let task = cx.background_spawn(async move {
-            GithubProvider::new(repository.account.clone()).pull_request(&repository, number)
-        });
+        let (read_token, cache) = admission.into_parts();
+        let task =
+            cx.background_spawn(async move {
+                let outcome = GithubProvider::new(repository.account.clone())
+                    .pull_request_conditional(&repository, number, cache);
+                (read_token, outcome)
+            });
         cx.spawn(async move |root, cx| {
-            let result = task.await;
+            let (read_token, outcome) = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
-                let Some(index) = this.tabs.iter().position(|tab| {
+                let (result, cache, directive, failure) = outcome.into_parts();
+                if !general_read_callback_is_current(
+                    read_workspace_instance,
+                    this.workspace_instance,
+                ) {
+                    this.general_reads
+                        .complete(&read_token, &directive, cache, false);
+                    return;
+                }
+                let matching_index = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == key
                         && tab.pull_request.number == number
                         && read_epoch.matches(tab.instance_generation, tab.metadata_generation)
-                }) else {
+                });
+                let superseded = matching_index.is_some_and(|index| {
+                    this.tabs[index].metadata_refresh.superseded_by_explicit()
+                });
+                let accept_payload = matching_index.is_some() && !superseded && result.is_ok();
+                let disposition =
+                    this.general_reads
+                        .complete(&read_token, &directive, cache, accept_payload);
+                if !disposition.matching_operation_released {
                     return;
-                };
-                if this.tabs[index].metadata_refresh.complete() {
+                }
+                let follow_up = matching_index
+                    .map(|index| this.tabs[index].metadata_refresh.complete())
+                    .unwrap_or(false);
+                if let Some(index) = matching_index
+                    && follow_up
+                {
                     this.refresh_metadata(index, true, cx);
+                    this.resume_general_read_followups(cx);
                     return;
                 }
-                let tab = &mut this.tabs[index];
-                match result {
-                    Ok(pull_request) => {
-                        tab.stack.observe_selected_revision(&pull_request.head_sha);
-                        if let Some(session) = &mut tab.canonical_session {
-                            session.observe_revision(pull_request.revision());
+                if let Some(index) = matching_index {
+                    let tab = &mut this.tabs[index];
+                    match result {
+                        Ok(pull_request) if disposition.payload_accepted => {
+                            tab.stack.observe_selected_revision(&pull_request.head_sha);
+                            if let Some(session) = &mut tab.canonical_session {
+                                session.observe_revision(pull_request.revision());
+                            }
+                            if matches!(
+                                tab.comparison_picker.request,
+                                ComparisonRequest::FullPullRequest
+                            ) && let Some(session) = &mut tab.session
+                            {
+                                session.observe_revision(pull_request.revision());
+                            }
+                            tab.pull_request = pull_request;
+                            this.schedule.succeeded(&format!("pr:{key}:{number}"));
                         }
-                        if matches!(
-                            tab.comparison_picker.request,
-                            ComparisonRequest::FullPullRequest
-                        ) && let Some(session) = &mut tab.session
-                        {
-                            session.observe_revision(pull_request.revision());
+                        Ok(_) => {}
+                        Err(_) => {
+                            this.status = general_read_failure_notice(failure).into();
+                            this.schedule.failed(&format!("pr:{key}:{number}"));
                         }
-                        tab.pull_request = pull_request;
-                        this.schedule.succeeded(&format!("pr:{key}:{number}"));
-                    }
-                    Err(error) => {
-                        this.status = format!(
-                            "Metadata refresh failed; displayed revision unchanged: {error:#}"
-                        );
-                        this.schedule.failed(&format!("pr:{key}:{number}"));
                     }
                 }
+                this.resume_general_read_followups(cx);
                 cx.notify();
             });
         })
@@ -11898,47 +12113,103 @@ impl ReviewWorkspace {
         explicit: bool,
         cx: &mut Context<Root>,
     ) {
-        let Some(tab) = self.tabs.get_mut(index) else {
+        let Some((repository, number, effective_explicit)) =
+            self.tabs.get_mut(index).and_then(|tab| {
+                if !general_read_tab_can_start(tab.submitted_summary_editor.close_after_save) {
+                    return None;
+                }
+                tab.lifecycle_refresh
+                    .begin_admission(explicit)
+                    .map(|effective| (tab.repository.clone(), tab.pull_request.number, effective))
+            })
+        else {
             return;
         };
-        if !tab.lifecycle_refresh.request(explicit) {
-            return;
-        }
+        let admission = match self.general_reads.begin(&repository.account) {
+            Ok(admission) => admission,
+            Err(read_sync::ReadDeferral::Busy) => {
+                self.tabs[index]
+                    .lifecycle_refresh
+                    .defer_admission(effective_explicit);
+                return;
+            }
+            Err(read_sync::ReadDeferral::Server(notice)) => {
+                self.tabs[index]
+                    .lifecycle_refresh
+                    .defer_admission(effective_explicit);
+                self.status = notice.into();
+                cx.notify();
+                return;
+            }
+        };
+        let tab = &mut self.tabs[index];
         tab.lifecycle_generation = tab.lifecycle_generation.saturating_add(1);
         let read_epoch = TabReadEpoch {
             instance: tab.instance_generation,
             generation: tab.lifecycle_generation,
         };
-        let repository = tab.repository.clone();
-        let number = tab.pull_request.number;
+        let read_workspace_instance = self.workspace_instance;
         let identity = repository.cache_key();
         if tab.lifecycle.snapshot.is_none() {
             tab.lifecycle_state = LoadState::Loading("Loading lifecycle metadata…".into());
         }
+        let (read_token, _cache) = admission.into_parts();
         let task = cx.background_spawn(async move {
             let provider = GithubProvider::new(repository.account.clone());
-            let snapshot = provider.pr_lifecycle_snapshot(&repository, number)?;
-            let choices = provider.pr_lifecycle_choices(&repository)?;
-            Ok::<_, anyhow::Error>((snapshot, choices))
+            let outcome = provider.general_read(|provider| {
+                let snapshot = provider.pr_lifecycle_snapshot(&repository, number)?;
+                let choices = provider.pr_lifecycle_choices(&repository)?;
+                Ok((snapshot, choices))
+            });
+            (read_token, outcome)
         });
         cx.spawn(async move |root, cx| {
-            let result = task.await;
+            let (read_token, outcome) = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
-                let Some(index) = this.tabs.iter().position(|tab| {
+                let (result, cache, directive, failure) = outcome.into_parts();
+                if !general_read_callback_is_current(
+                    read_workspace_instance,
+                    this.workspace_instance,
+                ) {
+                    this.general_reads
+                        .complete(&read_token, &directive, cache, false);
+                    return;
+                }
+                let matching_index = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == identity
                         && tab.pull_request.number == number
                         && read_epoch.matches(tab.instance_generation, tab.lifecycle_generation)
-                }) else {
-                    return;
-                };
-                if this.tabs[index].lifecycle_refresh.complete() {
-                    this.refresh_lifecycle(index, cx);
+                });
+                let superseded = matching_index.is_some_and(|index| {
+                    this.tabs[index]
+                        .lifecycle_refresh
+                        .superseded_by_explicit()
+                });
+                let accept_payload = matching_index.is_some() && !superseded && result.is_ok();
+                let disposition = this.general_reads.complete(
+                    &read_token,
+                    &directive,
+                    cache,
+                    accept_payload,
+                );
+                if !disposition.matching_operation_released {
                     return;
                 }
-                let tab = &mut this.tabs[index];
-                match result {
-                    Ok((snapshot, choices)) => {
+                let follow_up = matching_index
+                    .map(|index| this.tabs[index].lifecycle_refresh.complete())
+                    .unwrap_or(false);
+                if let Some(index) = matching_index
+                    && follow_up
+                {
+                    this.refresh_lifecycle(index, cx);
+                    this.resume_general_read_followups(cx);
+                    return;
+                }
+                if let Some(index) = matching_index {
+                    let tab = &mut this.tabs[index];
+                    match result {
+                    Ok((snapshot, choices)) if disposition.payload_accepted => {
                         let install = tab
                             .lifecycle
                             .install_snapshot(snapshot)
@@ -11952,12 +12223,15 @@ impl ReviewWorkspace {
                             }
                         }
                     }
-                    Err(error) => {
-                        tab.lifecycle_state = LoadState::Error(format!(
-                            "Lifecycle read failed; dirty forms and comparison state were preserved: {error:#}"
-                        ));
+                    Ok(_) => {}
+                    Err(_) => {
+                        tab.lifecycle_state = LoadState::Error(
+                            general_read_failure_notice(failure).into(),
+                        );
+                    }
                     }
                 }
+                this.resume_general_read_followups(cx);
                 cx.notify();
             });
         })
@@ -12406,20 +12680,42 @@ impl ReviewWorkspace {
         explicit: bool,
         cx: &mut Context<Root>,
     ) {
-        let Some(tab) = self.tabs.get_mut(index) else {
+        let Some((repository, number, effective_explicit)) =
+            self.tabs.get_mut(index).and_then(|tab| {
+                if !general_read_tab_can_start(tab.submitted_summary_editor.close_after_save) {
+                    return None;
+                }
+                tab.details_refresh
+                    .begin_admission(explicit)
+                    .map(|effective| (tab.repository.clone(), tab.pull_request.number, effective))
+            })
+        else {
             return;
         };
-        if !tab.details_refresh.request(explicit) {
-            return;
-        }
+        let admission = match self.general_reads.begin(&repository.account) {
+            Ok(admission) => admission,
+            Err(read_sync::ReadDeferral::Busy) => {
+                self.tabs[index]
+                    .details_refresh
+                    .defer_admission(effective_explicit);
+                return;
+            }
+            Err(read_sync::ReadDeferral::Server(notice)) => {
+                self.tabs[index]
+                    .details_refresh
+                    .defer_admission(effective_explicit);
+                self.status = notice.into();
+                cx.notify();
+                return;
+            }
+        };
+        let tab = &mut self.tabs[index];
         tab.details_generation += 1;
         let read_epoch = TabReadEpoch {
             instance: tab.instance_generation,
             generation: tab.details_generation,
         };
         let read_workspace_instance = self.workspace_instance;
-        let repository = tab.repository.clone();
-        let number = tab.pull_request.number;
         let key = repository.cache_key();
         let journal_root = self.interaction_root.clone();
         let collaboration_cache = self.collaboration_cache.clone();
@@ -12430,62 +12726,97 @@ impl ReviewWorkspace {
         if tab.details.is_none() {
             tab.details_state = LoadState::Loading("Loading PR details…".into());
         }
+        let (read_token, _cache) = admission.into_parts();
         let task = cx.background_spawn(async move {
             #[cfg(feature = "ui-smoke")]
             collaboration_read_attempts.fetch_add(1, Ordering::AcqRel);
             let prepared = collaboration_cache
                 .prepare_write(&repository, number)
                 .map_err(|error| format!("prepare disposable collaboration cache: {error:#}"));
-            #[cfg(feature = "ui-smoke")]
-            if collaboration_read_disabled {
-                return Err(anyhow::anyhow!(
-                    "scoped collaboration transport fixture refused the provider read"
-                ));
-            }
             let provider = GithubProvider::new(repository.account.clone());
-            let details = provider.details(&repository, number)?;
-            let observed_at = now_unix_ms()
-                .map_err(|error| format!("capture collaboration observation time: {error:#}"));
-            let cache_write = match (prepared, observed_at) {
-                (Ok(prepared), Ok(observed_at)) => Ok((prepared, observed_at)),
-                (Err(error), _) | (_, Err(error)) => Err(error),
-            };
-            let pending = provider.pending_review(&repository, number);
-            let journal = ReviewKey::for_repository("github", &repository, number)
-                .map_err(|error| error.to_string())
-                .and_then(|key| ActionJournal::open(&journal_root, key))
-                .and_then(|journal| journal.operations());
-            Ok::<_, anyhow::Error>((details, pending, journal, cache_write))
+            let outcome = provider.general_read(|provider| {
+                #[cfg(feature = "ui-smoke")]
+                if collaboration_read_disabled {
+                    return Err(anyhow::anyhow!(
+                        "scoped collaboration transport fixture refused the provider read"
+                    ));
+                }
+                let details = provider.details(&repository, number)?;
+                let observed_at = now_unix_ms()
+                    .map_err(|error| format!("capture collaboration observation time: {error:#}"));
+                let cache_write = match (prepared, observed_at) {
+                    (Ok(prepared), Ok(observed_at)) => Ok((prepared, observed_at)),
+                    (Err(error), _) | (_, Err(error)) => Err(error),
+                };
+                let pending = provider.pending_review(&repository, number);
+                let journal = ReviewKey::for_repository("github", &repository, number)
+                    .map_err(|error| error.to_string())
+                    .and_then(|key| ActionJournal::open(&journal_root, key))
+                    .and_then(|journal| journal.operations());
+                Ok((details, pending, journal, cache_write))
+            });
+            (read_token, outcome)
         });
         cx.spawn(async move |root, cx| {
-            let result = task.await;
+            let (read_token, outcome) = task.await;
             let _ = root.update(cx, |root, cx| {
                 let Root::Review(this) = root else { return };
-                if this.workspace_instance != read_workspace_instance {
+                let (result, cache, directive, failure) = outcome.into_parts();
+                if !general_read_callback_is_current(
+                    read_workspace_instance,
+                    this.workspace_instance,
+                ) {
+                    this.general_reads
+                        .complete(&read_token, &directive, cache, false);
                     return;
                 }
-                let Some(tab_index) = this.tabs.iter().position(|tab| {
+                let tab_index = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == key
                         && tab.pull_request.number == number
                         && tab.instance_generation == read_epoch.instance
-                }) else {
-                    return;
-                };
+                });
                 // Mutations can invalidate the observation while this read
                 // still owns the slot. Release that slot even when its result
                 // is obsolete, then honor an explicitly queued post-effect read.
-                if this.tabs[tab_index].details_refresh.complete() {
+                let generation_matches = tab_index.is_some_and(|index| {
+                    this.tabs[index].details_generation == read_epoch.generation
+                });
+                let superseded = tab_index.is_some_and(|index| {
+                    this.tabs[index]
+                        .details_refresh
+                        .superseded_by_explicit()
+                });
+                let accept_payload = generation_matches && !superseded && result.is_ok();
+                let disposition = this.general_reads.complete(
+                    &read_token,
+                    &directive,
+                    cache,
+                    accept_payload,
+                );
+                if !disposition.matching_operation_released {
+                    return;
+                }
+                let follow_up = tab_index
+                    .map(|index| this.tabs[index].details_refresh.complete())
+                    .unwrap_or(false);
+                if let Some(tab_index) = tab_index
+                    && follow_up
+                {
                     this.refresh_details(tab_index, cx);
+                    this.resume_general_read_followups(cx);
                     return;
                 }
-                if this.tabs[tab_index].details_generation != read_epoch.generation {
+                let Some(tab_index) = tab_index.filter(|_| generation_matches) else {
+                    this.resume_general_read_followups(cx);
                     return;
-                }
+                };
                 match result {
-                    Ok((details, pending, journal, cache_write)) => {
+                    Ok((details, pending, journal, cache_write))
+                        if disposition.payload_accepted =>
+                    {
                         let pending = match pending {
                             Ok(pending) => pending,
-                            Err(error) => {
+                            Err(_) => {
                                 this.queue_collaboration_save(
                                     tab_index,
                                     details.clone(),
@@ -12495,9 +12826,8 @@ impl ReviewWorkspace {
                                 let tab = &mut this.tabs[tab_index];
                                 tab.details = Some(details);
                                 tab.cached_collaboration = None;
-                                let notice = format!(
-                                    "PR details updated; pending review could not be refreshed: {error:#}. Previous pending data is retained and no review linkage was changed."
-                                );
+                                let notice = "PR details updated; pending review data is incomplete and previous linkage was retained."
+                                    .to_owned();
                                 tab.details_state = LoadState::Cached(notice.clone());
                                 match journal {
                                     Ok(operations) => {
@@ -12511,6 +12841,7 @@ impl ReviewWorkspace {
                                     controller.notice = Some(notice);
                                 }
                                 this.rebuild_diff(tab_index, this.wide);
+                                this.resume_general_read_followups(cx);
                                 cx.notify();
                                 return;
                             }
@@ -12624,17 +12955,20 @@ impl ReviewWorkspace {
                         }
                         this.rebuild_diff(tab_index, this.wide);
                     }
-                    Err(error) => {
+                    Ok(_) => {}
+                    Err(_) => {
                         let tab = &mut this.tabs[tab_index];
+                        let notice = general_read_failure_notice(failure);
                         tab.details_state = if tab.details.is_some()
                             || tab.cached_collaboration.is_some()
                         {
-                            LoadState::Cached(format!("Details refresh failed · {error:#}"))
+                            LoadState::Cached(notice.into())
                         } else {
-                            LoadState::Error(format!("PR details unavailable · {error:#}"))
+                            LoadState::Error(notice.into())
                         };
                     }
                 }
+                this.resume_general_read_followups(cx);
                 cx.notify();
             });
         })
@@ -20246,6 +20580,14 @@ fn poll_due(tick: u64, delay: Duration) -> bool {
     tick.is_multiple_of(periods)
 }
 
+fn general_read_failure_notice(failure: Option<GeneralReadFailureKind>) -> &'static str {
+    match failure {
+        Some(GeneralReadFailureKind::Unavailable) => read_sync::PROVIDER_UNAVAILABLE_NOTICE,
+        Some(GeneralReadFailureKind::RateLimited) => read_sync::RATE_DEFERRED_NOTICE,
+        Some(GeneralReadFailureKind::Incomplete) | None => read_sync::DATA_INCOMPLETE_NOTICE,
+    }
+}
+
 fn empty_unknown(value: &str) -> String {
     if value.is_empty() {
         "UNKNOWN".into()
@@ -21373,6 +21715,8 @@ mod layout_tests {
         ReviewAuxiliaryRequest, ReviewSubject, SubmittedReviewEditCapability,
     };
     use cibergit::participation::PublishedFile;
+    use cibergit::providers::{GeneralReadDelay, GeneralReadDirective};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
     #[cfg(feature = "ui-smoke")]
     use tempfile::tempdir;
 
@@ -22668,6 +23012,200 @@ mod layout_tests {
         assert!(lane.request(true));
         assert!(!lane.complete());
         assert!(lane.request(true));
+    }
+
+    #[test]
+    fn explicit_follow_up_retains_server_poll_floor_without_stranding_lane() {
+        let now = Instant::now();
+        let wall = UNIX_EPOCH + Duration::from_secs(40_000);
+        let account = Account {
+            host: "github.com".into(),
+            login: "alice".into(),
+        };
+        let mut lane = super::RefreshGate::default();
+        let mut reads = super::read_sync::GeneralReadController::default();
+        assert_eq!(lane.begin_admission(false), Some(false));
+        let (token, _) = reads.begin_at(&account, now).unwrap().into_parts();
+        assert_eq!(lane.begin_admission(true), None);
+        let follow_up = lane.complete();
+        assert!(follow_up);
+        let disposition = reads.complete_at(
+            &token,
+            &GeneralReadDirective {
+                x_poll_interval: Some(GeneralReadDelay::Seconds(90)),
+                rate_limit: None,
+            },
+            None,
+            false,
+            now,
+            wall,
+        );
+        assert!(disposition.matching_operation_released);
+        assert!(!disposition.payload_accepted);
+
+        assert_eq!(lane.begin_admission(true), Some(true));
+        let deferral = reads.begin_at(&account, now + Duration::from_secs(89));
+        assert!(matches!(
+            deferral,
+            Err(super::read_sync::ReadDeferral::Server(
+                super::read_sync::POLL_DEFERRED_NOTICE
+            ))
+        ));
+        lane.defer_admission(true);
+        assert!(lane.has_deferred());
+        assert_eq!(lane.begin_admission(false), Some(true));
+        assert!(
+            reads
+                .begin_at(&account, now + Duration::from_secs(90))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn periodic_cycle_fairly_dispatches_all_same_account_lanes() {
+        let now = Instant::now();
+        let wall = UNIX_EPOCH + Duration::from_secs(50_000);
+        let account = Account {
+            host: "github.com".into(),
+            login: "alice".into(),
+        };
+        // Metadata, details, lifecycle, then a later sidebar repository.
+        let mut lanes: [super::RefreshGate; 4] = std::array::from_fn(|_| Default::default());
+        let mut reads = super::read_sync::GeneralReadController::default();
+        let mut dispatched = [0usize; 4];
+
+        assert_eq!(lanes[0].begin_admission(false), Some(false));
+        let (metadata, _) = reads.begin_at(&account, now).unwrap().into_parts();
+        dispatched[0] += 1;
+        for lane in &mut lanes[1..] {
+            let explicit = lane.begin_admission(false).unwrap();
+            assert!(matches!(
+                reads.begin_at(&account, now),
+                Err(super::read_sync::ReadDeferral::Busy)
+            ));
+            lane.defer_admission(explicit);
+            assert!(lane.has_deferred());
+        }
+        assert!(
+            reads
+                .complete_at(
+                    &metadata,
+                    &GeneralReadDirective::default(),
+                    None,
+                    false,
+                    now,
+                    wall,
+                )
+                .matching_operation_released
+        );
+        assert!(!lanes[0].complete());
+
+        let mut cursor = 0usize;
+        while dispatched.contains(&0) {
+            let mut pending = (0..lanes.len())
+                .filter(|index| lanes[*index].has_deferred())
+                .collect::<Vec<_>>();
+            super::rotate_general_read_followups(&mut pending, &mut cursor);
+            let mut started = None;
+            for index in pending {
+                let explicit = lanes[index].begin_admission(false).unwrap();
+                match reads.begin_at(&account, now) {
+                    Ok(admission) => {
+                        dispatched[index] += 1;
+                        started = Some((index, admission.into_parts().0));
+                    }
+                    Err(super::read_sync::ReadDeferral::Busy) => {
+                        lanes[index].defer_admission(explicit)
+                    }
+                    Err(other) => panic!("unexpected server deferral: {other:?}"),
+                }
+            }
+            let (started_index, token) = started.expect("one pending lane must dispatch");
+
+            // Another periodic tick while this lane is active re-coalesces the
+            // other automatic intents. The rotating resume order must still
+            // reach lifecycle and the later repository.
+            for (index, lane) in lanes.iter_mut().enumerate() {
+                if let Some(explicit) = lane.begin_admission(false) {
+                    match reads.begin_at(&account, now) {
+                        Ok(_) => panic!("periodic work overlapped lane {started_index}"),
+                        Err(super::read_sync::ReadDeferral::Busy) => lane.defer_admission(explicit),
+                        Err(other) => panic!("unexpected server deferral: {other:?}"),
+                    }
+                } else {
+                    assert_eq!(index, started_index);
+                }
+            }
+            assert!(
+                reads
+                    .complete_at(
+                        &token,
+                        &GeneralReadDirective::default(),
+                        None,
+                        false,
+                        now,
+                        wall,
+                    )
+                    .matching_operation_released
+            );
+            assert!(!lanes[started_index].complete());
+        }
+        assert_eq!(dispatched, [1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn stale_workspace_ok_and_error_callbacks_mutate_no_lane_or_ui_state() {
+        for result in ["ok", "error"] {
+            let mut lane = super::RefreshGate::default();
+            assert_eq!(lane.begin_admission(false), Some(false));
+            let mut status = "replacement status";
+            let mut state = "replacement state";
+            let mut schedule = "replacement schedule";
+            if super::general_read_callback_is_current(10, 11) {
+                lane.complete();
+                status = result;
+                state = result;
+                schedule = result;
+            }
+            assert!(
+                lane.active,
+                "stale callback must not release replacement lane"
+            );
+            assert_eq!(status, "replacement status");
+            assert_eq!(state, "replacement state");
+            assert_eq!(schedule, "replacement schedule");
+        }
+    }
+
+    #[test]
+    fn pending_local_tab_close_blocks_general_read_start_and_resume() {
+        assert!(super::general_read_tab_can_start(false));
+        assert!(!super::general_read_tab_can_start(true));
+    }
+
+    #[test]
+    fn admission_deferral_leaves_pinned_diff_draft_and_journal_unchanged() {
+        let now = Instant::now();
+        let account = Account {
+            host: "github.com".into(),
+            login: "alice".into(),
+        };
+        let mut reads = super::read_sync::GeneralReadController::default();
+        let _active = reads.begin_at(&account, now).unwrap();
+        let mut lane = super::RefreshGate::default();
+        let explicit = lane.begin_admission(false).unwrap();
+        let pinned = ("base-sha", "head-sha", "selected-file", 144.0f32);
+        let draft = ("draft-id", "exact unsent body", true);
+        let journal = vec![("operation-id", "uncertain")];
+        assert!(matches!(
+            reads.begin_at(&account, now),
+            Err(super::read_sync::ReadDeferral::Busy)
+        ));
+        lane.defer_admission(explicit);
+        assert!(lane.has_deferred());
+        assert_eq!(pinned, ("base-sha", "head-sha", "selected-file", 144.0));
+        assert_eq!(draft, ("draft-id", "exact unsent body", true));
+        assert_eq!(journal, [("operation-id", "uncertain")]);
     }
 
     #[test]
