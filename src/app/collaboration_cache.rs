@@ -6,6 +6,7 @@ use cibergit::domain::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -672,6 +673,26 @@ fn validate_check_identities(identity: &CacheIdentity, details: &PullRequestDeta
     if details.pull_request_node_id.is_some() != details.base_repository.is_some() {
         bail!("refuse collaboration cache payload with incomplete PR/base identity");
     }
+    let has_current_source_or_check_identity = details.observed_head_sha.is_some()
+        || details.head_repository.is_some()
+        || details.rollup_commit_sha.is_some()
+        || details.rollup_repository.is_some()
+        || details.potential_merge_commit_sha.is_some()
+        || details.potential_merge_commit_repository.is_some()
+        || details.checks.iter().any(|check| {
+            check.github_permalink.is_some()
+                || check.database_id.is_some()
+                || check.suite.is_some()
+                || check.commit_sha.is_some()
+                || check.commit_repository.is_some()
+                || check.sha_class != CheckShaClass::Unknown
+                || !matches!(check.actions_linkage, ActionsLinkage::Unknown)
+        });
+    if has_current_source_or_check_identity && details.pull_request_node_id.is_none() {
+        bail!(
+            "refuse collaboration cache payload with current check identity but no PR/base identity"
+        );
+    }
     if details.rollup_commit_sha.is_some() != details.rollup_repository.is_some() {
         bail!("refuse collaboration cache payload with incomplete rollup commit identity");
     }
@@ -710,8 +731,12 @@ fn validate_check_identities(identity: &CacheIdentity, details: &PullRequestDeta
             bail!("refuse collaboration cache payload with foreign merge-candidate repository");
         }
     }
+    let mut check_ids = HashSet::new();
     for check in &details.checks {
         validate_cached_node_id(&check.coordinates.remote_id)?;
+        if !check_ids.insert(check.coordinates.remote_id.as_str()) {
+            bail!("refuse collaboration cache payload with duplicate check node ID");
+        }
         if let Some(sha) = &check.commit_sha {
             validate_cached_sha(sha)?;
         }
@@ -1402,8 +1427,41 @@ mod tests {
     }
 
     #[test]
+    fn mixed_legacy_current_check_identity_is_rejected_and_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = CollaborationCache::new(root.path().to_owned());
+        let repo = repository("octo", "one", "alice");
+        let foreign = CheckRepositoryIdentity {
+            node_id: "R-foreign".into(),
+            name_with_owner: "mallory/other".into(),
+        };
+        save(&cache, &repo, 7, &details(&repo, 7, "mixed-legacy-current"));
+        let record_path = cache.root.join(CacheIdentity::new(&repo, 7).filename());
+        let mut record: CacheRecord =
+            serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record.details.observed_head_sha = Some("a".repeat(40));
+        record.details.head_repository = Some(foreign.clone());
+        record.details.rollup_commit_sha = Some("a".repeat(40));
+        record.details.rollup_repository = Some(foreign.clone());
+        record.details.checks[0].commit_sha = Some("a".repeat(40));
+        record.details.checks[0].commit_repository = Some(foreign.clone());
+        record.details.checks[0].sha_class = CheckShaClass::Head;
+        record.details.checks[0].suite = Some(CheckSuiteIdentity {
+            node_id: "SUITE-foreign".into(),
+            database_id: Some(10),
+            repository: foreign,
+            app: None,
+        });
+        let mixed = serde_json::to_vec(&record).unwrap();
+        private_write(&record_path, &mixed);
+
+        assert!(cache.load(&repo, 7).is_err());
+        assert_eq!(fs::read(record_path).unwrap(), mixed);
+    }
+
+    #[test]
     fn malformed_cached_check_and_suite_node_ids_are_rejected_and_preserved() {
-        for defect in ["check-remote-id", "suite-node-id"] {
+        for defect in ["check-remote-id", "suite-node-id", "duplicate-check-id"] {
             let root = tempfile::tempdir().unwrap();
             let cache = CollaborationCache::new(root.path().to_owned());
             let repo = repository("octo", "one", "alice");
@@ -1437,6 +1495,9 @@ mod tests {
                 }
                 "suite-node-id" => {
                     record.details.checks[0].suite.as_mut().unwrap().node_id = "bad\0suite".into()
+                }
+                "duplicate-check-id" => {
+                    record.details.checks.push(record.details.checks[0].clone())
                 }
                 _ => unreachable!(),
             }

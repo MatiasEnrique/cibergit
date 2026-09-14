@@ -22602,63 +22602,61 @@ impl ReviewWorkspace {
                         let expanded =
                             tab.checks_selection.expanded_id.as_deref() == Some(remote_id.as_str());
                         let row_root = root.clone();
-                        let row_focus = self.checks_focus.clone();
-                        let mut row =
+                        let accessibility_label = format!(
+                            "{}; {}; {}; {}; {}; {}; {}",
+                            check.name,
+                            kind_label(check),
+                            required_label(check),
+                            sha_label(check),
+                            linkage_label(check),
+                            if selected { "selected" } else { "not selected" },
+                            if expanded { "expanded" } else { "collapsed" },
+                        );
+                        let row = check_identity_button(
+                            format!("check-row-{remote_id}"),
+                            accessibility_label,
+                            selected,
+                            expanded,
+                            colors,
+                        )
+                        .child(
                             div()
-                                .id(SharedString::from(format!("check-row-{remote_id}")))
-                                .mb_2()
-                                .p_2()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(if selected {
-                                    colors.accent
-                                } else {
-                                    colors.border
-                                })
-                                .when(selected, |row| row.bg(colors.selected))
-                                .cursor_pointer()
-                                .hover(|row| row.bg(colors.selected))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(check.name.clone())
                                 .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(check.name.clone())
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(colors.muted)
-                                                .child(if expanded { "Hide" } else { "Details" }),
-                                        ),
-                                )
-                                .child(div().mt_1().text_xs().text_color(colors.muted).child(
-                                    format!(
-                                        "{} · {}{}",
-                                        kind_label(check),
-                                        check.status,
-                                        check
-                                            .conclusion
-                                            .as_ref()
-                                            .map(|value| format!(" · {value}"))
-                                            .unwrap_or_default()
-                                    ),
-                                ))
-                                .child(div().text_xs().text_color(colors.faint).child(format!(
-                                    "{} · {} · {}",
-                                    required_label(check),
-                                    sha_label(check),
-                                    linkage_label(check)
-                                )))
-                                .on_click(move |_, window, cx| {
-                                    row_root.update(cx, |root, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.activate_check(&remote_id, cx);
-                                        }
-                                    });
-                                    row_focus.focus(window, cx);
-                                });
-                        if expanded {
-                            row = row.child(
+                                    div().text_xs().text_color(colors.muted).child(if expanded {
+                                        "Hide"
+                                    } else {
+                                        "Details"
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child(format!(
+                                    "{} · {}{}",
+                                    kind_label(check),
+                                    check.status,
+                                    check
+                                        .conclusion
+                                        .as_ref()
+                                        .map(|value| format!(" · {value}"))
+                                        .unwrap_or_default()
+                                )),
+                        )
+                        .child(div().text_xs().text_color(colors.faint).child(format!(
+                            "{} · {} · {}",
+                            required_label(check),
+                            sha_label(check),
+                            linkage_label(check)
+                        )))
+                        .when(expanded, |row| {
+                            row.child(
                                 div()
                                     .mt_2()
                                     .pt_2()
@@ -22682,8 +22680,15 @@ impl ReviewWorkspace {
                                                 )
                                         },
                                     )),
-                            );
-                        }
+                            )
+                        })
+                        .on_click(move |_, _, cx| {
+                            row_root.update(cx, |root, cx| {
+                                if let Root::Review(this) = root {
+                                    this.activate_check(&remote_id, cx);
+                                }
+                            });
+                        });
                         checks.push(row.into_any_element());
                     }
                     if !details.checks.is_empty() {
@@ -22706,20 +22711,25 @@ impl ReviewWorkspace {
                     if pages > 1 {
                         let previous_root = root.clone();
                         let next_root = root.clone();
-                        let previous_focus = self.checks_focus.clone();
-                        let next_focus = self.checks_focus.clone();
+                        let previous_disabled = page == 0;
+                        let next_disabled = page + 1 == pages;
                         checks.push(
                             div()
                                 .mt_2()
                                 .flex()
                                 .gap_2()
                                 .child(
-                                    action_link_with_id(
-                                        "checks-previous-page".into(),
+                                    checks_page_button(
+                                        "checks-previous-page",
                                         "Previous 40",
+                                        previous_disabled,
+                                        if previous_disabled {
+                                            "Previous 40 checks, unavailable on the first page"
+                                        } else {
+                                            "Previous 40 checks"
+                                        },
                                         colors,
                                     )
-                                    .when(page == 0, |button| button.text_color(colors.faint))
                                     .on_click(
                                         move |_, window, cx| {
                                             previous_root.update(cx, |root, cx| {
@@ -22727,19 +22737,21 @@ impl ReviewWorkspace {
                                                     this.move_checks_page(-1, window, cx);
                                                 }
                                             });
-                                            previous_focus.focus(window, cx);
                                         },
                                     ),
                                 )
                                 .child(
-                                    action_link_with_id(
-                                        "checks-next-page".into(),
+                                    checks_page_button(
+                                        "checks-next-page",
                                         "Next 40",
+                                        next_disabled,
+                                        if next_disabled {
+                                            "Next 40 checks, unavailable on the last page"
+                                        } else {
+                                            "Next 40 checks"
+                                        },
                                         colors,
                                     )
-                                    .when(page + 1 == pages, |button| {
-                                        button.text_color(colors.faint)
-                                    })
                                     .on_click(
                                         move |_, window, cx| {
                                             next_root.update(cx, |root, cx| {
@@ -22747,7 +22759,6 @@ impl ReviewWorkspace {
                                                     this.move_checks_page(1, window, cx);
                                                 }
                                             });
-                                            next_focus.focus(window, cx);
                                         },
                                     ),
                                 )
@@ -23987,6 +23998,64 @@ fn action_link_with_id(id: String, label: &'static str, colors: Palette) -> Stat
         .text_color(colors.accent)
         .hover(|button| button.bg(colors.selected))
         .child(label)
+}
+
+fn check_identity_button(
+    id: String,
+    accessibility_label: String,
+    selected: bool,
+    expanded: bool,
+    colors: Palette,
+) -> Button {
+    Button::new(id)
+        .mb_2()
+        .p_2()
+        .w_full()
+        .flex_col()
+        .items_stretch()
+        .rounded_md()
+        .border_1()
+        .border_color(if selected {
+            colors.accent
+        } else {
+            colors.border
+        })
+        .selected(selected)
+        .aria_selected(selected)
+        .aria_expanded(expanded)
+        .accessibility_label(accessibility_label)
+        .when(selected, |row| row.bg(colors.selected))
+        .cursor_pointer()
+        .hover(|row| row.bg(colors.selected))
+}
+
+fn checks_page_button(
+    id: &'static str,
+    visible_label: &'static str,
+    disabled: bool,
+    accessibility_label: &'static str,
+    colors: Palette,
+) -> Button {
+    Button::new(id)
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(colors.border)
+        .text_xs()
+        .text_color(if disabled {
+            colors.faint
+        } else {
+            colors.accent
+        })
+        .disabled(disabled)
+        .accessibility_label(accessibility_label)
+        .when(!disabled, |button| {
+            button
+                .cursor_pointer()
+                .hover(|button| button.bg(colors.selected))
+        })
+        .child(visible_label)
 }
 
 fn short_sha(sha: &str) -> &str {
@@ -25931,7 +26000,7 @@ mod layout_tests {
     use super::{
         DismissalConfirmationToken, DismissalPreparationToken, InspectorSection, InstallTabOptions,
         LoadState, NextCheck, NextCheckPage, OpenChecks, RepoRuntime, Root, Startup,
-        ToggleCheckIdentity,
+        ToggleCheckIdentity, check_identity_button, checks_page_button, palette,
     };
     use cibergit::domain::{
         Account, ActionsLinkage, CheckKind, CheckShaClass, MergeEligibility,
@@ -26205,6 +26274,162 @@ mod layout_tests {
             })
             .collect();
         details
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn checks_buttons_expose_accessibility_and_pointer_keyboard_semantics(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{
+            Context, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, Render, accesskit, canvas,
+            div, point, prelude::*, px,
+        };
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+
+        struct Harness {
+            disabled: bool,
+            activations: Rc<Cell<usize>>,
+        }
+
+        impl Render for Harness {
+            fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+                let activations = self.activations.clone();
+                let colors = palette(false);
+                div().size(px(120.)).child(if self.disabled {
+                    checks_page_button(
+                        "checks-disabled-witness",
+                        "Previous 40",
+                        true,
+                        "Previous 40 checks, unavailable on the first page",
+                        colors,
+                    )
+                    .size_full()
+                    .on_click(move |_, _, _| activations.set(activations.get() + 1))
+                } else {
+                    check_identity_button(
+                        "checks-row-witness".into(),
+                        "CI; Check run; Required; head; linked; selected; expanded".into(),
+                        true,
+                        true,
+                        colors,
+                    )
+                    .size_full()
+                    .on_click(move |_, _, _| activations.set(activations.get() + 1))
+                })
+            }
+        }
+
+        struct AccessibilityProbe {
+            captured: Rc<
+                RefCell<
+                    Option<(
+                        Option<gpui::Role>,
+                        accesskit::Node,
+                        Option<gpui::Role>,
+                        accesskit::Node,
+                    )>,
+                >,
+            >,
+        }
+
+        impl Render for AccessibilityProbe {
+            fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+                let captured = self.captured.clone();
+                canvas(
+                    move |_, window, cx| {
+                        let colors = palette(false);
+                        let row_element = check_identity_button(
+                            "checks-row-a11y".into(),
+                            "CI; selected; expanded".into(),
+                            true,
+                            true,
+                            colors,
+                        )
+                        .on_click(|_, _, _| {})
+                        .render(window, cx)
+                        .into_element();
+                        let row_role = row_element.a11y_role();
+                        let mut row_node =
+                            accesskit::Node::new(row_role.unwrap_or(gpui::Role::Unknown));
+                        row_element.write_a11y_info(&mut row_node);
+
+                        let disabled_element = checks_page_button(
+                            "checks-page-a11y",
+                            "Previous 40",
+                            true,
+                            "Previous 40 checks, unavailable on the first page",
+                            colors,
+                        )
+                        .on_click(|_, _, _| {})
+                        .render(window, cx)
+                        .into_element();
+                        let disabled_role = disabled_element.a11y_role();
+                        let mut disabled_node =
+                            accesskit::Node::new(disabled_role.unwrap_or(gpui::Role::Unknown));
+                        disabled_element.write_a11y_info(&mut disabled_node);
+                        *captured.borrow_mut() =
+                            Some((row_role, row_node, disabled_role, disabled_node));
+                    },
+                    |_, _, _, _| {},
+                )
+            }
+        }
+
+        cx.update(gpui_base::init);
+        let captured = Rc::new(RefCell::new(None));
+        let (_, probe_window) = cx.add_window_view({
+            let captured = captured.clone();
+            move |_, _| AccessibilityProbe { captured }
+        });
+        probe_window.update(|window, cx| window.draw(cx).clear(cx));
+        let (row_role, row_node, disabled_role, disabled_node) =
+            captured.borrow_mut().take().unwrap();
+        assert_eq!(row_role, Some(gpui::Role::Button));
+        assert_eq!(row_node.label(), Some("CI; selected; expanded"));
+        assert_eq!(row_node.is_selected(), Some(true));
+        assert_eq!(row_node.is_expanded(), Some(true));
+        assert!(row_node.supports_action(accesskit::Action::Click));
+        assert_eq!(disabled_role, Some(gpui::Role::Button));
+        assert_eq!(
+            disabled_node.label(),
+            Some("Previous 40 checks, unavailable on the first page")
+        );
+        assert!(!disabled_node.supports_action(accesskit::Action::Click));
+        assert!(!disabled_node.supports_action(accesskit::Action::Focus));
+
+        let activations = Rc::new(Cell::new(0));
+        let (harness, cx) = cx.add_window_view({
+            let activations = activations.clone();
+            move |_, _| Harness {
+                disabled: false,
+                activations,
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_click(point(px(10.), px(10.)), Modifiers::default());
+        for key in ["enter", "space"] {
+            let keystroke = Keystroke::parse(key).unwrap();
+            cx.simulate_event(KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(KeyUpEvent { keystroke });
+        }
+        assert_eq!(activations.get(), 3);
+
+        harness.update(cx, |harness, cx| {
+            harness.disabled = true;
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_click(point(px(10.), px(10.)), Modifiers::default());
+        cx.simulate_keystrokes("enter space");
+        assert_eq!(activations.get(), 3);
     }
 
     #[cfg(feature = "ui-smoke")]

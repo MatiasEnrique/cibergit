@@ -5478,9 +5478,16 @@ impl DetailsSourceIdentity {
             &pull.status_check_rollup,
             ObservedNullable::Null | ObservedNullable::Value(DetailsRollup { state: Some(_), .. })
         );
+        let rollup_commit_complete = match &pull.status_check_rollup {
+            ObservedNullable::Null => true,
+            ObservedNullable::Value(_) => {
+                matches!(&rollup_commit, ObservedNullable::Value(_))
+            }
+            ObservedNullable::Missing => false,
+        };
         let complete = !matches!(&pull.head_repository, ObservedNullable::Missing)
             && rollup_state_complete
-            && !matches!(&rollup_commit, ObservedNullable::Missing)
+            && rollup_commit_complete
             && !matches!(&potential_merge_commit, ObservedNullable::Missing);
         Ok(Self {
             base_repository,
@@ -6328,32 +6335,23 @@ fn map_check_suite(
             None
         }
         ObservedNullable::Null => None,
-        ObservedNullable::Value(app) => {
-            let (Some(node_id), Some(name), Some(slug)) = (app.id, app.name, app.slug) else {
-                return finish_check_suite(
-                    suite.id,
-                    database_id,
-                    suite_repository,
-                    None,
-                    commit_sha,
-                    ActionsLinkage::Unknown,
-                    false,
-                );
-            };
-            if validate_node_id(&node_id).is_err()
-                || !valid_identity_text(&name)
-                || !valid_identity_text(&slug)
+        ObservedNullable::Value(app) => match (app.id, app.name, app.slug) {
+            (Some(node_id), Some(name), Some(slug))
+                if validate_node_id(&node_id).is_ok()
+                    && valid_identity_text(&name)
+                    && valid_identity_text(&slug) =>
             {
-                complete = false;
-                None
-            } else {
                 Some(CheckAppIdentity {
                     node_id,
                     name,
                     slug,
                 })
             }
-        }
+            _ => {
+                complete = false;
+                None
+            }
+        },
     };
     let actions_linkage = match suite.workflow_run {
         ObservedNullable::Missing => {
@@ -6448,7 +6446,7 @@ fn map_optional_check_commit(
 ) -> Result<(Option<String>, bool)> {
     Ok(match commit {
         ObservedNullable::Missing => (None, false),
-        ObservedNullable::Null => (None, true),
+        ObservedNullable::Null => (None, false),
         ObservedNullable::Value(commit) => {
             validate_sha(&commit.oid)?;
             ensure!(
@@ -7537,6 +7535,41 @@ else:
     }
 
     #[test]
+    fn checks_identity_partial_app_does_not_erase_independent_workflow_evidence() {
+        for (case, workflow_run) in [
+            ("null-workflow", Value::Null),
+            ("linked-workflow", complete_workflow_run()),
+        ] {
+            let head = "b".repeat(40);
+            let base = repository_identity("R-base", "owner/repo");
+            let mut pull = details_overview();
+            let mut check =
+                complete_check_run("CHECK-partial-app", &head, base.clone(), workflow_run);
+            check["checkSuite"]["app"] = json!({"id": "APP-1", "name": "Builder"});
+            install_rollup(&mut pull, &head, base, json!([check]));
+            let (dir, provider) = fixture(
+                "alice",
+                vec![details_step(details_response(pull), json!({"number": 1}))],
+            );
+            let details = provider.details(&repo("alice"), 1).unwrap();
+            assert!(!details.checks_complete, "{case}");
+            assert!(details.checks[0].suite.as_ref().unwrap().app.is_none());
+            match case {
+                "null-workflow" => assert_eq!(
+                    details.checks[0].actions_linkage,
+                    ActionsLinkage::NoObservedLink
+                ),
+                "linked-workflow" => assert!(matches!(
+                    details.checks[0].actions_linkage,
+                    ActionsLinkage::Linked(_)
+                )),
+                _ => unreachable!(),
+            }
+            exhausted(&dir, 1);
+        }
+    }
+
+    #[test]
     fn checks_identity_status_context_named_ci_remains_commit_status() {
         let head = "b".repeat(40);
         let base = repository_identity("R-base", "owner/repo");
@@ -7561,6 +7594,34 @@ else:
         assert_eq!(check.kind, CheckKind::CommitStatus);
         assert!(check.database_id.is_none() && check.suite.is_none());
         assert_eq!(check.actions_linkage, ActionsLinkage::NoObservedLink);
+        exhausted(&dir, 1);
+    }
+
+    #[test]
+    fn checks_identity_null_status_context_commit_is_partial_unknown_sha() {
+        let head = "b".repeat(40);
+        let base = repository_identity("R-base", "owner/repo");
+        let mut pull = details_overview();
+        install_rollup(
+            &mut pull,
+            &head,
+            base,
+            json!([{
+                "__typename": "StatusContext", "id": "STATUS-null-commit", "context": "external/ci",
+                "state": "SUCCESS", "description": "complete", "targetUrl": "https://ci.example/status",
+                "createdAt": "2026-09-14T10:00:00Z", "updatedAt": "2026-09-14T10:01:00Z",
+                "isRequired": true, "commit": null
+            }]),
+        );
+        let (dir, provider) = fixture(
+            "alice",
+            vec![details_step(details_response(pull), json!({"number": 1}))],
+        );
+        let details = provider.details(&repo("alice"), 1).unwrap();
+        assert!(!details.checks_complete);
+        assert_eq!(details.checks.len(), 1);
+        assert!(details.checks[0].commit_sha.is_none());
+        assert_eq!(details.checks[0].sha_class, CheckShaClass::Unknown);
         exhausted(&dir, 1);
     }
 
@@ -7698,6 +7759,7 @@ else:
         for defect in [
             "null-rollup",
             "missing-rollup",
+            "null-rollup-commit",
             "null-contexts",
             "null-node",
             "unknown-node",
@@ -7708,6 +7770,15 @@ else:
                 "null-rollup" => pull["statusCheckRollup"] = Value::Null,
                 "missing-rollup" => {
                     pull.as_object_mut().unwrap().remove("statusCheckRollup");
+                }
+                "null-rollup-commit" => {
+                    install_rollup(
+                        &mut pull,
+                        &"b".repeat(40),
+                        repository_identity("R-base", "owner/repo"),
+                        json!([]),
+                    );
+                    pull["statusCheckRollup"]["commit"] = Value::Null;
                 }
                 "null-contexts" => {
                     pull["statusCheckRollup"] = json!({
