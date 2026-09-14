@@ -2996,8 +2996,13 @@ impl Runner {
                         }
                     }
                     Ok(PipeEvent::ConditionalPrefix(prefix)) => {
-                        header_prefix = prefix.clone();
-                        conditional::record_general_poll_from_included_prefix(&prefix);
+                        header_prefix = prefix;
+                        // Only a conditional read records into the general
+                        // collector. A mutation transport retains its prefix
+                        // solely for its own explicit return.
+                        if capture == HeaderPrefixCapture::ConditionalRead {
+                            conditional::record_general_poll_from_included_prefix(&header_prefix);
+                        }
                     }
                     Ok(PipeEvent::ConditionalProgress(prefix)) => header_prefix = prefix,
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -3148,6 +3153,25 @@ enum PipeEvent {
     ConditionalProgress(Vec<u8>),
 }
 
+/// The leading header block, delimiter included, and nothing after it.
+///
+/// A single pipe read can span the blank line, so an accumulated prefix may
+/// carry the first body bytes. A mutation transport must not retain those: its
+/// prefix is scheduling evidence only. Without a delimiter the whole prefix is
+/// still an incomplete header block and is returned as-is.
+fn header_block_only(prefix: &[u8]) -> Vec<u8> {
+    let crlf = prefix.windows(4).position(|window| window == b"\r\n\r\n");
+    let lf = prefix.windows(2).position(|window| window == b"\n\n");
+    let end = match (crlf, lf) {
+        (Some(a), Some(b)) if a <= b => a + 4,
+        (Some(_), Some(b)) => b + 2,
+        (Some(a), None) => a + 4,
+        (None, Some(b)) => b + 2,
+        (None, None) => prefix.len(),
+    };
+    prefix[..end.min(prefix.len())].to_vec()
+}
+
 fn conditional_prefix_complete(prefix: &[u8]) -> bool {
     prefix.windows(4).any(|window| window == b"\r\n\r\n")
         || prefix.windows(2).any(|window| window == b"\n\n")
@@ -3216,7 +3240,7 @@ fn terminate_runner_with_poll(
             conditional::record_general_poll_from_included_prefix(prefix);
         }
         HeaderPrefixCapture::MutationTransport => {
-            MUTATION_HEADER_PREFIX.with(|cell| cell.set(std::mem::take(prefix)));
+            MUTATION_HEADER_PREFIX.with(|cell| cell.set(header_block_only(prefix)));
         }
         HeaderPrefixCapture::None => {}
     }

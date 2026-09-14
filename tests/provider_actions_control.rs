@@ -739,6 +739,112 @@ sys.exit(step.get('exit', 0))
             assert_eq!(dispatch.directive.x_poll_interval, None);
         }
 
+        /// The prefix capture is exercised directly, because wrapping a whole
+        /// dispatch in a tracker scope would also divert its preflight reads
+        /// onto the conditional entrypoint and prove nothing about capture.
+        fn hanging_header_child(headers: &str, to_stderr: bool) -> (TempDir, Runner) {
+            let directory = tempfile::tempdir().unwrap();
+            let executable = directory.path().join("child");
+            let stream = if to_stderr { "stderr" } else { "stdout" };
+            fs::write(
+                &executable,
+                format!(
+                    "#!/usr/bin/python3\nimport sys, time\nsys.{stream}.write({headers:?})\nsys.{stream}.flush()\ntime.sleep(30)\n"
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let runner = Runner {
+                gh: executable,
+                timeout: Duration::from_millis(150),
+                ..Runner::default()
+            };
+            (directory, runner)
+        }
+
+        #[test]
+        fn mutation_prefix_capture_never_touches_an_active_general_collector() {
+            let (_directory, runner) = hanging_header_child(RATE_HEADERS, false);
+            let command = std::process::Command::new(&runner.gh);
+            let (result, collector, failure) = conditional::with_general_read_tracker(|| {
+                runner.run_mutation_with_input(command, b"{}")
+            });
+            let failure_output = result.err().expect("the hanging child must time out");
+            // The caller receives the server's own floor.
+            assert_eq!(
+                conditional::parse_mutation_response(&failure_output.header_prefix)
+                    .poll
+                    .rate_limit,
+                Some(GeneralReadDelay::Seconds(120))
+            );
+            // The active general collector is untouched.
+            assert_eq!(collector, GeneralReadDirective::default());
+            assert!(failure.is_none());
+        }
+
+        /// The conditional read path must keep recording into the collector.
+        #[test]
+        fn conditional_prefix_capture_still_records_into_the_general_collector() {
+            let (_directory, runner) = hanging_header_child(RATE_HEADERS, false);
+            let mut command = std::process::Command::new(&runner.gh);
+            let (result, collector, _) = conditional::with_general_read_tracker(|| {
+                runner.run_inner_maybe_cancelled(
+                    &mut command,
+                    "GitHub conditional read request",
+                    None,
+                    None,
+                    None,
+                )
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                collector.rate_limit,
+                Some(GeneralReadDelay::Seconds(120)),
+                "the conditional read path stopped recording its floor"
+            );
+        }
+
+        /// Child stderr is never scheduling evidence at the capture layer
+        /// either, so no prefix is retained from it at all.
+        #[test]
+        fn mutation_prefix_capture_retains_nothing_from_child_stderr() {
+            let (_directory, runner) = hanging_header_child(RATE_HEADERS, true);
+            let command = std::process::Command::new(&runner.gh);
+            let failure = runner
+                .run_mutation_with_input(command, b"{}")
+                .err()
+                .expect("the hanging child must time out");
+            assert!(
+                failure.header_prefix.is_empty(),
+                "child stderr was retained as a header prefix"
+            );
+        }
+
+        /// A single pipe read can span the blank line, so the retained prefix
+        /// must be cut at the first delimiter.
+        #[test]
+        fn a_retained_prefix_is_the_header_block_only() {
+            let crlf = b"HTTP/2.0 429 x\r\nretry-after: 5\r\n\r\nBODYBODY";
+            assert_eq!(
+                header_block_only(crlf),
+                b"HTTP/2.0 429 x\r\nretry-after: 5\r\n\r\n".to_vec()
+            );
+            let lf = b"HTTP/2.0 429 x\nretry-after: 5\n\nBODYBODY";
+            assert_eq!(
+                header_block_only(lf),
+                b"HTTP/2.0 429 x\nretry-after: 5\n\n".to_vec()
+            );
+            // A delimiter that has not arrived yet leaves an incomplete header
+            // block, which is still header-only.
+            let partial = b"HTTP/2.0 429 x\r\nretry-af";
+            assert_eq!(header_block_only(partial), partial.to_vec());
+            // The earliest delimiter wins, so a bare LF pair inside a CRLF
+            // stream cannot leak the bytes after it.
+            let mixed = b"HTTP/2.0 429 x\n\nBODY\r\n\r\nMORE";
+            assert_eq!(header_block_only(mixed), b"HTTP/2.0 429 x\n\n".to_vec());
+            assert!(header_block_only(b"").is_empty());
+        }
+
         #[test]
         fn a_refusal_status_after_send_is_uncertain_and_never_recorded_not_applied() {
             // Only 403 and 429 carry a rate directive; no other refusal status

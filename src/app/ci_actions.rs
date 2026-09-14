@@ -242,6 +242,234 @@ mod tests {
         }
     }
 
+    /// The real app-to-journal-to-provider seam: one durable `ActionJournal`
+    /// on disk, the real provider entrypoint, and a synthetic `gh` transport.
+    #[cfg(feature = "ui-smoke")]
+    mod journal_seam {
+        use super::super::*;
+        use crate::app::review_interactions::JournalStatus;
+        use cibergit::{
+            domain::{
+                ActionsAttemptLocator, ActionsRunControlAction, CheckRepositoryIdentity,
+                CheckSuiteIdentity, ProviderMutationOutcome, Repository, WorkflowRunIdentity,
+            },
+            participation::ReviewKey,
+            providers::GithubProvider,
+        };
+        use serde_json::{Value, json};
+        use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+        use tempfile::TempDir;
+
+        const SEAM_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        fn seam_repository() -> Repository {
+            Repository {
+                host: "github.com".into(),
+                owner: "owner".into(),
+                name: "repo".into(),
+                account: cibergit::domain::Account {
+                    host: "github.com".into(),
+                    login: "alice".into(),
+                },
+                local_path: None,
+            }
+        }
+
+        fn seam_locator() -> ActionsAttemptLocator {
+            let repository = CheckRepositoryIdentity {
+                node_id: "REPO_node".into(),
+                name_with_owner: "owner/repo".into(),
+            };
+            ActionsAttemptLocator {
+                account: seam_repository().account,
+                base_repository: repository.clone(),
+                pull_request_node_id: "PR_node".into(),
+                pull_request_number: 7,
+                observed_head_sha: SEAM_SHA.into(),
+                head_repository: repository.clone(),
+                rollup_commit_sha: SEAM_SHA.into(),
+                rollup_repository: repository.clone(),
+                check_node_id: "CHECK_node".into(),
+                check_database_id: 9,
+                check_commit_sha: SEAM_SHA.into(),
+                check_repository: repository.clone(),
+                suite: CheckSuiteIdentity {
+                    node_id: "SUITE_node".into(),
+                    database_id: Some(8),
+                    repository,
+                    app: None,
+                },
+                workflow_run: WorkflowRunIdentity {
+                    node_id: "RUN_node".into(),
+                    database_id: 6,
+                    run_attempt: 2,
+                    run_number: 5,
+                    event: "pull_request".into(),
+                    github_url: "https://github.com/owner/repo/actions/runs/6".into(),
+                    workflow_node_id: "WORKFLOW_node".into(),
+                    workflow_database_id: 4,
+                    workflow_name: "CI".into(),
+                },
+            }
+        }
+
+        fn run_body(attempt: u64, status: &str, conclusion: Option<&str>) -> Value {
+            json!({
+                "id":6,"node_id":"RUN_node","run_attempt":attempt,"run_number":5,
+                "event":"pull_request","status":status,"conclusion":conclusion,
+                "workflow_id":4,"check_suite_id":8,"check_suite_node_id":"SUITE_node",
+                "head_sha":SEAM_SHA,
+                "url":"https://api.github.com/repos/owner/repo/actions/runs/6",
+                "html_url":"https://github.com/owner/repo/actions/runs/6",
+                "workflow_url":"https://api.github.com/repos/owner/repo/actions/workflows/4",
+                "repository":{"node_id":"REPO_node","full_name":"owner/repo"},
+                "head_repository":{"node_id":"REPO_node","full_name":"owner/repo"}
+            })
+        }
+
+        fn responses(post_status: u16) -> Value {
+            json!({
+                "user": json!({"login":"alice","node_id":"VIEWER_node"}).to_string(),
+                "repos/owner/repo": json!({
+                    "node_id":"REPO_node","full_name":"owner/repo","archived":false,
+                    "permissions":{"admin":false,"maintain":false,"push":true}
+                }).to_string(),
+                "repos/owner/repo/actions/runs/6":
+                    run_body(2, "completed", Some("failure")).to_string(),
+                "POST": format!("HTTP/2.0 {post_status} Synthetic\r\n\r\n"),
+            })
+        }
+
+        fn seam_fixture(post_status: u16) -> (TempDir, GithubProvider) {
+            let directory = tempfile::tempdir().unwrap();
+            fs::write(
+                directory.path().join("responses.json"),
+                serde_json::to_vec(&responses(post_status)).unwrap(),
+            )
+            .unwrap();
+            let executable = directory.path().join("gh");
+            fs::write(
+                &executable,
+                r#"#!/usr/bin/python3
+import json, pathlib, sys, os
+root = pathlib.Path(__file__).parent
+responses = json.loads((root / 'responses.json').read_text())
+args = sys.argv[1:]
+if args[:2] == ['auth', 'token']:
+    print('private-alice')
+    sys.exit(0)
+assert os.environ.get('GH_TOKEN') == 'private-alice'
+if args[4] == 'POST':
+    assert '--include' in args, args
+    assert json.loads(sys.stdin.read()) == {}
+    body = responses['POST']
+    sys.stdout.write(body)
+    sys.exit(0 if body.split()[1] in ('201', '202') else 1)
+sys.stdout.write(responses[args[-1]])
+"#,
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let provider = GithubProvider::synthetic_with_gh(
+                seam_repository().account,
+                executable,
+                Duration::from_secs(30),
+            );
+            (directory, provider)
+        }
+
+        fn journal(root: &TempDir) -> ActionJournal {
+            let key = ReviewKey::for_repository("github", &seam_repository(), 7).unwrap();
+            ActionJournal::open(root.path(), key).unwrap()
+        }
+
+        #[test]
+        fn an_accepted_control_is_durably_recorded_and_never_replayed() {
+            let (fixture, provider) = seam_fixture(201);
+            let store = tempfile::tempdir().unwrap();
+            let mut durable = journal(&store);
+            let request = provider
+                .prepare_actions_run_control(
+                    &seam_repository(),
+                    &seam_locator(),
+                    ActionsRunControlAction::RerunAllJobs,
+                    "seam-op".into(),
+                    "seam-attempt".into(),
+                )
+                .unwrap();
+            let dispatch =
+                dispatch_actions_run_control(&mut durable, &provider, &seam_repository(), &request);
+            assert!(matches!(
+                dispatch.outcome,
+                ProviderMutationOutcome::Acknowledged(_)
+            ));
+            let operations = durable.operations().unwrap();
+            assert_eq!(operations.len(), 1);
+            assert!(matches!(
+                operations[0].request,
+                JournalRequest::ActionsRunControl(_)
+            ));
+            assert!(matches!(
+                operations[0].status,
+                JournalStatus::Acknowledged { .. }
+            ));
+
+            // The same exact attempt can never be admitted twice.
+            let replay =
+                dispatch_actions_run_control(&mut durable, &provider, &seam_repository(), &request);
+            assert!(matches!(
+                replay.outcome,
+                ProviderMutationOutcome::PreflightRejected { .. }
+            ));
+            assert_eq!(durable.operations().unwrap().len(), 1);
+            drop(fixture);
+        }
+
+        #[test]
+        fn an_unresolved_control_blocks_the_target_until_it_is_reconciled() {
+            let (_fixture, provider) = seam_fixture(403);
+            let store = tempfile::tempdir().unwrap();
+            let mut durable = journal(&store);
+            let request = provider
+                .prepare_actions_run_control(
+                    &seam_repository(),
+                    &seam_locator(),
+                    ActionsRunControlAction::RerunFailedJobs,
+                    "seam-op-2".into(),
+                    "seam-attempt-2".into(),
+                )
+                .unwrap();
+            let dispatch =
+                dispatch_actions_run_control(&mut durable, &provider, &seam_repository(), &request);
+            assert!(matches!(
+                dispatch.outcome,
+                ProviderMutationOutcome::Uncertain { .. }
+            ));
+            let operations = durable.operations().unwrap();
+            assert!(matches!(
+                operations[0].status,
+                JournalStatus::Uncertain { .. }
+            ));
+
+            // A different exact attempt is refused while the first is unresolved.
+            let next = provider
+                .prepare_actions_run_control(
+                    &seam_repository(),
+                    &seam_locator(),
+                    ActionsRunControlAction::RerunAllJobs,
+                    "seam-op-3".into(),
+                    "seam-attempt-3".into(),
+                )
+                .unwrap();
+            assert!(matches!(
+                dispatch_actions_run_control(&mut durable, &provider, &seam_repository(), &next)
+                    .outcome,
+                ProviderMutationOutcome::PreflightRejected { .. }
+            ));
+            assert_eq!(durable.operations().unwrap().len(), 1);
+        }
+    }
+
     #[test]
     fn only_the_owning_operation_releases_busy_state() {
         let mut state = CiActionsState::default();
