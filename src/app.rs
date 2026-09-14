@@ -1051,7 +1051,7 @@ enum NativeConfirmation {
         draft_id: String,
         body: String,
         target: cibergit::participation::PublishedFile,
-        source: cibergit::domain::PendingFileCommentSource,
+        source: Box<cibergit::domain::PendingFileCommentSource>,
     },
     Merge {
         preparation: Box<MergePreparation>,
@@ -1466,7 +1466,7 @@ impl FileCommentConfirmationToken {
                     && draft_id == &self.draft_id
                     && body == &self.body
                     && target == &self.target
-                    && source == &self.pending_source
+                    && source.as_ref() == &self.pending_source
             )
     }
 }
@@ -3794,7 +3794,7 @@ impl ReviewWorkspace {
                                     }) if frozen_draft == &draft_id
                                         && frozen_body == body
                                         && frozen_target == &target
-                                        && frozen_source == &source => *generation,
+                                        && frozen_source.as_ref() == &source => *generation,
                                     _ => return Err(this.status.clone()),
                                 };
                                 let token = FileCommentConfirmationToken {
@@ -3988,7 +3988,7 @@ impl ReviewWorkspace {
                                         draft_id: draft_id.clone(),
                                         body: body.clone(),
                                         target: target.clone(),
-                                        pending_source: source.clone(),
+                                        pending_source: source.as_ref().clone(),
                                     },
                                     _ => return Err(this.status.clone()),
                                 };
@@ -4018,7 +4018,7 @@ impl ReviewWorkspace {
                                         draft_id: draft_id.clone(),
                                         body: body.clone(),
                                         target: target.clone(),
-                                        pending_source: source.clone(),
+                                        pending_source: source.as_ref().clone(),
                                     },
                                     _ => return Err(this.status.clone()),
                                 };
@@ -10984,7 +10984,7 @@ impl ReviewWorkspace {
             draft_id,
             body: input_body,
             target,
-            source,
+            source: Box::new(source),
         });
         self.inspector_open = true;
         self.inspector_scroll.set_offset(point(px(0.), px(0.)));
@@ -11074,7 +11074,7 @@ impl ReviewWorkspace {
             .pending_snapshot
             .as_ref()
             .and_then(|pending| pending.file_comment_source.as_ref())
-            == Some(&source);
+            == Some(source.as_ref());
         let exact_draft = matches!(
             &self.tabs[index].interactions,
             InteractionState::Ready(controller)
@@ -11092,7 +11092,7 @@ impl ReviewWorkspace {
             return;
         }
         self.tabs[index].confirmation = None;
-        self.start_file_comment_write(source, token, cx);
+        self.start_file_comment_write(*source, token, cx);
     }
 
     fn start_file_comment_write(
@@ -18886,7 +18886,7 @@ impl ReviewWorkspace {
                     draft_id: draft_id.clone(),
                     body: body.clone(),
                     target: target.clone(),
-                    pending_source: source.clone(),
+                    pending_source: source.as_ref().clone(),
                 };
                 let confirm_root = cx.entity();
                 let cancel_root = confirm_root.clone();
@@ -21473,7 +21473,7 @@ mod layout_tests {
             draft_id: "file-draft-1".into(),
             body: "Whole-file rationale".into(),
             target: target.clone(),
-            source: source.clone(),
+            source: Box::new(source.clone()),
         };
         let token = FileCommentConfirmationToken {
             workspace_instance: 10,
@@ -22015,10 +22015,12 @@ mod layout_tests {
             active_review: None,
             drafts: vec![saved_a.clone(), saved_c.clone()],
         };
-        let mut editor = SubmittedSummaryEditor::default();
-        editor.active_review = Some(local_a.review.coordinates.clone());
-        editor.drafts = vec![local_a.clone(), local_b.clone()];
-        editor.edit_generation = 2;
+        let mut editor = SubmittedSummaryEditor {
+            active_review: Some(local_a.review.coordinates.clone()),
+            drafts: vec![local_a.clone(), local_b.clone()],
+            edit_generation: 2,
+            ..Default::default()
+        };
         assert!(!editor.merge_loaded(0, disk));
 
         let mut use_saved = editor.clone();
@@ -22067,8 +22069,10 @@ mod layout_tests {
     #[test]
     fn rejected_save_state_keeps_exact_current_text_and_close_barrier_dirty() {
         let (_, review) = submitted_review_fixture();
-        let mut editor = SubmittedSummaryEditor::default();
-        editor.load_state = SubmittedDraftLoadState::Ready;
+        let mut editor = SubmittedSummaryEditor {
+            load_state: SubmittedDraftLoadState::Ready,
+            ..Default::default()
+        };
         editor.begin(review);
         editor.store_active_body("must remain after rejected save".into());
         editor.queue_current();
@@ -22099,8 +22103,10 @@ mod layout_tests {
     #[test]
     fn delayed_save_actual_apply_path_rejects_tab_and_workspace_replacements() {
         let (repository, review) = submitted_review_fixture();
-        let mut editor = SubmittedSummaryEditor::default();
-        editor.load_state = SubmittedDraftLoadState::Ready;
+        let mut editor = SubmittedSummaryEditor {
+            load_state: SubmittedDraftLoadState::Ready,
+            ..Default::default()
+        };
         editor.begin(review);
         editor.store_active_body("delayed exact snapshot".into());
         editor.queue_current();
@@ -22165,8 +22171,10 @@ mod layout_tests {
     #[test]
     fn acknowledged_clear_queue_does_not_invalidate_owned_save_completion() {
         let (repository, review) = submitted_review_fixture();
-        let mut editor = SubmittedSummaryEditor::default();
-        editor.load_state = SubmittedDraftLoadState::Ready;
+        let mut editor = SubmittedSummaryEditor {
+            load_state: SubmittedDraftLoadState::Ready,
+            ..Default::default()
+        };
         editor.begin(review);
         editor.store_active_body("owned save before clear".into());
         let captured = editor.active_draft().unwrap().clone();
@@ -22207,8 +22215,10 @@ mod layout_tests {
     #[test]
     fn acknowledged_clear_actual_apply_path_preserves_newer_typed_body() {
         let (_, review) = submitted_review_fixture();
-        let mut editor = SubmittedSummaryEditor::default();
-        editor.load_state = SubmittedDraftLoadState::Ready;
+        let mut editor = SubmittedSummaryEditor {
+            load_state: SubmittedDraftLoadState::Ready,
+            ..Default::default()
+        };
         editor.begin(review);
         editor.store_active_body("exact sent body".into());
         let captured = editor.active_draft().unwrap().clone();
@@ -22253,16 +22263,18 @@ mod layout_tests {
             active_review: Some(draft_b.review.coordinates.clone()),
             drafts: vec![draft_b.clone()],
         };
-        let mut editor = SubmittedSummaryEditor::default();
-        editor.load_state = SubmittedDraftLoadState::Ready;
-        editor.active_review = Some(draft_b.review.coordinates.clone());
-        editor.drafts = vec![draft_a.clone(), draft_b.clone()];
-        editor.durable = SubmittedDraftStoreSnapshot {
-            generation: Some(12),
+        let mut editor = SubmittedSummaryEditor {
+            load_state: SubmittedDraftLoadState::Ready,
             active_review: Some(draft_b.review.coordinates.clone()),
-            drafts: editor.drafts.clone(),
+            drafts: vec![draft_a.clone(), draft_b.clone()],
+            durable: SubmittedDraftStoreSnapshot {
+                generation: Some(12),
+                active_review: Some(draft_b.review.coordinates.clone()),
+                drafts: editor.drafts.clone(),
+            },
+            clear_in_flight: true,
+            ..Default::default()
         };
-        editor.clear_in_flight = true;
         assert_eq!(
             editor.complete_clear(&draft_a, Ok(cleared.clone())),
             Ok(true)
@@ -22271,8 +22283,10 @@ mod layout_tests {
         assert_eq!(editor.active_draft().unwrap().body, "newer B");
         assert!(editor.pending.is_none());
 
-        let mut changed = SubmittedSummaryEditor::default();
-        changed.load_state = SubmittedDraftLoadState::Ready;
+        let mut changed = SubmittedSummaryEditor {
+            load_state: SubmittedDraftLoadState::Ready,
+            ..Default::default()
+        };
         let mut changed_a = draft_a.clone();
         changed_a.body = "new unsent A after acknowledgement".into();
         changed.active_review = Some(changed_a.review.coordinates.clone());
@@ -22383,7 +22397,7 @@ mod layout_tests {
             draft_id: "file-draft-1".into(),
             body: "Whole-file rationale".into(),
             target: target.clone(),
-            source: source.clone(),
+            source: Box::new(source.clone()),
         };
         assert!(!matches(
             &token,
@@ -22400,7 +22414,7 @@ mod layout_tests {
             draft_id: "file-draft-1".into(),
             body: "Whole-file rationale".into(),
             target,
-            source: changed_source,
+            source: Box::new(changed_source),
         };
         assert!(!matches(
             &token,
