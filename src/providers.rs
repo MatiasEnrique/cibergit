@@ -7995,7 +7995,10 @@ else:
             ],
         );
         let error = provider.details(&repo("alice"), 1).unwrap_err();
-        assert!(error.to_string().contains("head changed"));
+        assert!(
+            error.to_string().contains("source identity changed"),
+            "unexpected moving-head rejection: {error:#}"
+        );
         exhausted(&dir, 2);
     }
 
