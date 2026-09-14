@@ -19506,6 +19506,21 @@ impl ReviewWorkspace {
         }
     }
 
+    fn toggle_diff_layout(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        self.capture_scroll(index);
+        if let Some(session) = &mut self.tabs[index].session {
+            session.set_diff_mode(match session.diff_mode().resolve(self.wide) {
+                DiffMode::SideBySide => DiffMode::Unified,
+                _ => DiffMode::SideBySide,
+            });
+            self.rebuild_diff(index, self.wide);
+            self.save_workspace();
+            self.persist_session(index, cx);
+            cx.notify();
+        }
+    }
+
     fn toggle_viewed(&mut self, key: &str, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         if let Some(session) = &mut self.tabs[index].session {
@@ -23285,7 +23300,32 @@ impl ReviewWorkspace {
                     .border_color(colors.border)
                     .font_family(CODE_FONT)
                     .ui_text(TextRole::Body)
-                    .child(header)
+                    .child(div().flex_1().min_w_0().truncate().child(header))
+                    .child(
+                        Button::new("toggle-diff-layout")
+                            .debug_selector(|| "toggle-diff-layout".into())
+                            .control()
+                            .flex_none()
+                            .mr(px(ui::GAP_GROUP))
+                            .border_1()
+                            .border_color(colors.border)
+                            .font_family(UI_FONT)
+                            .accessibility_label(if split_mode {
+                                "Switch to unified diff"
+                            } else {
+                                "Switch to side-by-side diff"
+                            })
+                            .child(if split_mode {
+                                "Unified"
+                            } else {
+                                "Side by side"
+                            })
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                if let Root::Review(this) = root {
+                                    this.toggle_diff_layout(cx);
+                                }
+                            })),
+                    )
                     .child(
                         action_link_with_id("comment-on-file".into(), "Comment on file…", colors)
                             .on_click(move |_, window, cx| {
@@ -30403,6 +30443,31 @@ mod layout_tests {
         let files = cx.debug_bounds("pr-tab-files").unwrap();
         cx.simulate_click(files.center(), Modifiers::default());
         cx.update(|window, cx| window.draw(cx).clear(cx));
+        for _ in 0..2 {
+            let was_split = root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.tabs[0].diff_split
+            });
+            let toggle = cx.debug_bounds("toggle-diff-layout").unwrap();
+            cx.simulate_click(toggle.center(), Modifiers::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert_eq!(this.tabs[0].diff_split, !was_split);
+                assert_eq!(
+                    this.tabs[0].session.as_ref().unwrap().diff_mode(),
+                    if was_split {
+                        DiffMode::Unified
+                    } else {
+                        DiffMode::SideBySide
+                    }
+                );
+            });
+        }
         for (selector, panel) in [
             ("splitter-Sidebar", super::PanelKind::Sidebar),
             ("splitter-FileTree", super::PanelKind::FileTree),
