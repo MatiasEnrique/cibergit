@@ -11,3 +11,5 @@ pub mod review;
 pub mod stacks;
 pub mod workspace;
 pub mod worktrees;
+
+pub mod ui;

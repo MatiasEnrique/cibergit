@@ -1,5 +1,7 @@
 # Technical design
 
+For current interface typography, spacing, control geometry, and density, follow [UI density guidelines](ui-density.md) and `src/ui.rs`.
+
 Recorded on 2026-09-12. Read this with the [product requirements](product-requirements.md).
 
 This document distinguishes agreed choices from implementation proposals and upstream facts. Module names, storage engines, and internal data structures below are design recommendations, not code that has been built or additional user decisions. The current task authorizes documentation only.

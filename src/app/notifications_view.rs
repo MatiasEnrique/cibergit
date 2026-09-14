@@ -1,5 +1,6 @@
 use super::{Palette, Root};
 use anyhow::{Context as _, Result, ensure};
+use cibergit::ui::{self, Density, TextRole};
 use cibergit::{
     domain::{Account, Repository},
     notifications::{
@@ -1053,7 +1054,7 @@ impl NotificationController {
                 .collect::<Vec<_>>();
             Some(
                 div()
-                    .mb_5()
+                    .mb(px(ui::GAP_PAGE))
                     .child(
                         div()
                             .flex()
@@ -1066,11 +1067,9 @@ impl NotificationController {
                             .child(
                                 div()
                                     .id(SharedString::from(format!("notification-consent-{}", account.login)))
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
+                                    .control()
                                     .cursor_pointer()
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.accent)
                                     .child(if state.consent_transition {
                                         "Saving macOS preference…"
@@ -1089,16 +1088,16 @@ impl NotificationController {
                     .child(
                         div()
                             .mt_1()
-                            .text_xs()
+                            .ui_text(TextRole::Caption)
                             .text_color(colors.faint)
                             .child("In-app unread is always available. macOS alerts are opt-in and requested best effort; this app receives no permission or delivery receipt."),
                     )
                     .children(completeness)
                     .when_some(state.stale_notice.clone(), |section, notice| {
-                        section.child(div().mt_2().text_xs().text_color(colors.amber).child(notice))
+                        section.child(div().mt_2().ui_text(TextRole::Caption).text_color(colors.amber).child(notice))
                     })
                     .when_some(state.server_gate.notice(Instant::now()), |section, notice| {
-                        section.child(div().mt_2().text_xs().text_color(colors.amber).child(notice))
+                        section.child(div().mt_2().ui_text(TextRole::Caption).text_color(colors.amber).child(notice))
                     })
                     .child(div().mt_3().children(event_rows))
                     .when(event_count == 0, |section| {
@@ -1106,21 +1105,21 @@ impl NotificationController {
                     })
                     .when(incomplete_count > 0, |section| {
                         section
-                            .child(div().mt_4().text_xs().font_weight(gpui::FontWeight::SEMIBOLD).text_color(colors.amber).child(format!("INCOMPLETE CANDIDATES · {incomplete_count} (not counted unread)")))
+                            .child(div().mt(px(ui::GAP_PAGE)).ui_text(TextRole::Caption).font_weight(gpui::FontWeight::SEMIBOLD).text_color(colors.amber).child(format!("INCOMPLETE CANDIDATES · {incomplete_count} (not counted unread)")))
                             .children(incomplete_rows)
                     })
                     .child(
                         div()
                             .mt_3()
                             .flex()
-                            .gap_3()
+                            .gap(px(ui::GAP_COLUMNS))
                             .child(panel_action("Previous", colors).on_click(cx.listener(move |root, _, _, cx| {
                                 if let Root::Review(this) = root {
                                     this.notifications.previous_page(&account_for_previous);
                                     cx.notify();
                                 }
                             })))
-                            .child(div().py_1().text_xs().text_color(colors.faint).child(format!("Page {}", state.page + 1)))
+                            .child(div().py_1().ui_text(TextRole::Caption).text_color(colors.faint).child(format!("Page {}", state.page + 1)))
                             .child(panel_action("Next", colors).on_click(cx.listener(move |root, _, _, cx| {
                                 if let Root::Review(this) = root {
                                     this.notifications.next_page(&account_for_next);
@@ -1156,7 +1155,7 @@ impl NotificationController {
                     .child(
                         div()
                             .h(px(48.))
-                            .px_4()
+                            .px(px(ui::PANEL_GUTTER))
                             .flex()
                             .items_center()
                             .justify_between()
@@ -1182,7 +1181,7 @@ impl NotificationController {
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
-                            .p_4()
+                            .p(px(ui::PANEL_GUTTER))
                             .when(self.runtime.is_none(), |body| {
                                 body.child(div().text_color(colors.muted).child(
                                     self.initialization_error.clone().unwrap_or_else(|| {
@@ -1391,7 +1390,7 @@ fn render_event(
         )))
         .mb_2()
         .p_3()
-        .rounded_md()
+        .rounded(px(ui::CONTROL_RADIUS))
         .border_1()
         .border_color(colors.border)
         .cursor_pointer()
@@ -1403,7 +1402,7 @@ fn render_event(
                 .child(div().font_weight(gpui::FontWeight::MEDIUM).child(label))
                 .child(
                     div()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.faint)
                         .child(event.occurred_at.clone()),
                 ),
@@ -1412,7 +1411,7 @@ fn render_event(
         .child(
             div()
                 .mt_1()
-                .text_xs()
+                .ui_text(TextRole::Caption)
                 .text_color(colors.muted)
                 .child(format!(
                     "{} · {}/{} #{}{}",
@@ -1448,9 +1447,9 @@ fn render_incomplete(candidate: &IncompleteNotificationCandidate, colors: Palett
     div()
         .mt_2()
         .p_2()
-        .rounded_md()
+        .rounded(px(ui::CONTROL_RADIUS))
         .bg(colors.elevated)
-        .text_xs()
+        .ui_text(TextRole::Caption)
         .child(format!("{target} · {:?}", candidate.kind))
         .child(
             div()
@@ -1463,7 +1462,7 @@ fn render_incomplete(candidate: &IncompleteNotificationCandidate, colors: Palett
 fn render_completeness(repository: &RepositoryNotificationCompleteness, colors: Palette) -> Div {
     div()
         .mt_2()
-        .text_xs()
+        .ui_text(TextRole::Caption)
         .text_color(if repository.complete {
             colors.muted
         } else {
@@ -1487,11 +1486,9 @@ fn render_completeness(repository: &RepositoryNotificationCompleteness, colors: 
 fn panel_action(label: &'static str, colors: Palette) -> gpui::Stateful<Div> {
     div()
         .id(SharedString::from(format!("notification-action-{label}")))
-        .px_2()
-        .py_1()
-        .rounded_md()
+        .control()
         .cursor_pointer()
-        .text_xs()
+        .ui_text(TextRole::Caption)
         .text_color(colors.accent)
         .hover(|button| button.bg(colors.selected))
         .child(label)

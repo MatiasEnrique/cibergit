@@ -5,6 +5,7 @@
 //! gesture here. All checkout and Git I/O is started on GPUI's background executor;
 //! editor changes are serialized by one FIFO worker per open document.
 
+use cibergit::ui::{self, Density, TextRole};
 #[path = "local_workspace/conflict_view.rs"]
 mod conflict_view;
 #[path = "local_workspace/pr_publish.rs"]
@@ -3402,7 +3403,7 @@ impl Render for LocalWorkspace {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .px_2()
+            .px(px(ui::CELL_INSET))
             .py_2();
         for entry in browser_rows {
             let path = entry.relative_path.clone();
@@ -3424,12 +3425,12 @@ impl Render for LocalWorkspace {
                         )
                         .into(),
                     ))
-                    .h(px(28.))
-                    .px_2()
+                    .h(px(ui::CONTROL_HEIGHT))
+                    .px(px(ui::CELL_INSET))
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .rounded_md()
+                    .gap(px(ui::GAP_GROUP))
+                    .rounded(px(ui::CONTROL_RADIUS))
                     .when(selected, |row| row.bg(colors.selected))
                     .text_color(if editable { colors.text } else { colors.muted })
                     .cursor_pointer()
@@ -3473,20 +3474,25 @@ impl Render for LocalWorkspace {
             .child(
                 div()
                     .h(px(48.))
-                    .px_3()
+                    .px(px(ui::CONTROL_INSET))
                     .flex()
                     .items_center()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(FontWeight::MEDIUM)
                     .child("WORKTREE"),
             )
-            .child(div().px_2().pb_2().child(Input::new(&self.quick_open)))
+            .child(
+                div()
+                    .px(px(ui::CELL_INSET))
+                    .pb_2()
+                    .child(Input::new(&self.quick_open)),
+            )
             .child(files)
             .when_some(browser_notice, |panel, reason| {
                 panel.child(
                     div()
-                        .px_3()
+                        .px(px(ui::CONTROL_INSET))
                         .py_2()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.amber)
                         .child(format!("Enumeration truncated: {reason}")),
                 )
@@ -3513,7 +3519,7 @@ impl Render for LocalWorkspace {
             .flex()
             .flex_col()
             .font_family(UI_FONT)
-            .text_sm()
+            .ui_text(TextRole::Body)
             .bg(colors.canvas)
             .text_color(colors.text)
             .on_action(cx.listener(|this, _: &LocalSave, _, cx| this.save_active(cx)))
@@ -3577,7 +3583,7 @@ impl Render for LocalWorkspace {
             .child(
                 div()
                     .h(px(48.))
-                    .px_4()
+                    .px(px(ui::PANEL_GUTTER))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -3586,17 +3592,17 @@ impl Render for LocalWorkspace {
                     .border_color(colors.border)
                     .child(
                         div()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::MEDIUM)
                             .child(format!("{} · Local workspace", self.context.repository.full_name())),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_3()
+                            .gap(px(ui::GAP_COLUMNS))
                             .child(
                                 div()
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.muted)
                                     .child("Published Review stays pinned · Git auth/authorship come from installed Git"),
                             )
@@ -3618,12 +3624,12 @@ impl Render for LocalWorkspace {
             .child(
                 div()
                     .min_h(px(34.))
-                    .px_4()
+                    .px(px(ui::PANEL_GUTTER))
                     .py_2()
                     .bg(colors.surface)
                     .border_t_1()
                     .border_color(colors.border)
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .child(self.status.clone()),
             )
@@ -3700,7 +3706,7 @@ impl LocalWorkspace {
             .child(
                 div()
                     .h(px(44.))
-                    .px_3()
+                    .px(px(ui::CONTROL_INSET))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -3715,7 +3721,7 @@ impl LocalWorkspace {
                     .child(
                         div()
                             .flex()
-                            .gap_2()
+                            .gap(px(ui::GAP_GROUP))
                             .child(action_button(
                                 "Find",
                                 colors,
@@ -3755,7 +3761,7 @@ impl LocalWorkspace {
             panel = panel
                 .child(
                     div()
-                        .px_3()
+                        .px(px(ui::CONTROL_INSET))
                         .py_2()
                         .bg(if colors.dark { rgba(0x452f18ff) } else { rgba(0xfff4d6ff) })
                         .text_color(colors.amber)
@@ -3771,7 +3777,7 @@ impl LocalWorkspace {
                         .flex_1()
                         .min_h_0()
                         .flex()
-                        .gap_1()
+                        .gap(px(ui::GAP_ICON))
                         .child(conflict_column("BASE", base, colors))
                         .child(conflict_column("OURS", ours, colors))
                         .child(conflict_column("CURRENT DISK", disk, colors)),
@@ -3785,8 +3791,8 @@ impl LocalWorkspace {
                         .border_color(colors.border)
                         .child(
                             div()
-                                .h(px(32.))
-                                .px_3()
+                                .h(px(ui::CONTROL_HEIGHT))
+                                .px(px(ui::CONTROL_INSET))
                                 .flex()
                                 .items_center()
                                 .justify_between()
@@ -3794,7 +3800,7 @@ impl LocalWorkspace {
                                 .child(
                                     div()
                                         .flex()
-                                        .gap_2()
+                                        .gap(px(ui::GAP_GROUP))
                                         .child(action_button("Reload disk", colors, cx.listener(|this, _, _, cx| {
                                             this.reload_active_from_disk(cx)
                                         })))
@@ -3827,11 +3833,11 @@ impl LocalWorkspace {
             .child(
                 div()
                     .min_h(px(32.))
-                    .px_3()
+                    .px(px(ui::CONTROL_INSET))
                     .py_1()
                     .border_t_1()
                     .border_color(colors.border)
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(match status {
                         DocumentStatus::Clean => colors.green,
                         DocumentStatus::Dirty => colors.amber,
@@ -3870,7 +3876,7 @@ impl LocalWorkspace {
                 .bg(colors.sidebar)
                 .border_l_1()
                 .border_color(colors.border)
-                .p_4()
+                .p(px(ui::PANEL_GUTTER))
                 .text_color(colors.muted)
                 .child("Loading authoritative Local Changes…")
                 .into_any_element();
@@ -3899,7 +3905,7 @@ impl LocalWorkspace {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .px_3()
+            .px(px(ui::CONTROL_INSET))
             .py_2();
         for (label, path, target) in local_change_rows(&snapshot) {
             let diff_path = path.clone();
@@ -3908,10 +3914,10 @@ impl LocalWorkspace {
                     .id(ElementId::Name(
                         format!("change-{label}-{}", path.display).into(),
                     ))
-                    .h(px(28.))
+                    .h(px(ui::CONTROL_HEIGHT))
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap(px(ui::GAP_GROUP))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_local_diff(diff_path.clone(), target, cx)
@@ -3939,20 +3945,22 @@ impl LocalWorkspace {
             .border_color(colors.border)
             .child(
                 div()
-                    .px_3()
+                    .px(px(ui::CONTROL_INSET))
                     .py_3()
                     .border_b_1()
                     .border_color(colors.border)
+                    .child(div().font_weight(FontWeight::MEDIUM).child("LOCAL CHANGES"))
                     .child(
                         div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("LOCAL CHANGES"),
+                            .mt_2()
+                            .font_family(CODE_FONT)
+                            .ui_text(TextRole::Caption)
+                            .child(head),
                     )
-                    .child(div().mt_2().font_family(CODE_FONT).text_xs().child(head))
                     .child(
                         div()
                             .mt_1()
-                            .text_xs()
+                            .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child(format!(
                                 "upstream {} · ↑{} ↓{} · {operation}",
@@ -3966,7 +3974,7 @@ impl LocalWorkspace {
                             div()
                                 .mt_1()
                                 .font_family(CODE_FONT)
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!(
                                     "observed {}/{} = {}",
@@ -3988,27 +3996,27 @@ impl LocalWorkspace {
                         .border_color(colors.border)
                         .p_2()
                         .font_family(CODE_FONT)
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .whitespace_normal()
                         .child(diff),
                 )
             })
             .child(
                 div()
-                    .px_3()
+                    .px(px(ui::CONTROL_INSET))
                     .py_2()
                     .border_t_1()
                     .border_color(colors.border)
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap(px(ui::GAP_GROUP))
                     .child(Input::new(&self.commit_message))
                     .child(Input::new(&self.branch_name))
                     .child(
                         div()
                             .flex()
                             .flex_wrap()
-                            .gap_2()
+                            .gap(px(ui::GAP_GROUP))
                             .when(!stage_paths.is_empty(), |buttons| {
                                 buttons.child(action_button(
                                     "Stage all",
@@ -4158,34 +4166,30 @@ impl LocalWorkspace {
                 .border_color(colors.border)
                 .flex()
                 .flex_col()
-                .gap_1()
+                .gap(px(ui::GAP_ICON))
+                .child(div().font_weight(FontWeight::MEDIUM).child("Publish to PR"))
                 .child(
                     div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Publish to PR"),
-                )
-                .child(
-                    div()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .whitespace_normal()
                         .child(self.pr_publish_notice.clone()),
                 );
             if let Some(preparation) = preparation.clone() {
                 publish = publish
-                    .child(div().mt_1().text_xs().whitespace_normal().child(format!(
+                    .child(div().mt_1().ui_text(TextRole::Caption).whitespace_normal().child(format!(
                         "{} #{} · {}",
                         preparation.selected_repository, preparation.pull_request_number,
                         preparation.selected_account,
                     )))
-                    .child(div().text_xs().whitespace_normal().child(format!(
+                    .child(div().ui_text(TextRole::Caption).whitespace_normal().child(format!(
                         "Local: {} ({})", preparation.local_branch,
                         &preparation.local_oid[..12.min(preparation.local_oid.len())],
                     )))
-                    .child(div().text_xs().whitespace_normal().child(format!(
+                    .child(div().ui_text(TextRole::Caption).whitespace_normal().child(format!(
                         "To: {} · {}", preparation.source_repository, preparation.remote_branch,
                     )))
-                    .child(div().text_xs().text_color(colors.muted).whitespace_normal().child(
+                    .child(div().ui_text(TextRole::Caption).text_color(colors.muted).whitespace_normal().child(
                         match preparation.mode {
                             PrPublishMode::UpToDate => "These commits are already published.",
                             PrPublishMode::Publish => "Adds local commits without forcing the remote branch.",
@@ -4202,7 +4206,7 @@ impl LocalWorkspace {
                 if self.pr_publish_details_expanded {
                     publish = publish.child(
                         div()
-                            .text_xs()
+                            .ui_text(TextRole::Caption)
                             .font_family(CODE_FONT)
                             .whitespace_normal()
                             .child(format!(
@@ -4218,7 +4222,7 @@ impl LocalWorkspace {
                     );
                 }
             }
-            let mut buttons = div().mt_2().flex().flex_wrap().gap_2();
+            let mut buttons = div().mt_2().flex().flex_wrap().gap(px(ui::GAP_GROUP));
             if !controls_locked {
                 buttons = buttons.child(action_button(
                     if preparation.is_some() {
@@ -4263,15 +4267,20 @@ impl LocalWorkspace {
                     .border_color(colors.amber)
                     .child(
                         div()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::MEDIUM)
                             .child("Confirm Git action"),
                     )
-                    .child(div().mt_1().text_xs().child(pending.action.summary()))
+                    .child(
+                        div()
+                            .mt_1()
+                            .ui_text(TextRole::Caption)
+                            .child(pending.action.summary()),
+                    )
                     .child(
                         div()
                             .mt_2()
                             .flex()
-                            .gap_2()
+                            .gap(px(ui::GAP_GROUP))
                             .child(action_button(
                                 "Confirm",
                                 colors,
@@ -4292,16 +4301,16 @@ impl LocalWorkspace {
                     .bg(if colors.dark { rgba(0x411f21ff) } else { rgba(0xf9e2e0ff) })
                     .border_t_1()
                     .border_color(colors.red)
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Started action needs reconciliation"))
-                    .child(div().mt_1().text_xs().child(started.summary))
-                    .child(div().mt_1().text_xs().child("Refresh and inspect actual state. This control only acknowledges; it never retries."));
+                    .child(div().font_weight(FontWeight::MEDIUM).child("Started action needs reconciliation"))
+                    .child(div().mt_1().ui_text(TextRole::Caption).child(started.summary))
+                    .child(div().mt_1().ui_text(TextRole::Caption).child("Refresh and inspect actual state. This control only acknowledges; it never retries."));
             if let Some(attempt) = publish_attempt {
                 reconciliation = reconciliation
                     .child(
                         div()
                             .mt_1()
                             .font_family(CODE_FONT)
-                            .text_xs()
+                            .ui_text(TextRole::Caption)
                             .whitespace_normal()
                             .child(format!(
                                 "request {} · {} {} @ {} -> {}/{} expected {} · config {}",
@@ -4315,13 +4324,19 @@ impl LocalWorkspace {
                                 attempt.destination_configuration_fingerprint,
                             )),
                     )
-                    .child(div().mt_1().text_xs().whitespace_normal().child(format!(
-                        "target {} · selected {}/{} #{}",
-                        attempt.destination_repository,
-                        attempt.selected_host,
-                        attempt.selected_repository,
-                        attempt.pull_request_number,
-                    )));
+                    .child(
+                        div()
+                            .mt_1()
+                            .ui_text(TextRole::Caption)
+                            .whitespace_normal()
+                            .child(format!(
+                                "target {} · selected {}/{} #{}",
+                                attempt.destination_repository,
+                                attempt.selected_host,
+                                attempt.selected_repository,
+                                attempt.pull_request_number,
+                            )),
+                    );
             }
             reconciliation = reconciliation.child(action_button(
                 "Acknowledge observed current state",
@@ -4350,15 +4365,13 @@ fn action_button(
     let label = label.into();
     div()
         .id(ElementId::Name(format!("action-{}", label).into()))
-        .px_2()
-        .py_1()
-        .rounded_md()
+        .control()
         .border_1()
         .border_color(colors.border)
         .bg(colors.elevated)
         .hover(|button| button.bg(colors.selected))
         .cursor_pointer()
-        .text_xs()
+        .ui_text(TextRole::Caption)
         .on_click(listener)
         .child(label)
 }
@@ -4372,11 +4385,11 @@ fn conflict_column(label: &'static str, text: String, colors: LocalPalette) -> D
         .bg(colors.surface)
         .child(
             div()
-                .h(px(28.))
-                .px_2()
+                .h(px(ui::CONTROL_HEIGHT))
+                .px(px(ui::CELL_INSET))
                 .flex()
                 .items_center()
-                .text_xs()
+                .ui_text(TextRole::Caption)
                 .text_color(colors.muted)
                 .child(label),
         )
@@ -4388,7 +4401,7 @@ fn conflict_column(label: &'static str, text: String, colors: LocalPalette) -> D
                 .overflow_y_scroll()
                 .p_2()
                 .font_family(CODE_FONT)
-                .text_xs()
+                .ui_text(TextRole::Body)
                 .whitespace_normal()
                 .child(text),
         )

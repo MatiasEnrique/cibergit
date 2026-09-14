@@ -12,6 +12,7 @@ use crate::{
     CancelPullRequestCreation, ClosePullRequestCreation, ConfirmPullRequestCreation,
     PreparePullRequestCreation, TogglePullRequestCreationDraft,
 };
+use cibergit::ui::{self, Density, TextRole};
 use cibergit::{
     domain::{
         Account, MutationAdmissionReceipt, MutationContext, MutationTerminalRecord,
@@ -1960,7 +1961,7 @@ impl PrCreationDialog {
                     .mt_2()
                     .flex()
                     .flex_wrap()
-                    .gap_2()
+                    .gap(px(ui::GAP_GROUP))
                     .children(target_repositories),
             )
             .child(field_label("TARGET BASE BRANCH", colors).mt_3())
@@ -1973,13 +1974,13 @@ impl PrCreationDialog {
                 colors,
                 cx,
             ))
-            .child(section_label("PUBLISHED SOURCE REPOSITORY", colors).mt_4())
+            .child(section_label("PUBLISHED SOURCE REPOSITORY", colors).mt(px(ui::GAP_PAGE)))
             .child(
                 div()
                     .mt_2()
                     .flex()
                     .flex_wrap()
-                    .gap_2()
+                    .gap(px(ui::GAP_GROUP))
                     .children(source_repositories),
             )
             .child(field_label("PUBLISHED SOURCE BRANCH", colors).mt_3())
@@ -2003,7 +2004,7 @@ impl PrCreationDialog {
                     .h(px(112.))
                     .border_1()
                     .border_color(colors.border)
-                    .rounded_md()
+                    .rounded(px(ui::CONTROL_RADIUS))
                     .overflow_hidden()
                     .child(Textarea::new(&self.body)),
             )
@@ -2034,7 +2035,7 @@ impl PrCreationDialog {
             panel = panel.child(
                 div()
                     .mt_2()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .child("Loading bounded published branch choices…"),
             );
@@ -2043,7 +2044,7 @@ impl PrCreationDialog {
             panel = panel.child(
                 div()
                     .mt_2()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.amber)
                     .child(notice.clone()),
             );
@@ -2058,12 +2059,12 @@ impl PrCreationDialog {
         let input = &frozen.request.preparation.input;
         let preparation = &frozen.request.preparation;
         div()
-            .p_4()
-            .rounded_md()
+            .p(px(ui::PANEL_GUTTER))
+            .rounded(px(ui::CONTROL_RADIUS))
             .border_1()
             .border_color(colors.amber)
             .bg(colors.elevated)
-            .child(div().font_weight(FontWeight::SEMIBOLD).child("Confirm immutable PR creation"))
+            .child(div().font_weight(FontWeight::MEDIUM).child("Confirm immutable PR creation"))
             .child(div().mt_2().child(format!("{}:{}  →  {}:{}", input.source_repository.full_name(), input.source_branch, input.target_repository.full_name(), input.base_branch)))
             .child(div().mt_1().text_color(colors.muted).child(format!("Account {} · {}", preparation.viewer_login, if input.draft { "draft" } else { "normal" })))
             .child(div().mt_2().child(input.title.clone()))
@@ -2071,15 +2072,15 @@ impl PrCreationDialog {
             .child(clickable("creation-details-disclosure", if self.details_disclosed { "Hide full request details" } else { "Show full request details" }, colors, true)
                 .on_click(cx.listener(|this, _, _, cx| { this.details_disclosed = !this.details_disclosed; cx.notify(); })))
             .when(self.details_disclosed, |panel| panel.child(
-                div().mt_2().p_3().rounded_md().bg(colors.canvas).text_xs().child(confirmation_details(frozen))
+                div().mt_2().p_3().rounded(px(ui::CONTROL_RADIUS)).bg(colors.canvas).ui_text(TextRole::Caption).child(confirmation_details(frozen))
             ))
     }
 
     fn render_outcome(&self, colors: Palette, cx: &mut Context<Self>) -> Div {
         match &self.state {
             DialogState::Acknowledged(ack) => div()
-                .p_4().rounded_md().border_1().border_color(colors.green).bg(colors.elevated)
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("Created #{}", ack.pull_request.pull_request)))
+                .p(px(ui::PANEL_GUTTER)).rounded(px(ui::CONTROL_RADIUS)).border_1().border_color(colors.green).bg(colors.elevated)
+                .child(div().font_weight(FontWeight::MEDIUM).child(format!("Created #{}", ack.pull_request.pull_request)))
                 .child(div().mt_1().child(ack.url.clone()))
                 .child(div().mt_2().child(format!("Actual created head: {}", ack.actual_head_sha)))
                 .child(div().mt_1().text_color(if ack.actual_head_sha == ack.reviewed_head_sha { colors.muted } else { colors.amber }).child(format!("Reviewed preparation head: {}", ack.reviewed_head_sha)))
@@ -2090,8 +2091,8 @@ impl PrCreationDialog {
                     }
                 }))),
             DialogState::Uncertain(reason) => div()
-                .p_4().rounded_md().border_1().border_color(colors.red).bg(colors.elevated)
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("Creation outcome unresolved"))
+                .p(px(ui::PANEL_GUTTER)).rounded(px(ui::CONTROL_RADIUS)).border_1().border_color(colors.red).bg(colors.elevated)
+                .child(div().font_weight(FontWeight::MEDIUM).child("Creation outcome unresolved"))
                 .child(div().mt_2().text_color(colors.red).child(reason.clone()))
                 .child(div().mt_2().child("The exact request/context is durable. Do not retry: an unknown ID, lost reply, or terminal-save failure cannot be resolved by body search, branch-only adoption, or absence.")),
             _ => div(),
@@ -2105,7 +2106,7 @@ impl PrCreationDialog {
             .filter(|attempt| attempt.unresolved)
             .count();
         div()
-            .mt_4()
+            .mt(px(ui::GAP_PAGE))
             .child(
                 clickable(
                     "creation-attempts-disclosure",
@@ -2132,7 +2133,7 @@ impl PrCreationDialog {
                             div()
                                 .mt_2()
                                 .p_3()
-                                .rounded_md()
+                                .rounded(px(ui::CONTROL_RADIUS))
                                 .border_1()
                                 .border_color(if attempt.unresolved {
                                     colors.amber
@@ -2144,20 +2145,29 @@ impl PrCreationDialog {
                                         .font_weight(FontWeight::MEDIUM)
                                         .child(format!("{} → {}", attempt.source, attempt.target)),
                                 )
-                                .child(div().mt_1().text_xs().child(attempt.status.clone()))
-                                .child(div().mt_1().text_xs().text_color(colors.muted).child(
-                                    format!(
-                                        "{} / {} · reviewed {} · {}",
-                                        attempt.operation_id,
-                                        attempt.attempt_id,
-                                        attempt.reviewed_head,
-                                        attempt.title
-                                    ),
-                                ))
                                 .child(
                                     div()
                                         .mt_1()
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
+                                        .child(attempt.status.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .ui_text(TextRole::Caption)
+                                        .text_color(colors.muted)
+                                        .child(format!(
+                                            "{} / {} · reviewed {} · {}",
+                                            attempt.operation_id,
+                                            attempt.attempt_id,
+                                            attempt.reviewed_head,
+                                            attempt.title
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .ui_text(TextRole::Caption)
                                         .text_color(colors.faint)
                                         .child(attempt.authority.clone()),
                                 )
@@ -2250,17 +2260,17 @@ impl Render for PrCreationDialog {
                 div()
                     .id("pr-creation-dialog")
                     .w(px(760.)).max_w(rems(58.)).max_h(relative(0.92))
-                    .overflow_y_scroll().p_6().rounded_lg().border_1().border_color(colors.border).bg(colors.surface)
+                    .overflow_y_scroll().p(px(ui::PANEL_GUTTER)).rounded(px(ui::WINDOW_RADIUS)).border_1().border_color(colors.border).bg(colors.surface)
                     .child(div().flex().justify_between().items_start()
-                        .child(div().child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Create pull request"))
+                        .child(div().child(div().ui_text(TextRole::Display).font_weight(FontWeight::MEDIUM).child("Create pull request"))
                             .child(div().mt_1().text_color(colors.muted).child("Published branch only · no automatic push · explicit immutable confirmation")))
                         .child(clickable("close-pr-creation", "Close", colors, !self.state.busy()).on_click(cx.listener(|this, _, _, cx| this.request_close(cx)))))
                     .when(!confirmation && !outcome, |dialog| dialog.child(self.render_form(colors, cx)))
                     .when(confirmation, |dialog| dialog.child(self.render_confirmation(colors, cx)))
                     .when(outcome, |dialog| dialog.child(self.render_outcome(colors, cx)))
-                    .when_some(self.notice.clone(), |dialog, notice| dialog.child(div().mt_3().p_3().rounded_md().bg(colors.elevated).text_color(if matches!(self.state, DialogState::Uncertain(_)) { colors.red } else { colors.muted }).child(notice)))
-                    .when(matches!(self.state, DialogState::Preparing | DialogState::Creating | DialogState::Loading), |dialog| dialog.child(div().mt_4().text_color(colors.muted).child(match self.state { DialogState::Preparing => "Preparing with fresh read-only provider state…", DialogState::Creating => "Creation admitted durably; waiting for the single provider result…", _ => "Loading durable creation draft and recovery records…" })))
-                    .when(!outcome, |dialog| dialog.child(div().mt_5().flex().justify_end().gap_2()
+                    .when_some(self.notice.clone(), |dialog, notice| dialog.child(div().mt_3().p_3().rounded(px(ui::CONTROL_RADIUS)).bg(colors.elevated).text_color(if matches!(self.state, DialogState::Uncertain(_)) { colors.red } else { colors.muted }).child(notice)))
+                    .when(matches!(self.state, DialogState::Preparing | DialogState::Creating | DialogState::Loading), |dialog| dialog.child(div().mt(px(ui::GAP_PAGE)).text_color(colors.muted).child(match self.state { DialogState::Preparing => "Preparing with fresh read-only provider state…", DialogState::Creating => "Creation admitted durably; waiting for the single provider result…", _ => "Loading durable creation draft and recovery records…" })))
+                    .when(!outcome, |dialog| dialog.child(div().mt(px(ui::GAP_PAGE)).flex().justify_end().gap(px(ui::GAP_GROUP))
                         .child(clickable("cancel-pr-creation", if confirmation { "Cancel confirmation" } else { "Close" }, colors, !self.state.busy()).on_click(cx.listener(|this, _, _, cx| { if matches!(this.state, DialogState::Confirmation) { this.cancel(cx); } else { this.request_close(cx); } })))
                         .when(matches!(self.state, DialogState::Editing), |row| row.child(clickable("prepare-pr-creation", "Prepare creation…", colors, self.store.is_some()).on_click(cx.listener(|this, _, window, cx| this.prepare(window, cx)))))
                         .when(confirmation, |row| row.child(clickable("confirm-pr-creation", "Create pull request", colors, true).on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx)))))
@@ -2327,26 +2337,26 @@ fn set_textarea_value(
 
 fn field_label(label: &str, colors: Palette) -> Div {
     div()
-        .text_xs()
+        .ui_text(TextRole::Label)
         .text_color(colors.muted)
         .child(label.to_owned())
 }
 
 fn section_label(label: &str, colors: Palette) -> Div {
     div()
-        .mt_5()
-        .font_weight(FontWeight::SEMIBOLD)
+        .mt(px(ui::GAP_PAGE))
+        .font_weight(FontWeight::MEDIUM)
         .text_color(colors.text)
         .child(label.to_owned())
 }
 
 fn editor_box(editor: &Entity<InputState>, colors: Palette) -> Div {
     div()
-        .mt_1()
-        .h(px(36.))
+        .mt(px(ui::GAP_FIELD))
+        .h(px(ui::CONTROL_HEIGHT))
         .border_1()
         .border_color(colors.border)
-        .rounded_md()
+        .rounded(px(ui::CONTROL_RADIUS))
         .child(Input::new(editor))
 }
 
@@ -2358,10 +2368,9 @@ fn clickable(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .mt_3()
-        .px_3()
-        .py_2()
-        .rounded_md()
+        .mt(px(ui::GAP_GROUP))
+        .control()
+        .rounded(px(ui::CONTROL_RADIUS))
         .border_1()
         .border_color(colors.border)
         .text_color(if enabled { colors.accent } else { colors.faint })
@@ -2374,9 +2383,9 @@ fn clickable(
 fn pill(id: String, label: String, selected: bool, colors: Palette) -> Stateful<Div> {
     div()
         .id(SharedString::from(id))
-        .px_3()
+        .px(px(ui::CONTROL_INSET))
         .py_1()
-        .rounded_full()
+        .rounded(px(ui::CONTROL_RADIUS))
         .border_1()
         .border_color(if selected {
             colors.accent
@@ -2426,7 +2435,7 @@ fn branch_choices(
     cx: &mut Context<PrCreationDialog>,
 ) -> Div {
     let Some(choices) = choices else { return div() };
-    div().mt_2().flex().flex_wrap().gap_1()
+    div().mt_2().flex().flex_wrap().gap(px(ui::GAP_ICON))
         .children(choices.values.iter().take(24).enumerate().map(|(index, choice)| {
             let value = choice.name.clone();
             let mut button = clickable(SharedString::from(format!("creation-{prefix}-branch-{index}")), &value, colors, !inert);
@@ -2434,12 +2443,12 @@ fn branch_choices(
             button
         }))
         .when(choices.values.len() > 24, |row| row.child(
-            div().w_full().text_xs().text_color(colors.amber).child(format!(
+            div().w_full().ui_text(TextRole::Caption).text_color(colors.amber).child(format!(
                 "Showing 24 of {} bounded branch choices. Type an exact published branch to use a value outside this viewport.",
                 choices.values.len()
             ))
         ))
-        .when(!choices.complete, |row| row.child(div().w_full().text_xs().text_color(colors.amber).child(choices.notice.clone().unwrap_or_else(|| "Branch choices are incomplete; typed values still require provider verification.".into()))))
+        .when(!choices.complete, |row| row.child(div().w_full().ui_text(TextRole::Caption).text_color(colors.amber).child(choices.notice.clone().unwrap_or_else(|| "Branch choices are incomplete; typed values still require provider verification.".into()))))
 }
 
 #[cfg(feature = "ui-smoke")]

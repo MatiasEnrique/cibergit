@@ -8,6 +8,7 @@ use super::*;
 use cibergit::rebase::{
     ActiveOperationIdentity, BlobContent, ConflictFile, ConflictStage, StashRestoreState,
 };
+use cibergit::ui::{self, Density, TextRole};
 
 pub(super) const WIDE_CONFLICT_PANE_MIN: f32 = 820.;
 
@@ -402,7 +403,7 @@ pub(super) fn source_panel(
         .h(px(220.))
         .flex()
         .flex_col()
-        .rounded_md()
+        .rounded(px(ui::CONTROL_RADIUS))
         .border_1()
         .border_color(if selected {
             colors.accent
@@ -413,15 +414,15 @@ pub(super) fn source_panel(
         .child(
             div()
                 .min_h(px(48.))
-                .px_2()
+                .px(px(ui::CELL_INSET))
                 .py_1()
                 .border_b_1()
                 .border_color(colors.border)
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(label))
+                .child(div().font_weight(FontWeight::MEDIUM).child(label))
                 .child(
                     div()
                         .font_family(CODE_FONT)
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .child(source_summary(stage)),
                 ),
@@ -429,12 +430,12 @@ pub(super) fn source_panel(
         .when(show_details, |panel| {
             panel.child(
                 div()
-                    .px_2()
+                    .px(px(ui::CELL_INSET))
                     .py_1()
                     .border_b_1()
                     .border_color(colors.border)
                     .font_family(CODE_FONT)
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .child(source_details(stage)),
             )
@@ -458,7 +459,7 @@ pub(super) fn source_panel(
                                 // style. Bind the row font for identical measuring
                                 // and painting, including horizontal end bounds.
                                 .font_family(CODE_FONT)
-                                .text_size(px(12.))
+                                .ui_text(TextRole::Body)
                                 .whitespace_nowrap()
                                 .child(if line.is_empty() {
                                     " ".into()
@@ -477,7 +478,7 @@ pub(super) fn source_panel(
             .w_full()
             .p_2()
             .font_family(CODE_FONT)
-            .text_xs(),
+            .ui_text(TextRole::Caption),
         )
 }
 

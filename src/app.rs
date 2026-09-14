@@ -10,6 +10,7 @@ use crate::{
     SelectSinceLastReview, SidebarNarrower, SidebarWider, SubmitReview, ToggleComparisonPicker,
     ToggleFileTree, ToggleInspector, TogglePalette, ToggleSidebar, ToggleStackRelationships,
 };
+use cibergit::ui::{self, Density, TextRole};
 mod checks_view;
 mod ci_read;
 mod collaboration_cache;
@@ -5439,7 +5440,14 @@ impl ReviewWorkspace {
         let root = cx.weak_entity();
         window.spawn(cx, async move |window| {
             std::fs::create_dir_all(&output).unwrap();
-            for populated in [false, true] {
+            // Separate processes can capture each scene without reusing the native
+            // offscreen renderer's glyph atlas between exports.
+            let scenes: &[bool] = if std::env::var_os("CIBERGIT_SMOKE_SIDEBAR_POPULATED_ONLY").is_some() {
+                &[true]
+            } else {
+                &[false, true]
+            };
+            for &populated in scenes {
                 window.update(|_, cx| {
                     root.update(cx, |root, cx| {
                         let Root::Review(this) = root else { unreachable!() };
@@ -5472,7 +5480,7 @@ impl ReviewWorkspace {
                     window.render_to_image().unwrap().save(output.join(if populated { "sidebar-populated.png" } else { "sidebar-empty.png" })).unwrap();
                 }).unwrap();
             }
-            std::fs::write(output.join("report.txt"), "Sidebar layout: synthetic repositories only. Provider bootstrap and polling disabled; no credentials or remote calls. Empty and populated native captures.\n").unwrap();
+            std::fs::write(output.join("report.txt"), "Sidebar layout: synthetic repositories only. Provider bootstrap and polling disabled; no credentials or remote calls. Native sidebar capture; scenarios depend on the requested smoke mode.\n").unwrap();
             window.update(|_, cx| cx.quit()).unwrap();
         }).detach();
     }
@@ -20123,7 +20131,7 @@ impl ReviewWorkspace {
             .size_full()
             .flex()
             .font_family(UI_FONT)
-            .text_size(px(13.))
+            .ui_text(TextRole::Body)
             .text_color(colors.text)
             .bg(rgba(0x00000000))
             .child(self.render_sidebar(colors, window, cx))
@@ -20228,12 +20236,12 @@ impl ReviewWorkspace {
             .set(self.sidebar_materializations.get() + 1);
         match row {
             SidebarRow::Group { depth, label } => div()
-                .h(px(34.))
+                .h(px(ui::ROW_HEIGHT))
                 .pl(px(16. + *depth as f32 * 14.))
                 .pr_3()
                 .flex()
                 .items_center()
-                .gap_2()
+                .gap(px(ui::GAP_ICON))
                 .text_color(colors.muted)
                 .child(sidebar_icon(
                     if *depth == 0 { "folder" } else { "branch" },
@@ -20244,6 +20252,7 @@ impl ReviewWorkspace {
                         .min_w_0()
                         .overflow_hidden()
                         .text_ellipsis()
+                        .whitespace_nowrap()
                         .child(label.clone()),
                 )
                 .into_any_element(),
@@ -20267,7 +20276,7 @@ impl ReviewWorkspace {
                     .get(repository_index)
                     .filter(|runtime| runtime.repository.cache_key() == *repository_key)
                 else {
-                    return div().h(px(34.)).into_any_element();
+                    return div().h(px(ui::ROW_HEIGHT)).into_any_element();
                 };
                 let click_repository = runtime.repository.clone();
                 let unread = self.notifications.unread_for(
@@ -20278,21 +20287,23 @@ impl ReviewWorkspace {
                 );
                 div()
                     .w_full()
-                    .h(px(34.))
-                    .px_2()
-                    .py_px()
+                    .h(px(ui::ROW_HEIGHT))
+                    .px(px(ui::CELL_INSET))
+                    .py_0()
                     .child(
                         Button::new(format!("pr-{repository_index}-{number}"))
+                            .control()
+                            .ui_text(TextRole::Body)
                             .debug_selector(move || format!("sidebar-pr-{number}"))
                             .w_full()
                             .min_w_0()
-                            .h(px(32.))
+                            .h(px(ui::ROW_HEIGHT))
                             .pl(px(30.))
                             .pr_2()
-                            .rounded_md()
+                            .rounded(px(ui::CONTROL_RADIUS))
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap(px(ui::GAP_ICON))
                             .selected(selected)
                             .text_color(colors.muted)
                             .when(selected, |row| {
@@ -20315,12 +20326,14 @@ impl ReviewWorkspace {
                                     .min_w_0()
                                     .overflow_hidden()
                                     .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .debug_selector(move || format!("sidebar-pr-{number}-title"))
                                     .child(pull_request.title.clone()),
                             )
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(if unread > 0 {
                                         colors.accent
                                     } else {
@@ -20364,9 +20377,7 @@ impl ReviewWorkspace {
                     div()
                         .id("restore-sidebar")
                         .mt_12()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
+                        .control()
                         .cursor_pointer()
                         .text_color(colors.accent)
                         .child("›")
@@ -20411,10 +20422,10 @@ impl ReviewWorkspace {
         if sidebar_rows.is_empty() {
             rows.push(
                 div()
-                    .px_4().py_5()
-                    .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(colors.muted)
+                    .px(px(ui::PANEL_GUTTER)).py_5()
+                    .child(div().ui_text(TextRole::Subtitle).font_weight(FontWeight::MEDIUM).text_color(colors.muted)
                         .child(if self.repositories.is_empty() { "No repositories yet" } else { "No pull requests" }))
-                    .child(div().mt_1().text_xs().text_color(colors.muted).line_height(px(18.))
+                    .child(div().mt_1().ui_text(TextRole::Caption).text_color(colors.muted).line_height(px(18.))
                         .child(if self.repositories.is_empty() { "Add a repository to start reviewing." } else { "Nothing matches these filters. Try another view or clear your search." }))
                     .into_any_element(),
             );
@@ -20423,9 +20434,9 @@ impl ReviewWorkspace {
             if let Some(notice) = runtime.state.notice() {
                 rows.push(
                     div()
-                        .px_5()
+                        .px(px(ui::PANEL_GUTTER))
                         .py_1()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.faint)
                         .child(notice)
                         .into_any_element(),
@@ -20519,19 +20530,19 @@ impl ReviewWorkspace {
             )
             .child(
                 div()
-                    .px_3()
-                    .pb_3()
-                    .h(px(42.))
+                    .px(px(ui::CONTROL_INSET))
+                    .mt(px(ui::GAP_GROUP))
+                    .h(px(ui::DESKTOP_HIT))
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap(px(ui::GAP_ICON))
                     .child(
                         div()
                             .flex_1()
                             .pl_1()
-                            .text_size(px(17.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .ui_text(TextRole::Title)
+                            .font_weight(FontWeight::MEDIUM)
                             .child("cibergit"),
                     )
                     .child(
@@ -20587,9 +20598,9 @@ impl ReviewWorkspace {
                         div()
                             .mx_3()
                             .mb_2()
-                            .h(px(32.))
-                            .px_2()
-                            .rounded_md()
+                            .h(px(ui::CONTROL_HEIGHT))
+                            .px(px(ui::CELL_INSET))
+                            .rounded(px(ui::CONTROL_RADIUS))
                             .bg(colors.selected)
                             .border_1()
                             .border_color(colors.border)
@@ -20599,7 +20610,7 @@ impl ReviewWorkspace {
             )
             .child(
                 div()
-                    .px_2()
+                    .px(px(ui::CELL_INSET))
                     .flex_none()
                     .flex()
                     .flex_col()
@@ -20621,13 +20632,13 @@ impl ReviewWorkspace {
             .when(self.workspace.views.len() > 1, |sidebar| {
                 sidebar.child(
                     div()
-                        .px_2()
+                        .px(px(ui::CELL_INSET))
                         .pt_4()
                         .flex()
                         .flex_col()
                         .child(
                             div()
-                                .px_2()
+                                .px(px(ui::CELL_INSET))
                                 .pb_2()
                                 .text_color(colors.faint)
                                 .child("Saved views"),
@@ -20637,13 +20648,13 @@ impl ReviewWorkspace {
             })
             .child(
                 div()
-                    .px_3()
+                    .px(px(ui::CONTROL_INSET))
                     .pt_5()
                     .pb_1()
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap(px(ui::GAP_ICON))
                     .child(
                         div()
                             .pl_1()
@@ -20679,9 +20690,9 @@ impl ReviewWorkspace {
                 |sidebar| {
                     sidebar.child(
                         div()
-                            .px_4()
+                            .px(px(ui::PANEL_GUTTER))
                             .pb_2()
-                            .text_xs()
+                            .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child(view_summary(&view)),
                     )
@@ -20690,9 +20701,9 @@ impl ReviewWorkspace {
             .when(participating_incomplete, |sidebar| {
                 sidebar.child(
                     div()
-                        .px_4()
+                        .px(px(ui::PANEL_GUTTER))
                         .pb_2()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.amber)
                         .child("Some participant information is unavailable."),
                 )
@@ -20749,11 +20760,11 @@ impl ReviewWorkspace {
             .child(
                 div()
                     .h(px(48.))
-                    .px_4()
+                    .px(px(ui::PANEL_GUTTER))
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap(px(ui::GAP_GROUP))
                     .border_t_1()
                     .border_color(if colors.dark {
                         rgba(0xffffff12)
@@ -20770,7 +20781,7 @@ impl ReviewWorkspace {
                             .justify_center()
                             .bg(rgba(0x9165b5ff))
                             .text_color(rgba(0xffffffff))
-                            .text_size(px(10.))
+                            .ui_text(TextRole::Caption)
                             .font_weight(FontWeight::MEDIUM)
                             .child(initial),
                     )
@@ -20805,11 +20816,11 @@ impl ReviewWorkspace {
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap(px(ui::GAP_GROUP))
                             .child(
                                 div()
                                     .w(px(22.))
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.faint)
                                     .child(format!("{}", index + 1)),
                             )
@@ -20871,7 +20882,7 @@ impl ReviewWorkspace {
                                 .mt_2()
                                 .flex()
                                 .items_center()
-                                .gap_2()
+                                .gap(px(ui::GAP_GROUP))
                                 .child(
                                     side_control("Exact", !uses_prefix, colors)
                                         .id(SharedString::from(format!(
@@ -20905,9 +20916,9 @@ impl ReviewWorkspace {
                                 .child(
                                     div()
                                         .flex_1()
-                                        .h(px(32.))
-                                        .px_2()
-                                        .rounded_md()
+                                        .h(px(ui::CONTROL_HEIGHT))
+                                        .px(px(ui::CELL_INSET))
+                                        .rounded(px(ui::CONTROL_RADIUS))
                                         .border_1()
                                         .border_color(colors.border)
                                         .bg(colors.elevated)
@@ -20929,7 +20940,7 @@ impl ReviewWorkspace {
             .flex()
             .items_center()
             .justify_center()
-            .p_8()
+            .p(px(ui::PANEL_GUTTER))
             .bg(rgba(0x00000066))
             .child(
                 div()
@@ -20938,26 +20949,32 @@ impl ReviewWorkspace {
                     .max_h_full()
                     .flex()
                     .flex_col()
-                    .rounded_lg()
+                    .rounded(px(ui::WINDOW_RADIUS))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.surface)
                     .shadow_lg()
                     .child(
                         div()
-                            .px_5()
+                            .px(px(ui::PANEL_GUTTER))
                             .py_4()
                             .border_b_1()
                             .border_color(colors.border)
                             .child(
                                 div()
-                                    .text_lg()
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .ui_text(TextRole::Title)
+                                    .font_weight(FontWeight::MEDIUM)
                                     .child("Edit sidebar view"),
                             )
-                            .child(div().mt_1().text_xs().text_color(colors.muted).child(
-                                "Changes stay in this editor until you apply or save them.",
-                            )),
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .ui_text(TextRole::Caption)
+                                    .text_color(colors.muted)
+                                    .child(
+                                        "Changes stay in this editor until you apply or save them.",
+                                    ),
+                            ),
                     )
                     .child(
                         div()
@@ -20966,14 +20983,14 @@ impl ReviewWorkspace {
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
-                            .px_5()
+                            .px(px(ui::PANEL_GUTTER))
                             .py_4()
                             .child(editor_field("View name", &self.view_inputs.name, colors))
                             .child(section_label("FILTERS", colors))
                             .child(
                                 div()
                                     .flex()
-                                    .gap_3()
+                                    .gap(px(ui::GAP_COLUMNS))
                                     .child(editor_field("Search", &self.view_inputs.search, colors))
                                     .child(editor_field(
                                         "Author",
@@ -20984,7 +21001,7 @@ impl ReviewWorkspace {
                             .child(
                                 div()
                                     .flex()
-                                    .gap_3()
+                                    .gap(px(ui::GAP_COLUMNS))
                                     .child(editor_field(
                                         "Requested reviewer",
                                         &self.view_inputs.reviewer,
@@ -20999,7 +21016,7 @@ impl ReviewWorkspace {
                             .child(
                                 div()
                                     .flex()
-                                    .gap_3()
+                                    .gap(px(ui::GAP_COLUMNS))
                                     .child(editor_field("Label", &self.view_inputs.label, colors))
                                     .child(editor_field(
                                         "Review status",
@@ -21010,7 +21027,7 @@ impl ReviewWorkspace {
                             .child(
                                 div()
                                     .flex()
-                                    .gap_3()
+                                    .gap(px(ui::GAP_COLUMNS))
                                     .child(editor_field(
                                         "Checks",
                                         &self.view_inputs.check_status,
@@ -21100,7 +21117,7 @@ impl ReviewWorkspace {
                             .child(
                                 div()
                                     .mt_3()
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.muted)
                                     .child(format!(
                                         "Source prefix preview: {}",
@@ -21114,7 +21131,7 @@ impl ReviewWorkspace {
                     )
                     .child(
                         div()
-                            .px_5()
+                            .px(px(ui::PANEL_GUTTER))
                             .py_3()
                             .flex()
                             .items_center()
@@ -21133,7 +21150,7 @@ impl ReviewWorkspace {
                             .child(
                                 div()
                                     .flex()
-                                    .gap_2()
+                                    .gap(px(ui::GAP_GROUP))
                                     .child(
                                         modal_button("Cancel", false, colors)
                                             .id("cancel-view-editor")
@@ -21195,11 +21212,11 @@ impl ReviewWorkspace {
         let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
             div()
                 .id(SharedString::from(format!("tab-{index}")))
-                .h(px(42.))
-                .px_3()
+                .h(px(ui::DESKTOP_HIT))
+                .px(px(ui::CONTROL_INSET))
                 .flex()
                 .items_center()
-                .gap_2()
+                .gap(px(ui::GAP_GROUP))
                 .border_r_1()
                 .border_color(colors.border)
                 .cursor_pointer()
@@ -21221,7 +21238,7 @@ impl ReviewWorkspace {
                 }))
         });
         div()
-            .h(px(42.))
+            .h(px(ui::DESKTOP_HIT))
             .flex()
             .items_center()
             .border_b_1()
@@ -21252,19 +21269,19 @@ impl ReviewWorkspace {
             .flex()
             .items_center()
             .justify_center()
-            .p_8()
+            .p(px(ui::PANEL_GUTTER))
             .child(
                 div()
                     .w(px(560.))
-                    .p_6()
-                    .rounded_lg()
+                    .p(px(ui::PANEL_GUTTER))
+                    .rounded(px(ui::WINDOW_RADIUS))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.surface)
                     .child(
                         div()
-                            .text_size(px(18.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .ui_text(TextRole::Title)
+                            .font_weight(FontWeight::MEDIUM)
                             .child("Add a repository"),
                     )
                     .child(
@@ -21273,15 +21290,16 @@ impl ReviewWorkspace {
                             .text_color(colors.muted)
                             .child("Review without cloning. Existing local folders work too."),
                     )
-                    .child(field_label("REPOSITORY", colors).mt_5())
+                    .child(field_label("REPOSITORY", colors).mt(px(ui::GAP_PAGE)))
                     .child(input_box(&self.repository_input, colors))
                     .child(
                         Button::new("browse-repository")
+                            .control()
                             .debug_selector(|| "browse-repository".into())
                             .mt_2()
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
+                            .px(px(ui::CONTROL_INSET))
+                            .py_0()
+                            .rounded(px(ui::CONTROL_RADIUS))
                             .bg(colors.elevated)
                             .disabled(
                                 self.repository_picker_open
@@ -21295,21 +21313,27 @@ impl ReviewWorkspace {
                                 }
                             })),
                     )
-                    .child(field_label("GITHUB ACCOUNT", colors).mt_4())
-                    .child(div().mt_2().flex().flex_wrap().gap_2().children(accounts))
+                    .child(field_label("GITHUB ACCOUNT", colors).mt(px(ui::GAP_PAGE)))
                     .child(
                         div()
                             .mt_2()
-                            .text_xs()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(ui::GAP_GROUP))
+                            .children(accounts),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .ui_text(TextRole::Caption)
                             .text_color(colors.faint)
                             .child(account_status),
                     )
                     .child(
                         Button::new("refresh-repository-accounts")
+                            .control()
                             .mt_2()
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
+                            .control()
                             .bg(colors.elevated)
                             .disabled(
                                 matches!(self.accounts_state, LoadState::Loading(_))
@@ -21326,7 +21350,7 @@ impl ReviewWorkspace {
                                 }
                             })),
                     )
-                    .child(field_label("OPEN PR NUMBER (OPTIONAL)", colors).mt_4())
+                    .child(field_label("OPEN PR NUMBER (OPTIONAL)", colors).mt(px(ui::GAP_PAGE)))
                     .child(div().w(px(160.)).child(input_box(&self.pr_input, colors)))
                     .when_some(self.repository_setup_state.notice(), |card, notice| {
                         card.child(
@@ -21334,7 +21358,7 @@ impl ReviewWorkspace {
                                 .id("repository-setup-notice")
                                 .debug_selector(|| "repository-setup-notice".into())
                                 .mt_3()
-                                .text_sm()
+                                .ui_text(TextRole::Body)
                                 .text_color(
                                     if matches!(self.repository_setup_state, LoadState::Error(_)) {
                                         colors.red
@@ -21347,15 +21371,16 @@ impl ReviewWorkspace {
                     })
                     .child(
                         div()
-                            .mt_5()
+                            .my(px(ui::GAP_GROUP))
                             .flex()
                             .justify_end()
-                            .gap_2()
+                            .gap(px(ui::GAP_GROUP))
                             .child(
                                 Button::new("cancel-setup")
-                                    .px_4()
+                                    .control()
+                                    .px(px(ui::PANEL_GUTTER))
                                     .py_2()
-                                    .rounded_md()
+                                    .rounded(px(ui::CONTROL_RADIUS))
                                     .cursor_pointer()
                                     .child("Cancel")
                                     .on_click(cx.listener(|root, _, _, cx| {
@@ -21366,6 +21391,7 @@ impl ReviewWorkspace {
                             )
                             .child(
                                 Button::new("confirm-add-repository")
+                                    .control()
                                     .debug_selector(|| "confirm-add-repository".into())
                                     .disabled(
                                         self.repository_picker_open
@@ -21375,9 +21401,9 @@ impl ReviewWorkspace {
                                             ),
                                     )
                                     .accessibility_label("Add selected repository")
-                                    .px_4()
+                                    .px(px(ui::PANEL_GUTTER))
                                     .py_2()
-                                    .rounded_md()
+                                    .rounded(px(ui::CONTROL_RADIUS))
                                     .bg(colors.text)
                                     .text_color(colors.canvas)
                                     .cursor_pointer()
@@ -21407,7 +21433,7 @@ impl ReviewWorkspace {
                 .text_center()
                 .child(
                     div()
-                        .text_size(px(20.))
+                        .ui_text(TextRole::Display)
                         .font_weight(FontWeight::MEDIUM)
                         .child("Repository-to-PR review"),
                 )
@@ -21420,11 +21446,11 @@ impl ReviewWorkspace {
                 .child(
                     div()
                         .id("empty-add")
-                        .mt_5()
+                        .mt(px(ui::GAP_PAGE))
                         .mx_auto()
-                        .px_4()
-                        .py_2()
-                        .rounded_md()
+                        .px(px(ui::PANEL_GUTTER))
+                        .py_0()
+                        .control()
                         .bg(colors.elevated)
                         .cursor_pointer()
                         .child("Add repository")
@@ -21478,12 +21504,12 @@ impl ReviewWorkspace {
             ),
         ];
         div()
-            .px_5()
+            .px(px(ui::PANEL_GUTTER))
             .h(px(48.))
             .flex_none()
             .flex()
             .items_center()
-            .gap_2()
+            .gap(px(ui::GAP_ICON))
             .border_b_1()
             .border_color(colors.border)
             .bg(colors.surface)
@@ -21503,6 +21529,7 @@ impl ReviewWorkspace {
                     })
                     .child(
                         Button::new(id)
+                            .control()
                             .child(label.clone())
                             .selected(active)
                             .accessibility_label(format!(
@@ -21510,8 +21537,8 @@ impl ReviewWorkspace {
                                 if active { ", selected" } else { "" }
                             ))
                             .debug_selector(move || id.to_owned())
-                            .h(px(34.))
-                            .px_3()
+                            .h(px(ui::DESKTOP_HIT))
+                            .px(px(ui::CONTROL_INSET))
                             .bg(if active {
                                 colors.elevated
                             } else {
@@ -21568,11 +21595,11 @@ impl ReviewWorkspace {
                 .bg(colors.surface)
                 .child(
                     div()
-                        .px_4()
+                        .px(px(ui::PANEL_GUTTER))
                         .py_2()
                         .flex()
                         .items_center()
-                        .gap_3()
+                        .gap(px(ui::GAP_ICON))
                         .border_b_1()
                         .border_color(colors.border)
                         .child(
@@ -21611,7 +21638,7 @@ impl ReviewWorkspace {
             .bg(colors.surface)
             .child(
                 div()
-                    .px_5()
+                    .px(px(ui::PANEL_GUTTER))
                     .py_3()
                     .border_b_1()
                     .border_color(colors.border)
@@ -21619,22 +21646,19 @@ impl ReviewWorkspace {
                         div()
                             .flex()
                             .items_center()
-                            .gap_3()
+                            .gap(px(ui::GAP_ICON))
                             .child(
                                 div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
+                                    .badge()
                                     .bg(colors.elevated)
-                                    .text_xs()
                                     .child(format!("#{}", tab.pull_request.number)),
                             )
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .text_size(px(16.))
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .ui_text(TextRole::Title)
+                                    .font_weight(FontWeight::MEDIUM)
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .child(tab.pull_request.title.clone()),
@@ -21642,9 +21666,7 @@ impl ReviewWorkspace {
                             .child(
                                 div()
                                     .id("open-stack-view")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
+                                    .control()
                                     .border_1()
                                     .border_color(colors.border)
                                     .cursor_pointer()
@@ -21659,9 +21681,7 @@ impl ReviewWorkspace {
                             .child(
                                 div()
                                     .id("open-review-confirmation")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
+                                    .control()
                                     .border_1()
                                     .border_color(colors.border)
                                     .cursor_pointer()
@@ -21675,9 +21695,7 @@ impl ReviewWorkspace {
                             .child(
                                 div()
                                     .id("open-merge-confirmation")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
+                                    .control()
                                     .border_1()
                                     .border_color(colors.border)
                                     .cursor_pointer()
@@ -21690,7 +21708,7 @@ impl ReviewWorkspace {
                             )
                             .child(
                                 div()
-                                    .px_3()
+                                    .px(px(ui::CONTROL_INSET))
                                     .py_1()
                                     .text_color(colors.muted)
                                     .child("Published revision"),
@@ -21702,8 +21720,8 @@ impl ReviewWorkspace {
                             .flex()
                             .flex_wrap()
                             .items_center()
-                            .gap_2()
-                            .text_sm()
+                            .gap(px(ui::GAP_ICON))
+                            .ui_text(TextRole::Body)
                             .text_color(colors.muted)
                             .child(format!(
                                 "{}  →  {}",
@@ -21719,9 +21737,7 @@ impl ReviewWorkspace {
                                     div()
                                         .id("advance-revision")
                                         .ml_2()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
+                                        .control()
                                         .bg(colors.amber)
                                         .text_color(colors.canvas)
                                         .cursor_pointer()
@@ -21775,7 +21791,7 @@ impl ReviewWorkspace {
             .when_some(tab.state.notice(), |view, notice| {
                 view.child(
                     div()
-                        .px_5()
+                        .px(px(ui::PANEL_GUTTER))
                         .py_2()
                         .bg(colors.elevated)
                         .text_color(colors.muted)
@@ -21787,7 +21803,7 @@ impl ReviewWorkspace {
                 |view, notice| {
                     view.child(
                         div()
-                            .px_5()
+                            .px(px(ui::PANEL_GUTTER))
                             .py_2()
                             .bg(colors.elevated)
                             .text_color(colors.amber)
@@ -21798,7 +21814,7 @@ impl ReviewWorkspace {
             .when_some(tab.session_persistence_error.clone(), |view, notice| {
                 view.child(
                     div()
-                        .px_5()
+                        .px(px(ui::PANEL_GUTTER))
                         .py_2()
                         .bg(colors.elevated)
                         .text_color(colors.red)
@@ -21886,7 +21902,7 @@ impl ReviewWorkspace {
             .bg(colors.surface)
             .child(
                 div()
-                    .px_5()
+                    .px(px(ui::PANEL_GUTTER))
                     .py_3()
                     .border_b_1()
                     .border_color(colors.border)
@@ -21894,7 +21910,7 @@ impl ReviewWorkspace {
                         div()
                             .flex()
                             .items_center()
-                            .gap_3()
+                            .gap(px(ui::GAP_COLUMNS))
                             .child(
                                 div()
                                     .id("return-from-stack")
@@ -21909,8 +21925,8 @@ impl ReviewWorkspace {
                             )
                             .child(
                                 div()
-                                    .text_size(px(16.))
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .ui_text(TextRole::Title)
+                                    .font_weight(FontWeight::MEDIUM)
                                     .child(format!(
                                         "#{} · Stack",
                                         self.tabs[index].pull_request.number
@@ -21920,9 +21936,7 @@ impl ReviewWorkspace {
                             .child(
                                 div()
                                     .id("refresh-stack")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
+                                    .control()
                                     .border_1()
                                     .border_color(colors.border)
                                     .cursor_pointer()
@@ -21937,7 +21951,7 @@ impl ReviewWorkspace {
                             .child(
                                 div()
                                     .id("stack-diff-mode")
-                                    .px_2()
+                                    .px(px(ui::CELL_INSET))
                                     .cursor_pointer()
                                     .text_color(colors.accent)
                                     .child(
@@ -21964,8 +21978,8 @@ impl ReviewWorkspace {
                             .mt_2()
                             .flex()
                             .items_center()
-                            .gap_2()
-                            .text_sm()
+                            .gap(px(ui::GAP_GROUP))
+                            .ui_text(TextRole::Body)
                             .text_color(colors.muted)
                             .child(boundary)
                             .when(self.wide, |row| {
@@ -21998,7 +22012,7 @@ impl ReviewWorkspace {
             .when_some(native, |view, notice| {
                 view.child(
                     div()
-                        .px_5()
+                        .px(px(ui::PANEL_GUTTER))
                         .py_2()
                         .bg(colors.elevated)
                         .text_color(colors.muted)
@@ -22008,7 +22022,7 @@ impl ReviewWorkspace {
             .when_some(stack.state.notice().map(str::to_owned), |view, notice| {
                 view.child(
                     div()
-                        .px_5()
+                        .px(px(ui::PANEL_GUTTER))
                         .py_2()
                         .bg(colors.elevated)
                         .text_color(match stack.state {
@@ -22021,7 +22035,7 @@ impl ReviewWorkspace {
             .when_some(stack.feedback.clone(), |view, feedback| {
                 view.child(
                     div()
-                        .px_5()
+                        .px(px(ui::PANEL_GUTTER))
                         .py_2()
                         .bg(colors.elevated)
                         .text_color(colors.amber)
@@ -22094,8 +22108,8 @@ impl ReviewWorkspace {
             .bg(colors.canvas)
             .child(
                 div()
-                    .h(px(38.))
-                    .px_3()
+                    .h(px(ui::DESKTOP_HIT))
+                    .px(px(ui::CONTROL_INSET))
                     .flex()
                     .items_center()
                     .border_b_1()
@@ -22122,7 +22136,7 @@ impl ReviewWorkspace {
                                             .unwrap_or("Root");
                                         div()
                                             .h(px(52.))
-                                            .px_3()
+                                            .px(px(ui::CONTROL_INSET))
                                             .py_2()
                                             .border_b_1()
                                             .border_color(colors.border)
@@ -22134,7 +22148,7 @@ impl ReviewWorkspace {
                                                     .child(format!("#{}  {}", layer.id.number, layer.source.branch))
                                                     .child(
                                                         div()
-                                                            .text_xs()
+                                                            .ui_text(TextRole::Caption)
                                                             .text_color(if provenance == "Personal" { colors.amber } else { colors.faint })
                                                             .child(provenance),
                                                     ),
@@ -22142,7 +22156,7 @@ impl ReviewWorkspace {
                                             .child(
                                                 div()
                                                     .mt_1()
-                                                    .text_xs()
+                                                    .ui_text(TextRole::Caption)
                                                     .text_color(colors.muted)
                                                     .child(format!("→ {} · {:?}", layer.target.branch, layer.state)),
                                             )
@@ -22165,8 +22179,8 @@ impl ReviewWorkspace {
             .child(
                 div()
                     .id("toggle-stack-personal-relationship-actions")
-                    .h(px(42.))
-                    .px_3()
+                    .h(px(ui::DESKTOP_HIT))
+                    .px(px(ui::CONTROL_INSET))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -22191,7 +22205,7 @@ impl ReviewWorkspace {
                         .h(px(268.))
                         .flex_none()
                         .min_h_0()
-                        .px_3()
+                        .px(px(ui::CONTROL_INSET))
                         .py_3()
                         .border_t_1()
                         .border_color(colors.border)
@@ -22200,7 +22214,7 @@ impl ReviewWorkspace {
                         .child(
                         div()
                             .mt_2()
-                            .text_xs()
+                            .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child("Local only. Choose a labelled parent, then Stack refreshes and validates the full relationship graph."),
                         )
@@ -22223,7 +22237,7 @@ impl ReviewWorkspace {
                                                     let number = parent.number;
                                                     div()
                                                         .id(SharedString::from(format!("stack-parent-{number}")))
-                                                        .h(px(30.))
+                                                        .h(px(ui::ROW_HEIGHT))
                                                         .flex()
                                                         .items_center()
                                                         .cursor_pointer()
@@ -22317,15 +22331,20 @@ impl ReviewWorkspace {
             .bg(colors.canvas)
             .child(
                 div()
-                    .h(px(38.))
-                    .px_3()
+                    .h(px(ui::DESKTOP_HIT))
+                    .px(px(ui::CONTROL_INSET))
                     .flex()
                     .items_center()
                     .justify_between()
                     .border_b_1()
                     .border_color(colors.border)
                     .child(format!("Changed files  {count}"))
-                    .child(div().text_xs().text_color(colors.muted).child("⌘[  ⌘]")),
+                    .child(
+                        div()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.muted)
+                            .child("⌘[  ⌘]"),
+                    ),
             )
             .child(
                 uniform_list(
@@ -22341,7 +22360,7 @@ impl ReviewWorkspace {
                                 div()
                                     .id(SharedString::from(format!("stack-file-{row}")))
                                     .h(px(64.))
-                                    .px_3()
+                                    .px(px(ui::CONTROL_INSET))
                                     .py_2()
                                     .border_b_1()
                                     .border_color(colors.border)
@@ -22363,7 +22382,7 @@ impl ReviewWorkspace {
                                             .overflow_hidden()
                                             .whitespace_nowrap()
                                             .text_ellipsis()
-                                            .text_xs()
+                                            .ui_text(TextRole::Caption)
                                             .text_color(if file.patch.is_some() {
                                                 colors.muted
                                             } else {
@@ -22431,32 +22450,32 @@ impl ReviewWorkspace {
             .bg(colors.surface)
             .child(
                 div()
-                    .h(px(38.))
-                    .px_4()
+                    .h(px(ui::DESKTOP_HIT))
+                    .px(px(ui::PANEL_GUTTER))
                     .flex()
                     .items_center()
                     .border_b_1()
                     .border_color(colors.border)
                     .font_family(CODE_FONT)
-                    .text_sm()
+                    .ui_text(TextRole::Body)
                     .child(header),
             )
             .when(split, |pane| {
                 pane.child(
                     div()
-                        .h(px(24.))
+                        .h(px(ui::ROW_HEIGHT))
                         .flex()
                         .font_family(CODE_FONT)
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .bg(colors.elevated)
                         .border_b_1()
                         .border_color(colors.border)
-                        .child(div().w_1_2().px_3().child("OLD"))
+                        .child(div().w_1_2().px(px(ui::CONTROL_INSET)).child("OLD"))
                         .child(
                             div()
                                 .w_1_2()
-                                .px_3()
+                                .px(px(ui::CONTROL_INSET))
                                 .border_l_1()
                                 .border_color(colors.border)
                                 .child("NEW"),
@@ -22559,17 +22578,17 @@ impl ReviewWorkspace {
             .border_b_1()
             .border_color(colors.border)
             .bg(colors.canvas)
-            .px_5()
+            .px(px(ui::PANEL_GUTTER))
             .py_2()
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap(px(ui::GAP_GROUP))
                     .child(
                         div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .ui_text(TextRole::Caption)
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(colors.muted)
                             .child("COMPARE"),
                     )
@@ -22581,7 +22600,7 @@ impl ReviewWorkspace {
                     .child(
                         div()
                             .id("toggle-comparison-commits")
-                            .text_xs()
+                            .ui_text(TextRole::Caption)
                             .text_color(colors.accent)
                             .cursor_pointer()
                             .child(if picker.expanded {
@@ -22605,8 +22624,8 @@ impl ReviewWorkspace {
                         .flex()
                         .flex_wrap()
                         .items_center()
-                        .gap_2()
-                        .text_xs()
+                        .gap(px(ui::GAP_GROUP))
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .child(format!(
                             "Viewing {} → {} · Published PR {}",
@@ -22639,7 +22658,7 @@ impl ReviewWorkspace {
                         div()
                             .mt_1()
                             .font_family(CODE_FONT)
-                            .text_xs()
+                            .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child(format!(
                                 "Selected: {} → {}. Published PR: {} → {}.",
@@ -22654,7 +22673,7 @@ impl ReviewWorkspace {
             .child(
                 div()
                     .mt_1()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(if inventory_ready {
                         colors.faint
                     } else {
@@ -22670,7 +22689,7 @@ impl ReviewWorkspace {
             view = view.child(
                 div()
                     .mt_1()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.amber)
                     .child(notice),
             );
@@ -22698,7 +22717,7 @@ impl ReviewWorkspace {
             view = view.child(
                 div()
                     .mt_1()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.amber)
                     .child(baseline),
             );
@@ -22707,7 +22726,7 @@ impl ReviewWorkspace {
             view = view.child(
                 div()
                     .mt_1()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.amber)
                     .child(
                         "This comparison ends before the published PR revision. To comment or submit a review, return to Full PR or choose a range ending at the published revision.",
@@ -22743,8 +22762,12 @@ impl ReviewWorkspace {
                         .id(SharedString::from(format!(
                             "comparison-commit-{commit_index}"
                         )))
-                        .px_2()
-                        .py_2()
+                        .px(px(ui::CELL_INSET))
+                        .h(px(ui::TWO_LINE_ROW))
+                        .py_1()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
                         .border_b_1()
                         .border_color(colors.border)
                         .when(selected_commit, |row| row.bg(colors.selected))
@@ -22754,21 +22777,28 @@ impl ReviewWorkspace {
                             div()
                                 .flex()
                                 .items_center()
-                                .gap_2()
+                                .gap(px(ui::GAP_GROUP))
                                 .child(
                                     div()
                                         .font_family(CODE_FONT)
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
                                         .text_color(colors.accent)
                                         .child(short),
                                 )
-                                .child(div().text_sm().child(headline)),
+                                .child(
+                                    div()
+                                        .ui_text(TextRole::Body)
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .child(headline),
+                                ),
                         )
                         .child(
                             div()
-                                .mt_1()
                                 .font_family(CODE_FONT)
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.faint)
                                 .child(sha),
                         )
@@ -22796,9 +22826,10 @@ impl ReviewWorkspace {
                         "comparison-commit-list-{index}"
                     )))
                     .mt_2()
-                    .h(px((picker.commits().len() as f32 * 64.).clamp(64., 520.)))
+                    .h(px((picker.commits().len() as f32 * ui::TWO_LINE_ROW)
+                        .clamp(ui::TWO_LINE_ROW, 520.)))
                     .overflow_y_scroll()
-                    .rounded_md()
+                    .rounded(px(ui::CONTROL_RADIUS))
                     .border_1()
                     .border_color(colors.border)
                     .children(rows),
@@ -22841,9 +22872,7 @@ impl ReviewWorkspace {
                     div()
                         .id("restore-file-tree")
                         .mt_3()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
+                        .control()
                         .cursor_pointer()
                         .text_color(colors.accent)
                         .child("›")
@@ -22867,8 +22896,8 @@ impl ReviewWorkspace {
             .bg(colors.canvas)
             .child(
                 div()
-                    .h(px(38.))
-                    .px_3()
+                    .h(px(ui::DESKTOP_HIT))
+                    .px(px(ui::CONTROL_INSET))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -22884,8 +22913,8 @@ impl ReviewWorkspace {
                     .child(
                         div()
                             .flex()
-                            .gap_2()
-                            .text_xs()
+                            .gap(px(ui::GAP_ICON))
+                            .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child("⌘[  ⌘]")
                             .child(
@@ -22953,12 +22982,13 @@ impl ReviewWorkspace {
                                             .debug_selector(move || {
                                                 format!("file-tree-row-{row_index}")
                                             })
-                                            .h(px(28.))
+                                            .h(px(ui::ROW_HEIGHT))
+                                            .ui_text(TextRole::Body)
                                             .pl(px(8. + row.depth as f32 * 14.))
                                             .pr_2()
                                             .flex()
                                             .items_center()
-                                            .gap_1()
+                                            .gap(px(ui::GAP_ICON))
                                             .cursor_pointer()
                                             .when(selected, |row| row.bg(colors.selected))
                                             .when(is_cursor && !selected, |row| {
@@ -22995,7 +23025,7 @@ impl ReviewWorkspace {
                                                     .when(raw, |row| {
                                                         row.child(
                                                             div()
-                                                                .text_xs()
+                                                                .ui_text(TextRole::Caption)
                                                                 .text_color(colors.amber)
                                                                 .child("RAW"),
                                                         )
@@ -23052,7 +23082,7 @@ impl ReviewWorkspace {
                                                             .w(px(18.))
                                                             .flex_none()
                                                             .text_center()
-                                                            .text_xs()
+                                                            .ui_text(TextRole::Caption)
                                                             .text_color(colors.faint)
                                                             .child(file_status_badge(&status)),
                                                     )
@@ -23101,7 +23131,7 @@ impl ReviewWorkspace {
                                                     .when(raw, |row| {
                                                         row.child(
                                                             div()
-                                                                .text_xs()
+                                                                .ui_text(TextRole::Caption)
                                                                 .text_color(colors.amber)
                                                                 .child("RAW"),
                                                         )
@@ -23110,8 +23140,8 @@ impl ReviewWorkspace {
                                                         div()
                                                             .ml_1()
                                                             .flex()
-                                                            .gap_1()
-                                                            .text_xs()
+                                                            .gap(px(ui::GAP_ICON))
+                                                            .ui_text(TextRole::Caption)
                                                             .when(patch_available, |stats| {
                                                                 stats
                                                                     .child(
@@ -23253,15 +23283,15 @@ impl ReviewWorkspace {
             .bg(colors.surface)
             .child(
                 div()
-                    .h(px(38.))
-                    .px_4()
+                    .h(px(ui::DESKTOP_HIT))
+                    .px(px(ui::PANEL_GUTTER))
                     .flex()
                     .items_center()
                     .justify_between()
                     .border_b_1()
                     .border_color(colors.border)
                     .font_family(CODE_FONT)
-                    .text_sm()
+                    .ui_text(TextRole::Body)
                     .child(header)
                     .child(
                         action_link_with_id("comment-on-file".into(), "Comment on file…", colors)
@@ -23285,19 +23315,19 @@ impl ReviewWorkspace {
             .when(split_mode, |pane| {
                 pane.child(
                     div()
-                        .h(px(24.))
+                        .h(px(ui::ROW_HEIGHT))
                         .flex()
                         .font_family(CODE_FONT)
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .bg(colors.elevated)
                         .border_b_1()
                         .border_color(colors.border)
-                        .child(div().w_1_2().px_3().child("OLD"))
+                        .child(div().w_1_2().px(px(ui::CONTROL_INSET)).child("OLD"))
                         .child(
                             div()
                                 .w_1_2()
-                                .px_3()
+                                .px(px(ui::CONTROL_INSET))
                                 .border_l_1()
                                 .border_color(colors.border)
                                 .child("NEW"),
@@ -23389,7 +23419,7 @@ impl ReviewWorkspace {
         let Some(snapshot) = lifecycle.snapshot.as_ref() else {
             return div()
                 .mt_3()
-                .text_xs()
+                .ui_text(TextRole::Caption)
                 .text_color(colors.muted)
                 .child(
                     tab.lifecycle_state
@@ -23401,7 +23431,7 @@ impl ReviewWorkspace {
         let capability = |label: &'static str, value: &cibergit::domain::ProviderCapability| {
             div()
                 .mt_1()
-                .text_xs()
+                .ui_text(TextRole::Caption)
                 .text_color(if value.available {
                     colors.muted
                 } else {
@@ -23422,20 +23452,20 @@ impl ReviewWorkspace {
                 ))
         };
         let mut panel = div()
-            .p_5()
-            .rounded_lg()
+            .p(px(ui::PANEL_GUTTER))
+            .rounded(px(ui::WINDOW_RADIUS))
             .bg(colors.surface)
             .border_1()
             .border_color(colors.border)
             .child(
                 div()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(FontWeight::MEDIUM)
                     .child("Pull request"),
             )
             .child(
                 div()
                     .mt_1()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .child(format!(
                         "Signed in as {}",
@@ -23446,7 +23476,7 @@ impl ReviewWorkspace {
                 panel.child(
                     div()
                         .mt_1()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.amber)
                         .child(
                             snapshot
@@ -23461,23 +23491,23 @@ impl ReviewWorkspace {
                 .child(
                     div()
                         .mt_3()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .child("Title"),
                 )
                 .child(
                     div()
                         .mt_1()
-                        .h(px(36.))
+                        .h(px(ui::CONTROL_HEIGHT))
                         .border_1()
                         .border_color(colors.border)
-                        .rounded_md()
+                        .rounded(px(ui::CONTROL_RADIUS))
                         .child(Input::new(&self.metadata_title_input)),
                 )
                 .child(
                     div()
                         .mt_2()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .child("Description · Markdown"),
                 )
@@ -23487,24 +23517,24 @@ impl ReviewWorkspace {
                         .h(px(112.))
                         .border_1()
                         .border_color(colors.border)
-                        .rounded_md()
+                        .rounded(px(ui::CONTROL_RADIUS))
                         .overflow_hidden()
                         .child(Textarea::new(&self.metadata_body_input)),
                 )
                 .child(
                     div()
                         .mt_2()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .child("Base branch"),
                 )
                 .child(
                     div()
                         .mt_1()
-                        .h(px(36.))
+                        .h(px(ui::CONTROL_HEIGHT))
                         .border_1()
                         .border_color(colors.border)
-                        .rounded_md()
+                        .rounded(px(ui::CONTROL_RADIUS))
                         .child(Input::new(&self.metadata_base_input)),
                 );
             if let Some((branches, complete, notice)) = lifecycle.choices_for(ChoiceKind::Branch) {
@@ -23513,7 +23543,7 @@ impl ReviewWorkspace {
                         .mt_2()
                         .flex()
                         .flex_wrap()
-                        .gap_1()
+                        .gap(px(ui::GAP_ICON))
                         .children(branches.iter().take(10).map(|choice| {
                             let value = choice.name.clone();
                             action_link_with_id(
@@ -23534,11 +23564,12 @@ impl ReviewWorkspace {
                         }))
                         .when(!complete, |row| {
                             row.child(
-                                div().text_xs().text_color(colors.amber).child(
-                                    notice
-                                        .map(str::to_owned)
-                                        .unwrap_or_else(|| "Branch choices are incomplete.".into()),
-                                ),
+                                div()
+                                    .ui_text(TextRole::Caption)
+                                    .text_color(colors.amber)
+                                    .child(notice.map(str::to_owned).unwrap_or_else(|| {
+                                        "Branch choices are incomplete.".into()
+                                    })),
                             )
                         }),
                 );
@@ -23547,7 +23578,7 @@ impl ReviewWorkspace {
                 div()
                     .mt_3()
                     .flex()
-                    .gap_2()
+                    .gap(px(ui::GAP_GROUP))
                     .child(action_link("Review change…", colors).on_click(cx.listener(
                         |root, _, _, cx| {
                             if let Root::Review(this) = root {
@@ -23621,7 +23652,7 @@ impl ReviewWorkspace {
                 .mt_3()
                 .flex()
                 .flex_wrap()
-                .gap_2()
+                .gap(px(ui::GAP_GROUP))
                 .child(action_link(state_label, colors).on_click(cx.listener(
                     move |root, _, _, cx| {
                         if let Root::Review(this) = root {
@@ -23669,99 +23700,109 @@ impl ReviewWorkspace {
                 .child(capability("Comments", &snapshot.can_comment));
         }
 
-        let delta_group =
-            |title: &'static str,
-             selected: Vec<(String, PullRequestLifecycleAction)>,
-             available: Vec<(String, PullRequestLifecycleAction)>,
-             complete: bool,
-             notice: Option<String>| {
-                let mut group = div().mt_3().child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(title),
-                );
-                let group_index = match title {
-                    "Reviewers" => 0,
-                    "Labels" => 1,
-                    _ => 2,
-                };
-                let choices = selected.into_iter().chain(available).collect::<Vec<_>>();
-                let total = choices.len();
-                let page_count = total.div_ceil(18).max(1);
-                let page = tab.lifecycle_choice_pages[group_index].min(page_count - 1);
-                for (label, action) in choices.into_iter().skip(page * 18).take(18) {
-                    group = group.child(
-                        action_link_with_id(format!("lifecycle-delta-{title}-{label}"), "", colors)
-                            .mt_1()
-                            .child(label)
-                            .on_click(cx.listener(move |root, _, _, cx| {
-                                if let Root::Review(this) = root {
-                                    this.prepare_lifecycle_action(action.clone(), cx);
-                                }
-                            })),
-                    );
-                }
-                if page_count > 1 {
-                    group = group.child(
-                        div()
-                            .mt_2()
-                            .flex()
-                            .flex_wrap()
-                            .gap_2()
-                            .when(page > 0, |row| {
-                                row.child(
-                                    action_link_with_id(
-                                        format!("lifecycle-{title}-previous"),
-                                        "Previous",
-                                        colors,
-                                    )
-                                    .on_click(cx.listener(
-                                        move |root, _, _, cx| {
-                                            if let Root::Review(this) = root
-                                                && let Some(index) = this.active_tab
-                                            {
-                                                this.tabs[index].lifecycle_choice_pages
-                                                    [group_index] = page - 1;
-                                                cx.notify();
-                                            }
-                                        },
-                                    )),
-                                )
-                            })
-                            .child(div().text_xs().text_color(colors.muted).child(format!(
-                                "{}–{} of {total}",
-                                page * 18 + 1,
-                                ((page + 1) * 18).min(total)
-                            )))
-                            .when(page + 1 < page_count, |row| {
-                                row.child(
-                                    action_link_with_id(
-                                        format!("lifecycle-{title}-next"),
-                                        "Next",
-                                        colors,
-                                    )
-                                    .on_click(cx.listener(
-                                        move |root, _, _, cx| {
-                                            if let Root::Review(this) = root
-                                                && let Some(index) = this.active_tab
-                                            {
-                                                this.tabs[index].lifecycle_choice_pages
-                                                    [group_index] = page + 1;
-                                                cx.notify();
-                                            }
-                                        },
-                                    )),
-                                )
-                            }),
-                    )
-                }
-                group.when(!complete, |group| {
-                    group.child(div().mt_1().text_xs().text_color(colors.amber).child(
-                        notice.unwrap_or_else(|| format!("{title} choices are incomplete.")),
-                    ))
-                })
+        let delta_group = |title: &'static str,
+                           selected: Vec<(String, PullRequestLifecycleAction)>,
+                           available: Vec<(String, PullRequestLifecycleAction)>,
+                           complete: bool,
+                           notice: Option<String>| {
+            let mut group = div().mt_3().child(
+                div()
+                    .ui_text(TextRole::Caption)
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(title),
+            );
+            let group_index = match title {
+                "Reviewers" => 0,
+                "Labels" => 1,
+                _ => 2,
             };
+            let choices = selected.into_iter().chain(available).collect::<Vec<_>>();
+            let total = choices.len();
+            let page_count = total.div_ceil(18).max(1);
+            let page = tab.lifecycle_choice_pages[group_index].min(page_count - 1);
+            for (label, action) in choices.into_iter().skip(page * 18).take(18) {
+                group = group.child(
+                    action_link_with_id(format!("lifecycle-delta-{title}-{label}"), "", colors)
+                        .mt_1()
+                        .child(label)
+                        .on_click(cx.listener(move |root, _, _, cx| {
+                            if let Root::Review(this) = root {
+                                this.prepare_lifecycle_action(action.clone(), cx);
+                            }
+                        })),
+                );
+            }
+            if page_count > 1 {
+                group = group.child(
+                    div()
+                        .mt_2()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(ui::GAP_GROUP))
+                        .when(page > 0, |row| {
+                            row.child(
+                                action_link_with_id(
+                                    format!("lifecycle-{title}-previous"),
+                                    "Previous",
+                                    colors,
+                                )
+                                .on_click(cx.listener(
+                                    move |root, _, _, cx| {
+                                        if let Root::Review(this) = root
+                                            && let Some(index) = this.active_tab
+                                        {
+                                            this.tabs[index].lifecycle_choice_pages[group_index] =
+                                                page - 1;
+                                            cx.notify();
+                                        }
+                                    },
+                                )),
+                            )
+                        })
+                        .child(
+                            div()
+                                .ui_text(TextRole::Caption)
+                                .text_color(colors.muted)
+                                .child(format!(
+                                    "{}–{} of {total}",
+                                    page * 18 + 1,
+                                    ((page + 1) * 18).min(total)
+                                )),
+                        )
+                        .when(page + 1 < page_count, |row| {
+                            row.child(
+                                action_link_with_id(
+                                    format!("lifecycle-{title}-next"),
+                                    "Next",
+                                    colors,
+                                )
+                                .on_click(cx.listener(
+                                    move |root, _, _, cx| {
+                                        if let Root::Review(this) = root
+                                            && let Some(index) = this.active_tab
+                                        {
+                                            this.tabs[index].lifecycle_choice_pages[group_index] =
+                                                page + 1;
+                                            cx.notify();
+                                        }
+                                    },
+                                )),
+                            )
+                        }),
+                )
+            }
+            group.when(!complete, |group| {
+                group.child(
+                    div()
+                        .mt_1()
+                        .ui_text(TextRole::Caption)
+                        .text_color(colors.amber)
+                        .child(
+                            notice.unwrap_or_else(|| format!("{title} choices are incomplete.")),
+                        ),
+                )
+            })
+        };
         let reviewer_selected = snapshot
             .reviewers
             .iter()
@@ -23865,7 +23906,7 @@ impl ReviewWorkspace {
             panel = panel.child(
                 div()
                     .mt_3()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .child(notice.clone()),
             );
@@ -23887,21 +23928,21 @@ impl ReviewWorkspace {
         };
         Some(
             div()
-                .mb_4()
+                .mb(px(ui::GAP_PAGE))
                 .p_3()
-                .rounded_md()
+                .rounded(px(ui::CONTROL_RADIUS))
                 .border_1()
                 .border_color(colors.accent)
                 .child(
                     div()
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(FontWeight::MEDIUM)
                         .child("Confirm change"),
                 )
                 .child(render_lifecycle_change(frozen, colors))
                 .child(
                     div()
                         .mt_1()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .child(format!(
                             "{} #{} · {} · {}",
@@ -23935,7 +23976,7 @@ impl ReviewWorkspace {
                     card.child(
                         div()
                             .mt_2()
-                            .text_xs()
+                            .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child(frozen.summary().to_owned()),
                     )
@@ -23956,7 +23997,7 @@ impl ReviewWorkspace {
                         .mt_3()
                         .flex()
                         .flex_wrap()
-                        .gap_2()
+                        .gap(px(ui::GAP_GROUP))
                         .child(action_link("Confirm", colors).on_click(cx.listener(
                             |root, _, _, cx| {
                                 if let Root::Review(this) = root {
@@ -23997,7 +24038,7 @@ impl ReviewWorkspace {
                 .mb_3()
                 .flex()
                 .items_center()
-                .gap_2()
+                .gap(px(ui::GAP_GROUP))
                 .child(
                     action_link_with_id("actions-jobs-back".into(), "Back to checks", colors)
                         .on_click(move |_, window, cx| {
@@ -24026,7 +24067,7 @@ impl ReviewWorkspace {
             content.push(
                 div()
                     .mb_2()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.amber)
                     .child(notice.to_owned())
                     .into_any_element(),
@@ -24035,7 +24076,7 @@ impl ReviewWorkspace {
         let Some(snapshot) = tab.ci_read.jobs.visible() else {
             content.push(
                 div()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .child("No exact Actions jobs snapshot is available in memory.")
                     .into_any_element(),
@@ -24052,7 +24093,7 @@ impl ReviewWorkspace {
             div()
                 .mb_3()
                 .p_2()
-                .rounded_md()
+                .rounded(px(ui::CONTROL_RADIUS))
                 .border_1()
                 .border_color(colors.border)
                 .child(detail(
@@ -24090,12 +24131,16 @@ impl ReviewWorkspace {
             let focus = self.jobs_focus.clone();
             content.push(
                 Button::new(format!("actions-job-{id}"))
+                    .control()
+                    .h_auto()
+                    .min_h(px(ui::TWO_LINE_ROW))
+                    .ui_text(TextRole::Body)
                     .mb_2()
                     .p_2()
                     .w_full()
                     .flex_col()
                     .items_stretch()
-                    .rounded_md()
+                    .rounded(px(ui::CONTROL_RADIUS))
                     .border_1()
                     .border_color(if selected {
                         colors.accent
@@ -24120,11 +24165,11 @@ impl ReviewWorkspace {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .gap_2()
+                            .gap(px(ui::GAP_GROUP))
                             .child(div().min_w_0().flex_1().child(job.name.clone()))
                             .child(
                                 div()
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.muted)
                                     .child(format!("{} steps", job.steps.len())),
                             ),
@@ -24132,7 +24177,7 @@ impl ReviewWorkspace {
                     .child(
                         div()
                             .mt_1()
-                            .text_xs()
+                            .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child(format!(
                                 "{}{} · job ID {} · check-run ID {}",
@@ -24160,7 +24205,7 @@ impl ReviewWorkspace {
         content.push(
             div()
                 .mt_2()
-                .text_xs()
+                .ui_text(TextRole::Caption)
                 .text_color(colors.muted)
                 .child(format!(
                     "Showing {}–{} of {} jobs · page {} of {}.",
@@ -24180,7 +24225,7 @@ impl ReviewWorkspace {
                 .mt_2()
                 .flex()
                 .flex_wrap()
-                .gap_2()
+                .gap(px(ui::GAP_GROUP))
                 .child(
                     checks_page_button(
                         "actions-jobs-previous-page",
@@ -24215,13 +24260,12 @@ impl ReviewWorkspace {
                 )
                 .child(
                     Button::new("actions-load-selected-log")
+                        .control()
                         .debug_selector(|| "actions-load-selected-log".into())
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
+                        .control()
                         .border_1()
                         .border_color(colors.border)
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.accent)
                         .disabled(tab.ci_read.selected_job_id.is_none())
                         .accessibility_label("Load the selected exact job log read-only")
@@ -24268,7 +24312,7 @@ impl ReviewWorkspace {
             content.push(
                 div()
                     .mb_2()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.amber)
                     .child(notice.to_owned())
                     .into_any_element(),
@@ -24277,7 +24321,7 @@ impl ReviewWorkspace {
         let Some(log) = tab.ci_read.log.visible().cloned() else {
             content.push(
                 div()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .child("No exact job log is available in memory.")
                     .into_any_element(),
@@ -24289,7 +24333,7 @@ impl ReviewWorkspace {
             div()
                 .mb_3()
                 .p_2()
-                .rounded_md()
+                .rounded(px(ui::CONTROL_RADIUS))
                 .border_1()
                 .border_color(colors.border)
                 .child(detail(
@@ -24379,11 +24423,11 @@ impl ReviewWorkspace {
                                         .w(px(line_width))
                                         .flex()
                                         .font_family(CODE_FONT)
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
                                         .child(
                                             div()
                                                 .w(px(62.))
-                                                .px_2()
+                                                .px(px(ui::CELL_INSET))
                                                 .text_right()
                                                 .text_color(colors.faint)
                                                 .child(row_number.to_string()),
@@ -24428,7 +24472,7 @@ impl ReviewWorkspace {
         content.push(
             div()
                 .mt_2()
-                .text_xs()
+                .ui_text(TextRole::Caption)
                 .text_color(colors.muted)
                 .child(format!(
                     "Virtualized plain text · at most {MAX_RENDERED_LOG_ROWS} rows are materialized per render request. Escape returns to jobs."
@@ -24524,8 +24568,8 @@ impl ReviewWorkspace {
                         .when_some(fallback_description, |page, details| {
                             page.child(
                                 div()
-                                    .p_5()
-                                    .rounded_lg()
+                                    .p(px(ui::PANEL_GUTTER))
+                                    .rounded(px(ui::WINDOW_RADIUS))
                                     .border_1()
                                     .border_color(colors.border)
                                     .bg(colors.surface)
@@ -24539,7 +24583,14 @@ impl ReviewWorkspace {
                         })
                         .child(self.render_lifecycle_overview(index, colors, cx))
                         .child(pr_reactions)
-                        .child(div().mt_5().flex().flex_wrap().gap_6().children(fields))
+                        .child(
+                            div()
+                                .mt(px(ui::GAP_PAGE))
+                                .flex()
+                                .flex_wrap()
+                                .gap_6()
+                                .children(fields),
+                        )
                         .into_any_element(),
                 ]
             }
@@ -24550,7 +24601,7 @@ impl ReviewWorkspace {
                         activity.push(
                             div()
                                 .mb_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child(error.clone()),
                         );
@@ -24562,8 +24613,8 @@ impl ReviewWorkspace {
                                 .p_3()
                                 .border_1()
                                 .border_color(colors.amber)
-                                .rounded_md()
-                                .child(div().text_sm().child(format!(
+                                .rounded(px(ui::CONTROL_RADIUS))
+                                .child(div().ui_text(TextRole::Body).child(format!(
                                     "Recovered review {} while remote Activity is unavailable",
                                     draft.review.coordinates.remote_id
                                 )))
@@ -24571,14 +24622,14 @@ impl ReviewWorkspace {
                                     div()
                                         .mt_2()
                                         .font_family(CODE_FONT)
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
                                         .child(format!(
                                             "Unsent body (exact, {} bytes):\n{}",
                                             draft.body.len(),
                                             draft.body
                                         )),
                                 )
-                                .child(div().mt_2().text_xs().text_color(colors.amber).child(
+                                .child(div().mt_2().ui_text(TextRole::Caption).text_color(colors.amber).child(
                                     "Recoverable local history only; no confirmation or write authority was restored.",
                                 )),
                         );
@@ -24586,15 +24637,15 @@ impl ReviewWorkspace {
                 }
                 if let Some(snapshot) = tab.lifecycle.snapshot.as_ref() {
                     let mut composer = div()
-                        .mb_4()
+                        .mb(px(ui::GAP_PAGE))
                         .p_3()
-                        .rounded_md()
+                        .rounded(px(ui::CONTROL_RADIUS))
                         .bg(colors.elevated)
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Discussion"))
+                        .child(div().font_weight(FontWeight::MEDIUM).child("Discussion"))
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!("Comment as {}", snapshot.viewer_login)),
                         );
@@ -24606,7 +24657,7 @@ impl ReviewWorkspace {
                                     .h(px(110.))
                                     .border_1()
                                     .border_color(colors.border)
-                                    .rounded_md()
+                                    .rounded(px(ui::CONTROL_RADIUS))
                                     .overflow_hidden()
                                     .child(Textarea::new(&self.discussion_input)),
                             )
@@ -24614,7 +24665,7 @@ impl ReviewWorkspace {
                                 div()
                                     .mt_2()
                                     .flex()
-                                    .gap_2()
+                                    .gap(px(ui::GAP_GROUP))
                                     .child(action_link("Review comment…", colors).on_click(
                                         cx.listener(|root, _, _, cx| {
                                             if let Root::Review(this) = root {
@@ -24689,15 +24740,15 @@ impl ReviewWorkspace {
                             || !journal_unresolved.is_empty()
                             || pending_start_requires_attention;
                         let mut pending_card = div()
-                                .mb_4()
+                                .mb(px(ui::GAP_PAGE))
                                 .p_3()
-                                .rounded_md()
+                                .rounded(px(ui::CONTROL_RADIUS))
                                 .bg(colors.elevated)
                                 .child("Your pending review")
                                 .child(
                                     div()
                                         .mt_1()
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
                                         .text_color(colors.muted)
                                         .child(format!(
                                             "{} local comment(s)",
@@ -24708,7 +24759,7 @@ impl ReviewWorkspace {
                                     card.child(
                                         div()
                                             .mt_1()
-                                            .text_xs()
+                                            .ui_text(TextRole::Caption)
                                             .text_color(colors.faint)
                                             .child(
                                                 controller
@@ -24730,7 +24781,7 @@ impl ReviewWorkspace {
                                     card.child(
                                         div()
                                             .mt_1()
-                                            .text_xs()
+                                            .ui_text(TextRole::Caption)
                                             .text_color(colors.amber)
                                             .child("Pending comment linkage is partial."),
                                     )
@@ -24739,7 +24790,7 @@ impl ReviewWorkspace {
                                     card.child(
                                         div()
                                             .mt_1()
-                                            .text_xs()
+                                            .ui_text(TextRole::Caption)
                                             .text_color(colors.amber)
                                             .child(if unresolved_reviews == 1 {
                                                 "1 review action needs read-only reconciliation before retry."
@@ -24835,14 +24886,14 @@ impl ReviewWorkspace {
                                 div()
                                     .mt_2()
                                     .p_2()
-                                    .rounded_md()
+                                    .rounded(px(ui::CONTROL_RADIUS))
                                     .border_1()
                                     .border_color(if pending_start_requires_attention {
                                         colors.amber
                                     } else {
                                         colors.border
                                     })
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .child(start_description),
                             );
                             if record.may_continue_file_thread() {
@@ -24857,12 +24908,10 @@ impl ReviewWorkspace {
                                         .mt_2()
                                         .flex()
                                         .flex_wrap()
-                                        .gap_2()
+                                        .gap(px(ui::GAP_GROUP))
                                         .child(
                                             Button::new("continue-pending-file-start")
-                                                .px_2()
-                                                .py_1()
-                                                .rounded_md()
+                                                .control()
                                                 .border_1()
                                                 .border_color(colors.border)
                                                 .text_color(colors.accent)
@@ -24885,9 +24934,7 @@ impl ReviewWorkspace {
                                         )
                                         .child(
                                             Button::new("stop-pending-file-start")
-                                                .px_2()
-                                                .py_1()
-                                                .rounded_md()
+                                                .control()
                                                 .border_1()
                                                 .border_color(colors.border)
                                                 .text_color(colors.amber)
@@ -24916,9 +24963,7 @@ impl ReviewWorkspace {
                                 pending_card = pending_card.child(
                                     div().mt_2().child(
                                         Button::new("cancel-prepared-pending-file-start")
-                                            .px_2()
-                                            .py_1()
-                                            .rounded_md()
+                                            .control()
                                             .border_1()
                                             .border_color(colors.border)
                                             .text_color(colors.amber)
@@ -24947,10 +24992,7 @@ impl ReviewWorkspace {
                                 let finish_flow = record.intent.flow_id.clone();
                                 pending_card = pending_card.child(
                                     div().mt_2().child(
-                                        Button::new("finish-acknowledged-pending-file-start")
-                                            .px_2()
-                                            .py_1()
-                                            .rounded_md()
+                                        Button::new("finish-acknowledged-pending-file-start").control()
                                             .border_1()
                                             .border_color(colors.border)
                                             .text_color(colors.accent)
@@ -25026,7 +25068,7 @@ impl ReviewWorkspace {
                             pending_card = pending_card.child(
                                 div()
                                     .mt_1()
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.amber)
                                     .child(description),
                             );
@@ -25036,13 +25078,16 @@ impl ReviewWorkspace {
                                 ReviewReconciliationOutcome::Reconciled(_) => colors.green,
                                 ReviewReconciliationOutcome::Unresolved(_) => colors.amber,
                             };
-                            pending_card =
-                                pending_card.child(div().mt_1().text_xs().text_color(color).child(
-                                    review_reconciliation_description(
+                            pending_card = pending_card.child(
+                                div()
+                                    .mt_1()
+                                    .ui_text(TextRole::Caption)
+                                    .text_color(color)
+                                    .child(review_reconciliation_description(
                                         item,
                                         recovery_details_expanded,
-                                    ),
-                                ));
+                                    )),
+                            );
                         }
                         for draft in controller.composition.file_drafts.iter().filter(|draft| {
                             draft.disposition == cibergit::participation::DraftDisposition::Pending
@@ -25054,7 +25099,7 @@ impl ReviewWorkspace {
                                 div()
                                     .mt_2()
                                     .p_2()
-                                    .rounded_md()
+                                    .rounded(px(ui::CONTROL_RADIUS))
                                     .border_1()
                                     .border_color(colors.border)
                                     .child(format!(
@@ -25062,7 +25107,7 @@ impl ReviewWorkspace {
                                         draft.target.path,
                                         short_sha(&draft.target.commit_sha)
                                     ))
-                                    .child(div().mt_1().text_xs().text_color(colors.muted).child(
+                                    .child(div().mt_1().ui_text(TextRole::Caption).text_color(colors.muted).child(
                                         "Saved locally; no provider write has been acknowledged.",
                                     ))
                                     .child(action_link("Open file draft", colors).on_click(
@@ -25087,8 +25132,8 @@ impl ReviewWorkspace {
                                     .flex()
                                     .flex_wrap()
                                     .w_full()
-                                    .gap_2()
-                                    .text_xs()
+                                    .gap(px(ui::GAP_GROUP))
+                                    .ui_text(TextRole::Caption)
                                     .child(action_link("Edit pending summary", colors).on_click(
                                         move |_, window, cx| {
                                             edit_root.update(cx, |root, cx| {
@@ -25137,7 +25182,7 @@ impl ReviewWorkspace {
                                             .h(px(72.))
                                             .border_1()
                                             .border_color(colors.border)
-                                            .rounded_md()
+                                            .rounded(px(ui::CONTROL_RADIUS))
                                             .overflow_hidden()
                                             .child(Textarea::new(&self.review_summary_input)),
                                     )
@@ -25212,7 +25257,7 @@ impl ReviewWorkspace {
                                                 .flex()
                                                 .flex_wrap()
                                                 .w_full()
-                                                .gap_2()
+                                                .gap(px(ui::GAP_GROUP))
                                                 .when_some(linked_local_draft, |row, draft_id| {
                                                     row.child(
                                                         action_link_with_id(
@@ -25265,7 +25310,7 @@ impl ReviewWorkspace {
                                         card.child(
                                             div()
                                                 .mt_1()
-                                                .text_xs()
+                                                .ui_text(TextRole::Caption)
                                                 .text_color(colors.muted)
                                                 .child(
                                                     "Browser-created pending comment is authoritative but has no local recovery link; edit it in GitHub rather than guessing a draft identity.",
@@ -25280,7 +25325,7 @@ impl ReviewWorkspace {
                             let mut journal_card = div()
                                 .mb_2()
                                 .p_3()
-                                .rounded_md()
+                                .rounded(px(ui::CONTROL_RADIUS))
                                 .bg(colors.elevated)
                                 .child(format!(
                                     "{} auxiliary / merge action(s) require separate reconciliation",
@@ -25295,14 +25340,14 @@ impl ReviewWorkspace {
                                 journal_card = journal_card.child(
                                     div()
                                         .mt_1()
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
                                         .text_color(colors.amber)
                                         .child(description),
                                 );
                             }
                             activity.push(journal_card);
                             activity.push(
-                                div().mb_4().child(
+                                div().mb(px(ui::GAP_PAGE)).child(
                                     action_link("Reconcile auxiliary / merge actions", colors)
                                         .on_click(cx.listener(|root, _, _, cx| {
                                             if let Root::Review(this) = root {
@@ -25315,8 +25360,8 @@ impl ReviewWorkspace {
                         if let Some(error) = &tab.journal_error {
                             activity.push(
                                 div()
-                                    .mb_4()
-                                    .text_xs()
+                                    .mb(px(ui::GAP_PAGE))
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.red)
                                     .child(format!(
                                         "Auxiliary / merge journal could not be read and remains frozen: {error}"
@@ -25343,7 +25388,7 @@ impl ReviewWorkspace {
                                 .mb_3()
                                 .flex()
                                 .flex_wrap()
-                                .gap_2()
+                                .gap(px(ui::GAP_GROUP))
                                 .when(comment_page > 0, |row| {
                                     row.child(action_link("Previous comments", colors).on_click(
                                         cx.listener(move |root, _, _, cx| {
@@ -25357,11 +25402,16 @@ impl ReviewWorkspace {
                                         }),
                                     ))
                                 })
-                                .child(div().text_xs().text_color(colors.muted).child(format!(
-                                    "Comments {}–{} of {comment_count}",
-                                    comment_page * 20 + 1,
-                                    ((comment_page + 1) * 20).min(comment_count)
-                                )))
+                                .child(
+                                    div()
+                                        .ui_text(TextRole::Caption)
+                                        .text_color(colors.muted)
+                                        .child(format!(
+                                            "Comments {}–{} of {comment_count}",
+                                            comment_page * 20 + 1,
+                                            ((comment_page + 1) * 20).min(comment_count)
+                                        )),
+                                )
                                 .when(comment_page + 1 < comment_pages, |row| {
                                     row.child(action_link("Next comments", colors).on_click(
                                         cx.listener(move |root, _, _, cx| {
@@ -25398,7 +25448,7 @@ impl ReviewWorkspace {
                             .child(
                                 div()
                                     .mt_1()
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.faint)
                                     .child(format!("Remote ID {}", comment.coordinates.remote_id)),
                             )
@@ -25418,7 +25468,7 @@ impl ReviewWorkspace {
                                     div()
                                         .mt_2()
                                         .flex()
-                                        .gap_2()
+                                        .gap(px(ui::GAP_GROUP))
                                         .child(
                                             action_link_with_id(
                                                 format!(
@@ -25473,7 +25523,7 @@ impl ReviewWorkspace {
                                 .mb_3()
                                 .flex()
                                 .flex_wrap()
-                                .gap_2()
+                                .gap(px(ui::GAP_GROUP))
                                 .when(review_page > 0, |row| {
                                     row.child(action_link("Previous reviews", colors).on_click(
                                         cx.listener(move |root, _, _, cx| {
@@ -25486,11 +25536,16 @@ impl ReviewWorkspace {
                                         }),
                                     ))
                                 })
-                                .child(div().text_xs().text_color(colors.muted).child(format!(
-                                    "Reviews {}–{} of {review_count}",
-                                    review_range.start + 1,
-                                    review_range.end
-                                )))
+                                .child(
+                                    div()
+                                        .ui_text(TextRole::Caption)
+                                        .text_color(colors.muted)
+                                        .child(format!(
+                                            "Reviews {}–{} of {review_count}",
+                                            review_range.start + 1,
+                                            review_range.end
+                                        )),
+                                )
                                 .when(review_page + 1 < review_pages, |row| {
                                     row.child(action_link("Next reviews", colors).on_click(
                                         cx.listener(move |root, _, _, cx| {
@@ -25513,7 +25568,7 @@ impl ReviewWorkspace {
                         activity.push(
                             div()
                                 .mb_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child(if tab.submitted_summary_editor.clear_in_flight
                                     || tab.submitted_summary_editor.pending_clear.is_some()
@@ -25532,15 +25587,15 @@ impl ReviewWorkspace {
                                 .p_3()
                                 .border_1()
                                 .border_color(colors.amber)
-                                .rounded_md()
-                                .text_xs()
+                                .rounded(px(ui::CONTROL_RADIUS))
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child(error.clone())
                                 .child(
                                     div()
                                         .mt_2()
                                         .flex()
-                                        .gap_3()
+                                        .gap(px(ui::GAP_COLUMNS))
                                         .child(action_link("Retry safe recovery", colors).on_click(
                                             {
                                                 let root = root.clone();
@@ -25600,29 +25655,29 @@ impl ReviewWorkspace {
                                 .p_3()
                                 .border_1()
                                 .border_color(colors.amber)
-                                .rounded_md()
-                                .child(div().text_sm().child(
+                                .rounded(px(ui::CONTROL_RADIUS))
+                                .child(div().ui_text(TextRole::Body).child(
                                     "Same-review draft conflict — both exact versions are preserved",
                                 ))
                                 .child(
                                     div()
                                         .mt_2()
                                         .font_family(CODE_FONT)
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
                                         .child(saved_text),
                                 )
                                 .child(
                                     div()
                                         .mt_2()
                                         .font_family(CODE_FONT)
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
                                         .child(current_text),
                                 )
                                 .child(
                                     div()
                                         .mt_2()
                                         .flex()
-                                        .gap_3()
+                                        .gap(px(ui::GAP_COLUMNS))
                                         .child(action_link("Use saved text", colors).on_click({
                                             let root = root.clone();
                                             move |_, window, cx| {
@@ -25660,12 +25715,12 @@ impl ReviewWorkspace {
                                 .p_3()
                                 .border_1()
                                 .border_color(colors.amber)
-                                .rounded_md()
-                                .child(div().text_sm().child(format!(
+                                .rounded(px(ui::CONTROL_RADIUS))
+                                .child(div().ui_text(TextRole::Body).child(format!(
                                     "Recovered unavailable review {}",
                                     draft.review.coordinates.remote_id
                                 )))
-                                .child(div().mt_1().text_xs().text_color(colors.muted).child(
+                                .child(div().mt_1().ui_text(TextRole::Caption).text_color(colors.muted).child(
                                     format!(
                                         "Historical source: {} by {} at {} · commit {}",
                                         draft.review.state,
@@ -25678,14 +25733,14 @@ impl ReviewWorkspace {
                                     div()
                                         .mt_2()
                                         .font_family(CODE_FONT)
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
                                         .child(format!(
                                             "Unsent body (exact, {} bytes):\n{}",
                                             draft.body.len(),
                                             draft.body
                                         )),
                                 )
-                                .child(div().mt_2().text_xs().text_color(colors.amber).child(
+                                .child(div().mt_2().ui_text(TextRole::Caption).text_color(colors.amber).child(
                                     "This text is recoverable local history only. No confirmation or write is available until the exact review returns in a fresh read.",
                                 )),
                         );
@@ -25704,7 +25759,7 @@ impl ReviewWorkspace {
                             Some(position) if position / 20 != review_page => activity.push(
                                 div()
                                     .mb_2()
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.amber)
                                     .child(format!(
                                         "Submitted-review edit draft retained on review page {}.",
@@ -25714,7 +25769,7 @@ impl ReviewWorkspace {
                             None => activity.push(
                                 div()
                                     .mb_2()
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.amber)
                                     .child("The edited review is absent from the fresh activity read. Your typed draft is retained; no confirmation is available."),
                             ),
@@ -25742,7 +25797,7 @@ impl ReviewWorkspace {
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.faint)
                                 .child(format!(
                                     "{} · Remote ID {}",
@@ -25779,7 +25834,7 @@ impl ReviewWorkspace {
                                         .child(
                                             div()
                                                 .mt_2()
-                                                .text_xs()
+                                                .ui_text(TextRole::Caption)
                                                 .text_color(if unknown {
                                                     colors.amber
                                                 } else {
@@ -25796,10 +25851,7 @@ impl ReviewWorkspace {
                                                 Button::new(format!(
                                                     "dismiss-review-{}",
                                                     review.coordinates.remote_id
-                                                ))
-                                                .px_2()
-                                                .py_1()
-                                                .rounded_md()
+                                                )).control()
                                                 .border_1()
                                                 .border_color(colors.border)
                                                 .text_color(if tab.write_in_flight {
@@ -25829,22 +25881,24 @@ impl ReviewWorkspace {
                                 }
                                 Some(capability) => {
                                     card = card.child(
-                                        div().mt_1().text_xs().text_color(colors.amber).child(
-                                            format!(
+                                        div()
+                                            .mt_1()
+                                            .ui_text(TextRole::Caption)
+                                            .text_color(colors.amber)
+                                            .child(format!(
                                                 "Dismiss unavailable: {}",
                                                 capability
                                                     .authority
                                                     .reason()
                                                     .unwrap_or("fresh target is ineligible")
-                                            ),
-                                        ),
+                                            )),
                                     );
                                 }
                                 None => {
                                     card = card.child(
                                         div()
                                             .mt_1()
-                                            .text_xs()
+                                            .ui_text(TextRole::Caption)
                                             .text_color(colors.amber)
                                             .child("Dismiss unavailable: cached, partial, or stale activity cannot authorize an attempt."),
                                     );
@@ -25866,14 +25920,14 @@ impl ReviewWorkspace {
                                             .h(px(84.))
                                             .border_1()
                                             .border_color(colors.border)
-                                            .rounded_md()
+                                            .rounded(px(ui::CONTROL_RADIUS))
                                             .overflow_hidden()
                                             .child(Textarea::new(&self.dismissal_reason_input)),
                                     )
                                     .child(
                                         div()
                                             .mt_1()
-                                            .text_xs()
+                                            .ui_text(TextRole::Caption)
                                             .text_color(colors.faint)
                                             .child("Reason is retained across cancellation and in-process tab/target switches, but is not persisted before dispatch; an abrupt restart can lose it."),
                                     )
@@ -25882,10 +25936,7 @@ impl ReviewWorkspace {
                                             Button::new(format!(
                                                 "review-dismissal-{}",
                                                 review.coordinates.remote_id
-                                            ))
-                                            .px_2()
-                                            .py_1()
-                                            .rounded_md()
+                                            )).control()
                                             .border_1()
                                             .border_color(colors.border)
                                             .text_color(if tab.write_in_flight {
@@ -25987,7 +26038,7 @@ impl ReviewWorkspace {
                                     card = card.child(
                                         div()
                                             .mt_1()
-                                            .text_xs()
+                                            .ui_text(TextRole::Caption)
                                             .text_color(colors.amber)
                                             .child(format!("Edit unavailable: {reason}")),
                                     );
@@ -26009,7 +26060,7 @@ impl ReviewWorkspace {
                                 card.child(
                                     div()
                                         .mt_2()
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
                                         .text_color(colors.amber)
                                         .child("A typed draft is retained for this review. Choose Edit to resume it."),
                                 )
@@ -26020,7 +26071,7 @@ impl ReviewWorkspace {
                                     card.child(
                                         div()
                                             .mt_2()
-                                            .text_xs()
+                                            .ui_text(TextRole::Caption)
                                             .text_color(colors.amber)
                                             .child("The fresh review changed after editing began. Your typed draft is retained; choose Edit again to adopt the new source before confirmation."),
                                     )
@@ -26031,7 +26082,7 @@ impl ReviewWorkspace {
                                         .h(px(84.))
                                         .border_1()
                                         .border_color(colors.border)
-                                        .rounded_md()
+                                        .rounded(px(ui::CONTROL_RADIUS))
                                         .overflow_hidden()
                                         .child(Textarea::new(&self.submitted_summary_input)),
                                 )
@@ -26133,7 +26184,7 @@ impl ReviewWorkspace {
                                 .child(
                                     div()
                                         .mt_1()
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
                                         .text_color(colors.faint)
                                         .child(format!(
                                             "Subject {:?} · current {:?} {:?}–{:?} · original {:?}–{:?} · commit {:?} · original commit {:?}",
@@ -26166,13 +26217,16 @@ impl ReviewWorkspace {
                                     .border_l_2()
                                     .border_color(colors.border)
                                     .child(
-                                        div().text_xs().text_color(colors.muted).child(
-                                            comment
-                                                .author
-                                                .as_deref()
-                                                .unwrap_or("Unknown author")
-                                                .to_owned(),
-                                        ),
+                                        div()
+                                            .ui_text(TextRole::Caption)
+                                            .text_color(colors.muted)
+                                            .child(
+                                                comment
+                                                    .author
+                                                    .as_deref()
+                                                    .unwrap_or("Unknown author")
+                                                    .to_owned(),
+                                            ),
                                     )
                                     .child(
                                         markdown_text(
@@ -26183,7 +26237,7 @@ impl ReviewWorkspace {
                                             &comment.body,
                                             colors,
                                         )
-                                        .text_size(px(12.)),
+                                        .ui_text(TextRole::Body),
                                     )
                                     .child(render_reaction_row(
                                         reaction_subject(
@@ -26201,7 +26255,7 @@ impl ReviewWorkspace {
                         if !thread.thread.comments_complete {
                             thread_card =
                                 thread_card
-                                    .child(div().mt_1().text_xs().text_color(colors.amber).child(
+                                    .child(div().mt_1().ui_text(TextRole::Caption).text_color(colors.amber).child(
                                     "Thread comments are partial at the explicit provider bound.",
                                 ));
                         }
@@ -26256,7 +26310,7 @@ impl ReviewWorkspace {
                                 div()
                                     .mb_2()
                                     .p_2()
-                                    .rounded_md()
+                                    .rounded(px(ui::CONTROL_RADIUS))
                                     .border_1()
                                     .border_color(colors.border)
                                     .child(detail(
@@ -26302,7 +26356,7 @@ impl ReviewWorkspace {
                             .unwrap_or_else(|| {
                                 div()
                                     .mb_2()
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.muted)
                                     .child("Observed Checks source identity is unavailable.")
                             });
@@ -26311,6 +26365,7 @@ impl ReviewWorkspace {
                                 .mb_3()
                                 .child(
                                     Button::new("checks-source-details")
+                                        .control()
                                         .child(if tab.checks_source_expanded {
                                             "Hide revision details"
                                         } else {
@@ -26361,7 +26416,7 @@ impl ReviewWorkspace {
                                             },
                                         ),
                                     )
-                                    .child(div().mt_1().text_xs().text_color(colors.muted).child(
+                                    .child(div().mt_1().ui_text(TextRole::Caption).text_color(colors.muted).child(
                                         "Read-only · exact run attempt · memory-only result",
                                     ))
                                     .into_any_element(),
@@ -26399,7 +26454,7 @@ impl ReviewWorkspace {
                                         .flex()
                                         .items_center()
                                         .justify_between()
-                                        .gap_2()
+                                        .gap(px(ui::GAP_GROUP))
                                         .child(
                                             div()
                                                 .min_w_0()
@@ -26412,29 +26467,38 @@ impl ReviewWorkspace {
                                             div()
                                                 .flex_none()
                                                 .whitespace_nowrap()
-                                                .text_xs()
+                                                .ui_text(TextRole::Caption)
                                                 .text_color(colors.muted)
                                                 .child(if expanded { "Hide" } else { "Details" }),
                                         ),
                                 )
-                                .child(div().mt_1().text_xs().text_color(colors.muted).child(
-                                    format!(
-                                    "{} · {}{}",
-                                    kind_label(check),
-                                    check.status,
-                                    check
-                                        .conclusion
-                                        .as_ref()
-                                        .map(|value| format!(" · {value}"))
-                                        .unwrap_or_default()
-                                ),
-                                ))
-                                .child(div().text_xs().text_color(colors.faint).child(format!(
-                                    "{} · {} · {}",
-                                    required_label(check),
-                                    sha_label(check),
-                                    linkage_label(check)
-                                )))
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .ui_text(TextRole::Caption)
+                                        .text_color(colors.muted)
+                                        .child(format!(
+                                            "{} · {}{}",
+                                            kind_label(check),
+                                            check.status,
+                                            check
+                                                .conclusion
+                                                .as_ref()
+                                                .map(|value| format!(" · {value}"))
+                                                .unwrap_or_default()
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .ui_text(TextRole::Caption)
+                                        .text_color(colors.faint)
+                                        .child(format!(
+                                            "{} · {} · {}",
+                                            required_label(check),
+                                            sha_label(check),
+                                            linkage_label(check)
+                                        )),
+                                )
                                 .when(expanded, |row| {
                                     row.child(
                                         div()
@@ -26448,13 +26512,13 @@ impl ReviewWorkspace {
                                                         .mb_1()
                                                         .child(
                                                             div()
-                                                                .text_xs()
+                                                                .ui_text(TextRole::Caption)
                                                                 .text_color(colors.muted)
                                                                 .child(label),
                                                         )
                                                         .child(
                                                             div()
-                                                                .text_xs()
+                                                                .ui_text(TextRole::Caption)
                                                                 .text_color(colors.text)
                                                                 .child(value),
                                                         )
@@ -26475,7 +26539,7 @@ impl ReviewWorkspace {
                                 checks.push(
                                     div()
                                         .mt_2()
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
                                         .text_color(colors.muted)
                                         .child(format!(
                                             "Showing {}–{} of {} observed checks · page {} of {}.",
@@ -26497,7 +26561,7 @@ impl ReviewWorkspace {
                             div()
                                 .mt_2()
                                 .flex()
-                                .gap_2()
+                                .gap(px(ui::GAP_GROUP))
                                 .child(
                                     checks_page_button(
                                         "checks-previous-page",
@@ -26584,10 +26648,10 @@ impl ReviewWorkspace {
                 self.render_pr_section_content(index, InspectorSection::Overview, colors, cx);
             content.push(
                 div()
-                    .mt_6()
-                    .mb_4()
-                    .text_size(px(17.))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .mt(px(ui::GAP_PAGE))
+                    .mb(px(ui::GAP_PAGE))
+                    .ui_text(TextRole::Title)
+                    .font_weight(FontWeight::MEDIUM)
                     .child("Conversation")
                     .into_any_element(),
             );
@@ -26615,9 +26679,9 @@ impl ReviewWorkspace {
                 let details = &observation.details;
                 panel.child(
                     div()
-                        .px_4()
+                        .px(px(ui::PANEL_GUTTER))
                         .py_2()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.amber)
                         .child(format!(
                             "Cached · saved {} · read-only.{}{}",
@@ -26641,9 +26705,9 @@ impl ReviewWorkspace {
             .when_some(tab.details_state.notice(), |panel, notice| {
                 panel.child(
                     div()
-                        .px_4()
+                        .px(px(ui::PANEL_GUTTER))
                         .py_2()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .child(notice),
                 )
@@ -26651,9 +26715,9 @@ impl ReviewWorkspace {
             .when_some(tab.collaboration_cache_notice.clone(), |panel, notice| {
                 panel.child(
                     div()
-                        .px_4()
+                        .px(px(ui::PANEL_GUTTER))
                         .py_2()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.amber)
                         .child(notice),
                 )
@@ -26665,9 +26729,9 @@ impl ReviewWorkspace {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .px_6()
+                    .px(px(ui::PANEL_GUTTER))
                     .py_5()
-                    .text_size(px(14.))
+                    .ui_text(TextRole::Body)
                     .overflow_y_scroll()
                     .when_some(
                         self.render_confirmation(index, colors, cx),
@@ -26755,20 +26819,20 @@ impl ReviewWorkspace {
                     .map(|revision| revision.head_sha.as_str());
                 Some(
                     div()
-                        .mb_5()
+                        .mb(px(ui::GAP_PAGE))
                         .p_3()
-                        .rounded_md()
+                        .rounded(px(ui::CONTROL_RADIUS))
                         .border_1()
                         .border_color(colors.accent)
                         .child(
                             div()
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_weight(FontWeight::MEDIUM)
                                 .child("Submit review?"),
                         )
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!(
                                     "{} · #{} · {} · {} pending comment(s)",
@@ -26781,14 +26845,14 @@ impl ReviewWorkspace {
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .child(format!("Actually reviewed head: {reviewed}")),
                         )
                         .when_some(newer, |card, newer| {
                             card.child(
                                 div()
                                     .mt_2()
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.amber)
                                     .child(format!(
                                         "Newer head {newer} exists. Confirmation still submits the displayed older head {reviewed}; it does not advance the diff."
@@ -26800,7 +26864,7 @@ impl ReviewWorkspace {
                                 .mt_3()
                                 .flex()
                                 .flex_wrap()
-                                .gap_1()
+                                .gap(px(ui::GAP_ICON))
                                 .child(event_button("Comment", ReviewEvent::Comment))
                                 .child(event_button("Approve", ReviewEvent::Approve))
                                 .child(event_button(
@@ -26814,7 +26878,7 @@ impl ReviewWorkspace {
                                 .h(px(84.))
                                 .border_1()
                                 .border_color(colors.border)
-                                .rounded_md()
+                                .rounded(px(ui::CONTROL_RADIUS))
                                 .overflow_hidden()
                                 .child(Textarea::new(&self.review_summary_input)),
                         )
@@ -26844,20 +26908,20 @@ impl ReviewWorkspace {
                 };
                 Some(
                     div()
-                        .mb_5()
+                        .mb(px(ui::GAP_PAGE))
                         .p_3()
-                        .rounded_md()
+                        .rounded(px(ui::CONTROL_RADIUS))
                         .border_1()
                         .border_color(colors.accent)
                         .child(
                             div()
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_weight(FontWeight::MEDIUM)
                                 .child("Edit submitted review summary?"),
                         )
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!(
                                     "{} · #{} · review {}",
@@ -26869,7 +26933,7 @@ impl ReviewWorkspace {
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .child(format!(
                                     "Author {selected_author} · state {submitted_state} · reviewed commit {submitted_commit_sha}"
                                 )),
@@ -26877,35 +26941,35 @@ impl ReviewWorkspace {
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.faint)
                                 .child("Frozen previous body (exact quoted text)"),
                         )
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .font_family(CODE_FONT)
                                 .child(format!("{expected_body:?}")),
                         )
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.faint)
                                 .child("Requested new body (exact quoted text)"),
                         )
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .font_family(CODE_FONT)
                                 .child(format!("{body:?}")),
                         )
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child("GitHub rechecks this exact review before saving, but another edit could happen between that check and the save. The review may refer to an older commit; this action does not change the displayed comparison."),
                         )
@@ -26937,20 +27001,20 @@ impl ReviewWorkspace {
                 };
                 Some(
                     div()
-                        .mb_5()
+                        .mb(px(ui::GAP_PAGE))
                         .p_3()
-                        .rounded_md()
+                        .rounded(px(ui::CONTROL_RADIUS))
                         .border_1()
                         .border_color(colors.amber)
                         .child(
                             div()
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_weight(FontWeight::MEDIUM)
                                 .child("Dismiss submitted review?"),
                         )
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!(
                                     "{} · #{} · selected account {} ({})",
@@ -26961,7 +27025,7 @@ impl ReviewWorkspace {
                                 )),
                         )
                         .child(
-                            div().mt_1().text_xs().child(format!(
+                            div().mt_1().ui_text(TextRole::Caption).child(format!(
                                 "Review {} · author {} · state {} · submitted {} · commit {}",
                                 request.target.review.remote_id,
                                 request.target.review_author.as_deref().unwrap_or("null"),
@@ -26977,42 +27041,42 @@ impl ReviewWorkspace {
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.faint)
                                 .child("Frozen previous body (exact quoted text)"),
                         )
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .font_family(CODE_FONT)
                                 .child(format!("{:?}", request.target.review_body)),
                         )
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.faint)
                                 .child("Required dismissal reason (exact quoted text)"),
                         )
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .font_family(CODE_FONT)
                                 .child(format!("{:?}", request.reason)),
                         )
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child(format!("Authority: {authority}")),
                         )
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child("Confirm durably records this exact request, repeats the exact preflight, then sends one GraphQL mutation. GitHub offers no atomic expected-state/body/commit condition, so the review can still race after that read. A later DISMISSED state alone cannot prove this exact reason."),
                         )
@@ -27021,12 +27085,9 @@ impl ReviewWorkspace {
                                 .mt_3()
                                 .flex()
                                 .flex_wrap()
-                                .gap_3()
+                                .gap(px(ui::GAP_COLUMNS))
                                 .child(
-                                    Button::new("confirm-review-dismissal")
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
+                                    Button::new("confirm-review-dismissal").control()
                                         .border_1()
                                         .border_color(colors.border)
                                         .text_color(colors.amber)
@@ -27045,10 +27106,7 @@ impl ReviewWorkspace {
                                         .child("Confirm one dismissal"),
                                 )
                                 .child(
-                                    Button::new("cancel-review-dismissal")
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
+                                    Button::new("cancel-review-dismissal").control()
                                         .border_1()
                                         .border_color(colors.border)
                                         .text_color(colors.accent)
@@ -27094,20 +27152,20 @@ impl ReviewWorkspace {
                 let confirm_token = token.clone();
                 Some(
                     div()
-                        .mb_5()
+                        .mb(px(ui::GAP_PAGE))
                         .p_3()
-                        .rounded_md()
+                        .rounded(px(ui::CONTROL_RADIUS))
                         .border_1()
                         .border_color(colors.green)
                         .child(
                             div()
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_weight(FontWeight::MEDIUM)
                                 .child("Add a file-level comment to your pending review?"),
                         )
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!(
                                     "{} · #{} · selected account {}",
@@ -27119,13 +27177,13 @@ impl ReviewWorkspace {
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .child(format!("Whole file: {}", target.path)),
                         )
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .child(format!(
                                     "Pending review {} · reviewed commit {}",
                                     source.review.remote_id, source.review_commit_sha
@@ -27134,14 +27192,14 @@ impl ReviewWorkspace {
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .font_family(CODE_FONT)
                                 .child(format!("Exact comment: {body:?}")),
                         )
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child("This only adds to the existing pending review; it does not submit the review or post immediately. GitHub is checked again just before sending, but the head can still change in the small gap before the write."),
                         )
@@ -27149,8 +27207,8 @@ impl ReviewWorkspace {
                             div()
                                 .mt_3()
                                 .flex()
-                                .gap_3()
-                                .text_xs()
+                                .gap(px(ui::GAP_COLUMNS))
+                                .ui_text(TextRole::Caption)
                                 .child(action_link("Add to pending review", colors).on_click(
                                     move |_, _, cx| {
                                         let token = confirm_token.clone();
@@ -27201,13 +27259,13 @@ impl ReviewWorkspace {
                 };
                 Some(
                     div()
-                        .mb_5()
+                        .mb(px(ui::GAP_PAGE))
                         .p_3()
-                        .rounded_md()
+                        .rounded(px(ui::CONTROL_RADIUS))
                         .border_1()
                         .border_color(colors.amber)
                         .child(
-                            div().font_weight(FontWeight::SEMIBOLD).child(if review_id.is_some() {
+                            div().font_weight(FontWeight::MEDIUM).child(if review_id.is_some() {
                                 "Continue adding this whole-file comment?"
                             } else {
                                 "Create a pending review and add this whole-file comment?"
@@ -27216,7 +27274,7 @@ impl ReviewWorkspace {
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!(
                                     "{} · #{} · selected account {}",
@@ -27228,11 +27286,11 @@ impl ReviewWorkspace {
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .child(format!("Whole file: {}", target.path)),
                         )
                         .child(
-                            div().mt_1().text_xs().child(format!(
+                            div().mt_1().ui_text(TextRole::Caption).child(format!(
                                 "Reviewed commit: {}{}",
                                 intent.observed_head_sha,
                                 review_id
@@ -27243,14 +27301,14 @@ impl ReviewWorkspace {
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .font_family(CODE_FONT)
                                 .child(format!("Exact comment: {:?}", intent.body)),
                         )
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child(if review_id.is_some() {
                                     "This sends one GitHub write to add a FILE thread to the exact unsubmitted review shown above. It does not submit or delete the review. If the write is uncertain, the draft is kept and no retry occurs automatically."
@@ -27263,12 +27321,9 @@ impl ReviewWorkspace {
                                 .mt_3()
                                 .flex()
                                 .flex_wrap()
-                                .gap_3()
+                                .gap(px(ui::GAP_COLUMNS))
                                 .child(
-                                    Button::new("confirm-pending-review-start")
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
+                                    Button::new("confirm-pending-review-start").control()
                                         .border_1()
                                         .border_color(colors.border)
                                         .text_color(colors.amber)
@@ -27296,10 +27351,7 @@ impl ReviewWorkspace {
                                         }),
                                 )
                                 .child(
-                                    Button::new("cancel-pending-review-start")
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
+                                    Button::new("cancel-pending-review-start").control()
                                         .border_1()
                                         .border_color(colors.border)
                                         .text_color(colors.accent)
@@ -27380,20 +27432,20 @@ impl ReviewWorkspace {
                     .unwrap_or("Provider default");
                 Some(
                     div()
-                        .mb_5()
+                        .mb(px(ui::GAP_PAGE))
                         .p_3()
-                        .rounded_md()
+                        .rounded(px(ui::CONTROL_RADIUS))
                         .border_1()
                         .border_color(colors.green)
                         .child(
                             div()
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_weight(FontWeight::MEDIUM)
                                 .child("Confirm guarded merge action"),
                         )
                         .child(
                             div()
                                 .mt_1()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!(
                                     "{} · #{} · account {}",
@@ -27423,7 +27475,7 @@ impl ReviewWorkspace {
                             card.child(
                                 div()
                                     .mt_2()
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.amber)
                                     .child(format!(
                                         "Blockers: {}",
@@ -27432,7 +27484,7 @@ impl ReviewWorkspace {
                             )
                         })
                         .child(
-                            div().mt_2().flex().flex_wrap().gap_1().children(
+                            div().mt_2().flex().flex_wrap().gap(px(ui::GAP_ICON)).children(
                                 preparation
                                     .allowed_methods
                                     .iter()
@@ -27445,7 +27497,7 @@ impl ReviewWorkspace {
                                 .mt_2()
                                 .flex()
                                 .flex_wrap()
-                                .gap_1()
+                                .gap(px(ui::GAP_ICON))
                                 .when(
                                     !preparation.merge_queue_required
                                         && preparation.blockers.is_empty(),
@@ -27479,23 +27531,23 @@ impl ReviewWorkspace {
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!("Suggested headline: {suggested_title}")),
                         )
                         .child(
                             div()
                                 .mt_1()
-                                .h(px(34.))
+                                .h(px(ui::CONTROL_HEIGHT))
                                 .border_1()
                                 .border_color(colors.border)
-                                .rounded_md()
+                                .rounded(px(ui::CONTROL_RADIUS))
                                 .child(Input::new(&self.merge_title_input)),
                         )
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!("Suggested body: {suggested_body}")),
                         )
@@ -27505,21 +27557,21 @@ impl ReviewWorkspace {
                                 .h(px(72.))
                                 .border_1()
                                 .border_color(colors.border)
-                                .rounded_md()
+                                .rounded(px(ui::CONTROL_RADIUS))
                                 .overflow_hidden()
                                 .child(Textarea::new(&self.merge_body_input)),
                         )
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.faint)
                                 .child("Delete branch unavailable: GitHub deleteRef has no expected-OID/CAS guard."),
                         )
                         .child(
                             div()
                                 .mt_2()
-                                .text_xs()
+                                .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child("Admin bypass is never selected automatically. Confirm dispatches exactly one guarded request."),
                         )
@@ -27554,7 +27606,7 @@ impl ReviewWorkspace {
             .flex()
             .flex_wrap()
             .items_center()
-            .gap_3()
+            .gap(px(ui::GAP_COLUMNS))
             .child(confirm)
             .child(
                 action_link("Cancel", colors).on_click(cx.listener(|root, _, _, cx| {
@@ -27579,11 +27631,11 @@ impl ReviewWorkspace {
         let confirm_token = token.clone();
         let cancel_token = token;
         div()
-            .mt_3()
+            .my(px(ui::GAP_GROUP))
             .flex()
             .flex_wrap()
             .items_center()
-            .gap_3()
+            .gap(px(ui::GAP_GROUP))
             .child(
                 action_link("Confirm exact edit", colors).on_click(cx.listener(
                     move |root, _, _, cx| {
@@ -27604,15 +27656,15 @@ impl ReviewWorkspace {
 
     fn render_status(&self, colors: Palette) -> impl IntoElement {
         div()
-            .h(px(28.))
-            .px_4()
+            .h(px(ui::CONTROL_HEIGHT))
+            .px(px(ui::PANEL_GUTTER))
             .flex()
             .items_center()
-            .gap_3()
+            .gap(px(ui::GAP_COLUMNS))
             .border_t_1()
             .border_color(colors.border)
             .bg(colors.canvas)
-            .text_xs()
+            .ui_text(TextRole::Caption)
             .text_color(colors.muted)
             .child(if self.focused {
                 "Online reads · polling active"
@@ -27642,17 +27694,17 @@ impl ReviewWorkspace {
             .child(
                 div()
                     .w(px(520.))
-                    .p_2()
-                    .rounded_lg()
+                    .p(px(ui::MENU_INSET))
+                    .rounded(px(ui::POPOVER_RADIUS))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.surface)
                     .shadow_lg()
                     .child(
                         div()
-                            .px_3()
+                            .px(px(ui::CONTROL_INSET))
                             .py_2()
-                            .text_xs()
+                            .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child("COMMANDS"),
                     )
@@ -27866,7 +27918,7 @@ impl ReviewWorkspace {
                         div()
                             .id("close-palette")
                             .mt_2()
-                            .px_3()
+                            .px(px(ui::CONTROL_INSET))
                             .py_2()
                             .text_color(colors.accent)
                             .cursor_pointer()
@@ -27884,21 +27936,22 @@ impl ReviewWorkspace {
 
 fn field_label(label: &str, colors: Palette) -> Div {
     div()
-        .text_xs()
+        .ui_text(TextRole::Label)
         .text_color(colors.muted)
         .child(label.to_owned())
 }
 
 fn input_box(editor: &Entity<InputState>, colors: Palette) -> Div {
     div()
-        .mt_2()
-        .h(px(36.))
-        .px_2()
-        .rounded_md()
+        .mt(px(ui::GAP_FIELD))
+        .h(px(ui::CONTROL_HEIGHT))
+        .px(px(ui::CELL_INSET))
+        .rounded(px(ui::CONTROL_RADIUS))
         .bg(colors.elevated)
         .border_1()
         .border_color(colors.border)
         .font_family(UI_FONT)
+        .ui_text(TextRole::Body)
         .child(Input::new(editor))
 }
 
@@ -27906,27 +27959,23 @@ fn editor_field(label: &str, editor: &Entity<InputState>, colors: Palette) -> Di
     div()
         .flex_1()
         .min_w_0()
-        .mb_3()
+        .mb(px(ui::GAP_GROUP))
         .child(field_label(label, colors))
         .child(input_box(editor, colors))
 }
 
 fn section_label(label: &str, colors: Palette) -> Div {
-    div()
-        .mt_3()
-        .mb_2()
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
+    ui::kicker(label)
+        .mt(px(ui::GAP_GROUP))
+        .mb(px(ui::GAP_GROUP))
+        .ui_text(TextRole::Kicker)
         .text_color(colors.faint)
-        .child(label.to_owned())
 }
 
 fn small_action(label: &str, colors: Palette) -> Div {
     div()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_xs()
+        .control()
+        .ui_text(TextRole::Label)
         .text_color(colors.accent)
         .cursor_pointer()
         .hover(|button| button.bg(colors.selected))
@@ -27935,11 +27984,12 @@ fn small_action(label: &str, colors: Palette) -> Div {
 
 fn modal_button(label: &str, primary: bool, colors: Palette) -> Div {
     div()
-        .h(px(32.))
-        .px_3()
+        .control()
+        .h(px(ui::CONTROL_HEIGHT))
+        .px(px(ui::CONTROL_INSET))
         .flex()
         .items_center()
-        .rounded_md()
+        .rounded(px(ui::CONTROL_RADIUS))
         .border_1()
         .border_color(if primary {
             colors.accent
@@ -27981,9 +28031,16 @@ fn choice_row(
                 }))
         });
     div()
-        .mb_3()
+        .mb(px(ui::GAP_GROUP))
         .child(field_label(label, colors))
-        .child(div().mt_2().flex().flex_wrap().gap_1().children(controls))
+        .child(
+            div()
+                .mt_2()
+                .flex()
+                .flex_wrap()
+                .gap(px(ui::GAP_ICON))
+                .children(controls),
+        )
 }
 
 fn view_summary(view: &cibergit::workspace::SavedView) -> String {
@@ -28041,21 +28098,32 @@ fn sidebar_icon(name: &str, color: Rgba) -> Svg {
         }
     };
     svg().data(format!("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'>{shape}</svg>").as_bytes())
-        .size(px(16.)).flex_none().text_color(color)
+        .size(px(ui::ICON_SIZE)).flex_none().text_color(color)
 }
 
 fn sidebar_icon_button(id: &'static str, label: &str, icon: &str, colors: Palette) -> Button {
+    // Reserve the full hit area in layout; painted control remains 28px.
     Button::new(id)
         .debug_selector(move || id.to_owned())
-        .size(px(28.))
-        .rounded_md()
+        .group(id)
+        .size(px(ui::DESKTOP_HIT))
+        .p_0()
+        .flex_none()
         .flex()
         .items_center()
         .justify_center()
-        .text_color(colors.muted)
-        .hover(|button| button.bg(colors.selected))
         .accessibility_label(label.to_owned())
-        .child(sidebar_icon(icon, colors.muted))
+        .child(
+            div()
+                .debug_selector(move || format!("{id}-visual"))
+                .size(px(ui::CONTROL_HEIGHT))
+                .rounded(px(ui::CONTROL_RADIUS))
+                .flex()
+                .items_center()
+                .justify_center()
+                .group_hover(id, |control| control.bg(colors.selected))
+                .child(sidebar_icon(icon, colors.muted)),
+        )
 }
 
 fn sidebar_nav_button(id: String, label: &str, selected: bool, colors: Palette) -> Button {
@@ -28068,16 +28136,17 @@ fn sidebar_nav_button(id: String, label: &str, selected: bool, colors: Palette) 
     };
     let selector = id.clone();
     Button::new(id)
+        .control()
         .debug_selector(move || selector.clone())
         .w_full()
-        .h(px(32.))
-        .px_2()
-        .rounded_md()
+        .h(px(ui::CONTROL_HEIGHT))
+        .px(px(ui::CELL_INSET))
+        .rounded(px(ui::CONTROL_RADIUS))
         .flex()
         .items_center()
-        .gap_2()
+        .gap(px(ui::GAP_ICON))
         .selected(selected)
-        .text_size(px(13.))
+        .ui_text(TextRole::Body)
         .text_color(if selected { colors.text } else { colors.muted })
         .when(selected, |row| row.bg(colors.selected))
         .hover(|row| row.bg(colors.selected))
@@ -28098,11 +28167,9 @@ fn sidebar_nav_button(id: String, label: &str, selected: bool, colors: Palette) 
 
 fn side_control(label: &str, selected: bool, colors: Palette) -> Div {
     div()
-        .px_2()
-        .py_1()
-        .rounded_md()
+        .control()
         .cursor_pointer()
-        .text_xs()
+        .ui_text(TextRole::Label)
         .when(selected, |item| {
             item.bg(colors.selected).text_color(colors.text)
         })
@@ -28117,9 +28184,7 @@ fn action_link(label: &'static str, colors: Palette) -> Stateful<Div> {
 fn action_link_with_id(id: String, label: &'static str, colors: Palette) -> Stateful<Div> {
     div()
         .id(SharedString::from(id))
-        .px_2()
-        .py_1()
-        .rounded_md()
+        .control()
         .border_1()
         .border_color(colors.border)
         .cursor_pointer()
@@ -28136,12 +28201,16 @@ fn check_identity_button(
     colors: Palette,
 ) -> Button {
     Button::new(id)
+        .control()
+        .h_auto()
+        .min_h(px(ui::TWO_LINE_ROW))
+        .ui_text(TextRole::Body)
         .mb_2()
-        .p_2()
+        .p(px(ui::CELL_INSET))
         .w_full()
         .flex_col()
         .items_stretch()
-        .rounded_md()
+        .rounded(px(ui::CONTROL_RADIUS))
         .border_1()
         .border_color(if selected {
             colors.accent
@@ -28165,12 +28234,10 @@ fn checks_page_button(
     colors: Palette,
 ) -> Button {
     Button::new(id)
-        .px_2()
-        .py_1()
-        .rounded_md()
+        .control()
         .border_1()
         .border_color(colors.border)
-        .text_xs()
+        .ui_text(TextRole::Label)
         .text_color(if disabled {
             colors.faint
         } else {
@@ -28570,25 +28637,28 @@ fn observe_merge(
 
 fn command_row(label: &str, shortcut: &str, colors: Palette) -> Div {
     div()
-        .px_3()
-        .py_2()
+        .h(px(ui::ROW_HEIGHT))
+        .px(px(ui::MENU_INSET))
+        .py_0()
+        .items_center()
+        .ui_text(TextRole::Body)
         .flex()
         .justify_between()
-        .rounded_md()
+        .rounded(px(ui::CONTROL_RADIUS))
         .child(label.to_owned())
         .child(div().text_color(colors.muted).child(shortcut.to_owned()))
 }
 
 fn detail(label: &str, value: impl Into<String>, colors: Palette) -> Div {
     div()
-        .mb_4()
+        .mb(px(ui::GAP_PAGE))
         .child(
             div()
-                .text_xs()
+                .ui_text(TextRole::Label)
                 .text_color(colors.muted)
                 .child(label.to_owned()),
         )
-        .child(div().mt_1().child(value.into()))
+        .child(div().mt(px(ui::GAP_FIELD)).child(value.into()))
 }
 
 fn render_lifecycle_change(frozen: &FrozenMutation, colors: Palette) -> Div {
@@ -28597,32 +28667,42 @@ fn render_lifecycle_change(frozen: &FrozenMutation, colors: Palette) -> Div {
             .mt_2()
             .child(
                 div()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .child(label.to_owned()),
             )
-            .child(div().mt_1().text_xs().child(if value.is_empty() {
-                "(empty)".to_owned()
-            } else {
-                value.to_owned()
-            }))
+            .child(
+                div()
+                    .mt_1()
+                    .ui_text(TextRole::Caption)
+                    .child(if value.is_empty() {
+                        "(empty)".to_owned()
+                    } else {
+                        value.to_owned()
+                    }),
+            )
     };
     match frozen {
-        FrozenMutation::Lifecycle { request, .. } => match &request.action {
-            PullRequestLifecycleAction::UpdateTitle { observed, value }
-            | PullRequestLifecycleAction::UpdateBody { observed, value }
-            | PullRequestLifecycleAction::UpdateBaseBranch { observed, value } => div()
-                .child(div().mt_2().font_weight(FontWeight::SEMIBOLD).child(
-                    match &request.action {
-                        PullRequestLifecycleAction::UpdateTitle { .. } => "Title",
-                        PullRequestLifecycleAction::UpdateBody { .. } => "Description",
-                        _ => "Base branch",
-                    },
-                ))
-                .child(text("Current", observed))
-                .child(text("Replace with", value)),
-            _ => div().mt_2().text_xs().child(frozen.summary().to_owned()),
-        },
+        FrozenMutation::Lifecycle { request, .. } => {
+            match &request.action {
+                PullRequestLifecycleAction::UpdateTitle { observed, value }
+                | PullRequestLifecycleAction::UpdateBody { observed, value }
+                | PullRequestLifecycleAction::UpdateBaseBranch { observed, value } => div()
+                    .child(div().mt_2().font_weight(FontWeight::MEDIUM).child(
+                        match &request.action {
+                            PullRequestLifecycleAction::UpdateTitle { .. } => "Title",
+                            PullRequestLifecycleAction::UpdateBody { .. } => "Description",
+                            _ => "Base branch",
+                        },
+                    ))
+                    .child(text("Current", observed))
+                    .child(text("Replace with", value)),
+                _ => div()
+                    .mt_2()
+                    .ui_text(TextRole::Caption)
+                    .child(frozen.summary().to_owned()),
+            }
+        }
         FrozenMutation::Discussion { request, .. } => match &request.action {
             PullRequestDiscussionAction::Create { body } => div().child(text("Post comment", body)),
             PullRequestDiscussionAction::Edit {
@@ -28644,36 +28724,36 @@ fn compact_detail(label: &str, value: impl Into<String>, colors: Palette) -> Div
         .mt_1()
         .flex()
         .flex_wrap()
-        .gap_1()
-        .text_xs()
+        .gap(px(ui::GAP_ICON))
+        .ui_text(TextRole::Caption)
         .child(div().text_color(colors.muted).child(format!("{label}:")))
         .child(value.into())
 }
 
 fn markdown_detail(id: String, label: &str, body: &str, colors: Palette) -> Div {
     div()
-        .mb_4()
+        .mb(px(ui::GAP_PAGE))
         .child(
             div()
-                .text_xs()
+                .ui_text(TextRole::Label)
                 .text_color(colors.muted)
                 .child(label.to_owned()),
         )
         .child(
             div()
-                .mt_1()
-                .child(markdown_text(id, body, colors).text_size(px(14.))),
+                .mt(px(ui::GAP_FIELD))
+                .child(markdown_text(id, body, colors).ui_text(TextRole::Body)),
         )
 }
 
 fn activity_item(id: String, author: &str, body: &str, timestamp: &str, colors: Palette) -> Div {
     div()
-        .mb_4()
+        .mb(px(ui::GAP_PAGE))
         .child(
             div()
                 .flex()
                 .justify_between()
-                .text_xs()
+                .ui_text(TextRole::Caption)
                 .child(author.to_owned())
                 .child(
                     div()
@@ -28685,7 +28765,7 @@ fn activity_item(id: String, author: &str, body: &str, timestamp: &str, colors: 
         .child(
             div()
                 .mt_1()
-                .child(markdown_text(id, body, colors).text_size(px(14.))),
+                .child(markdown_text(id, body, colors).ui_text(TextRole::Body)),
         )
 }
 
@@ -28718,7 +28798,7 @@ fn render_reaction_row(
     let Some(snapshot) = snapshot else {
         return div()
             .mt_2()
-            .text_xs()
+            .ui_text(TextRole::Caption)
             .text_color(colors.faint)
             .child("Reactions unavailable in this snapshot.");
     };
@@ -28727,7 +28807,12 @@ fn render_reaction_row(
         .fresh_capability
         .as_ref()
         .is_some_and(|capability| capability.viewer_can_react);
-    let mut row = div().mt_2().flex().flex_wrap().gap_1().text_xs();
+    let mut row = div()
+        .mt_2()
+        .flex()
+        .flex_wrap()
+        .gap(px(ui::GAP_ICON))
+        .ui_text(TextRole::Caption);
     for content in ReactionContent::ALL {
         let group = snapshot
             .reactions
@@ -28766,9 +28851,7 @@ fn render_reaction_row(
         let root = root.clone();
         let snapshot = snapshot.clone();
         let chip = Button::new(id)
-            .px_2()
-            .py_1()
-            .rounded_md()
+            .control()
             .border_1()
             .border_color(if selected {
                 colors.accent
@@ -28831,9 +28914,9 @@ fn markdown_text(id: String, source: &str, colors: Palette) -> TextView {
                 .with_border(colors.border.into())
                 .with_heading_base_font_size(px(12.))
                 .with_heading_font_size(|level, base| match level {
-                    1 => base * 1.5,
-                    2 => base * 1.35,
-                    3 => base * 1.2,
+                    1 => px(24.),
+                    2 => px(15.),
+                    3 => px(13.),
                     _ => base,
                 })
                 .with_dark(colors.dark),
@@ -28841,8 +28924,8 @@ fn markdown_text(id: String, source: &str, colors: Palette) -> TextView {
         // gpui-base's inline flow measures each wrapped row from the inherited
         // window line height. Own that metric here so a narrow panel cannot
         // combine 12px body text and independently-sized headings on a 13px row.
-        .text_size(px(12.))
-        .line_height(px(20.))
+        .ui_text(TextRole::Body)
+        .line_height(px(18.))
         .selectable(true)
 }
 
@@ -29244,27 +29327,27 @@ fn line_text(text: &str, foreground: Rgba) -> Div {
 fn render_diff_row(row: &DiffRow, colors: Palette) -> AnyElement {
     match row {
         DiffRow::Hunk(header) => div()
-            .h(px(26.))
+            .h(px(ui::ROW_HEIGHT))
             .w_full()
-            .px_3()
+            .px(px(ui::CONTROL_INSET))
             .flex()
             .items_center()
             .bg(colors.elevated)
             .text_color(colors.accent)
             .font_family(CODE_FONT)
-            .text_xs()
+            .ui_text(TextRole::Body)
             .child(header.clone())
             .into_any_element(),
         DiffRow::Unified(line) => {
             let (background, foreground, marker) = line_colors(line.kind, colors);
             div()
-                .h(px(24.))
+                .h(px(ui::ROW_HEIGHT))
                 .w_full()
                 .flex()
                 .items_center()
                 .bg(background)
                 .font_family(CODE_FONT)
-                .text_xs()
+                .ui_text(TextRole::Body)
                 .child(line_number(line.old_line, colors))
                 .child(line_number(line.new_line, colors))
                 .child(div().w(px(18.)).text_color(foreground).child(marker))
@@ -29272,11 +29355,11 @@ fn render_diff_row(row: &DiffRow, colors: Palette) -> AnyElement {
                 .into_any_element()
         }
         DiffRow::Split(row) => div()
-            .h(px(24.))
+            .h(px(ui::ROW_HEIGHT))
             .w_full()
             .flex()
             .font_family(CODE_FONT)
-            .text_xs()
+            .ui_text(TextRole::Body)
             .child(split_cell(row.old.as_ref(), true, colors))
             .child(split_cell(row.new.as_ref(), false, colors))
             .into_any_element(),
@@ -29295,13 +29378,13 @@ fn render_read_only_diff_row(
         DiffRow::Unified(line) => {
             let (background, foreground, marker) = line_colors(line.kind, colors);
             div()
-                .h(px(24.))
+                .h(px(ui::ROW_HEIGHT))
                 .w_full()
                 .flex()
                 .items_center()
                 .bg(background)
                 .font_family(CODE_FONT)
-                .text_xs()
+                .ui_text(TextRole::Body)
                 .child(line_number(line.old_line, colors))
                 .child(line_number(line.new_line, colors))
                 .child(
@@ -29325,12 +29408,12 @@ fn render_read_only_diff_row(
                 .into_any_element()
         }
         DiffRow::Split(row) => div()
-            .h(px(24.))
+            .h(px(ui::ROW_HEIGHT))
             .w_full()
             .flex()
             .overflow_hidden()
             .font_family(CODE_FONT)
-            .text_xs()
+            .ui_text(TextRole::Body)
             .child(split_cell_scrolled(
                 row.old.as_ref(),
                 true,
@@ -29416,13 +29499,13 @@ fn render_unified_scrolled(
         .map(|line| (DiffSide::New, line))
         .or_else(|| line.old_line.map(|line| (DiffSide::Old, line)));
     let mut row = div()
-        .h(px(24.))
+        .h(px(ui::ROW_HEIGHT))
         .w_full()
         .flex()
         .items_center()
         .bg(background)
         .font_family(CODE_FONT)
-        .text_xs()
+        .ui_text(TextRole::Body)
         .child(line_number(line.old_line, colors))
         .child(line_number(line.new_line, colors))
         .child(
@@ -29467,12 +29550,12 @@ fn render_split_interactive(
     root: &Entity<Root>,
 ) -> AnyElement {
     div()
-        .h(px(24.))
+        .h(px(ui::ROW_HEIGHT))
         .w_full()
         .flex()
         .overflow_hidden()
         .font_family(CODE_FONT)
-        .text_xs()
+        .ui_text(TextRole::Body)
         .child(split_cell_scrolled_interactive(
             row.old.as_ref(),
             true,
@@ -29536,7 +29619,7 @@ fn render_inline_thread(
     let mut card = div()
         .w_full()
         .min_h(px(72.))
-        .px_4()
+        .px(px(ui::PANEL_GUTTER))
         .py_3()
         .bg(if colors.dark {
             rgba(0x232934ff)
@@ -29550,12 +29633,12 @@ fn render_inline_thread(
                 .flex()
                 .items_center()
                 .justify_between()
-                .text_xs()
+                .ui_text(TextRole::Body)
                 .child(format!("Review thread · {state} · {anchor_label}"))
                 .child(
                     div()
                         .flex()
-                        .gap_2()
+                        .gap(px(ui::GAP_GROUP))
                         .child(
                             action_link_with_id(
                                 format!("thread-reply-{remote_id}"),
@@ -29609,13 +29692,16 @@ fn render_inline_thread(
                 .border_l_2()
                 .border_color(colors.accent)
                 .child(
-                    div().text_xs().text_color(colors.muted).child(
-                        comment
-                            .author
-                            .as_deref()
-                            .unwrap_or("Unknown author")
-                            .to_owned(),
-                    ),
+                    div()
+                        .ui_text(TextRole::Body)
+                        .text_color(colors.muted)
+                        .child(
+                            comment
+                                .author
+                                .as_deref()
+                                .unwrap_or("Unknown author")
+                                .to_owned(),
+                        ),
                 )
                 .child(markdown_text(
                     format!("inline-thread-{remote_id}-{position}"),
@@ -29638,7 +29724,7 @@ fn render_inline_thread(
         card = card.child(
             div()
                 .mt_2()
-                .text_xs()
+                .ui_text(TextRole::Body)
                 .text_color(colors.amber)
                 .child("Thread replies are partial; GitHub response limits were reached."),
         );
@@ -29656,7 +29742,7 @@ fn render_inline_thread(
                 .h(px(82.))
                 .border_1()
                 .border_color(colors.border)
-                .rounded_md()
+                .rounded(px(ui::CONTROL_RADIUS))
                 .overflow_hidden()
                 .child(Textarea::new(reply_input)),
         );
@@ -29664,8 +29750,8 @@ fn render_inline_thread(
             div()
                 .mt_2()
                 .flex()
-                .gap_2()
-                .text_xs()
+                .gap(px(ui::GAP_GROUP))
+                .ui_text(TextRole::Body)
                 .when_some(pending_review, |row, pending_review| {
                     row.child(
                         action_link_with_id(
@@ -29761,7 +29847,7 @@ fn render_inline_composer(
         .key_context("ReviewComposer")
         .w_full()
         .min_h(px(172.))
-        .px_4()
+        .px(px(ui::PANEL_GUTTER))
         .py_3()
         .bg(if colors.dark {
             rgba(0x202a24ff)
@@ -29774,7 +29860,7 @@ fn render_inline_composer(
             div()
                 .flex()
                 .justify_between()
-                .text_xs()
+                .ui_text(TextRole::Body)
                 .text_color(colors.muted)
                 .child(format!("New inline comment · {range}"))
                 .child(if split_mode {
@@ -29787,7 +29873,7 @@ fn render_inline_composer(
             composer.child(
                 div()
                     .mt_1()
-                    .text_xs()
+                    .ui_text(TextRole::Body)
                     .text_color(colors.muted)
                     .child(
                         "Shown in the selected direct pair · independently re-anchored to the retained Full PR patch",
@@ -29800,7 +29886,7 @@ fn render_inline_composer(
                 .h(px(88.))
                 .border_1()
                 .border_color(colors.border)
-                .rounded_md()
+                .rounded(px(ui::CONTROL_RADIUS))
                 .overflow_hidden()
                 .child(Textarea::new(input)),
         )
@@ -29809,8 +29895,8 @@ fn render_inline_composer(
                 .mt_2()
                 .flex()
                 .items_center()
-                .gap_3()
-                .text_xs()
+                .gap(px(ui::GAP_COLUMNS))
+                .ui_text(TextRole::Body)
                 .child(
                     action_link("Save locally", colors).on_click(move |_, _, cx| {
                         save_root.update(cx, |root, cx| {
@@ -29862,7 +29948,7 @@ fn render_file_composer(
     div()
         .w_full()
         .min_h(px(174.))
-        .px_4()
+        .px(px(ui::PANEL_GUTTER))
         .py_3()
         .bg(if colors.dark {
             rgba(0x202a24ff)
@@ -29875,7 +29961,7 @@ fn render_file_composer(
             div()
                 .flex()
                 .justify_between()
-                .text_xs()
+                .ui_text(TextRole::Body)
                 .text_color(colors.muted)
                 .child(format!("New file-level comment · {}", state.target.path))
                 .child(format!("reviewed {}", short_sha(&state.target.commit_sha))),
@@ -29883,7 +29969,7 @@ fn render_file_composer(
         .child(
             div()
                 .mt_1()
-                .text_xs()
+                .ui_text(TextRole::Body)
                 .text_color(colors.muted)
                 .child("Targets the whole file; no line or diff side will be sent."),
         )
@@ -29893,7 +29979,7 @@ fn render_file_composer(
                 .h(px(88.))
                 .border_1()
                 .border_color(colors.border)
-                .rounded_md()
+                .rounded(px(ui::CONTROL_RADIUS))
                 .overflow_hidden()
                 .child(Textarea::new(input)),
         )
@@ -29902,8 +29988,8 @@ fn render_file_composer(
                 .mt_2()
                 .flex()
                 .items_center()
-                .gap_3()
-                .text_xs()
+                .gap(px(ui::GAP_COLUMNS))
+                .ui_text(TextRole::Body)
                 .child(
                     action_link("Save locally", colors).on_click(move |_, _, cx| {
                         save_root.update(cx, |root, cx| {
@@ -29951,7 +30037,7 @@ fn diff_horizontal_scrollbar(index: usize, horizontal: &ScrollHandle) -> Div {
 fn line_number(number: Option<u64>, colors: Palette) -> Div {
     div()
         .w(px(48.))
-        .px_2()
+        .px(px(ui::CELL_INSET))
         .text_right()
         .text_color(colors.faint)
         .child(number.map(|number| number.to_string()).unwrap_or_default())
@@ -30101,12 +30187,12 @@ impl EditorWorkspace {
 
     fn render(&mut self, window: &mut Window, cx: &mut Context<Root>) -> impl IntoElement {
         let colors = palette(is_dark(window));
-        div().size_full().flex().flex_col().p_6().gap_4()
+        div().size_full().flex().flex_col().p(px(ui::PANEL_GUTTER)).gap(px(ui::GAP_PAGE))
             .bg(colors.canvas).font_family(UI_FONT).text_color(colors.text)
-            .child(div().text_lg().child("Open a pull request to edit locally"))
+            .child(div().ui_text(TextRole::Title).child("Open a pull request to edit locally"))
             .child(self.path.display().to_string())
             .child("Choose Edit locally in a pull-request tab, then create a dedicated checkout or attach an existing one.")
-            .child(div().id("open-review-from-legacy-editor").px_3().py_2().rounded_md()
+            .child(div().id("open-review-from-legacy-editor").control()
                 .bg(colors.selected).cursor_pointer().child("Open review workspace")
                 .on_click(cx.listener(|root, _, window, cx| {
                     *root = Root::review(window, cx, Startup::default());
@@ -30184,6 +30270,92 @@ mod layout_tests {
     };
     #[cfg(feature = "ui-smoke")]
     use tempfile::tempdir;
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn density_controls_keep_visual_metrics_and_real_hit_targets(cx: &mut gpui::TestAppContext) {
+        use cibergit::ui::{self, Density, TextRole};
+        use gpui::{prelude::*, *};
+        struct Harness {
+            input: Entity<gpui_base::input::InputState>,
+            clicks: Rc<Cell<usize>>,
+        }
+        impl Render for Harness {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let colors = super::palette(false);
+                let clicks = self.clicks.clone();
+                div()
+                    .size_full()
+                    .p(px(ui::PANEL_GUTTER))
+                    .ui_text(TextRole::Body)
+                    .child(
+                        super::field_label("Repository", colors)
+                            .debug_selector(|| "density-label".into()),
+                    )
+                    .child(
+                        super::input_box(&self.input, colors)
+                            .debug_selector(|| "density-input".into()),
+                    )
+                    .child(
+                        super::modal_button("Add repository", true, colors)
+                            .debug_selector(|| "density-button".into()),
+                    )
+                    .child(
+                        div()
+                            .badge()
+                            .debug_selector(|| "density-badge".into())
+                            .child("Open"),
+                    )
+                    .child(
+                        super::command_row("Open Checks", "⇧⌘C", colors)
+                            .debug_selector(|| "density-menu".into()),
+                    )
+                    .child(super::sidebar_nav_button(
+                        "density-nav".into(),
+                        "Pull requests",
+                        true,
+                        colors,
+                    ))
+                    .child(
+                        super::sidebar_icon_button("density-icon", "Search", "search", colors)
+                            .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+                    )
+            }
+        }
+        cx.update(gpui_base::init);
+        let clicks = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view(|window, cx| Harness {
+            input: cx.new(|cx| gpui_base::input::InputState::new(window, cx)),
+            clicks: clicks.clone(),
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for (id, height) in [
+            ("density-label", 16.),
+            ("density-input", 28.),
+            ("density-button", 28.),
+            ("density-badge", 20.),
+            ("density-menu", 28.),
+            ("density-nav", 28.),
+            ("density-icon", 40.),
+            ("density-icon-visual", 28.),
+        ] {
+            assert_eq!(cx.debug_bounds(id).unwrap().size.height, px(height), "{id}");
+        }
+        let label = cx.debug_bounds("density-label").unwrap();
+        let input = cx.debug_bounds("density-input").unwrap();
+        assert_eq!(input.top() - label.bottom(), px(6.));
+        assert_eq!(input.left(), px(20.));
+        let target = cx.debug_bounds("density-icon").unwrap();
+        let visual = cx.debug_bounds("density-icon-visual").unwrap();
+        let edge = target.origin + point(px(2.), px(2.));
+        assert!(!visual.contains(&edge));
+        cx.simulate_click(edge, Modifiers::default());
+        assert_eq!(
+            clicks.get(),
+            1,
+            "padding outside the painted icon must be clickable"
+        );
+    }
 
     #[cfg(feature = "ui-smoke")]
     #[gpui::test]

@@ -13,6 +13,7 @@ use cibergit::rebase::{
     OperationState as RebaseState, PlanAction, PlanStep, PrepareOutcome, RebasePlan,
     RebasePreparation, SplitState, StashRestoreState,
 };
+use cibergit::ui::{self, Density, TextRole};
 use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1493,7 +1494,7 @@ impl LocalWorkspace {
         let inputs_frozen = pending.is_some();
         let selected = self.rebase.selected_step;
         let inventory = self.rebase_inventory().cloned();
-        let mut plan_rows = div().flex().flex_col().gap_1();
+        let mut plan_rows = div().flex().flex_col().gap(px(ui::GAP_ICON));
         for (index, step) in self.rebase.steps.clone().into_iter().enumerate() {
             let commit = inventory.as_ref().and_then(|inventory| {
                 inventory
@@ -1510,9 +1511,7 @@ impl LocalWorkspace {
                 div()
                     .id(ElementId::Name(format!("rebase-step-{index}").into()))
                     .min_h(px(42.))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
+                    .control()
                     .border_1()
                     .border_color(if selected == Some(index) {
                         colors.accent
@@ -1533,9 +1532,14 @@ impl LocalWorkspace {
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap(px(ui::GAP_GROUP))
                             .child(div().w(px(62.)).text_color(colors.accent).child(action))
-                            .child(div().font_family(CODE_FONT).text_xs().child(oid))
+                            .child(
+                                div()
+                                    .font_family(CODE_FONT)
+                                    .ui_text(TextRole::Caption)
+                                    .child(oid),
+                            )
                             .child(
                                 div()
                                     .flex_1()
@@ -1555,10 +1559,10 @@ impl LocalWorkspace {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .p_4()
+            .p(px(ui::PANEL_GUTTER))
             .flex()
             .flex_col()
-            .gap_3();
+            .gap(px(ui::GAP_COLUMNS));
         if self.rebase.conflict_view.is_some() {
             content = content.child(self.render_conflict_view(colors, window, cx));
         } else if let Some(operation) = operation {
@@ -1576,7 +1580,7 @@ impl LocalWorkspace {
                 }
                 PrepareOutcome::Dirty(dirty) => {
                     content = content.child(
-                        div().flex().gap_2()
+                        div().flex().gap(px(ui::GAP_GROUP))
                             .child(action_button("Commit in Local Changes", colors, cx.listener(|this, _, _, cx| this.route_dirty_commit(cx))))
                             .child(action_button("Stash including untracked", colors, cx.listener(|this, _, _, cx| this.request_create_stash(cx))))
                             .child(action_button("Cancel preparation", colors, cx.listener(|this, _, _, cx| this.cancel_rebase_preparation(cx))))
@@ -1594,10 +1598,10 @@ impl LocalWorkspace {
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .child(div().font_weight(FontWeight::SEMIBOLD).child("LINEAR PLAN"))
+                                .child(div().font_weight(FontWeight::MEDIUM).child("LINEAR PLAN"))
                                 .child(
                                     div()
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
                                         .text_color(colors.muted)
                                         .child("⌘↑ / ⌘↓ moves the selected commit"),
                                 ),
@@ -1618,8 +1622,8 @@ impl LocalWorkspace {
             }
         } else {
             content = content
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("CHOOSE A LOCAL BASE"))
-                .child(div().text_xs().text_color(colors.muted).child("Candidates below are already resolved to immutable full commit OIDs. Manual input accepts HEAD, a full OID, or a fully-qualified refs/* name; ambiguous expressions are refused."))
+                .child(div().font_weight(FontWeight::MEDIUM).child("CHOOSE A LOCAL BASE"))
+                .child(div().ui_text(TextRole::Caption).text_color(colors.muted).child("Candidates below are already resolved to immutable full commit OIDs. Manual input accepts HEAD, a full OID, or a fully-qualified refs/* name; ambiguous expressions are refused."))
                 .child(Input::new(&self.rebase.base));
             if let Some(snapshot) = self.snapshot.clone() {
                 if let Some(oid) = snapshot.upstream_oid {
@@ -1661,18 +1665,18 @@ impl LocalWorkspace {
                     div()
                         .mt_2()
                         .p_2()
-                        .rounded_md()
+                        .rounded(px(ui::CONTROL_RADIUS))
                         .border_1()
                         .border_color(colors.amber)
                         .font_family(CODE_FONT)
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .whitespace_normal()
                         .child(description)
                 }))
                 .child(
                     div()
                         .mt_2()
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .child("Plan, base, and message inputs are disabled until Cancel. Confirmation rechecks their exact frozen identity before dispatch."),
                 )
@@ -1680,7 +1684,7 @@ impl LocalWorkspace {
                     div()
                         .mt_2()
                         .flex()
-                        .gap_2()
+                        .gap(px(ui::GAP_GROUP))
                         .child(action_button(
                             "Confirm exact transition",
                             colors,
@@ -1704,7 +1708,7 @@ impl LocalWorkspace {
             .child(
                 div()
                     .min_h(px(52.))
-                    .px_4()
+                    .px(px(ui::PANEL_GUTTER))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -1713,10 +1717,10 @@ impl LocalWorkspace {
                     .border_color(colors.border)
                     .child(
                         div()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child("REBASE"))
+                            .child(div().font_weight(FontWeight::MEDIUM).child("REBASE"))
                             .child(
                                 div()
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .text_color(colors.muted)
                                     .child("Rebase this branch"),
                             ),
@@ -1731,11 +1735,11 @@ impl LocalWorkspace {
             .child(
                 div()
                     .min_h(px(36.))
-                    .px_4()
+                    .px(px(ui::PANEL_GUTTER))
                     .py_2()
                     .border_t_1()
                     .border_color(colors.border)
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .child(self.rebase.status.clone()),
             )
@@ -1751,7 +1755,7 @@ impl LocalWorkspace {
         let actions = div()
             .flex()
             .flex_wrap()
-            .gap_1()
+            .gap(px(ui::GAP_ICON))
             .child(action_button(
                 "Pick",
                 colors,
@@ -1797,7 +1801,7 @@ impl LocalWorkspace {
             .h(px(170.))
             .flex()
             .flex_col()
-            .gap_2()
+            .gap(px(ui::GAP_GROUP))
             .child(actions)
             .child(
                 div()
@@ -1805,7 +1809,7 @@ impl LocalWorkspace {
                     .min_h_0()
                     .border_1()
                     .border_color(colors.border)
-                    .rounded_md()
+                    .rounded(px(ui::CONTROL_RADIUS))
                     .font_family(CODE_FONT)
                     .child(Editor::new(&self.rebase.message)),
             )
@@ -1829,7 +1833,7 @@ impl LocalWorkspace {
         let tab = self.documents.get(&path);
         let tab_state = tab.map(|tab| (tab.editor.clone(), tab.view.status, tab.message.clone()));
 
-        let mut selectors = div().flex().flex_wrap().gap_2();
+        let mut selectors = div().flex().flex_wrap().gap(px(ui::GAP_GROUP));
         for source in ConflictSource::ALL {
             let label = view.source(source).0;
             selectors = selectors.child(
@@ -1848,7 +1852,7 @@ impl LocalWorkspace {
         }
 
         let mut sources = if wide {
-            div().flex().gap_2()
+            div().flex().gap(px(ui::GAP_GROUP))
         } else {
             div().flex().flex_col()
         };
@@ -1865,31 +1869,31 @@ impl LocalWorkspace {
         let mut body = div()
             .flex()
             .flex_col()
-            .gap_3()
+            .gap(px(ui::GAP_COLUMNS))
             .child(
                 div()
                     .flex()
                     .items_start()
                     .justify_between()
-                    .gap_3()
+                    .gap(px(ui::GAP_COLUMNS))
                     .child(
                         div()
                             .min_w_0()
                             .child(
                                 div()
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(FontWeight::MEDIUM)
                                     .child("THREE-WAY CONFLICT"),
                             )
                             .child(
                                 div()
                                     .font_family(CODE_FONT)
-                                    .text_xs()
+                                    .ui_text(TextRole::Caption)
                                     .child(view.conflict().path.display.clone()),
                             )
                             .when(view.show_details(), |header| {
                                 header.child(
                                     div()
-                                        .text_xs()
+                                        .ui_text(TextRole::Caption)
                                         .text_color(colors.muted)
                                         .child(format!("Operation {}", view.operation_id())),
                                 )
@@ -1919,12 +1923,12 @@ impl LocalWorkspace {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap_2()
+                    .gap(px(ui::GAP_GROUP))
                     .child(selectors)
                     .child(
                         div()
                             .flex()
-                            .gap_2()
+                            .gap(px(ui::GAP_GROUP))
                             .child(
                                 action_button(
                                     if view.show_details() {
@@ -1962,7 +1966,7 @@ impl LocalWorkspace {
             )
             .child(
                 div()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .child(if wide {
                         "Immutable sources are side by side. Select with the mouse or ⌘← / ⌘→; each pane scrolls to the actual end of long lines."
@@ -1974,7 +1978,7 @@ impl LocalWorkspace {
 
         let result_header = div()
             .min_h(px(42.))
-            .px_3()
+            .px(px(ui::CONTROL_INSET))
             .flex()
             .items_center()
             .justify_between()
@@ -1984,12 +1988,12 @@ impl LocalWorkspace {
                 div()
                     .child(
                         div()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::MEDIUM)
                             .child("EDITABLE RESULT"),
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child("Same Local Changes document · save is explicit"),
                     ),
@@ -1997,7 +2001,7 @@ impl LocalWorkspace {
         if !editor_candidate {
             body = body.child(
                 div()
-                    .rounded_md()
+                    .rounded(px(ui::CONTROL_RADIUS))
                     .border_1()
                     .border_color(colors.red)
                     .bg(colors.surface)
@@ -2019,7 +2023,7 @@ impl LocalWorkspace {
             );
             let result_actions = div()
                 .flex()
-                .gap_2()
+                .gap(px(ui::GAP_GROUP))
                 .child(
                     action_button(
                         "Save result ⌘S",
@@ -2048,7 +2052,7 @@ impl LocalWorkspace {
                 .min_h(px(220.))
                 .flex()
                 .flex_col()
-                .rounded_md()
+                .rounded(px(ui::CONTROL_RADIUS))
                 .border_1()
                 .border_color(if disk_conflict {
                     colors.red
@@ -2098,11 +2102,11 @@ impl LocalWorkspace {
                 result.child(
                     div()
                         .min_h(px(30.))
-                        .px_3()
+                        .px(px(ui::CONTROL_INSET))
                         .py_1()
                         .border_t_1()
                         .border_color(colors.border)
-                        .text_xs()
+                        .ui_text(TextRole::Caption)
                         .text_color(if status == DocumentStatus::Clean {
                             colors.green
                         } else if status == DocumentStatus::Dirty {
@@ -2117,7 +2121,7 @@ impl LocalWorkspace {
             body = body.child(
                 div()
                     .h(px(220.))
-                    .rounded_md()
+                    .rounded(px(ui::CONTROL_RADIUS))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.surface)
@@ -2158,7 +2162,7 @@ impl LocalWorkspace {
         let mut body = div()
             .flex()
             .flex_col()
-            .gap_3()
+            .gap(px(ui::GAP_COLUMNS))
             .child(
                 div()
                     .flex()
@@ -2166,23 +2170,23 @@ impl LocalWorkspace {
                     .justify_between()
                     .child(
                         div()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::MEDIUM)
                             .child(format!("{} · attempt {}", state, operation.attempt)),
                     )
                     .child(
                         div()
                             .font_family(CODE_FONT)
-                            .text_xs()
+                            .ui_text(TextRole::Caption)
                             .child(short_oid(&operation.original_head_oid)),
                     ),
             )
             .child(
                 div()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap(px(ui::GAP_ICON))
                     .child(format!("branch {}", operation.original_branch))
                     .child(format!("base {}", short_oid(&operation.base_oid)))
                     .children(stopped),
@@ -2207,14 +2211,14 @@ impl LocalWorkspace {
         }
         if !self.rebase.conflicts.is_empty() {
             let conflict_controls_frozen = self.rebase.has_pending_or_running();
-            body = body.child(div().font_weight(FontWeight::SEMIBOLD).child("CONFLICTS"));
+            body = body.child(div().font_weight(FontWeight::MEDIUM).child("CONFLICTS"));
             for (index, conflict) in self.rebase.conflicts.clone().into_iter().enumerate() {
                 let detail = conflict_reason(&conflict, self.rebase.show_operation_details);
-                body = body.child(div().p_2().border_1().border_color(colors.border).rounded_md()
+                body = body.child(div().p_2().border_1().border_color(colors.border).rounded(px(ui::CONTROL_RADIUS))
                     .child(div().font_family(CODE_FONT).child(conflict.path.display.clone()))
-                    .child(div().mt_1().text_xs().text_color(colors.muted).child(detail))
-                    .child(div().mt_1().text_xs().child("Rebase orientation: ours = already rebased series; theirs = replayed original commit."))
-                    .child(div().mt_2().flex().gap_2()
+                    .child(div().mt_1().ui_text(TextRole::Caption).text_color(colors.muted).child(detail))
+                    .child(div().mt_1().ui_text(TextRole::Caption).child("Rebase orientation: ours = already rebased series; theirs = replayed original commit."))
+                    .child(div().mt_2().flex().gap(px(ui::GAP_GROUP))
                         .child(action_button("Open sources and result", colors, cx.listener(move |this, _, window, cx| this.open_rebase_conflict(index, window, cx)))
                             .when(conflict_controls_frozen, |button| button.opacity(0.52).cursor_default()))
                         .child(action_button("Stage saved result", colors, cx.listener(move |this, _, _, cx| this.request_stage_rebase_conflict(index, cx)))
@@ -2227,7 +2231,7 @@ impl LocalWorkspace {
         match operation.state {
             RebaseState::PausedForEdit if operation.split.is_some() => {
                 body = body.child(self.render_edit_message("Split part message", colors))
-                    .child(div().flex().flex_wrap().gap_2()
+                    .child(div().flex().flex_wrap().gap(px(ui::GAP_GROUP))
                         .child(action_button("Stage via Local Changes", colors, cx.listener(|this, _, _, cx| this.route_rebase_to_local_changes("Stage the selected split paths in Local Changes, then reopen Rebase", cx))))
                         .child(action_button("Commit staged part", colors, cx.listener(|this, _, _, cx| this.request_commit_split_part(cx))))
                         .child(action_button("Finish validated split", colors, cx.listener(|this, _, _, cx| this.request_finish_split(cx))))
@@ -2235,7 +2239,7 @@ impl LocalWorkspace {
             }
             RebaseState::PausedForEdit => {
                 body = body.child(self.render_edit_message("Optional amend message", colors))
-                    .child(div().flex().flex_wrap().gap_2()
+                    .child(div().flex().flex_wrap().gap(px(ui::GAP_GROUP))
                         .child(action_button("Open/stage in Local Changes", colors, cx.listener(|this, _, _, cx| this.route_rebase_to_local_changes("Edit safely, save, and stage selected paths in Local Changes; then reopen Rebase", cx))))
                         .child(action_button("Amend", colors, cx.listener(|this, _, _, cx| this.request_amend_rebase(cx))))
                         .child(action_button("Begin split", colors, cx.listener(|this, _, _, cx| this.request_begin_split(cx))))
@@ -2253,7 +2257,7 @@ impl LocalWorkspace {
                     body = body.child(
                         div()
                             .flex()
-                            .gap_2()
+                            .gap(px(ui::GAP_GROUP))
                             .child(action_button(
                                 "Continue",
                                 colors,
@@ -2276,7 +2280,7 @@ impl LocalWorkspace {
                 body = body.child(
                     div()
                         .flex()
-                        .gap_2()
+                        .gap(px(ui::GAP_GROUP))
                         .child(action_button(
                             "Observe now",
                             colors,
@@ -2293,15 +2297,16 @@ impl LocalWorkspace {
                 if !operation.resulting_commits.is_empty() {
                     body = body.child(
                         div()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::MEDIUM)
                             .child("RESULTING COMMITS"),
                     );
                     for commit in &operation.resulting_commits {
-                        body = body.child(div().font_family(CODE_FONT).text_xs().child(format!(
-                            "{}  {}",
-                            commit.oid,
-                            first_line(&commit.message)
-                        )));
+                        body = body.child(
+                            div()
+                                .font_family(CODE_FONT)
+                                .ui_text(TextRole::Caption)
+                                .child(format!("{}  {}", commit.oid, first_line(&commit.message))),
+                        );
                     }
                 }
                 if operation.publish_handoff.is_some() {
@@ -2312,7 +2317,7 @@ impl LocalWorkspace {
                 body = body.child(
                     div()
                         .flex()
-                        .gap_2()
+                        .gap(px(ui::GAP_GROUP))
                         .when(unrestored, |row| {
                             row.child(action_button(
                                 "Restore exact retained stash",
@@ -2343,10 +2348,10 @@ impl LocalWorkspace {
             .h(px(150.))
             .flex()
             .flex_col()
-            .gap_1()
+            .gap(px(ui::GAP_ICON))
             .child(
                 div()
-                    .text_xs()
+                    .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .child(if inputs_frozen {
                         format!("{label} · frozen until Cancel")
@@ -2360,7 +2365,7 @@ impl LocalWorkspace {
                     .min_h_0()
                     .border_1()
                     .border_color(colors.border)
-                    .rounded_md()
+                    .rounded(px(ui::CONTROL_RADIUS))
                     .font_family(CODE_FONT)
                     .child(Editor::new(&self.rebase.message))
                     .when(inputs_frozen, |editor| editor.opacity(0.62)),
@@ -2585,11 +2590,11 @@ fn render_preparation_summary(outcome: &PrepareOutcome, colors: LocalPalette) ->
     };
     div()
         .p_3()
-        .rounded_md()
+        .rounded(px(ui::CONTROL_RADIUS))
         .border_1()
         .border_color(colors.border)
         .bg(colors.surface)
-        .child(div().font_weight(FontWeight::SEMIBOLD).child(format!(
+        .child(div().font_weight(FontWeight::MEDIUM).child(format!(
             "{} commits · {}",
             inventory.commits.len(),
             inventory.branch
@@ -2598,14 +2603,14 @@ fn render_preparation_summary(outcome: &PrepareOutcome, colors: LocalPalette) ->
             div()
                 .mt_1()
                 .font_family(CODE_FONT)
-                .text_xs()
+                .ui_text(TextRole::Body)
                 .child(format!("base {}", inventory.base_oid)),
         )
         .child(
             div()
                 .mt_1()
                 .font_family(CODE_FONT)
-                .text_xs()
+                .ui_text(TextRole::Body)
                 .child(format!("head {}", inventory.head_oid)),
         )
         .into_any_element()
@@ -2642,15 +2647,15 @@ fn notice_box(
 ) -> Div {
     div()
         .p_3()
-        .rounded_md()
+        .rounded(px(ui::CONTROL_RADIUS))
         .border_1()
         .border_color(accent)
         .bg(colors.surface)
-        .child(div().font_weight(FontWeight::SEMIBOLD).child(title.into()))
+        .child(div().font_weight(FontWeight::MEDIUM).child(title.into()))
         .child(
             div()
                 .mt_1()
-                .text_xs()
+                .ui_text(TextRole::Caption)
                 .whitespace_normal()
                 .child(body.into()),
         )
@@ -2660,22 +2665,22 @@ fn operation_details_box(operation: &RebaseOperationView, colors: LocalPalette) 
     let active = operation.active.as_ref();
     div()
         .p_3()
-        .rounded_md()
+        .rounded(px(ui::CONTROL_RADIUS))
         .border_1()
         .border_color(colors.accent)
         .bg(colors.surface)
         .child(
             div()
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(FontWeight::MEDIUM)
                 .child("Operation details"),
         )
         .child(
             div()
                 .mt_1()
-                .text_xs()
+                .ui_text(TextRole::Caption)
                 .flex()
                 .flex_col()
-                .gap_1()
+                .gap(px(ui::GAP_ICON))
                 .child(format!("operation {}", operation.operation_id))
                 .child(format!("base {}", operation.base_oid))
                 .child(format!("original {}", operation.original_head_oid))

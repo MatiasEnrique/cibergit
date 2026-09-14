@@ -2,6 +2,7 @@
 use super::local_workspace::{
     LocalWorkspace, LocalWorkspaceAppearance, LocalWorkspaceContext, PrPublishContext,
 };
+use cibergit::ui::{self, Density, TextRole};
 use cibergit::{
     domain::{PullRequest, PullRequestCheckoutSource, Repository, Revision},
     local_git::LocalGit,
@@ -453,24 +454,24 @@ impl Render for LocalCheckout {
             WindowAppearance::Dark | WindowAppearance::VibrantDark
         );
         let colors = super::palette(dark);
-        div().size_full().flex().flex_col().p_6().gap_4().bg(colors.surface).text_color(colors.text)
-            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Edit this pull request locally"))
+        div().size_full().flex().flex_col().p(px(ui::PANEL_GUTTER)).gap(px(ui::GAP_PAGE)).bg(colors.surface).text_color(colors.text)
+            .child(div().ui_text(TextRole::Title).font_weight(FontWeight::MEDIUM).child("Edit this pull request locally"))
             .child(format!("{} #{} · Review commit {}", self.repository.full_name(), self.pull.number, &self.revision.head_sha[..self.revision.head_sha.len().min(12)]))
             .when_some(self.source.as_ref(), |view, source| view.child(format!("PR source: {} · {}",
                 source.source_repository.as_ref().map(Repository::full_name).unwrap_or_else(|| "repository unavailable".into()), source.source_branch)))
             .child(div().text_color(colors.muted).child("A dedicated checkout keeps local edits separate. Existing checkouts are attached only when you choose them. Closing this tab keeps the checkout and recovery files."))
-            .child(div().h(px(36.)).flex_shrink_0().child(Input::new(&self.branch_input)))
-            .child(div().id("create-pr-checkout").px_3().py_2().rounded_md().bg(colors.selected).cursor_pointer()
+            .child(div().h(px(ui::CONTROL_HEIGHT)).flex_shrink_0().child(Input::new(&self.branch_input)))
+            .child(div().id("create-pr-checkout").control().bg(colors.selected).cursor_pointer()
                 .child(if self.busy { "Working…" } else { "Create dedicated checkout" })
                 .on_click(cx.listener(|this, _, _, cx| this.create(cx))))
-            .child(div().h(px(36.)).flex_shrink_0().child(Input::new(&self.path_input)))
-            .child(div().id("attach-pr-checkout").px_3().py_2().rounded_md().bg(colors.selected).cursor_pointer()
+            .child(div().h(px(ui::CONTROL_HEIGHT)).flex_shrink_0().child(Input::new(&self.path_input)))
+            .child(div().id("attach-pr-checkout").control().bg(colors.selected).cursor_pointer()
                 .child("Verify and attach existing checkout")
                 .on_click(cx.listener(|this, _, _, cx| this.inspect_attachment(cx))))
-            .child(div().id("reconcile-pr-checkout").px_3().py_2().rounded_md().cursor_pointer()
+            .child(div().id("reconcile-pr-checkout").control().cursor_pointer()
                 .child("Reconcile interrupted setup")
                 .on_click(cx.listener(|this, _, _, cx| this.reconcile_setup(cx))))
-            .child(div().text_sm().text_color(colors.muted).child(self.notice.clone()))
+            .child(div().ui_text(TextRole::Body).text_color(colors.muted).child(self.notice.clone()))
             .into_any_element()
     }
 }
