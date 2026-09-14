@@ -919,6 +919,7 @@ mod tests {
             review_threads: vec![ReviewThread {
                 coordinates: coordinates(repository, number, "thread-1"),
                 path: "src/lib.rs".into(),
+                subject: cibergit::domain::ReviewSubject::Line,
                 line: Some(2),
                 original_line: Some(2),
                 start_line: Some(2),
@@ -935,6 +936,7 @@ mod tests {
                     updated_at: "2026-09-13T12:02:00Z".into(),
                     url: "https://example.test/comment-1".into(),
                     path: "src/lib.rs".into(),
+                    subject: cibergit::domain::ReviewSubject::Line,
                     line: Some(2),
                     original_line: Some(2),
                     start_line: Some(2),

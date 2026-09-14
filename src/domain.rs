@@ -149,6 +149,10 @@ pub struct ReviewComment {
     pub updated_at: String,
     pub url: String,
     pub path: String,
+    /// Explicit provider subject. Cached records written before subject
+    /// support deserialize as `Unknown` and must remain read-only.
+    #[serde(default)]
+    pub subject: ReviewSubject,
     pub line: Option<u64>,
     pub original_line: Option<u64>,
     pub start_line: Option<u64>,
@@ -176,6 +180,45 @@ pub struct PendingReviewSnapshot {
     /// False when any review/thread/comment connection needed for linkage was
     /// partial or capped.
     pub comments_complete: bool,
+    /// Fresh, complete provider evidence required to target this exact pending
+    /// review with a file-level comment. This is deliberately never cached.
+    #[serde(skip)]
+    pub file_comment_source: Option<PendingFileCommentSource>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReviewSubject {
+    Line,
+    File,
+    #[default]
+    Unknown,
+}
+
+impl ReviewSubject {
+    pub fn from_provider(value: &str) -> Self {
+        match value {
+            "LINE" => Self::Line,
+            "FILE" => Self::File,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Immutable provider evidence from one fresh, complete pending-review read.
+/// It is frozen into a file-comment request and checked again immediately
+/// before dispatch; it is not cached permission or pending authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingFileCommentSource {
+    pub viewer_login: String,
+    pub repository: Repository,
+    pub pull_request: ProviderCoordinates,
+    pub pull_request_state: String,
+    pub current_base_sha: String,
+    pub current_head_sha: String,
+    pub review: ProviderCoordinates,
+    pub review_author: String,
+    pub review_commit_sha: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,6 +482,8 @@ pub struct ReviewWriteAcknowledgement {
     pub operation_id: String,
     pub review_id: Option<String>,
     pub comment_id: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -600,6 +645,10 @@ pub struct BranchDeletionAcknowledgement {
 pub struct ReviewThread {
     pub coordinates: ProviderCoordinates,
     pub path: String,
+    /// Explicit provider subject. `Unknown` is never inferred from missing line
+    /// fields and cannot authorize reply/edit/resolve affordances.
+    #[serde(default)]
+    pub subject: ReviewSubject,
     pub line: Option<u64>,
     pub original_line: Option<u64>,
     pub start_line: Option<u64>,

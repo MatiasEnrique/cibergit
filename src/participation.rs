@@ -5,8 +5,8 @@
 
 use crate::{
     domain::{
-        Account, ChangedFile, Comparison, ProviderCoordinates, PullRequestDetails, Repository,
-        Revision,
+        Account, ChangedFile, Comparison, PendingFileCommentSource, ProviderCoordinates,
+        PullRequestDetails, Repository, Revision,
     },
     review::{
         ComparisonMetadata, ComparisonMode, DiffLineKind, ReviewSession, file_key, parse_file,
@@ -428,6 +428,27 @@ pub struct PublishedPosition {
     pub start_side: Option<DiffSide>,
 }
 
+/// Exact provider-safe identity for a file in the canonical published PR
+/// comparison. No line or side is implied by this value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedFile {
+    pub base_sha: String,
+    pub commit_sha: String,
+    /// Raw-safe local key used to select the exact file without lossy path
+    /// conversion.
+    pub file_key: String,
+    /// UTF-8 path accepted by the provider API.
+    pub path: String,
+    pub previous_path: Option<String>,
+    pub raw_previous_path: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewCommentTarget {
+    Line(PublishedPosition),
+    File(PublishedFile),
+}
+
 /// A comparison explicitly identified as the full published PR patch. The
 /// marker prevents accidentally validating against the active commit/range view.
 #[derive(Clone, Copy, Debug)]
@@ -522,6 +543,52 @@ pub fn map_to_canonical_published(
     })
 }
 
+/// Prove that the selected file is the same exact file in the retained Full PR
+/// comparison. Patch text is intentionally irrelevant, so empty and binary
+/// files remain eligible when their provider path and file identity are exact.
+pub fn map_file_to_canonical_published(
+    displayed: &ReviewSession,
+    selected_file_key: &str,
+    canonical: CanonicalPublishedPatch<'_>,
+) -> Result<PublishedFile, MappingIssue> {
+    let displayed_file = displayed
+        .comparison()
+        .files
+        .iter()
+        .find(|file| file_key(file) == selected_file_key)
+        .ok_or(MappingIssue::FileMissing)?;
+    let canonical = canonical.comparison();
+    if displayed.revision().head_sha != canonical.revision.head_sha {
+        return Err(MappingIssue::OutdatedRevision {
+            reviewed_head: displayed.revision().head_sha.clone(),
+            canonical_head: canonical.revision.head_sha.clone(),
+        });
+    }
+    let canonical_file = canonical
+        .files
+        .iter()
+        .find(|file| file_key(file) == selected_file_key)
+        .ok_or(MappingIssue::FileMissing)?;
+    if displayed_file.path != canonical_file.path
+        || displayed_file.previous_path != canonical_file.previous_path
+        || displayed_file.raw_path != canonical_file.raw_path
+        || displayed_file.raw_previous_path != canonical_file.raw_previous_path
+    {
+        return Err(MappingIssue::FileIdentityChanged);
+    }
+    if canonical_file.raw_path.is_some() {
+        return Err(MappingIssue::RawPathUnsupported);
+    }
+    Ok(PublishedFile {
+        base_sha: canonical.revision.base_sha.clone(),
+        commit_sha: canonical.revision.head_sha.clone(),
+        file_key: file_key(canonical_file),
+        path: canonical_file.path.clone(),
+        previous_path: canonical_file.previous_path.clone(),
+        raw_previous_path: canonical_file.raw_previous_path.clone(),
+    })
+}
+
 fn coordinate_has_valid_shape(coordinate: &DraftCoordinate) -> bool {
     let selection = LineSelection {
         side: coordinate.side,
@@ -592,6 +659,17 @@ pub struct LocalDraft {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalFileDraft {
+    pub id: String,
+    pub target: PublishedFile,
+    pub body: String,
+    pub dirty: bool,
+    pub disposition: DraftDisposition,
+    pub remote: Option<RemoteDraftIds>,
+    pub observed_remote_body: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewEvent {
     Comment,
     Approve,
@@ -601,6 +679,7 @@ pub enum ReviewEvent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewOperationTarget {
     SynchronizePendingComment { draft_id: String },
+    SynchronizePendingFileComment { draft_id: String },
     PostImmediateComment { draft_id: String },
     SubmitReview { event: ReviewEvent },
 }
@@ -646,6 +725,7 @@ pub struct ReviewOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewOperationPayload {
     PendingComment(PendingCommentIntent),
+    PendingFileComment(PendingFileCommentIntent),
     ImmediateComment(ImmediateCommentIntent),
     Submission(SubmissionIntent),
 }
@@ -659,6 +739,29 @@ pub struct PendingCommentIntent {
     pub position: PublishedPosition,
     pub pending_review_id: Option<String>,
     pub existing_comment_id: Option<String>,
+}
+
+/// Serializable frozen target facts. Unlike `PendingFileCommentSource`, this
+/// record does not carry freshness/capability authority after restart; the
+/// provider must repeat the complete pending-review read before dispatch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingFileReviewTarget {
+    pub pull_request: ProviderCoordinates,
+    pub pending_review: ProviderCoordinates,
+    pub selected_author: String,
+    pub observed_base_sha: String,
+    pub observed_head_sha: String,
+    pub review_commit_sha: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingFileCommentIntent {
+    pub operation_id: String,
+    pub key: ReviewKey,
+    pub draft_id: String,
+    pub body: String,
+    pub target: ReviewCommentTarget,
+    pub pending: PendingFileReviewTarget,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -686,6 +789,8 @@ pub struct ReviewComposition {
     pub key: ReviewKey,
     pub reviewed_revision: Revision,
     pub drafts: Vec<LocalDraft>,
+    #[serde(default)]
+    pub file_drafts: Vec<LocalFileDraft>,
     pub operations: Vec<ReviewOperation>,
     /// Last pending review identity observed for this account. Absence on a later
     /// refresh does not infer that the review was submitted.
@@ -707,6 +812,7 @@ impl ReviewComposition {
             key,
             reviewed_revision,
             drafts: Vec::new(),
+            file_drafts: Vec::new(),
             operations: Vec::new(),
             observed_pending_review_id: None,
             acknowledged_pending_review_id: None,
@@ -722,7 +828,7 @@ impl ReviewComposition {
         coordinate: DraftCoordinate,
         body: impl Into<String>,
     ) -> Result<&LocalDraft, ParticipationError> {
-        if self.drafts.len() >= MAX_DRAFTS {
+        if self.drafts.len() + self.file_drafts.len() >= MAX_DRAFTS {
             return Err(ParticipationError::TooManyDrafts { limit: MAX_DRAFTS });
         }
         if coordinate.reviewed_revision != self.reviewed_revision {
@@ -774,6 +880,59 @@ impl ReviewComposition {
 
     fn draft_mut(&mut self, id: &str) -> Result<&mut LocalDraft, ParticipationError> {
         self.drafts
+            .iter_mut()
+            .find(|draft| draft.id == id)
+            .ok_or_else(|| ParticipationError::DraftNotFound(id.into()))
+    }
+
+    pub fn add_file_draft(
+        &mut self,
+        target: PublishedFile,
+        body: impl Into<String>,
+    ) -> Result<&LocalFileDraft, ParticipationError> {
+        if self.drafts.len() + self.file_drafts.len() >= MAX_DRAFTS {
+            return Err(ParticipationError::TooManyDrafts { limit: MAX_DRAFTS });
+        }
+        validate_published_file(&target, &self.reviewed_revision)?;
+        let body = body.into();
+        validate_text("draft text", &body, MAX_DRAFT_TEXT_BYTES)?;
+        let id = format!("draft-{}", self.next_draft_number);
+        self.next_draft_number = self.next_draft_number.checked_add(1).ok_or_else(|| {
+            ParticipationError::OperationState("local draft identifier space is exhausted".into())
+        })?;
+        self.file_drafts.push(LocalFileDraft {
+            id,
+            target,
+            body,
+            dirty: true,
+            disposition: DraftDisposition::Pending,
+            remote: None,
+            observed_remote_body: None,
+        });
+        Ok(self.file_drafts.last().expect("just pushed"))
+    }
+
+    pub fn edit_file_draft(
+        &mut self,
+        id: &str,
+        body: impl Into<String>,
+    ) -> Result<(), ParticipationError> {
+        let body = body.into();
+        validate_text("draft text", &body, MAX_DRAFT_TEXT_BYTES)?;
+        let draft = self.file_draft_mut(id)?;
+        if draft.body != body {
+            draft.body = body;
+            draft.dirty = true;
+        }
+        Ok(())
+    }
+
+    pub fn file_draft(&self, id: &str) -> Option<&LocalFileDraft> {
+        self.file_drafts.iter().find(|draft| draft.id == id)
+    }
+
+    fn file_draft_mut(&mut self, id: &str) -> Result<&mut LocalFileDraft, ParticipationError> {
+        self.file_drafts
             .iter_mut()
             .find(|draft| draft.id == id)
             .ok_or_else(|| ParticipationError::DraftNotFound(id.into()))
@@ -831,6 +990,50 @@ impl ReviewComposition {
         Ok(intent)
     }
 
+    pub fn prepare_pending_file_comment(
+        &mut self,
+        draft_id: &str,
+        source: &PendingFileCommentSource,
+    ) -> Result<PendingFileCommentIntent, ParticipationError> {
+        self.ensure_target_available(|_| true)?;
+        let draft = self
+            .file_draft(draft_id)
+            .ok_or_else(|| ParticipationError::DraftNotFound(draft_id.into()))?;
+        if draft.disposition != DraftDisposition::Pending || draft.remote.is_some() {
+            return Err(ParticipationError::OperationState(
+                "a completed file comment is historical; create a new draft for another comment"
+                    .into(),
+            ));
+        }
+        validate_nonempty_text("draft text", &draft.body, MAX_DRAFT_TEXT_BYTES)?;
+        validate_pending_file_source(source, &self.key, &draft.target)?;
+        let body = draft.body.clone();
+        let target = ReviewCommentTarget::File(draft.target.clone());
+        let pending = PendingFileReviewTarget {
+            pull_request: source.pull_request.clone(),
+            pending_review: source.review.clone(),
+            selected_author: source.review_author.clone(),
+            observed_base_sha: source.current_base_sha.clone(),
+            observed_head_sha: source.current_head_sha.clone(),
+            review_commit_sha: source.review_commit_sha.clone(),
+        };
+        let operation_id =
+            self.push_operation(ReviewOperationTarget::SynchronizePendingFileComment {
+                draft_id: draft_id.into(),
+            })?;
+        let intent = PendingFileCommentIntent {
+            operation_id,
+            key: self.key.clone(),
+            draft_id: draft_id.into(),
+            body,
+            target,
+            pending,
+        };
+        self.operation_mut(&intent.operation_id)?.payload =
+            Some(ReviewOperationPayload::PendingFileComment(intent.clone()));
+        Ok(intent)
+    }
+
     pub fn prepare_immediate_comment(
         &mut self,
         draft_id: &str,
@@ -884,7 +1087,15 @@ impl ReviewComposition {
                 draft.disposition == DraftDisposition::Pending
                     && (draft.dirty || draft.remote.is_none())
             })
-            .count();
+            .count()
+            + self
+                .file_drafts
+                .iter()
+                .filter(|draft| {
+                    draft.disposition == DraftDisposition::Pending
+                        && (draft.dirty || draft.remote.is_none())
+                })
+                .count();
         if unsynchronized > 0 {
             return Err(ParticipationError::UnsynchronizedDrafts {
                 count: unsynchronized,
@@ -1077,6 +1288,11 @@ impl ReviewComposition {
             ReviewOperationTarget::PostImmediateComment { draft_id } => {
                 (draft_id, DraftDisposition::PostedImmediately)
             }
+            ReviewOperationTarget::SynchronizePendingFileComment { .. } => {
+                return Err(ParticipationError::OperationState(
+                    "line-comment success cannot acknowledge a file-comment operation".into(),
+                ));
+            }
             ReviewOperationTarget::SubmitReview { .. } => {
                 return Err(ParticipationError::OperationState(
                     "comment success cannot acknowledge a submission operation".into(),
@@ -1143,6 +1359,71 @@ impl ReviewComposition {
         Ok(())
     }
 
+    pub fn reconcile_observed_file_comment_success(
+        &mut self,
+        operation_id: &str,
+        remote_review_id: String,
+        remote_comment_id: String,
+    ) -> Result<(), ParticipationError> {
+        validate_nonempty_id("remote_review_id", &remote_review_id)?;
+        validate_nonempty_id("remote_comment_id", &remote_comment_id)?;
+        let intent = self
+            .operations
+            .iter()
+            .find(|operation| operation.id == operation_id)
+            .and_then(|operation| operation.payload.as_ref())
+            .and_then(|payload| match payload {
+                ReviewOperationPayload::PendingFileComment(intent) => Some(intent.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                ParticipationError::OperationState(
+                    "file-comment acknowledgement has no frozen file request".into(),
+                )
+            })?;
+        if remote_review_id != intent.pending.pending_review.remote_id {
+            return Err(ParticipationError::RemoteState(
+                "file-comment acknowledgement identifies another pending review".into(),
+            ));
+        }
+        {
+            let operation = self.operation_mut(operation_id)?;
+            if !matches!(
+                operation.status,
+                ReviewOperationStatus::InFlight { .. } | ReviewOperationStatus::Uncertain { .. }
+            ) {
+                return Err(ParticipationError::OperationState(format!(
+                    "review operation `{operation_id}` has no started attempt to reconcile"
+                )));
+            }
+            operation.status = ReviewOperationStatus::Acknowledged {
+                remote_review_id: Some(remote_review_id.clone()),
+                remote_comment_id: Some(remote_comment_id.clone()),
+            };
+        }
+        let ReviewCommentTarget::File(sent_target) = intent.target else {
+            return Err(ParticipationError::OperationState(
+                "pending file request contains a non-file target".into(),
+            ));
+        };
+        let draft = self.file_draft_mut(&intent.draft_id)?;
+        if draft.target != sent_target {
+            return Err(ParticipationError::RemoteState(
+                "file draft target changed after the frozen request".into(),
+            ));
+        }
+        if draft.body == intent.body {
+            draft.remote = Some(RemoteDraftIds {
+                review_id: Some(remote_review_id.clone()),
+                comment_id: remote_comment_id,
+            });
+            draft.observed_remote_body = Some(intent.body);
+            draft.dirty = false;
+        }
+        self.acknowledged_pending_review_id = Some(remote_review_id);
+        Ok(())
+    }
+
     pub fn reconcile_observed_submission_success(
         &mut self,
         operation_id: &str,
@@ -1206,6 +1487,22 @@ impl ReviewComposition {
             {
                 if draft.dirty {
                     // Edits made while submission ran stay as a new local draft.
+                    draft.remote = None;
+                    draft.observed_remote_body = None;
+                } else {
+                    draft.disposition = DraftDisposition::Submitted;
+                }
+            }
+        }
+        for draft in &mut self.file_drafts {
+            if draft.disposition == DraftDisposition::Pending
+                && draft
+                    .remote
+                    .as_ref()
+                    .and_then(|remote| remote.review_id.as_deref())
+                    == Some(remote_review_id)
+            {
+                if draft.dirty {
                     draft.remote = None;
                     draft.observed_remote_body = None;
                 } else {
@@ -1320,6 +1617,34 @@ impl ReviewComposition {
                 report.clean_drafts_updated += 1;
             }
         }
+        for draft in &mut self.file_drafts {
+            let Some(remote) = &draft.remote else {
+                continue;
+            };
+            let observed = details
+                .review_threads
+                .iter()
+                .filter(|thread| thread.subject == crate::domain::ReviewSubject::File)
+                .flat_map(|thread| &thread.comments)
+                .find(|comment| {
+                    comment.subject == crate::domain::ReviewSubject::File
+                        && comment.coordinates.remote_id == remote.comment_id
+                        && comment.path == draft.target.path
+                        && self.key.matches(&comment.coordinates)
+                });
+            let Some(observed) = observed else {
+                report.linked_comments_missing += 1;
+                continue;
+            };
+            validate_text("remote comment body", &observed.body, MAX_DRAFT_TEXT_BYTES)?;
+            draft.observed_remote_body = Some(observed.body.clone());
+            if draft.dirty {
+                report.dirty_drafts_preserved += 1;
+            } else if draft.body != observed.body {
+                draft.body = observed.body.clone();
+                report.clean_drafts_updated += 1;
+            }
+        }
         Ok(report)
     }
 
@@ -1347,7 +1672,7 @@ impl ReviewComposition {
                 "retired review cannot remain an active pending target".into(),
             ));
         }
-        if self.drafts.len() > MAX_DRAFTS {
+        if self.drafts.len() + self.file_drafts.len() > MAX_DRAFTS {
             return Err(ParticipationError::TooManyDrafts { limit: MAX_DRAFTS });
         }
         if self.operations.len() > MAX_OPERATIONS {
@@ -1391,6 +1716,36 @@ impl ReviewComposition {
                 }
             }
         }
+        for draft in &self.file_drafts {
+            validate_nonempty_id("draft_id", &draft.id)?;
+            draft
+                .id
+                .strip_prefix("draft-")
+                .and_then(|number| number.parse::<u64>().ok())
+                .filter(|number| *number > 0 && *number < self.next_draft_number)
+                .ok_or_else(|| {
+                    ParticipationError::OperationState(
+                        "review recovery record contains an invalid local file draft counter"
+                            .into(),
+                    )
+                })?;
+            if !draft_ids.insert(draft.id.as_str()) {
+                return Err(ParticipationError::OperationState(
+                    "review recovery record contains duplicate draft IDs".into(),
+                ));
+            }
+            validate_published_file(&draft.target, &self.reviewed_revision)?;
+            validate_text("draft text", &draft.body, MAX_DRAFT_TEXT_BYTES)?;
+            if let Some(body) = &draft.observed_remote_body {
+                validate_text("remote comment body", body, MAX_DRAFT_TEXT_BYTES)?;
+            }
+            if let Some(remote) = &draft.remote {
+                validate_nonempty_id("remote_comment_id", &remote.comment_id)?;
+                if let Some(id) = &remote.review_id {
+                    validate_nonempty_id("remote_review_id", id)?;
+                }
+            }
+        }
         let mut operation_ids = HashSet::new();
         for operation in &self.operations {
             if let Some(payload) = &operation.payload {
@@ -1415,6 +1770,24 @@ impl ReviewComposition {
                         &intent.position.commit_sha,
                         Some(&intent.position),
                     ),
+                    ReviewOperationPayload::PendingFileComment(intent) => {
+                        let ReviewCommentTarget::File(file) = &intent.target else {
+                            return Err(ParticipationError::OperationState(
+                                "stored pending file operation contains a line target".into(),
+                            ));
+                        };
+                        validate_pending_file_target(&intent.pending, &intent.key, file)?;
+                        (
+                            &intent.operation_id,
+                            &intent.key,
+                            ReviewOperationTarget::SynchronizePendingFileComment {
+                                draft_id: intent.draft_id.clone(),
+                            },
+                            &intent.body,
+                            &file.commit_sha,
+                            None,
+                        )
+                    }
                     ReviewOperationPayload::Submission(intent) => (
                         &intent.operation_id,
                         &intent.key,
@@ -1474,9 +1847,21 @@ impl ReviewComposition {
             match &operation.target {
                 ReviewOperationTarget::SynchronizePendingComment { draft_id }
                 | ReviewOperationTarget::PostImmediateComment { draft_id } => {
-                    if !draft_ids.contains(draft_id.as_str()) {
+                    if !draft_ids.contains(draft_id.as_str())
+                        || !self.drafts.iter().any(|draft| &draft.id == draft_id)
+                    {
                         return Err(ParticipationError::OperationState(format!(
                             "review operation `{}` refers to a missing draft",
+                            operation.id
+                        )));
+                    }
+                }
+                ReviewOperationTarget::SynchronizePendingFileComment { draft_id } => {
+                    if !draft_ids.contains(draft_id.as_str())
+                        || !self.file_drafts.iter().any(|draft| &draft.id == draft_id)
+                    {
+                        return Err(ParticipationError::OperationState(format!(
+                            "review operation `{}` refers to a missing file draft",
                             operation.id
                         )));
                     }
@@ -1571,6 +1956,103 @@ fn validate_nonempty_id(field: &'static str, value: &str) -> Result<(), Particip
 fn validate_revision(revision: &Revision) -> Result<(), ParticipationError> {
     validate_nonempty_id("revision.base_sha", &revision.base_sha)?;
     validate_nonempty_id("revision.head_sha", &revision.head_sha)
+}
+
+fn validate_published_file(
+    file: &PublishedFile,
+    revision: &Revision,
+) -> Result<(), ParticipationError> {
+    validate_nonempty_id("file base", &file.base_sha)?;
+    validate_nonempty_id("file commit", &file.commit_sha)?;
+    validate_nonempty_id("file path", &file.path)?;
+    validate_nonempty_id("file key", &file.file_key)?;
+    if file.base_sha != revision.base_sha
+        || file.commit_sha != revision.head_sha
+        || file.file_key != file.path
+    {
+        return Err(ParticipationError::InvalidCoordinate(
+            "published file identity does not match the canonical reviewed head or UTF-8 path"
+                .into(),
+        ));
+    }
+    if let Some(previous) = &file.previous_path {
+        validate_nonempty_id("previous file path", previous)?;
+    }
+    if file
+        .raw_previous_path
+        .as_ref()
+        .is_some_and(|path| path.is_empty() || path.len() > MAX_IDENTITY_BYTES)
+    {
+        return Err(ParticipationError::InvalidCoordinate(
+            "raw previous file identity is empty or too large".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pending_file_source(
+    source: &PendingFileCommentSource,
+    key: &ReviewKey,
+    file: &PublishedFile,
+) -> Result<(), ParticipationError> {
+    if source.repository.host != key.host
+        || source.repository.owner != key.owner
+        || source.repository.name != key.repository
+        || source.repository.account != key.account
+        || source.pull_request_state != "OPEN"
+        || !source.viewer_login.eq_ignore_ascii_case(&key.account.login)
+        || !source
+            .review_author
+            .eq_ignore_ascii_case(&key.account.login)
+        || !key.matches(&source.pull_request)
+        || !key.matches(&source.review)
+    {
+        return Err(ParticipationError::RemoteState(
+            "fresh pending-review source does not match the selected account and pull request"
+                .into(),
+        ));
+    }
+    let target = PendingFileReviewTarget {
+        pull_request: source.pull_request.clone(),
+        pending_review: source.review.clone(),
+        selected_author: source.review_author.clone(),
+        observed_base_sha: source.current_base_sha.clone(),
+        observed_head_sha: source.current_head_sha.clone(),
+        review_commit_sha: source.review_commit_sha.clone(),
+    };
+    validate_pending_file_target(&target, key, file)
+}
+
+fn validate_pending_file_target(
+    pending: &PendingFileReviewTarget,
+    key: &ReviewKey,
+    file: &PublishedFile,
+) -> Result<(), ParticipationError> {
+    validate_published_file(
+        file,
+        &Revision {
+            base_sha: pending.observed_base_sha.clone(),
+            head_sha: pending.observed_head_sha.clone(),
+        },
+    )?;
+    validate_nonempty_id("pending selected author", &pending.selected_author)?;
+    validate_nonempty_id("pending base", &pending.observed_base_sha)?;
+    validate_nonempty_id("pending review commit", &pending.review_commit_sha)?;
+    validate_nonempty_id("pending pull request ID", &pending.pull_request.remote_id)?;
+    validate_nonempty_id("pending review ID", &pending.pending_review.remote_id)?;
+    if !pending
+        .selected_author
+        .eq_ignore_ascii_case(&key.account.login)
+        || !key.matches(&pending.pull_request)
+        || !key.matches(&pending.pending_review)
+        || pending.review_commit_sha != pending.observed_head_sha
+        || file.commit_sha != pending.observed_head_sha
+    {
+        return Err(ParticipationError::RemoteState(
+            "frozen pending review, canonical file, and selected account identities differ".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]

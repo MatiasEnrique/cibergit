@@ -1,13 +1,15 @@
 use cibergit::{
     domain::{
-        Account, ChangedFile, Comparison, MergeEligibility, ProviderCoordinates,
-        PullRequestDetails, PullRequestReview, ReviewComment, ReviewThread, Revision,
+        Account, ChangedFile, Comparison, MergeEligibility, PendingFileCommentSource,
+        PendingReviewSnapshot, ProviderCoordinates, PullRequestDetails, PullRequestReview,
+        ReviewComment, ReviewSubject, ReviewThread, Revision,
     },
     participation::{
         CanonicalPublishedPatch, DiffSide, DraftDisposition, DraftStore, LineSelection,
         LoadOutcome, MAX_DRAFT_TEXT_BYTES, MAX_DRAFTS, MAX_OPERATIONS, MappingIssue,
-        ParticipationError, ReviewComposition, ReviewEvent, ReviewKey, ReviewOperationStatus,
-        map_to_canonical_published, validate_coordinate,
+        ParticipationError, ReviewCommentTarget, ReviewComposition, ReviewEvent, ReviewKey,
+        ReviewOperationStatus, map_file_to_canonical_published, map_to_canonical_published,
+        validate_coordinate,
     },
     review::{ComparisonMetadata, ComparisonMode, ReviewSession, file_key},
 };
@@ -117,6 +119,7 @@ fn details(
         .map(|id| ReviewThread {
             coordinates: provider_coordinates("thread-1"),
             path: "src/lib.rs".into(),
+            subject: cibergit::domain::ReviewSubject::Line,
             line: Some(11),
             original_line: None,
             start_line: None,
@@ -133,6 +136,7 @@ fn details(
                 updated_at: String::new(),
                 url: String::new(),
                 path: "src/lib.rs".into(),
+                subject: cibergit::domain::ReviewSubject::Line,
                 line: Some(11),
                 original_line: None,
                 start_line: None,
@@ -331,6 +335,7 @@ fn dirty_local_text_survives_remote_pending_refresh_while_clean_text_updates() {
         updated_at: String::new(),
         url: String::new(),
         path: "src/lib.rs".into(),
+        subject: cibergit::domain::ReviewSubject::Line,
         line: Some(11),
         original_line: None,
         start_line: None,
@@ -763,4 +768,180 @@ fn late_comment_ack_cannot_resurrect_review_submitted_in_browser() {
         }
         store.save(&state).unwrap();
     }
+}
+
+fn repository(login: &str) -> cibergit::domain::Repository {
+    cibergit::domain::Repository {
+        host: "github.com".into(),
+        owner: "acme".into(),
+        name: "rocket".into(),
+        account: Account {
+            host: "github.com".into(),
+            login: login.into(),
+        },
+        local_path: None,
+    }
+}
+
+fn pending_file_source(base: &str, head: &str) -> PendingFileCommentSource {
+    PendingFileCommentSource {
+        viewer_login: "alice".into(),
+        repository: repository("alice"),
+        pull_request: provider_coordinates("PR_42"),
+        pull_request_state: "OPEN".into(),
+        current_base_sha: base.into(),
+        current_head_sha: head.into(),
+        review: provider_coordinates("REVIEW_pending"),
+        review_author: "alice".into(),
+        review_commit_sha: head.into(),
+    }
+}
+
+#[test]
+fn canonical_file_target_supports_binary_rename_but_rejects_raw_or_changed_identity() {
+    let mut changed = file("assets/new.bin");
+    changed.previous_path = Some("assets/old.bin".into());
+    changed.status = "renamed".into();
+    changed.patch = None;
+    changed.patch_complete = false;
+    let canonical = comparison("base", "head", changed.clone());
+    let displayed = ReviewSession::new(canonical.clone());
+    let target =
+        map_file_to_canonical_published(&displayed, &file_key(&changed), published(&canonical))
+            .unwrap();
+    assert_eq!(target.path, "assets/new.bin");
+    assert_eq!(target.previous_path.as_deref(), Some("assets/old.bin"));
+    assert_eq!(target.base_sha, "base");
+    assert_eq!(target.commit_sha, "head");
+
+    let mut raw = changed.clone();
+    raw.raw_path = Some(vec![0xff]);
+    let raw_comparison = comparison("base", "head", raw.clone());
+    let raw_session = ReviewSession::new(raw_comparison.clone());
+    assert!(matches!(
+        map_file_to_canonical_published(&raw_session, &file_key(&raw), published(&raw_comparison)),
+        Err(MappingIssue::RawPathUnsupported)
+    ));
+
+    let mut different = changed;
+    different.previous_path = Some("assets/another.bin".into());
+    let different_comparison = comparison("base", "head", different);
+    assert!(matches!(
+        map_file_to_canonical_published(
+            &displayed,
+            &target.file_key,
+            published(&different_comparison)
+        ),
+        Err(MappingIssue::FileIdentityChanged)
+    ));
+}
+
+#[test]
+fn file_draft_ack_updates_only_exact_frozen_target_and_body() {
+    let canonical = comparison("base", "head", file("src/lib.rs"));
+    let session = ReviewSession::new(canonical.clone());
+    let target =
+        map_file_to_canonical_published(&session, "src/lib.rs", published(&canonical)).unwrap();
+    let mut other_target = target.clone();
+    other_target.path = "src/other.rs".into();
+    other_target.file_key = "src/other.rs".into();
+    let mut state = ReviewComposition::new(key("alice"), revision("base", "head")).unwrap();
+    let first = state
+        .add_file_draft(target.clone(), "sent exact file body")
+        .unwrap()
+        .id
+        .clone();
+    let other = state
+        .add_file_draft(other_target, "unrelated file body")
+        .unwrap()
+        .id
+        .clone();
+    let intent = state
+        .prepare_pending_file_comment(&first, &pending_file_source("base", "head"))
+        .unwrap();
+    assert!(matches!(intent.target, ReviewCommentTarget::File(_)));
+    state
+        .mark_in_flight(&intent.operation_id, "attempt-1")
+        .unwrap();
+    state.edit_file_draft(&other, "unrelated edit").unwrap();
+    state
+        .reconcile_observed_file_comment_success(
+            &intent.operation_id,
+            "REVIEW_pending".into(),
+            "COMMENT_new".into(),
+        )
+        .unwrap();
+    assert_eq!(
+        state
+            .file_draft(&first)
+            .unwrap()
+            .remote
+            .as_ref()
+            .map(|remote| remote.comment_id.as_str()),
+        Some("COMMENT_new")
+    );
+    assert_eq!(state.file_draft(&other).unwrap().body, "unrelated edit");
+    assert!(state.file_draft(&other).unwrap().remote.is_none());
+
+    let changed = state
+        .add_file_draft(target, "original frozen body")
+        .unwrap()
+        .id
+        .clone();
+    let changed_intent = state
+        .prepare_pending_file_comment(&changed, &pending_file_source("base", "head"))
+        .unwrap();
+    state
+        .mark_in_flight(&changed_intent.operation_id, "attempt-2")
+        .unwrap();
+    state.edit_file_draft(&changed, "new unsent edit").unwrap();
+    state
+        .reconcile_observed_file_comment_success(
+            &changed_intent.operation_id,
+            "REVIEW_pending".into(),
+            "COMMENT_old_payload".into(),
+        )
+        .unwrap();
+    assert_eq!(state.file_draft(&changed).unwrap().body, "new unsent edit");
+    assert!(state.file_draft(&changed).unwrap().remote.is_none());
+}
+
+#[test]
+fn pending_file_freshness_witness_never_survives_snapshot_serialization() {
+    let snapshot = PendingReviewSnapshot {
+        review: PullRequestReview {
+            coordinates: provider_coordinates("REVIEW_pending"),
+            author: Some("alice".into()),
+            body: String::new(),
+            state: "PENDING".into(),
+            submitted_at: None,
+            commit_sha: Some("head".into()),
+            edit_summary_capability: None,
+            url: String::new(),
+        },
+        comments: Vec::new(),
+        comments_complete: true,
+        file_comment_source: Some(pending_file_source("base", "head")),
+    };
+    let encoded = serde_json::to_vec(&snapshot).unwrap();
+    assert!(!String::from_utf8_lossy(&encoded).contains("file_comment_source"));
+    let decoded: PendingReviewSnapshot = serde_json::from_slice(&encoded).unwrap();
+    assert!(decoded.file_comment_source.is_none());
+
+    let old_thread = serde_json::json!({
+        "coordinates": provider_coordinates("THREAD_old"),
+        "path": "src/lib.rs",
+        "line": null,
+        "original_line": null,
+        "start_line": null,
+        "original_start_line": null,
+        "side": null,
+        "start_side": null,
+        "resolved": false,
+        "outdated": false,
+        "comments": [],
+        "comments_complete": true
+    });
+    let decoded_thread: ReviewThread = serde_json::from_value(old_thread).unwrap();
+    assert_eq!(decoded_thread.subject, ReviewSubject::Unknown);
 }

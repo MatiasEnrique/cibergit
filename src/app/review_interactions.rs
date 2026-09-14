@@ -8,9 +8,9 @@ use cibergit::{
     },
     participation::{
         CanonicalPublishedPatch, DraftCoordinate, DraftStore, LineSelection, LoadOutcome,
-        PublishedPosition, ReviewComposition, ReviewEvent, ReviewKey, ReviewOperation,
-        ReviewOperationPayload, ReviewOperationStatus, ReviewOperationTarget,
-        map_to_canonical_published, validate_coordinate,
+        PublishedFile, PublishedPosition, ReviewComposition, ReviewEvent, ReviewKey,
+        ReviewOperation, ReviewOperationPayload, ReviewOperationStatus, ReviewOperationTarget,
+        map_file_to_canonical_published, map_to_canonical_published, validate_coordinate,
     },
     providers::{AdmittedMutationAttempt, MutationAdmission},
     review::{ReviewSession, file_key},
@@ -53,6 +53,15 @@ pub struct ComposerState {
 }
 
 #[derive(Clone, Debug)]
+pub struct FileComposerState {
+    pub target: PublishedFile,
+    pub draft_id: Option<String>,
+    pub body: String,
+    pub durable: bool,
+    pub notice: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub enum ControllerLoad {
     Ready(Box<ReviewInteractionController>),
     RecoveryRequired(String),
@@ -66,6 +75,7 @@ pub struct ReviewInteractionController {
     pub durable_composition: Option<ReviewComposition>,
     undurable_drafts: HashSet<String>,
     pub composer: Option<ComposerState>,
+    pub file_composer: Option<FileComposerState>,
     pub pending_review: Option<PendingReviewSnapshot>,
     pub pending_complete: bool,
     pub notice: Option<String>,
@@ -159,6 +169,7 @@ impl ReviewInteractionController {
             durable_composition,
             undurable_drafts: HashSet::new(),
             composer: None,
+            file_composer: None,
             pending_review: None,
             pending_complete: true,
             notice: None,
@@ -173,6 +184,13 @@ impl ReviewInteractionController {
         selection: LineSelection,
     ) -> Result<(), String> {
         self.require_writable_display(displayed, canonical)?;
+        if self
+            .file_composer
+            .as_ref()
+            .is_some_and(|composer| !composer.durable)
+        {
+            return Err("Save the open file-level draft before changing comment targets.".into());
+        }
         let selected = displayed
             .selected_file()
             .ok_or_else(|| "Select a text file before starting a discussion.".to_owned())?;
@@ -240,6 +258,62 @@ impl ReviewInteractionController {
                 ),
             },
         });
+        self.file_composer = None;
+        Ok(())
+    }
+
+    pub fn select_file_with_canonical(
+        &mut self,
+        displayed: &ReviewSession,
+        canonical: &ReviewSession,
+    ) -> Result<(), String> {
+        self.require_writable_display(displayed, canonical)?;
+        if self
+            .composer
+            .as_ref()
+            .is_some_and(|composer| !composer.durable)
+        {
+            return Err("Save the open inline draft before changing comment targets.".into());
+        }
+        let selected = displayed
+            .selected_file()
+            .ok_or_else(|| "Select a file before starting a file-level discussion.".to_owned())?;
+        let target = map_file_to_canonical_published(
+            displayed,
+            &file_key(selected),
+            CanonicalPublishedPatch::new(canonical.comparison(), canonical.metadata())
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| format!("This file target is read-only: {error}."))?;
+        let existing = self.composition.file_drafts.iter().find(|draft| {
+            draft.target == target
+                && draft.disposition == cibergit::participation::DraftDisposition::Pending
+                && draft.remote.is_none()
+        });
+        self.file_composer = Some(match existing {
+            Some(draft) => FileComposerState {
+                target,
+                draft_id: Some(draft.id.clone()),
+                body: draft.body.clone(),
+                durable: !self.undurable_drafts.contains(&draft.id),
+                notice: Some(if self.undurable_drafts.contains(&draft.id) {
+                    "The latest text has not finished saving locally.".into()
+                } else {
+                    "Reopened local file-level text.".into()
+                }),
+            },
+            None => FileComposerState {
+                target,
+                draft_id: None,
+                body: String::new(),
+                durable: false,
+                notice: Some(
+                    "Bound to this exact canonical file. Text becomes durable after its first local save."
+                        .into(),
+                ),
+            },
+        });
+        self.composer = None;
         Ok(())
     }
 
@@ -301,6 +375,34 @@ impl ReviewInteractionController {
             }),
         };
         self.composer = Some(composer.clone());
+        self.file_composer = None;
+        Ok(composer)
+    }
+
+    pub fn reopen_file_draft(&mut self, draft_id: &str) -> Result<FileComposerState, String> {
+        let draft = self
+            .composition
+            .file_draft(draft_id)
+            .ok_or_else(|| "The linked local file draft no longer exists.".to_owned())?;
+        if draft.disposition != cibergit::participation::DraftDisposition::Pending
+            || draft.remote.is_some()
+        {
+            return Err("Published file comments are historical; create a new file draft.".into());
+        }
+        let durable = !self.undurable_drafts.contains(&draft.id);
+        let composer = FileComposerState {
+            target: draft.target.clone(),
+            draft_id: Some(draft.id.clone()),
+            body: draft.body.clone(),
+            durable,
+            notice: Some(if durable {
+                "Reopened local file-level text.".into()
+            } else {
+                "The latest text has not finished saving locally.".into()
+            }),
+        };
+        self.file_composer = Some(composer.clone());
+        self.composer = None;
         Ok(composer)
     }
 
@@ -308,6 +410,26 @@ impl ReviewInteractionController {
     /// from the UI thread and then report the save result through
     /// `finish_composer_save`.
     pub fn stage_composer_text(&mut self, body: String) -> Result<ReviewComposition, String> {
+        if let Some(composer) = self.file_composer.as_mut() {
+            composer.body = body.clone();
+            composer.durable = false;
+            composer.notice = Some("Saving local recovery…".into());
+            if let Some(draft_id) = composer.draft_id.as_deref() {
+                self.composition
+                    .edit_file_draft(draft_id, body)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                let draft = self
+                    .composition
+                    .add_file_draft(composer.target.clone(), body)
+                    .map_err(|error| error.to_string())?;
+                composer.draft_id = Some(draft.id.clone());
+            }
+            if let Some(draft_id) = &composer.draft_id {
+                self.undurable_drafts.insert(draft_id.clone());
+            }
+            return Ok(self.composition.clone());
+        }
         let composer = self
             .composer
             .as_mut()
@@ -342,6 +464,26 @@ impl ReviewInteractionController {
         if result.is_ok() {
             self.durable_composition = Some(saved.clone());
             self.undurable_drafts.remove(draft_id);
+        }
+        if let Some(composer) = self.file_composer.as_mut()
+            && composer.draft_id.as_deref() == Some(draft_id)
+            && composer.body == saved_body
+        {
+            match result {
+                Ok(()) => {
+                    composer.durable = true;
+                    composer.notice =
+                        Some("Saved locally for restart and offline recovery.".into());
+                }
+                Err(ref error) => {
+                    self.undurable_drafts.insert(draft_id.into());
+                    composer.durable = false;
+                    composer.notice = Some(format!(
+                        "Local save failed; text remains only in this open window: {error}"
+                    ));
+                }
+            }
+            return;
         }
         let Some(composer) = self.composer.as_mut() else {
             return;
@@ -387,6 +529,19 @@ impl ReviewInteractionController {
     #[allow(dead_code)] // Retained for focused controller tests and full-session callers.
     pub fn prepare_pending(&mut self, session: &ReviewSession) -> Result<String, String> {
         self.prepare_pending_with_canonical(session, session)
+    }
+
+    pub fn prepare_pending_file_comment(
+        &mut self,
+        source: &cibergit::domain::PendingFileCommentSource,
+    ) -> Result<String, String> {
+        let draft_id = self.saved_file_composer_id()?;
+        let intent = self
+            .composition
+            .prepare_pending_file_comment(&draft_id, source)
+            .map_err(|error| error.to_string())?;
+        self.reconciliation_results.clear();
+        Ok(intent.operation_id)
     }
 
     pub fn prepare_immediate_with_canonical(
@@ -473,6 +628,14 @@ impl ReviewInteractionController {
             .iter()
             .filter(|draft| draft.disposition == cibergit::participation::DraftDisposition::Pending)
             .count()
+            + self
+                .composition
+                .file_drafts
+                .iter()
+                .filter(|draft| {
+                    draft.disposition == cibergit::participation::DraftDisposition::Pending
+                })
+                .count()
     }
 
     pub fn unresolved_operations(&self) -> usize {
@@ -546,6 +709,23 @@ impl ReviewInteractionController {
             .draft_id
             .clone()
             .ok_or_else(|| "The composer has no durable draft identity.".into())
+    }
+
+    fn saved_file_composer_id(&self) -> Result<String, String> {
+        let composer = self
+            .file_composer
+            .as_ref()
+            .ok_or_else(|| "No file-level composer is open.".to_owned())?;
+        if !composer.durable {
+            return Err(
+                "Save the local file-level text successfully before starting a remote operation."
+                    .into(),
+            );
+        }
+        composer
+            .draft_id
+            .clone()
+            .ok_or_else(|| "The file-level composer has no durable draft identity.".into())
     }
 }
 
@@ -922,6 +1102,23 @@ fn observe_review_operation(
                 ),
             })
         }
+        ReviewOperationPayload::PendingFileComment(intent) => {
+            if operation.target
+                != (ReviewOperationTarget::SynchronizePendingFileComment {
+                    draft_id: intent.draft_id.clone(),
+                })
+                || intent.operation_id != operation.id
+                || intent.key != expected_key
+            {
+                return Err(
+                    "The frozen file-comment operation identity or target is inconsistent.".into(),
+                );
+            }
+            Err(
+                "GitHub does not preserve this local attempt ID on the newly created file-level thread. Without the returned new thread and comment IDs, body, path, time, or list position cannot establish identity; the attempt remains unresolved and will not replay."
+                    .into(),
+            )
+        }
         ReviewOperationPayload::ImmediateComment(intent) => {
             if operation.target
                 != (ReviewOperationTarget::PostImmediateComment {
@@ -1246,6 +1443,13 @@ fn concise_request_summary(operation: &ReviewOperation) -> String {
             "Publish comment · {}:{}",
             intent.position.path, intent.position.line
         ),
+        Some(ReviewOperationPayload::PendingFileComment(intent)) => {
+            let path = match &intent.target {
+                cibergit::participation::ReviewCommentTarget::File(file) => file.path.as_str(),
+                cibergit::participation::ReviewCommentTarget::Line(_) => "invalid-line-target",
+            };
+            format!("Add pending file comment · {path}")
+        }
         Some(ReviewOperationPayload::Submission(_)) => "Submit pending review".into(),
         None => "Recover earlier review action".into(),
     }
@@ -1282,6 +1486,25 @@ fn frozen_request_summary(operation: &ReviewOperation) -> String {
             frozen_position_summary(&intent.position),
             intent.body
         ),
+        Some(ReviewOperationPayload::PendingFileComment(intent)) => {
+            let target = match &intent.target {
+                cibergit::participation::ReviewCommentTarget::File(file) => format!(
+                    "file {} · base {} · head {}",
+                    file.path, file.base_sha, file.commit_sha
+                ),
+                cibergit::participation::ReviewCommentTarget::Line(_) => {
+                    "invalid line target".into()
+                }
+            };
+            format!(
+                "pending file comment draft {} · review {} · PR {} · {} · body {:?}",
+                intent.draft_id,
+                intent.pending.pending_review.remote_id,
+                intent.pending.pull_request.remote_id,
+                target,
+                intent.body
+            )
+        }
         Some(ReviewOperationPayload::Submission(intent)) => format!(
             "submit {:?} · review {} · head {} · body {:?}",
             intent.event,
@@ -1422,6 +1645,28 @@ pub fn place_threads_with_canonical(
 }
 
 fn place_thread(session: &ReviewSession, thread: &ReviewThread) -> Result<InlineAnchor, String> {
+    match thread.subject {
+        cibergit::domain::ReviewSubject::File => {
+            return Err(
+                "File-level discussion targets the whole file and is shown in Activity, never at a fabricated inline position."
+                    .into(),
+            );
+        }
+        cibergit::domain::ReviewSubject::Unknown => {
+            return Err(
+                "Provider subject provenance is unknown; this cached/legacy discussion is read-only."
+                    .into(),
+            );
+        }
+        cibergit::domain::ReviewSubject::Line => {}
+    }
+    if thread
+        .comments
+        .iter()
+        .any(|comment| comment.subject != cibergit::domain::ReviewSubject::Line)
+    {
+        return Err("Thread/comment subject provenance disagrees; discussion is read-only.".into());
+    }
     let file = session
         .comparison()
         .files
@@ -2321,10 +2566,12 @@ mod tests {
     use super::*;
     use cibergit::domain::{
         Account, ChangedFile, Comparison, LinkedReviewComment, MergeEligibility,
-        ProviderCoordinates, PullRequestLifecycleAction, PullRequestMutationTarget,
-        PullRequestReview, ReviewComment, Revision,
+        PendingFileCommentSource, ProviderCoordinates, PullRequestLifecycleAction,
+        PullRequestMutationTarget, PullRequestReview, ReviewComment, Revision,
     };
-    use cibergit::participation::{DiffSide, RemoteDraftIds, ReviewOperationStatus};
+    use cibergit::participation::{
+        DiffSide, RemoteDraftIds, ReviewCommentTarget, ReviewOperationStatus,
+    };
     use std::{
         process::Command,
         sync::{
@@ -2373,6 +2620,34 @@ mod tests {
 
     fn review_key() -> ReviewKey {
         ReviewKey::for_repository("github", &repository(), 7).unwrap()
+    }
+
+    fn pending_file_source() -> PendingFileCommentSource {
+        PendingFileCommentSource {
+            viewer_login: "reader".into(),
+            repository: repository(),
+            pull_request: ProviderCoordinates {
+                provider: "github".into(),
+                host: "github.com".into(),
+                owner: "octo".into(),
+                repository: "repo".into(),
+                pull_request: 7,
+                remote_id: "PR_node".into(),
+            },
+            pull_request_state: "OPEN".into(),
+            current_base_sha: "1111111".into(),
+            current_head_sha: "2222222".into(),
+            review: ProviderCoordinates {
+                provider: "github".into(),
+                host: "github.com".into(),
+                owner: "octo".into(),
+                repository: "repo".into(),
+                pull_request: 7,
+                remote_id: "REVIEW_pending".into(),
+            },
+            review_author: "reader".into(),
+            review_commit_sha: "2222222".into(),
+        }
     }
 
     #[test]
@@ -2437,6 +2712,77 @@ mod tests {
         assert!(
             older_error.contains("older than the reviewed head"),
             "{older_error}"
+        );
+    }
+
+    #[test]
+    fn file_draft_restarts_on_exact_target_and_prepares_only_fresh_pending_source() {
+        let root = tempdir().unwrap();
+        let session = session();
+        let mut controller =
+            match ReviewInteractionController::load(root.path(), &repository(), 7, &session)
+                .unwrap()
+            {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+        controller
+            .select_file_with_canonical(&session, &session)
+            .unwrap();
+        let saved = controller
+            .stage_composer_text("Whole-file rationale".into())
+            .unwrap();
+        controller.store.save(&saved).unwrap();
+        let draft_id = controller
+            .file_composer
+            .as_ref()
+            .and_then(|composer| composer.draft_id.clone())
+            .unwrap();
+        let target = controller.file_composer.as_ref().unwrap().target.clone();
+        controller.finish_composer_save(&saved, &draft_id, "Whole-file rationale", Ok(()));
+        drop(controller);
+
+        let mut restarted =
+            match ReviewInteractionController::load(root.path(), &repository(), 7, &session)
+                .unwrap()
+            {
+                ControllerLoad::Ready(controller) => controller,
+                ControllerLoad::RecoveryRequired(reason) => panic!("{reason}"),
+            };
+        assert!(restarted.file_composer.is_none());
+        let reopened = restarted.reopen_file_draft(&draft_id).unwrap();
+        assert!(reopened.durable);
+        assert_eq!(reopened.body, "Whole-file rationale");
+        assert_eq!(reopened.target, target);
+
+        let operation_id = restarted
+            .prepare_pending_file_comment(&pending_file_source())
+            .unwrap();
+        let operation = restarted
+            .composition
+            .operations
+            .iter()
+            .find(|operation| operation.id == operation_id)
+            .unwrap();
+        let Some(ReviewOperationPayload::PendingFileComment(intent)) = &operation.payload else {
+            panic!("file draft must produce its distinct frozen payload")
+        };
+        assert_eq!(intent.body, "Whole-file rationale");
+        assert_eq!(intent.target, ReviewCommentTarget::File(target));
+        assert_eq!(intent.pending.pending_review.remote_id, "REVIEW_pending");
+
+        restarted
+            .composition
+            .cancel_prepared(&operation_id)
+            .unwrap();
+        let mut changed = pending_file_source();
+        changed.current_head_sha = "different-head".into();
+        let error = restarted
+            .prepare_pending_file_comment(&changed)
+            .unwrap_err();
+        assert!(
+            error.contains("canonical file") || error.contains("identity"),
+            "{error}"
         );
     }
 
@@ -2593,6 +2939,7 @@ mod tests {
                     updated_at: "now".into(),
                     url: String::new(),
                     path: "src/lib.rs".into(),
+                    subject: cibergit::domain::ReviewSubject::Line,
                     line: Some(1),
                     original_line: Some(1),
                     start_line: None,
@@ -2605,6 +2952,7 @@ mod tests {
                 },
             }],
             comments_complete: complete,
+            file_comment_source: None,
         }
     }
 
@@ -2612,6 +2960,7 @@ mod tests {
         ReviewThread {
             coordinates: coordinates("thread-1"),
             path: "src/lib.rs".into(),
+            subject: cibergit::domain::ReviewSubject::Line,
             line: Some(1),
             original_line: Some(1),
             start_line: None,
@@ -2628,6 +2977,7 @@ mod tests {
                 updated_at: "now".into(),
                 url: String::new(),
                 path: "src/lib.rs".into(),
+                subject: cibergit::domain::ReviewSubject::Line,
                 line: Some(1),
                 original_line: Some(1),
                 start_line: None,
@@ -3925,6 +4275,7 @@ mod tests {
             updated_at: "now".into(),
             url: String::new(),
             path: "src/lib.rs".into(),
+            subject: cibergit::domain::ReviewSubject::Line,
             line: Some(1),
             original_line: Some(1),
             start_line: None,
@@ -3941,6 +4292,7 @@ mod tests {
                 ..comment.coordinates.clone()
             },
             path: "src/lib.rs".into(),
+            subject: cibergit::domain::ReviewSubject::Line,
             line: Some(1),
             original_line: Some(1),
             start_line: None,
@@ -3953,6 +4305,31 @@ mod tests {
             comments_complete: true,
         };
         assert_eq!(place_thread(&session, &current).unwrap().line, 1);
+        let file_level = ReviewThread {
+            subject: cibergit::domain::ReviewSubject::File,
+            comments: vec![ReviewComment {
+                subject: cibergit::domain::ReviewSubject::File,
+                line: None,
+                ..comment.clone()
+            }],
+            line: None,
+            side: None,
+            ..current.clone()
+        };
+        assert!(
+            place_thread(&session, &file_level)
+                .unwrap_err()
+                .contains("whole file")
+        );
+        let unknown = ReviewThread {
+            subject: cibergit::domain::ReviewSubject::Unknown,
+            ..current.clone()
+        };
+        assert!(
+            place_thread(&session, &unknown)
+                .unwrap_err()
+                .contains("read-only")
+        );
         let range = ReviewThread {
             line: Some(2),
             start_line: Some(1),

@@ -14,14 +14,16 @@ use crate::domain::{
     Account, BranchDeletionAcknowledgement, BranchDeletionRequest, ChangedFile, CheckKind,
     Comparison, IssueComment, LinkedReviewComment, MergeAcknowledgement, MergeAction,
     MergeEligibility, MergeExecutionRequest, MergeMethod, MergePreparation, MutationContext,
-    PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome, PullRequest,
-    PullRequestCheck, PullRequestCheckoutSource, PullRequestDetails, PullRequestReview, Repository,
-    ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewComment,
-    ReviewThread, ReviewWriteAcknowledgement, Revision, SubmittedReviewEditCapability,
+    PendingFileCommentSource, PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome,
+    PullRequest, PullRequestCheck, PullRequestCheckoutSource, PullRequestDetails,
+    PullRequestReview, Repository, ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryAction,
+    ReviewAuxiliaryRequest, ReviewComment, ReviewSubject, ReviewThread, ReviewWriteAcknowledgement,
+    Revision, SubmittedReviewEditCapability,
 };
 use crate::participation::{
-    DraftStore, PendingCommentIntent, ReviewComposition, ReviewEvent, ReviewOperationPayload,
-    ReviewOperationStatus, SubmissionIntent,
+    DraftStore, PendingCommentIntent, PendingFileCommentIntent, ReviewCommentTarget,
+    ReviewComposition, ReviewEvent, ReviewOperationPayload, ReviewOperationStatus,
+    SubmissionIntent,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -348,6 +350,12 @@ impl GithubProvider {
                             ack.comment_id.clone().unwrap_or_default(),
                             intent.body.clone(),
                         ),
+                    ReviewOperationPayload::PendingFileComment(_) => composition
+                        .reconcile_observed_file_comment_success(
+                            operation_id,
+                            ack.review_id.clone().unwrap_or_default(),
+                            ack.comment_id.clone().unwrap_or_default(),
+                        ),
                     ReviewOperationPayload::Submission(_) => composition
                         .reconcile_observed_submission_success(
                             operation_id,
@@ -367,6 +375,7 @@ impl GithubProvider {
                     operation_id: operation_id.to_owned(),
                     review_id: ack.review_id,
                     comment_id: ack.comment_id,
+                    thread_id: ack.thread_id,
                 };
                 if let Err(error) = store.save(composition) {
                     *composition = saved_in_flight;
@@ -430,12 +439,21 @@ impl GithubProvider {
             ReviewOperationPayload::ImmediateComment(intent) => {
                 (&intent.key, intent.position.commit_sha.as_str())
             }
+            ReviewOperationPayload::PendingFileComment(intent) => {
+                let ReviewCommentTarget::File(file) = &intent.target else {
+                    return Err("pending file comment contains a line target".into());
+                };
+                (&intent.key, file.commit_sha.as_str())
+            }
             ReviewOperationPayload::Submission(intent) => {
                 (&intent.key, intent.reviewed_commit_sha.as_str())
             }
         };
         validate_sha(reviewed_sha).map_err(|error| error.to_string())?;
         let mut session = Session::new(self);
+        if let ReviewOperationPayload::PendingFileComment(intent) = payload {
+            return prepare_pending_file_comment_mutation(&mut session, repo, intent);
+        }
         let context = session
             .review_action_context(repo, key.pull_request)
             .map_err(|error| error.to_string())?;
@@ -471,6 +489,9 @@ impl GithubProvider {
             }
             ReviewOperationPayload::Submission(intent) => {
                 prepare_submission_mutation(&mut session, &context, intent)
+            }
+            ReviewOperationPayload::PendingFileComment(_) => {
+                unreachable!("pending file comments return after their complete preflight")
             }
         }
     }
@@ -1321,6 +1342,7 @@ fn validate_review_key(
         .map_err(|error| error.to_string())?;
     let key = match payload {
         ReviewOperationPayload::PendingComment(intent) => &intent.key,
+        ReviewOperationPayload::PendingFileComment(intent) => &intent.key,
         ReviewOperationPayload::ImmediateComment(intent) => &intent.key,
         ReviewOperationPayload::Submission(intent) => &intent.key,
     };
@@ -1761,6 +1783,77 @@ impl<'a> Session<'a> {
         })
     }
 
+    fn pending_file_preflight(
+        &mut self,
+        repo: &Repository,
+        number: u64,
+    ) -> Result<PendingFilePreflight> {
+        let response: GraphqlResult<PendingFilePreflightData> = self.graphql(
+            PENDING_FILE_PREFLIGHT_QUERY,
+            json!({"owner": repo.owner, "name": repo.name, "number": number}),
+        )?;
+        ensure!(
+            !response.partial,
+            "GitHub pending file-comment preflight was partial"
+        );
+        ensure!(
+            response
+                .data
+                .viewer
+                .login
+                .eq_ignore_ascii_case(&self.provider.account.login),
+            "selected GitHub credential resolved to another account"
+        );
+        let repository = response
+            .data
+            .repository
+            .context("GitHub pending file-comment repository is unavailable")?;
+        ensure!(
+            repository
+                .name_with_owner
+                .eq_ignore_ascii_case(&repo.full_name()),
+            "GitHub pending file-comment repository mismatch"
+        );
+        let pull = repository
+            .pull_request
+            .context("GitHub pending file-comment pull request is unavailable")?;
+        ensure!(
+            pull.number == number
+                && pull.url == format!("https://{}/{}/pull/{number}", repo.host, repo.full_name()),
+            "GitHub pending file-comment pull request mismatch"
+        );
+        validate_sha(&pull.base_ref_oid)?;
+        validate_sha(&pull.head_ref_oid)?;
+        ensure!(
+            !pull.reviews.page_info.has_next_page && pull.reviews.nodes.iter().all(Option::is_some),
+            "GitHub pending-review list is incomplete"
+        );
+        let mut selected = pull.reviews.nodes.into_iter().flatten().filter(|review| {
+            review.author.as_ref().is_some_and(|author| {
+                author
+                    .login
+                    .eq_ignore_ascii_case(&self.provider.account.login)
+            })
+        });
+        let review = selected
+            .next()
+            .context("GitHub returned no pending review for the selected account")?;
+        ensure!(
+            selected.next().is_none(),
+            "GitHub returned multiple pending reviews for the selected account"
+        );
+        Ok(PendingFilePreflight {
+            viewer_login: response.data.viewer.login,
+            repository: repository.name_with_owner,
+            pull_id: pull.id,
+            pull_number: pull.number,
+            pull_state: pull.state,
+            base_sha: pull.base_ref_oid,
+            head_sha: pull.head_ref_oid,
+            review,
+        })
+    }
+
     fn review_node(&mut self, id: &str) -> Result<ActionReviewNode> {
         validate_node_id(id)?;
         let response: GraphqlResult<ActionReviewNodeData> =
@@ -2072,6 +2165,13 @@ impl<'a> Session<'a> {
             !response.partial,
             "GitHub pending-review import was partial"
         );
+        let viewer_login = response.data.viewer.map(|viewer| viewer.login);
+        if let Some(viewer_login) = &viewer_login {
+            ensure!(
+                viewer_login.eq_ignore_ascii_case(&self.provider.account.login),
+                "selected GitHub credential resolved to another account"
+            );
+        }
         let repository = response
             .data
             .repository
@@ -2086,8 +2186,20 @@ impl<'a> Session<'a> {
             .pull_request
             .context("GitHub pending-review PR is unavailable")?;
         ensure!(pull.number == number, "GitHub pending-review PR mismatch");
+        if let Some(url) = &pull.url {
+            ensure!(
+                url == &format!("https://{}/{}/pull/{number}", repo.host, repo.full_name()),
+                "GitHub pending-review PR mismatch"
+            );
+        }
+        if let Some(base) = &pull.base_ref_oid {
+            validate_sha(base)?;
+        }
+        if let Some(head) = &pull.head_ref_oid {
+            validate_sha(head)?;
+        }
         ensure!(
-            !pull.reviews.page_info.has_next_page,
+            !pull.reviews.page_info.has_next_page && pull.reviews.nodes.iter().all(Option::is_some),
             "Pending-review list exceeds the explicit 100-review import bound"
         );
         let mut selected = pull.reviews.nodes.into_iter().flatten().filter(|review| {
@@ -2128,6 +2240,40 @@ impl<'a> Session<'a> {
                 })
             })
             .collect();
+        let file_comment_source = (comments_complete
+            && pull.state.as_deref() == Some("OPEN")
+            && review.state == "PENDING"
+            && review.submitted_at.is_none()
+            && review.author.as_ref().is_some_and(|author| {
+                viewer_login
+                    .as_ref()
+                    .is_some_and(|viewer| author.login.eq_ignore_ascii_case(viewer))
+            })
+            && review.commit.as_ref().map(|commit| commit.oid.as_str())
+                == pull.head_ref_oid.as_deref()
+            && pull.id.is_some()
+            && pull.base_ref_oid.is_some()
+            && pull.head_ref_oid.is_some()
+            && viewer_login.is_some())
+        .then(|| PendingFileCommentSource {
+            viewer_login: viewer_login.clone().expect("checked"),
+            repository: repo.clone(),
+            pull_request: coordinates(repo, number, pull.id.clone().expect("checked")),
+            pull_request_state: pull.state.clone().expect("checked"),
+            current_base_sha: pull.base_ref_oid.clone().expect("checked"),
+            current_head_sha: pull.head_ref_oid.clone().expect("checked"),
+            review: coordinates(repo, number, review.id.clone()),
+            review_author: review
+                .author
+                .as_ref()
+                .map(|author| author.login.clone())
+                .unwrap_or_default(),
+            review_commit_sha: review
+                .commit
+                .as_ref()
+                .map(|commit| commit.oid.clone())
+                .unwrap_or_default(),
+        });
         Ok(Some(PendingReviewSnapshot {
             review: PullRequestReview {
                 coordinates: coordinates(repo, number, review.id),
@@ -2141,6 +2287,7 @@ impl<'a> Session<'a> {
             },
             comments,
             comments_complete,
+            file_comment_source,
         }))
     }
 
@@ -3132,19 +3279,36 @@ fn validate_ref_name(value: &str) -> Result<()> {
     Ok(())
 }
 
-const PENDING_REVIEW_QUERY: &str = r#"query PendingReview(
+const PENDING_FILE_PREFLIGHT_QUERY: &str = r#"query PendingFileCommentPreflight(
   $owner: String!, $name: String!, $number: Int!
 ) {
+  viewer { login }
   repository(owner: $owner, name: $name) {
     nameWithOwner
     pullRequest(number: $number) {
-      number
+      id number url state baseRefOid headRefOid
+      reviews(first: 100, states: PENDING) {
+        nodes { id state submittedAt author { login } commit { oid } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}"#;
+
+const PENDING_REVIEW_QUERY: &str = r#"query PendingReview(
+  $owner: String!, $name: String!, $number: Int!
+) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequest(number: $number) {
+      id number url state baseRefOid headRefOid
       reviews(first: 100, states: PENDING) {
         nodes {
           id author { login } body state submittedAt commit { oid } url
           comments(first: 100) {
             nodes {
-              id author { login } body createdAt updatedAt url path line originalLine
+              id author { login } body createdAt updatedAt url path subjectType line originalLine
               startLine originalStartLine diffHunk outdated commit { oid } originalCommit { oid }
               pullRequestReview { id }
             }
@@ -3219,6 +3383,32 @@ const ADD_REVIEW_THREAD_MUTATION: &str = r#"mutation AddReviewThread(
     line: $line, side: $side, startLine: $startLine, startSide: $startSide,
     clientMutationId: $clientMutationId
   }) { thread { comments(first: 1) { nodes { id body pullRequestReview { id } } } } }
+}"#;
+
+const ADD_PENDING_FILE_THREAD_MUTATION: &str = r#"mutation AddPendingFileReviewThread(
+  $pullRequestReviewId: ID!, $body: String!, $path: String!,
+  $subjectType: PullRequestReviewThreadSubjectType!, $clientMutationId: String!
+) {
+  addPendingFileReviewThread: addPullRequestReviewThread(input: {
+    pullRequestReviewId: $pullRequestReviewId, body: $body, path: $path,
+    subjectType: $subjectType, clientMutationId: $clientMutationId
+  }) {
+    clientMutationId
+    thread {
+      id path subjectType
+      comments(first: 2) {
+        totalCount
+        nodes {
+          id body path subjectType author { login }
+          pullRequestReview {
+            id state submittedAt author { login } commit { oid }
+            pullRequest { id number repository { nameWithOwner } }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
 }"#;
 
 const UPDATE_REVIEW_COMMENT_MUTATION: &str = r#"mutation UpdateReviewComment(
@@ -3311,6 +3501,7 @@ struct ReviewActionContextData {
 
 #[derive(Deserialize)]
 struct PendingReviewData {
+    viewer: Option<GraphqlActor>,
     repository: Option<PendingReviewRepository>,
 }
 
@@ -3323,7 +3514,14 @@ struct PendingReviewRepository {
 
 #[derive(Deserialize)]
 struct PendingReviewPull {
+    id: Option<String>,
     number: u64,
+    url: Option<String>,
+    state: Option<String>,
+    #[serde(rename = "baseRefOid")]
+    base_ref_oid: Option<String>,
+    #[serde(rename = "headRefOid")]
+    head_ref_oid: Option<String>,
     reviews: GraphqlConnection<PendingReviewNode>,
 }
 
@@ -3361,6 +3559,52 @@ struct ReviewActionContext {
     viewer: GraphqlActor,
     repository: String,
     pull: ActionPullIdentity,
+}
+
+#[derive(Deserialize)]
+struct PendingFilePreflightData {
+    viewer: GraphqlActor,
+    repository: Option<PendingFilePreflightRepository>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingFilePreflightRepository {
+    name_with_owner: String,
+    pull_request: Option<PendingFilePreflightPull>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingFilePreflightPull {
+    id: String,
+    number: u64,
+    url: String,
+    state: String,
+    base_ref_oid: String,
+    head_ref_oid: String,
+    reviews: GraphqlConnection<PendingFilePreflightReview>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingFilePreflightReview {
+    id: String,
+    state: String,
+    submitted_at: Option<String>,
+    author: Option<GraphqlActor>,
+    commit: Option<GraphqlOid>,
+}
+
+struct PendingFilePreflight {
+    viewer_login: String,
+    repository: String,
+    pull_id: String,
+    pull_number: u64,
+    pull_state: String,
+    base_sha: String,
+    head_sha: String,
+    review: PendingFilePreflightReview,
 }
 
 #[derive(Deserialize)]
@@ -3453,6 +3697,17 @@ enum ReviewMutationKind {
     AddThread {
         review_id: String,
     },
+    AddFileThread {
+        operation_id: String,
+        review_id: String,
+        selected_author: String,
+        commit_sha: String,
+        pull_request_id: String,
+        pull_request_number: u64,
+        repository: String,
+        path: String,
+        body: String,
+    },
     UpdateComment {
         review_id: String,
         comment_id: String,
@@ -3466,6 +3721,7 @@ enum ReviewMutationKind {
 struct ReviewAck {
     review_id: Option<String>,
     comment_id: Option<String>,
+    thread_id: Option<String>,
 }
 
 impl ReviewMutationKind {
@@ -3496,6 +3752,7 @@ impl ReviewMutationKind {
                 Ok(ReviewAck {
                     review_id: Some(review.id),
                     comment_id: Some(comment.id),
+                    thread_id: None,
                 })
             }
             Self::AddThread { review_id } => {
@@ -3519,6 +3776,95 @@ impl ReviewMutationKind {
                 Ok(ReviewAck {
                     review_id: Some(comment.pull_request_review.id),
                     comment_id: Some(comment.id),
+                    thread_id: None,
+                })
+            }
+            Self::AddFileThread {
+                operation_id,
+                review_id,
+                selected_author,
+                commit_sha,
+                pull_request_id,
+                pull_request_number,
+                repository,
+                path,
+                body,
+            } => {
+                let payload = data.add_pending_file_review_thread.ok_or_else(|| {
+                    "GitHub omitted the created file-level review thread acknowledgement".to_owned()
+                })?;
+                if payload.client_mutation_id.as_deref() != Some(operation_id.as_str()) {
+                    return Err("GitHub echoed another file-comment operation ID".into());
+                }
+                let thread = payload
+                    .thread
+                    .ok_or_else(|| "GitHub omitted the created file-level thread".to_owned())?;
+                validate_acknowledgement_id(&thread.id, "created file-level thread")?;
+                if thread.path != path
+                    || ReviewSubject::from_provider(&thread.subject_type) != ReviewSubject::File
+                    || thread.comments.total_count != 1
+                    || thread.comments.page_info.has_next_page
+                    || thread.comments.nodes.len() != 1
+                {
+                    return Err(
+                        "GitHub file-level thread acknowledgement did not match the exact subject and path"
+                            .into(),
+                    );
+                }
+                let comment = thread
+                    .comments
+                    .nodes
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .ok_or_else(|| "GitHub omitted the created file-level comment".to_owned())?;
+                validate_acknowledgement_id(&comment.id, "created file-level comment")?;
+                validate_acknowledgement_id(
+                    &comment.pull_request_review.id,
+                    "created file-level comment parent review",
+                )?;
+                if thread.id == comment.id
+                    || thread.id == review_id
+                    || comment.id == review_id
+                    || comment.path != path
+                    || comment.body != body
+                    || ReviewSubject::from_provider(&comment.subject_type) != ReviewSubject::File
+                    || !comment
+                        .author
+                        .as_ref()
+                        .is_some_and(|author| author.login.eq_ignore_ascii_case(&selected_author))
+                    || comment.pull_request_review.id != review_id
+                    || comment.pull_request_review.state != "PENDING"
+                    || comment.pull_request_review.submitted_at.is_some()
+                    || !comment
+                        .pull_request_review
+                        .author
+                        .as_ref()
+                        .is_some_and(|author| author.login.eq_ignore_ascii_case(&selected_author))
+                    || comment
+                        .pull_request_review
+                        .commit
+                        .as_ref()
+                        .map(|commit| commit.oid.as_str())
+                        != Some(commit_sha.as_str())
+                    || comment.pull_request_review.pull_request.id != pull_request_id
+                    || comment.pull_request_review.pull_request.number != pull_request_number
+                    || !comment
+                        .pull_request_review
+                        .pull_request
+                        .repository
+                        .name_with_owner
+                        .eq_ignore_ascii_case(&repository)
+                {
+                    return Err(
+                        "GitHub file-level comment acknowledgement did not match the exact frozen parent, actor, path, body, and commit"
+                            .into(),
+                    );
+                }
+                Ok(ReviewAck {
+                    review_id: Some(review_id),
+                    comment_id: Some(comment.id),
+                    thread_id: Some(thread.id),
                 })
             }
             Self::UpdateComment {
@@ -3548,6 +3894,7 @@ impl ReviewMutationKind {
                 Ok(ReviewAck {
                     review_id: Some(comment.pull_request_review.id),
                     comment_id: Some(comment.id),
+                    thread_id: None,
                 })
             }
             Self::SubmitReview { review_id } => {
@@ -3564,6 +3911,7 @@ impl ReviewMutationKind {
                 Ok(ReviewAck {
                     review_id: Some(review.id),
                     comment_id: None,
+                    thread_id: None,
                 })
             }
             Self::AddSubmittedReview => {
@@ -3577,6 +3925,7 @@ impl ReviewMutationKind {
                 Ok(ReviewAck {
                     review_id: Some(review.id),
                     comment_id: None,
+                    thread_id: None,
                 })
             }
         }
@@ -3593,6 +3942,7 @@ fn validate_acknowledgement_id(id: &str, kind: &str) -> std::result::Result<(), 
 struct ReviewMutationData {
     add_pull_request_review: Option<AddReviewPayload>,
     add_pull_request_review_thread: Option<AddThreadPayload>,
+    add_pending_file_review_thread: Option<AddFileThreadPayload>,
     update_pull_request_review_comment: Option<UpdateCommentPayload>,
     submit_pull_request_review: Option<SubmitReviewPayload>,
 }
@@ -3605,6 +3955,51 @@ struct AddReviewPayload {
 #[derive(Deserialize)]
 struct AddThreadPayload {
     thread: Option<MutationThread>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddFileThreadPayload {
+    client_mutation_id: Option<String>,
+    thread: Option<FileMutationThread>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileMutationThread {
+    id: String,
+    path: String,
+    subject_type: String,
+    comments: FileMutationCommentConnection,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileMutationCommentConnection {
+    total_count: u64,
+    nodes: Vec<Option<FileMutationComment>>,
+    page_info: PageInfo,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileMutationComment {
+    id: String,
+    body: String,
+    path: String,
+    subject_type: String,
+    author: Option<GraphqlActor>,
+    pull_request_review: FileMutationParentReview,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileMutationParentReview {
+    id: String,
+    state: String,
+    submitted_at: Option<String>,
+    author: Option<GraphqlActor>,
+    commit: Option<GraphqlOid>,
+    pull_request: ActionReviewPull,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3841,6 +4236,104 @@ struct AuxThreadPayload {
 struct AuxThread {
     id: String,
     is_resolved: bool,
+}
+
+fn prepare_pending_file_comment_mutation(
+    session: &mut Session<'_>,
+    repo: &Repository,
+    intent: &PendingFileCommentIntent,
+) -> std::result::Result<PreparedReviewMutation, String> {
+    validate_action_text(&intent.body, false)?;
+    let ReviewCommentTarget::File(file) = &intent.target else {
+        return Err("pending file comment contains a line target".into());
+    };
+    validate_sha(&file.base_sha).map_err(|error| error.to_string())?;
+    validate_sha(&file.commit_sha).map_err(|error| error.to_string())?;
+    validate_sha(&intent.pending.observed_base_sha).map_err(|error| error.to_string())?;
+    validate_sha(&intent.pending.observed_head_sha).map_err(|error| error.to_string())?;
+    validate_sha(&intent.pending.review_commit_sha).map_err(|error| error.to_string())?;
+    if file.path.is_empty()
+        || file.path.len() > 4096
+        || file.path.contains('\0')
+        || file.file_key != file.path
+    {
+        return Err("pending file target has no exact provider-safe UTF-8 path".into());
+    }
+    validate_coordinates(repo, intent.key.pull_request, &intent.pending.pull_request)?;
+    validate_coordinates(
+        repo,
+        intent.key.pull_request,
+        &intent.pending.pending_review,
+    )?;
+    if !intent
+        .pending
+        .selected_author
+        .eq_ignore_ascii_case(&session.provider.account.login)
+        || intent.pending.observed_base_sha != file.base_sha
+        || intent.pending.observed_head_sha != file.commit_sha
+        || intent.pending.review_commit_sha != file.commit_sha
+    {
+        return Err(
+            "frozen pending review, selected account, and canonical file target differ".into(),
+        );
+    }
+    let fresh = session
+        .pending_file_preflight(repo, intent.key.pull_request)
+        .map_err(|error| error.to_string())?;
+    if fresh.pull_state != "OPEN"
+        || fresh.pull_number != intent.key.pull_request
+        || fresh.pull_id != intent.pending.pull_request.remote_id
+        || !fresh.repository.eq_ignore_ascii_case(&repo.full_name())
+        || !fresh
+            .viewer_login
+            .eq_ignore_ascii_case(&intent.pending.selected_author)
+        || fresh.base_sha != intent.pending.observed_base_sha
+        || fresh.head_sha != intent.pending.observed_head_sha
+    {
+        return Err(
+            "pull request identity, canonical revision, or selected viewer changed before dispatch"
+                .into(),
+        );
+    }
+    let review = fresh.review;
+    if review.id != intent.pending.pending_review.remote_id
+        || review.state != "PENDING"
+        || review.submitted_at.is_some()
+        || !review.author.as_ref().is_some_and(|author| {
+            author
+                .login
+                .eq_ignore_ascii_case(&intent.pending.selected_author)
+        })
+        || review.commit.as_ref().map(|commit| commit.oid.as_str())
+            != Some(intent.pending.review_commit_sha.as_str())
+    {
+        return Err(
+            "selected account pending review changed or targets another commit before dispatch"
+                .into(),
+        );
+    }
+    Ok(PreparedReviewMutation::new(
+        "add-pending-file-comment",
+        ADD_PENDING_FILE_THREAD_MUTATION,
+        json!({
+            "pullRequestReviewId": intent.pending.pending_review.remote_id,
+            "body": intent.body,
+            "path": file.path,
+            "subjectType": "FILE",
+            "clientMutationId": intent.operation_id,
+        }),
+        ReviewMutationKind::AddFileThread {
+            operation_id: intent.operation_id.clone(),
+            review_id: intent.pending.pending_review.remote_id.clone(),
+            selected_author: intent.pending.selected_author.clone(),
+            commit_sha: intent.pending.review_commit_sha.clone(),
+            pull_request_id: intent.pending.pull_request.remote_id.clone(),
+            pull_request_number: intent.key.pull_request,
+            repository: repo.full_name(),
+            path: file.path.clone(),
+            body: intent.body.clone(),
+        },
+    ))
 }
 
 fn prepare_pending_comment_mutation(
@@ -4170,11 +4663,11 @@ const DETAILS_QUERY: &str = r#"query PullRequestDetails(
       }
       reviewThreads(first: 50, after: $threadsCursor) @include(if: $includeThreads) {
         nodes {
-          id path line originalLine startLine originalStartLine diffSide startDiffSide
+          id path subjectType line originalLine startLine originalStartLine diffSide startDiffSide
           isResolved isOutdated
           comments(first: 100) {
             nodes {
-              id author { login } body createdAt updatedAt url path line originalLine
+              id author { login } body createdAt updatedAt url path subjectType line originalLine
               startLine originalStartLine diffHunk outdated commit { oid } originalCommit { oid }
             }
             pageInfo { hasNextPage endCursor }
@@ -4370,6 +4863,7 @@ struct GraphqlNodeId {
 struct DetailsThread {
     id: String,
     path: String,
+    subject_type: Option<String>,
     line: Option<u64>,
     original_line: Option<u64>,
     start_line: Option<u64>,
@@ -4391,6 +4885,7 @@ struct DetailsReviewComment {
     updated_at: String,
     url: String,
     path: String,
+    subject_type: Option<String>,
     line: Option<u64>,
     original_line: Option<u64>,
     start_line: Option<u64>,
@@ -4756,6 +5251,11 @@ impl DetailsThread {
         ReviewThread {
             coordinates: coordinates(repo, number, self.id),
             path: self.path,
+            subject: self
+                .subject_type
+                .as_deref()
+                .map(ReviewSubject::from_provider)
+                .unwrap_or(ReviewSubject::Unknown),
             line: self.line,
             original_line: self.original_line,
             start_line: self.start_line,
@@ -4786,6 +5286,11 @@ impl DetailsReviewComment {
             updated_at: self.updated_at,
             url: self.url,
             path: self.path,
+            subject: self
+                .subject_type
+                .as_deref()
+                .map(ReviewSubject::from_provider)
+                .unwrap_or(ReviewSubject::Unknown),
             line: self.line,
             original_line: self.original_line,
             start_line: self.start_line,

@@ -988,6 +988,7 @@ struct ReviewTab {
     editing_pending_summary: bool,
     submitted_summary_editor: SubmittedSummaryEditor,
     submitted_confirmation_generation: u64,
+    file_confirmation_generation: u64,
     recovery_details_expanded: bool,
     lifecycle_details_expanded: bool,
     lifecycle_choice_pages: [usize; 3],
@@ -1014,6 +1015,13 @@ enum NativeConfirmation {
     UpdateSubmittedSummary {
         generation: u64,
         action: Box<ReviewAuxiliaryAction>,
+    },
+    PendingFileComment {
+        generation: u64,
+        draft_id: String,
+        body: String,
+        target: cibergit::participation::PublishedFile,
+        source: cibergit::domain::PendingFileCommentSource,
     },
     Merge {
         preparation: Box<MergePreparation>,
@@ -1388,6 +1396,49 @@ struct SubmittedConfirmationToken {
     pull_request: u64,
     confirmation_generation: u64,
     action: ReviewAuxiliaryAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileCommentConfirmationToken {
+    workspace_instance: u64,
+    tab_instance: u64,
+    repository_key: String,
+    pull_request: u64,
+    generation: u64,
+    draft_id: String,
+    body: String,
+    target: cibergit::participation::PublishedFile,
+    pending_source: cibergit::domain::PendingFileCommentSource,
+}
+
+impl FileCommentConfirmationToken {
+    fn matches_values(
+        &self,
+        workspace_instance: u64,
+        tab_instance: u64,
+        repository_key: &str,
+        pull_request: u64,
+        confirmation: Option<&NativeConfirmation>,
+    ) -> bool {
+        self.workspace_instance == workspace_instance
+            && self.tab_instance == tab_instance
+            && self.repository_key == repository_key
+            && self.pull_request == pull_request
+            && matches!(
+                confirmation,
+                Some(NativeConfirmation::PendingFileComment {
+                    generation,
+                    draft_id,
+                    body,
+                    target,
+                    source,
+                }) if *generation == self.generation
+                    && draft_id == &self.draft_id
+                    && body == &self.body
+                    && target == &self.target
+                    && source == &self.pending_source
+            )
+    }
 }
 
 impl SubmittedConfirmationToken {
@@ -2525,6 +2576,10 @@ impl ReviewWorkspace {
             self.start_offline_collaboration_smoke(window, cx, output, phase);
             return;
         }
+        if std::env::var_os("CIBERGIT_SMOKE_PENDING_FILE").is_some() {
+            self.start_pending_file_comment_smoke(window, cx, output);
+            return;
+        }
         let second_pr = std::env::var("CIBERGIT_SMOKE_SECOND_PR")
             .ok()
             .and_then(|value| value.parse::<u64>().ok());
@@ -3526,6 +3581,363 @@ impl ReviewWorkspace {
                     }
                     cx.quit();
                 });
+            })
+            .detach();
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn start_pending_file_comment_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+        output: PathBuf,
+    ) {
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                let started = std::time::Instant::now();
+                loop {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                    let ready = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                matches!(root, Root::Review(this) if this.smoke_ready())
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready || started.elapsed() > Duration::from_secs(90) {
+                        break;
+                    }
+                }
+                let _ = std::fs::create_dir_all(&output);
+                let body = "Synthetic pending witness; exact whole-file draft retained unless the confirmed one-write acknowledgement is complete.";
+                let opened = window
+                    .update(|window, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err("pending-file smoke left the review workspace".to_owned());
+                            };
+                            this.open_file_composer(window, cx);
+                            let index = this
+                                .active_tab
+                                .ok_or_else(|| "pending-file smoke has no tab".to_owned())?;
+                            if !matches!(
+                                this.tabs[index].interactions,
+                                InteractionState::Ready(ref controller)
+                                    if controller.file_composer.is_some()
+                            ) {
+                                return Err(this.status.clone());
+                            }
+                            this.composer_input.update(cx, |input, cx| {
+                                input.set_value(body, window, cx);
+                            });
+                            this.persist_composer(cx);
+                            Ok(())
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke entity unavailable: {error:#}")))
+                    })
+                    .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")));
+
+                let save_started = std::time::Instant::now();
+                let durable = loop {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                    let durable = window
+                        .update(|_, cx| {
+                            weak.read_with(cx, |root, _| {
+                                let Root::Review(this) = root else { return false };
+                                let Some(index) = this.active_tab else { return false };
+                                matches!(
+                                    this.tabs[index].interactions,
+                                    InteractionState::Ready(ref controller)
+                                        if controller.file_composer.as_ref().is_some_and(|composer| {
+                                            composer.durable && composer.body == body
+                                        })
+                                )
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if durable || save_started.elapsed() > Duration::from_secs(15) {
+                        break durable;
+                    }
+                };
+
+                let prepared = if opened.is_ok() && durable {
+                    window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("pending-file smoke left the review workspace".to_owned());
+                                };
+                                let index = this
+                                    .active_tab
+                                    .ok_or_else(|| "pending-file smoke has no tab".to_owned())?;
+                                let repository = this.tabs[index].repository.clone();
+                                let number = this.tabs[index].pull_request.number;
+                                let (draft_id, target) = match &this.tabs[index].interactions {
+                                    InteractionState::Ready(controller) => {
+                                        let composer = controller.file_composer.as_ref().ok_or_else(|| {
+                                            "pending-file smoke composer disappeared".to_owned()
+                                        })?;
+                                        (
+                                            composer.draft_id.clone().ok_or_else(|| {
+                                                "pending-file smoke draft has no ID".to_owned()
+                                            })?,
+                                            composer.target.clone(),
+                                        )
+                                    }
+                                    _ => return Err("pending-file controller is unavailable".into()),
+                                };
+                                let coordinates = |remote_id: &str| {
+                                    cibergit::domain::ProviderCoordinates {
+                                        provider: "github".into(),
+                                        host: repository.host.clone(),
+                                        owner: repository.owner.clone(),
+                                        repository: repository.name.clone(),
+                                        pull_request: number,
+                                        remote_id: remote_id.into(),
+                                    }
+                                };
+                                let source = cibergit::domain::PendingFileCommentSource {
+                                    viewer_login: repository.account.login.clone(),
+                                    repository: repository.clone(),
+                                    pull_request: coordinates("SYNTHETIC_PR_NODE_PENDING_FILE_SMOKE"),
+                                    pull_request_state: "OPEN".into(),
+                                    current_base_sha: target.base_sha.clone(),
+                                    current_head_sha: target.commit_sha.clone(),
+                                    review: coordinates("SYNTHETIC_PENDING_REVIEW_FILE_SMOKE"),
+                                    review_author: repository.account.login.clone(),
+                                    review_commit_sha: target.commit_sha.clone(),
+                                };
+                                let snapshot = cibergit::domain::PendingReviewSnapshot {
+                                    review: cibergit::domain::PullRequestReview {
+                                        coordinates: source.review.clone(),
+                                        author: Some(repository.account.login.clone()),
+                                        body: "Clearly labelled synthetic pending review for zero-transport native smoke".into(),
+                                        state: "PENDING".into(),
+                                        submitted_at: None,
+                                        commit_sha: Some(target.commit_sha.clone()),
+                                        edit_summary_capability: None,
+                                        url: String::new(),
+                                    },
+                                    comments: Vec::new(),
+                                    comments_complete: true,
+                                    file_comment_source: Some(source.clone()),
+                                };
+                                if let InteractionState::Ready(controller) =
+                                    &mut this.tabs[index].interactions
+                                {
+                                    controller.install_pending_snapshot(Some(snapshot.clone()));
+                                }
+                                this.tabs[index].pending_snapshot = Some(snapshot);
+                                this.tabs[index].inspector_section = InspectorSection::Activity;
+                                this.inspector_open = true;
+                                this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                                this.prepare_file_comment_confirmation(cx);
+                                let generation = match &this.tabs[index].confirmation {
+                                    Some(NativeConfirmation::PendingFileComment {
+                                        generation,
+                                        draft_id: frozen_draft,
+                                        body: frozen_body,
+                                        target: frozen_target,
+                                        source: frozen_source,
+                                    }) if frozen_draft == &draft_id
+                                        && frozen_body == body
+                                        && frozen_target == &target
+                                        && frozen_source == &source => *generation,
+                                    _ => return Err(this.status.clone()),
+                                };
+                                let token = FileCommentConfirmationToken {
+                                    workspace_instance: this.workspace_instance,
+                                    tab_instance: this.tabs[index].instance_generation,
+                                    repository_key: repository.cache_key(),
+                                    pull_request: number,
+                                    generation,
+                                    draft_id: draft_id.clone(),
+                                    body: body.into(),
+                                    target: target.clone(),
+                                    pending_source: source,
+                                };
+                                Ok((
+                                    token,
+                                    draft_id,
+                                    target,
+                                    format!(
+                                        "{}/{}#{} selected account {}",
+                                        repository.owner,
+                                        repository.name,
+                                        number,
+                                        repository.account.login
+                                    ),
+                                ))
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")))
+                } else {
+                    Err(opened
+                        .err()
+                        .unwrap_or_else(|| "file draft did not become durable".into()))
+                };
+
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(400))
+                    .await;
+                let confirmation_captured = prepared.is_ok()
+                    && window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| {
+                                    image
+                                        .save(output.join("native-pending-file-confirmation.png"))
+                                        .map_err(Into::into)
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+
+                let exercised = match prepared {
+                    Ok((first_token, draft_id, original_target, readonly_target)) => window
+                        .update(|window, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("pending-file smoke left the review workspace".to_owned());
+                                };
+                                let index = this
+                                    .active_tab
+                                    .ok_or_else(|| "pending-file smoke has no tab".to_owned())?;
+                                this.cancel_file_comment_confirmation(&first_token, cx);
+                                let retained_after_cancel = matches!(
+                                    &this.tabs[index].interactions,
+                                    InteractionState::Ready(controller)
+                                        if controller.composition.file_draft(&draft_id).is_some()
+                                            && controller.file_composer.as_ref().is_some_and(|composer| {
+                                                composer.body == body && composer.target == original_target
+                                            })
+                                );
+                                this.prepare_file_comment_confirmation(cx);
+                                let second_token = match &this.tabs[index].confirmation {
+                                    Some(NativeConfirmation::PendingFileComment {
+                                        generation,
+                                        draft_id,
+                                        body,
+                                        target,
+                                        source,
+                                    }) => FileCommentConfirmationToken {
+                                        workspace_instance: this.workspace_instance,
+                                        tab_instance: this.tabs[index].instance_generation,
+                                        repository_key: this.tabs[index].repository.cache_key(),
+                                        pull_request: this.tabs[index].pull_request.number,
+                                        generation: *generation,
+                                        draft_id: draft_id.clone(),
+                                        body: body.clone(),
+                                        target: target.clone(),
+                                        pending_source: source.clone(),
+                                    },
+                                    _ => return Err(this.status.clone()),
+                                };
+                                this.cancel_file_comment_confirmation(&first_token, cx);
+                                let stale_cancel_rejected = this.tabs[index]
+                                    .confirmation
+                                    .as_ref()
+                                    .is_some_and(|confirmation| {
+                                        second_token.matches_values(
+                                            this.workspace_instance,
+                                            this.tabs[index].instance_generation,
+                                            &this.tabs[index].repository.cache_key(),
+                                            this.tabs[index].pull_request.number,
+                                            Some(confirmation),
+                                        )
+                                    });
+                                this.cancel_file_comment_confirmation(&second_token, cx);
+                                let cancelled = this.tabs[index].confirmation.is_none();
+                                let alternate = this.tabs[index]
+                                    .session
+                                    .as_ref()
+                                    .into_iter()
+                                    .flat_map(|session| &session.comparison().files)
+                                    .find(|file| {
+                                        file_key(file) != original_target.file_key
+                                            && file.raw_path.is_none()
+                                    })
+                                    .map(file_key);
+                                let target_switched = if let Some(alternate) = alternate {
+                                    this.select_file(&alternate, this.wide, cx);
+                                    this.open_file_composer(window, cx);
+                                    matches!(
+                                        &this.tabs[index].interactions,
+                                        InteractionState::Ready(controller)
+                                            if controller.file_composer.as_ref().is_some_and(|composer| {
+                                                composer.target.file_key == alternate
+                                            })
+                                    )
+                                } else {
+                                    false
+                                };
+                                this.reopen_file_draft(&draft_id, window, cx);
+                                let exact_reopened = matches!(
+                                    &this.tabs[index].interactions,
+                                    InteractionState::Ready(controller)
+                                        if controller.file_composer.as_ref().is_some_and(|composer| {
+                                            composer.draft_id.as_deref() == Some(draft_id.as_str())
+                                                && composer.body == body
+                                                && composer.target == original_target
+                                        })
+                                            && controller.composition.operations.is_empty()
+                                );
+                                Ok((
+                                    readonly_target,
+                                    retained_after_cancel,
+                                    stale_cancel_rejected,
+                                    cancelled,
+                                    target_switched,
+                                    exact_reopened,
+                                ))
+                            })
+                            .unwrap_or_else(|error| {
+                                Err(format!("smoke entity unavailable: {error:#}"))
+                            })
+                        })
+                        .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}"))),
+                    Err(error) => Err(error),
+                };
+
+                let appearance = std::env::var("CIBERGIT_SMOKE_APPEARANCE")
+                    .unwrap_or_else(|_| "system".into());
+                let (passed, report) = match exercised {
+                    Ok((target, retained, stale, cancelled, switched, reopened)) => {
+                        let passed = confirmation_captured
+                            && retained
+                            && stale
+                            && cancelled
+                            && switched
+                            && reopened;
+                        (
+                            passed,
+                            format!(
+                                "Native pending file-comment smoke ({appearance})\nReal public read-only preparation: {target}\nSynthetic authority: exact selected-account PENDING witness, clearly labelled and never sent\nActual open/save/confirm-view/cancel/reopen handlers: used\nComplete confirmation capture: {confirmation_captured}\nCancel retained exact draft: {retained}\nCancelled/reprepared identical confirmation rejected stale callback: {stale}\nCurrent cancellation retained zero writes: {cancelled}\nExact target switch and original-target restart recovery: {}\nRemote mutation transport: ZERO (confirm handler deliberately not invoked)\nPhysical input / AX / focus: not established; background native scene only\n",
+                                switched && reopened
+                            ),
+                        )
+                    }
+                    Err(error) => (false, format!("Native pending file-comment smoke failed: {error}\n")),
+                };
+                let _ = std::fs::write(output.join("native-pending-file-smoke.txt"), report);
+                if !passed {
+                    panic!("native pending file-comment smoke assertions failed");
+                }
+                let _ = window.update(|_, cx| cx.quit());
             })
             .detach();
     }
@@ -4566,6 +4978,7 @@ impl ReviewWorkspace {
                     updated_at: "2026-09-13T12:00:00Z".into(),
                     url: String::new(),
                     path: path.clone(),
+                    subject: cibergit::domain::ReviewSubject::Line,
                     line: Some(selection.1),
                     original_line: Some(selection.1),
                     start_line: None,
@@ -4580,6 +4993,7 @@ impl ReviewWorkspace {
             cibergit::domain::ReviewThread {
                 coordinates: coordinates(remote_id),
                 path: path.clone(),
+                subject: cibergit::domain::ReviewSubject::Line,
                 line: Some(selection.1),
                 original_line: Some(selection.1),
                 start_line: None,
@@ -4894,6 +5308,7 @@ impl ReviewWorkspace {
             updated_at: "2026-09-13T12:00:00Z".into(),
             url: String::new(),
             path: intent.position.path.clone(),
+            subject: cibergit::domain::ReviewSubject::Line,
             line: Some(intent.position.line),
             original_line: Some(intent.position.line),
             start_line: intent.position.start_line,
@@ -4920,6 +5335,7 @@ impl ReviewWorkspace {
                 comment: pending_comment.clone(),
             }],
             comments_complete: true,
+            file_comment_source: None,
         };
         let mut details = self.tabs[index]
             .details
@@ -4930,6 +5346,7 @@ impl ReviewWorkspace {
         details.review_threads.push(cibergit::domain::ReviewThread {
             coordinates: coordinates("cibergit-reconcile-thread"),
             path: intent.position.path.clone(),
+            subject: cibergit::domain::ReviewSubject::Line,
             line: Some(intent.position.line),
             original_line: Some(intent.position.line),
             start_line: intent.position.start_line,
@@ -8496,6 +8913,7 @@ impl ReviewWorkspace {
             editing_pending_summary: false,
             submitted_summary_editor: SubmittedSummaryEditor::default(),
             submitted_confirmation_generation: 0,
+            file_confirmation_generation: 0,
             recovery_details_expanded: false,
             lifecycle_details_expanded: false,
             lifecycle_choice_pages: [0; 3],
@@ -8697,6 +9115,76 @@ impl ReviewWorkspace {
         }
     }
 
+    fn open_file_composer(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "This review state is frozen until the started write is reconciled.".into();
+            return;
+        }
+        let current_body = self.composer_input.read(cx).value().to_string();
+        let transition_needs_save = match &self.tabs[index].interactions {
+            InteractionState::Ready(controller) => controller
+                .composer
+                .as_ref()
+                .map(|composer| {
+                    composer.body != current_body
+                        || composer.draft_id.is_some() && !composer.durable
+                        || composer.draft_id.is_none() && !current_body.is_empty()
+                })
+                .or_else(|| {
+                    controller.file_composer.as_ref().map(|composer| {
+                        composer.body != current_body
+                            || composer.draft_id.is_some() && !composer.durable
+                            || composer.draft_id.is_none() && !current_body.is_empty()
+                    })
+                })
+                .unwrap_or(false),
+            _ => false,
+        };
+        if transition_needs_save {
+            self.persist_composer(cx);
+            self.status =
+                "Saving the current exact comment target; choose Comment on file again after it is durable."
+                    .into();
+            return;
+        }
+        let (Some(displayed), Some(canonical)) = (
+            self.tabs[index].session.clone(),
+            self.tabs[index].canonical_session.clone(),
+        ) else {
+            self.status = "The canonical full pull request is still loading.".into();
+            return;
+        };
+        let result = match &mut self.tabs[index].interactions {
+            InteractionState::Ready(controller) => {
+                controller.select_file_with_canonical(&displayed, &canonical)
+            }
+            InteractionState::Loading => Err("Review recovery is still loading.".into()),
+            InteractionState::RecoveryRequired(reason) => Err(reason.clone()),
+        };
+        match result {
+            Ok(()) => {
+                let body = match &self.tabs[index].interactions {
+                    InteractionState::Ready(controller) => controller
+                        .file_composer
+                        .as_ref()
+                        .map(|composer| composer.body.clone())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                self.composer_input.update(cx, |input, cx| {
+                    input.set_value(body, window, cx);
+                    input.focus(window, cx);
+                });
+                self.rebuild_diff(index, self.wide);
+                self.status = "File-level draft bound to the exact canonical file.".into();
+            }
+            Err(error) => self.status = error,
+        }
+        cx.notify();
+    }
+
     fn reopen_pending_draft(
         &mut self,
         draft_id: &str,
@@ -8753,6 +9241,68 @@ impl ReviewWorkspace {
         cx.notify();
     }
 
+    fn reopen_file_draft(&mut self, draft_id: &str, window: &mut Window, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "Wait for the started review action before editing this file draft.".into();
+            return;
+        }
+        let current_body = self.composer_input.read(cx).value().to_string();
+        let needs_save = matches!(
+            &self.tabs[index].interactions,
+            InteractionState::Ready(controller)
+                if controller.file_composer.as_ref().is_some_and(|composer| {
+                    composer.body != current_body
+                        || composer.draft_id.is_some() && !composer.durable
+                        || composer.draft_id.is_none() && !current_body.is_empty()
+                })
+        );
+        if needs_save {
+            self.persist_composer(cx);
+            self.status = "Saving the active file draft before changing targets; open the saved draft again afterward."
+                .into();
+            return;
+        }
+        if !matches!(
+            self.tabs[index].comparison_picker.request,
+            ComparisonRequest::FullPullRequest
+        ) {
+            self.restore_full_comparison(index, cx);
+        }
+        let result = match &mut self.tabs[index].interactions {
+            InteractionState::Ready(controller) => controller.reopen_file_draft(draft_id),
+            InteractionState::Loading => Err("Review recovery is still loading.".into()),
+            InteractionState::RecoveryRequired(reason) => Err(reason.clone()),
+        };
+        match result {
+            Ok(composer) => {
+                if self.tabs[index]
+                    .session
+                    .as_mut()
+                    .is_some_and(|session| session.select_file(&composer.target.file_key))
+                    && let Some(row) = self.tabs[index]
+                        .file_tree
+                        .reveal_file(&composer.target.file_key)
+                {
+                    self.tabs[index]
+                        .file_tree_scroll
+                        .scroll_to_item(row, ScrollStrategy::Nearest);
+                }
+                self.composer_input.update(cx, |input, cx| {
+                    input.set_value(composer.body, window, cx);
+                    input.focus(window, cx);
+                });
+                self.rebuild_diff(index, self.wide);
+                self.status = composer
+                    .notice
+                    .unwrap_or_else(|| "File-level draft opened.".into());
+            }
+            Err(error) => self.status = error,
+        }
+        cx.notify();
+    }
+
     fn persist_composer(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         if self.tabs[index].write_in_flight {
@@ -8777,6 +9327,12 @@ impl ReviewWorkspace {
                 .composer
                 .as_ref()
                 .and_then(|composer| composer.draft_id.clone())
+                .or_else(|| {
+                    controller
+                        .file_composer
+                        .as_ref()
+                        .and_then(|composer| composer.draft_id.clone())
+                })
                 .expect("staging creates a draft identity");
             (
                 snapshot,
@@ -8856,7 +9412,14 @@ impl ReviewWorkspace {
             InteractionState::Ready(controller) => controller
                 .composer
                 .as_ref()
-                .is_some_and(|composer| !composer.durable || composer.body != body),
+                .map(|composer| !composer.durable || composer.body != body)
+                .or_else(|| {
+                    controller
+                        .file_composer
+                        .as_ref()
+                        .map(|composer| !composer.durable || composer.body != body)
+                })
+                .unwrap_or(false),
             InteractionState::Loading | InteractionState::RecoveryRequired(_) => false,
         };
         if needs_save {
@@ -8867,6 +9430,7 @@ impl ReviewWorkspace {
         }
         if let InteractionState::Ready(controller) = &mut self.tabs[index].interactions {
             controller.composer = None;
+            controller.file_composer = None;
         }
         self.rebuild_diff(index, self.wide);
         self.status = "Inline composer closed; saved text remains available.".into();
@@ -8879,12 +9443,27 @@ impl ReviewWorkspace {
             self.status = "A review write is already in progress.".into();
             return;
         }
+        if matches!(
+            &self.tabs[index].interactions,
+            InteractionState::Ready(controller) if controller.file_composer.is_some()
+        ) {
+            self.status = "Use Review pending-only write for a file-level comment; file comments are never posted immediately."
+                .into();
+            return;
+        }
         let input_body = self.composer_input.read(cx).value().to_string();
         let needs_save = match &self.tabs[index].interactions {
             InteractionState::Ready(controller) => controller
                 .composer
                 .as_ref()
-                .is_none_or(|composer| !composer.durable || composer.body != input_body),
+                .map(|composer| !composer.durable || composer.body != input_body)
+                .or_else(|| {
+                    controller
+                        .file_composer
+                        .as_ref()
+                        .map(|composer| !composer.durable || composer.body != input_body)
+                })
+                .unwrap_or(true),
             _ => true,
         };
         if needs_save {
@@ -10068,6 +10647,323 @@ impl ReviewWorkspace {
             "Submitted review edit cancelled; draft retained and zero writes sent.".into();
         cx.notify();
         true
+    }
+
+    fn prepare_file_comment_confirmation(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.tabs[index].write_in_flight {
+            self.status =
+                "Wait for the active review write before confirming this file comment.".into();
+            return;
+        }
+        let input_body = self.composer_input.read(cx).value().to_string();
+        let (draft_id, target, durable, staged_body) = match &self.tabs[index].interactions {
+            InteractionState::Ready(controller) => {
+                let Some(composer) = controller.file_composer.as_ref() else {
+                    self.status = "No file-level composer is open.".into();
+                    return;
+                };
+                (
+                    composer.draft_id.clone(),
+                    composer.target.clone(),
+                    composer.durable,
+                    composer.body.clone(),
+                )
+            }
+            InteractionState::Loading => {
+                self.status = "Review recovery is still loading.".into();
+                return;
+            }
+            InteractionState::RecoveryRequired(reason) => {
+                self.status = reason.clone();
+                return;
+            }
+        };
+        if !durable || staged_body != input_body {
+            self.persist_composer(cx);
+            self.status = "The exact file-level text must finish saving locally; review the write again afterward."
+                .into();
+            return;
+        }
+        if input_body.is_empty() {
+            self.status = "A file-level comment body is required.".into();
+            return;
+        }
+        let Some(draft_id) = draft_id else {
+            self.status = "The file-level draft has no durable identity.".into();
+            return;
+        };
+        let Some(pending) = self.tabs[index].pending_snapshot.as_ref() else {
+            self.status = "File-level comments are pending-only in this release, and no existing pending review was observed for the selected account. The local draft is retained; nothing was posted and no pending review was created."
+                .into();
+            return;
+        };
+        let Some(source) = pending.file_comment_source.clone() else {
+            self.status = "The existing pending review lacks complete fresh file-comment evidence. Refresh Activity; the local draft is retained and zero writes were sent."
+                .into();
+            return;
+        };
+        if source.current_base_sha != target.base_sha
+            || source.current_head_sha != target.commit_sha
+            || source.repository.cache_key() != self.tabs[index].repository.cache_key()
+            || source.review.remote_id != pending.review.coordinates.remote_id
+        {
+            self.status = "The fresh pending review and exact canonical file target no longer match. Refresh before confirming; the draft is retained."
+                .into();
+            return;
+        }
+        let Some(generation) = self.tabs[index].file_confirmation_generation.checked_add(1) else {
+            self.status =
+                "File-comment confirmation identity is exhausted; reopen this tab.".into();
+            return;
+        };
+        self.tabs[index].file_confirmation_generation = generation;
+        self.tabs[index].confirmation = Some(NativeConfirmation::PendingFileComment {
+            generation,
+            draft_id,
+            body: input_body,
+            target,
+            source,
+        });
+        self.inspector_open = true;
+        self.inspector_scroll.set_offset(point(px(0.), px(0.)));
+        self.status = "Review the exact pending-only file comment before sending.".into();
+        cx.notify();
+    }
+
+    fn cancel_file_comment_confirmation(
+        &mut self,
+        token: &FileCommentConfirmationToken,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.tabs.iter().position(|tab| {
+            token.matches_values(
+                self.workspace_instance,
+                tab.instance_generation,
+                &tab.repository.cache_key(),
+                tab.pull_request.number,
+                tab.confirmation.as_ref(),
+            )
+        }) else {
+            self.status =
+                "That file-comment confirmation is no longer current; zero writes sent.".into();
+            cx.notify();
+            return;
+        };
+        self.tabs[index].confirmation = None;
+        self.status =
+            "File-comment confirmation cancelled; local draft retained and zero writes sent."
+                .into();
+        cx.notify();
+    }
+
+    fn confirm_file_comment(
+        &mut self,
+        token: FileCommentConfirmationToken,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.tabs.iter().position(|tab| {
+            token.matches_values(
+                self.workspace_instance,
+                tab.instance_generation,
+                &tab.repository.cache_key(),
+                tab.pull_request.number,
+                tab.confirmation.as_ref(),
+            )
+        }) else {
+            self.status = "That file-comment confirmation is stale; zero writes sent and the draft remains available."
+                .into();
+            cx.notify();
+            return;
+        };
+        if self.active_tab != Some(index) || self.tabs[index].write_in_flight {
+            self.status =
+                "The workspace or active action changed; zero file-comment writes sent.".into();
+            cx.notify();
+            return;
+        }
+        let Some(NativeConfirmation::PendingFileComment { source, .. }) =
+            self.tabs[index].confirmation.clone()
+        else {
+            return;
+        };
+        let still_fresh = self.tabs[index]
+            .pending_snapshot
+            .as_ref()
+            .and_then(|pending| pending.file_comment_source.as_ref())
+            == Some(&source);
+        let exact_draft = matches!(
+            &self.tabs[index].interactions,
+            InteractionState::Ready(controller)
+                if controller.file_composer.as_ref().is_some_and(|composer|
+                    composer.durable
+                        && composer.draft_id.as_deref() == Some(token.draft_id.as_str())
+                        && composer.body == token.body
+                        && composer.target == token.target)
+        );
+        if !still_fresh || !exact_draft {
+            self.tabs[index].confirmation = None;
+            self.status = "The pending source or exact local file draft changed after confirmation opened; zero writes sent. Review the retained draft again."
+                .into();
+            cx.notify();
+            return;
+        }
+        self.tabs[index].confirmation = None;
+        self.start_file_comment_write(source, token, cx);
+    }
+
+    fn start_file_comment_write(
+        &mut self,
+        source: cibergit::domain::PendingFileCommentSource,
+        confirmed: FileCommentConfirmationToken,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(index) = self.active_tab else { return };
+        let (repository, number, mut composition, store, authority, expected, operation_id) = {
+            let tab = &mut self.tabs[index];
+            let InteractionState::Ready(controller) = &mut tab.interactions else {
+                self.status = "Review recovery is unavailable.".into();
+                return;
+            };
+            let operation_id = match controller.prepare_pending_file_comment(&source) {
+                Ok(operation_id) => operation_id,
+                Err(error) => {
+                    self.status = error;
+                    return;
+                }
+            };
+            let exact = controller.composition.operations.iter().any(|operation| {
+                operation.id == operation_id
+                    && matches!(
+                        operation.payload.as_ref(),
+                        Some(cibergit::participation::ReviewOperationPayload::PendingFileComment(intent))
+                            if intent.draft_id == confirmed.draft_id
+                                && intent.body == confirmed.body
+                                && intent.target == cibergit::participation::ReviewCommentTarget::File(confirmed.target.clone())
+                                && intent.pending.pending_review.remote_id == confirmed.pending_source.review.remote_id
+                    )
+            });
+            if !exact {
+                let _ = controller.composition.cancel_prepared(&operation_id);
+                self.status = "Frozen file-comment preparation changed; zero writes sent.".into();
+                return;
+            }
+            tab.details_generation += 1;
+            tab.write_in_flight = true;
+            (
+                tab.repository.clone(),
+                tab.pull_request.number,
+                controller.composition.clone(),
+                controller.store.clone(),
+                controller.authority.clone(),
+                controller.durable_composition.clone(),
+                operation_id,
+            )
+        };
+        self.composer_input
+            .update(cx, |input, cx| input.set_disabled(true, cx));
+        let workspace_instance = self.workspace_instance;
+        let tab_instance = self.tabs[index].instance_generation;
+        let identity = repository.cache_key();
+        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let completion_latest = latest.clone();
+        let completion_operation_id = operation_id.clone();
+        let attempt_id = next_attempt_id(&operation_id);
+        let provider = GithubProvider::new(repository.account.clone());
+        let task = cx.background_spawn(async move {
+            let fallback = expected.clone();
+            let execution = match lock.lock() {
+                Err(_) => Err("Review recovery save lock failed; zero writes sent.".to_owned()),
+                Ok(_guard) if latest.load(Ordering::Acquire) != sequence => Err(
+                    "A newer review-state write superseded this file-comment preparation; zero writes sent."
+                        .to_owned(),
+                ),
+                Ok(_guard) => authority.execute_if_current(&store, expected.as_ref(), || {
+                    provider.execute_review_operation(
+                        &repository,
+                        &mut composition,
+                        &store,
+                        &operation_id,
+                        &attempt_id,
+                    )
+                }),
+            };
+            let (outcome, durable) = match execution {
+                Ok((outcome, durable)) => (outcome, durable),
+                Err(reason) => (
+                    ProviderMutationOutcome::PreflightRejected { reason },
+                    fallback,
+                ),
+            };
+            if matches!(outcome, ProviderMutationOutcome::PreflightRejected { .. }) {
+                let _ = composition.cancel_prepared(&operation_id);
+            }
+            (composition, durable, outcome)
+        });
+        cx.spawn(async move |root, cx| {
+            let (composition, durable, outcome) = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                if this.workspace_instance != workspace_instance
+                    || completion_latest.load(Ordering::Acquire) != sequence
+                {
+                    return;
+                }
+                let Some(index) = this.tabs.iter().position(|tab| {
+                    tab.instance_generation == tab_instance
+                        && tab.repository.cache_key() == identity
+                        && tab.pull_request.number == number
+                }) else {
+                    return;
+                };
+                let owns_action = matches!(
+                    &this.tabs[index].interactions,
+                    InteractionState::Ready(controller)
+                        if controller.composition.operations.iter().any(|operation| {
+                            operation.id == completion_operation_id
+                                && matches!(
+                                    operation.target,
+                                    cibergit::participation::ReviewOperationTarget::SynchronizePendingFileComment { .. }
+                                )
+                        })
+                );
+                if !owns_action {
+                    return;
+                }
+                this.tabs[index].write_in_flight = false;
+                if let InteractionState::Ready(controller) = &mut this.tabs[index].interactions {
+                    controller.composition = composition;
+                    controller.durable_composition = durable;
+                    if matches!(outcome, ProviderMutationOutcome::Acknowledged(_))
+                        && controller.file_composer.as_ref().is_some_and(|composer| {
+                            composer.draft_id.as_deref() == Some(confirmed.draft_id.as_str())
+                                && composer.body == confirmed.body
+                                && composer.target == confirmed.target
+                        })
+                    {
+                        controller.file_composer = None;
+                    }
+                }
+                if this.active_tab == Some(index) {
+                    this.composer_input
+                        .update(cx, |input, cx| input.set_disabled(false, cx));
+                }
+                this.status = match outcome {
+                    ProviderMutationOutcome::Acknowledged(_) => "File-level comment added to the exact selected-account pending review; the review remains unsubmitted."
+                        .into(),
+                    ProviderMutationOutcome::PreflightRejected { reason } => format!(
+                        "File-level comment was not sent; the local draft is retained: {reason}"
+                    ),
+                    ProviderMutationOutcome::Uncertain { reason, .. } => format!(
+                        "File-level comment outcome is uncertain and will not replay automatically; the frozen operation remains recoverable: {reason}"
+                    ),
+                };
+                this.rebuild_diff(index, this.wide);
+                this.refresh_details(index, cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn dispatch_auxiliary_action(&mut self, action: ReviewAuxiliaryAction, cx: &mut Context<Root>) {
@@ -11504,6 +12400,22 @@ impl ReviewWorkspace {
             return;
         }
         let current = self.composer_input.read(cx).value().to_string();
+        if matches!(
+            &self.tabs[index].interactions,
+            InteractionState::Ready(controller)
+                if controller.file_composer.as_ref().is_some_and(|composer| {
+                    composer.body != current
+                        || composer.draft_id.is_some() && !composer.durable
+                        || composer.draft_id.is_none() && !current.is_empty()
+                })
+        ) {
+            self.persist_composer(cx);
+            self.status =
+                "Saving the exact file-level target before navigation; choose the file again after it is durable."
+                    .into();
+            cx.notify();
+            return;
+        }
         if matches!(&self.tabs[index].interactions, InteractionState::Ready(controller) if controller.composer.as_ref().is_some_and(|composer| composer.body != current))
         {
             self.persist_composer(cx);
@@ -11541,6 +12453,23 @@ impl ReviewWorkspace {
         if self.tabs[index].write_in_flight {
             self.status =
                 "File navigation is paused while this review write is being reconciled.".into();
+            cx.notify();
+            return;
+        }
+        let current = self.composer_input.read(cx).value().to_string();
+        if matches!(
+            &self.tabs[index].interactions,
+            InteractionState::Ready(controller)
+                if controller.file_composer.as_ref().is_some_and(|composer| {
+                    composer.body != current
+                        || composer.draft_id.is_some() && !composer.durable
+                        || composer.draft_id.is_none() && !current.is_empty()
+                })
+        ) {
+            self.persist_composer(cx);
+            self.status =
+                "Saving the exact file-level target before navigation; navigate again after it is durable."
+                    .into();
             cx.notify();
             return;
         }
@@ -15250,6 +16179,7 @@ impl ReviewWorkspace {
         let unified_text_width = unified_text_content_width(&rows);
         let focus = self.diff_focus.clone();
         let root = cx.entity();
+        let file_action_root = root.clone();
         let composer = self.composer_input.clone();
         let reply_input = self.reply_input.clone();
         let reply_thread = tab.reply_thread.clone();
@@ -15258,6 +16188,19 @@ impl ReviewWorkspace {
                 .pending_review
                 .as_ref()
                 .map(|snapshot| snapshot.review.coordinates.clone()),
+            _ => None,
+        };
+        let file_composer = match &tab.interactions {
+            InteractionState::Ready(controller) => controller
+                .file_composer
+                .as_ref()
+                .filter(|composer| {
+                    tab.session
+                        .as_ref()
+                        .and_then(ReviewSession::selected_file)
+                        .is_some_and(|file| file_key(file) == composer.target.file_key)
+                })
+                .cloned(),
             _ => None,
         };
         div()
@@ -15273,12 +16216,31 @@ impl ReviewWorkspace {
                     .px_4()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .border_b_1()
                     .border_color(colors.border)
                     .font_family(CODE_FONT)
                     .text_sm()
-                    .child(header),
+                    .child(header)
+                    .child(
+                        action_link_with_id("comment-on-file".into(), "Comment on file…", colors)
+                            .on_click(move |_, window, cx| {
+                                file_action_root.update(cx, |root, cx| {
+                                    if let Root::Review(this) = root {
+                                        this.open_file_composer(window, cx);
+                                    }
+                                });
+                            }),
+                    ),
             )
+            .when_some(file_composer, |pane, composer_state| {
+                pane.child(render_file_composer(
+                    &composer_state,
+                    colors,
+                    &root,
+                    &composer,
+                ))
+            })
             .when(split_mode, |pane| {
                 pane.child(
                     div()
@@ -16343,6 +17305,38 @@ impl ReviewWorkspace {
                                     ),
                                 ));
                         }
+                        for draft in controller.composition.file_drafts.iter().filter(|draft| {
+                            draft.disposition == cibergit::participation::DraftDisposition::Pending
+                                && draft.remote.is_none()
+                        }) {
+                            let reopen_root = cx.entity();
+                            let draft_id = draft.id.clone();
+                            pending_card = pending_card.child(
+                                div()
+                                    .mt_2()
+                                    .p_2()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .child(format!(
+                                        "File-level draft · {} · reviewed {}",
+                                        draft.target.path,
+                                        short_sha(&draft.target.commit_sha)
+                                    ))
+                                    .child(div().mt_1().text_xs().text_color(colors.muted).child(
+                                        "Saved locally; no provider write has been acknowledged.",
+                                    ))
+                                    .child(action_link("Open file draft", colors).on_click(
+                                        move |_, window, cx| {
+                                            reopen_root.update(cx, |root, cx| {
+                                                if let Root::Review(this) = root {
+                                                    this.reopen_file_draft(&draft_id, window, cx);
+                                                }
+                                            });
+                                        },
+                                    )),
+                            );
+                        }
                         if let Some(snapshot) = &controller.pending_review {
                             let edit_root = cx.entity();
                             let edit_body = snapshot.review.body.clone();
@@ -16452,6 +17446,18 @@ impl ReviewWorkspace {
                                         .pl_2()
                                         .border_l_2()
                                         .border_color(colors.accent)
+                                        .child(match linked.comment.subject {
+                                            cibergit::domain::ReviewSubject::File => {
+                                                format!("File-level · {}", linked.comment.path)
+                                            }
+                                            cibergit::domain::ReviewSubject::Line => {
+                                                format!("Line-level · {}", linked.comment.path)
+                                            }
+                                            cibergit::domain::ReviewSubject::Unknown => format!(
+                                                "Unknown provider subject · {} · read-only",
+                                                linked.comment.path
+                                            ),
+                                        })
                                         .child(markdown_text(
                                             format!("pending-comment-{comment_id}"),
                                             &linked.comment.body,
@@ -17134,35 +18140,46 @@ impl ReviewWorkspace {
                         })
                         .unwrap_or_default();
                     for thread in placed.iter().take(30) {
-                        let location = thread.anchor.as_ref().map_or_else(
-                            || {
-                                format!(
-                                    "Unplaced · {}",
-                                    thread
-                                        .unplaced_reason
-                                        .as_deref()
-                                        .unwrap_or("unknown reason")
+                        let location = match thread.thread.subject {
+                            cibergit::domain::ReviewSubject::File => {
+                                format!("File-level · {}", thread.thread.path)
+                            }
+                            cibergit::domain::ReviewSubject::Unknown => format!(
+                                "Unknown provider subject · {} · read-only",
+                                thread.thread.path
+                            ),
+                            cibergit::domain::ReviewSubject::Line => {
+                                thread.anchor.as_ref().map_or_else(
+                                    || {
+                                        format!(
+                                            "Unplaced · {}",
+                                            thread
+                                                .unplaced_reason
+                                                .as_deref()
+                                                .unwrap_or("unknown reason")
+                                        )
+                                    },
+                                    |anchor| {
+                                        if anchor.start_line == anchor.line {
+                                            format!(
+                                                "{} · {} {}",
+                                                thread.thread.path,
+                                                anchor.side.provider_name(),
+                                                anchor.line
+                                            )
+                                        } else {
+                                            format!(
+                                                "{} · {} {}–{}",
+                                                thread.thread.path,
+                                                anchor.side.provider_name(),
+                                                anchor.start_line,
+                                                anchor.line
+                                            )
+                                        }
+                                    },
                                 )
-                            },
-                            |anchor| {
-                                if anchor.start_line == anchor.line {
-                                    format!(
-                                        "{} · {} {}",
-                                        thread.thread.path,
-                                        anchor.side.provider_name(),
-                                        anchor.line
-                                    )
-                                } else {
-                                    format!(
-                                        "{} · {} {}–{}",
-                                        thread.thread.path,
-                                        anchor.side.provider_name(),
-                                        anchor.start_line,
-                                        anchor.line
-                                    )
-                                }
-                            },
-                        );
+                            }
+                        };
                         activity.push(
                             div()
                                 .mb_3()
@@ -17182,7 +18199,8 @@ impl ReviewWorkspace {
                                         .text_xs()
                                         .text_color(colors.faint)
                                         .child(format!(
-                                            "Current {:?} {:?}–{:?} · original {:?}–{:?} · commit {:?} · original commit {:?}",
+                                            "Subject {:?} · current {:?} {:?}–{:?} · original {:?}–{:?} · commit {:?} · original commit {:?}",
+                                            thread.thread.subject,
                                             thread.thread.side,
                                             thread.thread.start_line,
                                             thread.thread.line,
@@ -17564,6 +18582,108 @@ impl ReviewWorkspace {
                                 .child("GitHub rechecks this exact review before saving, but another edit could happen between that check and the save. The review may refer to an older commit; this action does not change the displayed comparison."),
                         )
                         .child(self.submitted_summary_confirmation_controls(token, colors, cx))
+                        .into_any_element(),
+                )
+            }
+            NativeConfirmation::PendingFileComment {
+                generation,
+                draft_id,
+                body,
+                target,
+                source,
+            } => {
+                let token = FileCommentConfirmationToken {
+                    workspace_instance: self.workspace_instance,
+                    tab_instance: tab.instance_generation,
+                    repository_key: tab.repository.cache_key(),
+                    pull_request: tab.pull_request.number,
+                    generation: *generation,
+                    draft_id: draft_id.clone(),
+                    body: body.clone(),
+                    target: target.clone(),
+                    pending_source: source.clone(),
+                };
+                let confirm_root = cx.entity();
+                let cancel_root = confirm_root.clone();
+                let confirm_token = token.clone();
+                Some(
+                    div()
+                        .mb_5()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.green)
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Add a file-level comment to your pending review?"),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child(format!(
+                                    "{} · #{} · selected account {}",
+                                    tab.repository.full_name(),
+                                    tab.pull_request.number,
+                                    source.viewer_login
+                                )),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .child(format!("Whole file: {}", target.path)),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .child(format!(
+                                    "Pending review {} · reviewed commit {}",
+                                    source.review.remote_id, source.review_commit_sha
+                                )),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .font_family(CODE_FONT)
+                                .child(format!("Exact comment: {body:?}")),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(colors.amber)
+                                .child("This only adds to the existing pending review; it does not submit the review or post immediately. GitHub is checked again just before sending, but the head can still change in the small gap before the write."),
+                        )
+                        .child(
+                            div()
+                                .mt_3()
+                                .flex()
+                                .gap_3()
+                                .text_xs()
+                                .child(action_link("Add to pending review", colors).on_click(
+                                    move |_, _, cx| {
+                                        let token = confirm_token.clone();
+                                        confirm_root.update(cx, |root, cx| {
+                                            if let Root::Review(this) = root {
+                                                this.confirm_file_comment(token, cx);
+                                            }
+                                        });
+                                    },
+                                ))
+                                .child(action_link("Cancel", colors).on_click(move |_, _, cx| {
+                                    let token = token.clone();
+                                    cancel_root.update(cx, |root, cx| {
+                                        if let Root::Review(this) = root {
+                                            this.cancel_file_comment_confirmation(&token, cx);
+                                        }
+                                    });
+                                })),
+                        )
                         .into_any_element(),
                 )
             }
@@ -19672,6 +20792,90 @@ fn render_inline_composer(
         .into_any_element()
 }
 
+fn render_file_composer(
+    state: &review_interactions::FileComposerState,
+    colors: Palette,
+    root: &Entity<Root>,
+    input: &Entity<TextareaState>,
+) -> AnyElement {
+    let save_root = root.clone();
+    let review_root = root.clone();
+    let close_root = root.clone();
+    div()
+        .w_full()
+        .min_h(px(174.))
+        .px_4()
+        .py_3()
+        .bg(if colors.dark {
+            rgba(0x202a24ff)
+        } else {
+            rgba(0xf0f8f3ff)
+        })
+        .border_b_1()
+        .border_color(colors.green)
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .text_xs()
+                .text_color(colors.muted)
+                .child(format!("New file-level comment · {}", state.target.path))
+                .child(format!("reviewed {}", short_sha(&state.target.commit_sha))),
+        )
+        .child(
+            div()
+                .mt_1()
+                .text_xs()
+                .text_color(colors.muted)
+                .child("Targets the whole file; no line or diff side will be sent."),
+        )
+        .child(
+            div()
+                .mt_2()
+                .h(px(88.))
+                .border_1()
+                .border_color(colors.border)
+                .rounded_md()
+                .overflow_hidden()
+                .child(Textarea::new(input)),
+        )
+        .child(
+            div()
+                .mt_2()
+                .flex()
+                .items_center()
+                .gap_3()
+                .text_xs()
+                .child(
+                    action_link("Save locally", colors).on_click(move |_, _, cx| {
+                        save_root.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                this.persist_composer(cx);
+                            }
+                        });
+                    }),
+                )
+                .child(action_link("Review pending-only write…", colors).on_click(
+                    move |_, _, cx| {
+                        review_root.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                this.prepare_file_comment_confirmation(cx);
+                            }
+                        });
+                    },
+                ))
+                .child(div().flex_1())
+                .child(action_link("Close", colors).on_click(move |_, _, cx| {
+                    close_root.update(cx, |root, cx| {
+                        if let Root::Review(this) = root {
+                            this.close_inline_composer(cx);
+                        }
+                    });
+                })),
+        )
+        .into_any_element()
+}
+
 fn diff_horizontal_scrollbar(index: usize, horizontal: &ScrollHandle) -> Div {
     div()
         .absolute()
@@ -19862,7 +21066,7 @@ mod layout_tests {
     use super::{
         ActionJournalCompletionToken, COLLAPSED_PANEL_WIDTH, CollaborationReadToken,
         DEFAULT_SIDEBAR_WIDTH, DiffLine, DiffLineKind, DiffMode, DiffRow,
-        EXCEPTIONAL_LINE_CHUNK_BYTES, InstallTabOptions, JournalOperation, JournalRequest,
+        EXCEPTIONAL_LINE_CHUNK_BYTES, FileCommentConfirmationToken, InstallTabOptions, JournalOperation, JournalRequest,
         JournalStatus, LoadState, MAX_PANEL_WIDTH, MIN_DETAILS_WIDTH, MIN_FILE_TREE_WIDTH,
         MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
         RepoRuntime, Root, Startup, SubmittedConfirmationToken, SubmittedDraftCallbackToken,
@@ -19874,11 +21078,12 @@ mod layout_tests {
         submitted_review_edit_action,
     };
     use cibergit::domain::{
-        Account, MergeEligibility, ProviderCoordinates, PullRequest, PullRequestDetails,
+        Account, MergeEligibility, PendingFileCommentSource, ProviderCoordinates, PullRequest, PullRequestDetails,
         PullRequestReview, Repository, ReviewAuxiliaryAction, ReviewAuxiliaryRequest,
         SubmittedReviewEditCapability,
     };
     use tempfile::tempdir;
+    use cibergit::participation::PublishedFile;
 
     fn submitted_review_fixture() -> (Repository, PullRequestReview) {
         let repository = Repository {
@@ -19927,6 +21132,69 @@ mod layout_tests {
             head_sha: format!("{number:040}"),
             ..Default::default()
         }
+    }
+
+    fn pending_file_confirmation_fixture() -> (
+        Repository,
+        PendingFileCommentSource,
+        PublishedFile,
+        NativeConfirmation,
+        FileCommentConfirmationToken,
+    ) {
+        let (repository, _) = submitted_review_fixture();
+        let pull_request = ProviderCoordinates {
+            provider: "github".into(),
+            host: "github.com".into(),
+            owner: "octo".into(),
+            repository: "repo".into(),
+            pull_request: 7,
+            remote_id: "PR_node".into(),
+        };
+        let source = PendingFileCommentSource {
+            viewer_login: "alice".into(),
+            repository: repository.clone(),
+            pull_request,
+            pull_request_state: "OPEN".into(),
+            current_base_sha: "1".repeat(40),
+            current_head_sha: "2".repeat(40),
+            review: ProviderCoordinates {
+                provider: "github".into(),
+                host: "github.com".into(),
+                owner: "octo".into(),
+                repository: "repo".into(),
+                pull_request: 7,
+                remote_id: "REVIEW_pending".into(),
+            },
+            review_author: "alice".into(),
+            review_commit_sha: "2".repeat(40),
+        };
+        let target = PublishedFile {
+            base_sha: "1".repeat(40),
+            commit_sha: "2".repeat(40),
+            file_key: "assets/example.bin".into(),
+            path: "assets/example.bin".into(),
+            previous_path: Some("assets/old.bin".into()),
+            raw_previous_path: None,
+        };
+        let confirmation = NativeConfirmation::PendingFileComment {
+            generation: 30,
+            draft_id: "file-draft-1".into(),
+            body: "Whole-file rationale".into(),
+            target: target.clone(),
+            source: source.clone(),
+        };
+        let token = FileCommentConfirmationToken {
+            workspace_instance: 10,
+            tab_instance: 20,
+            repository_key: repository.cache_key(),
+            pull_request: 7,
+            generation: 30,
+            draft_id: "file-draft-1".into(),
+            body: "Whole-file rationale".into(),
+            target: target.clone(),
+            pending_source: source.clone(),
+        };
+        (repository, source, target, confirmation, token)
     }
 
     fn details_with_reviews(reviews: Vec<PullRequestReview>) -> PullRequestDetails {
@@ -20614,6 +21882,92 @@ mod layout_tests {
         };
         assert!(!token.matches_values(10, 20, &repository.cache_key(), 7, Some(&changed)));
         assert!(!token.matches_values(10, 20, &repository.cache_key(), 7, None));
+    }
+
+    #[test]
+    fn file_confirmation_token_rejects_full_fence_changes_and_identical_aba() {
+        let (repository, source, target, confirmation, token) = pending_file_confirmation_fixture();
+        let matches = |token: &FileCommentConfirmationToken,
+                       workspace,
+                       tab,
+                       repository_key: &str,
+                       pull_request,
+                       confirmation: Option<&NativeConfirmation>| {
+            token.matches_values(workspace, tab, repository_key, pull_request, confirmation)
+        };
+        assert!(matches(
+            &token,
+            10,
+            20,
+            &repository.cache_key(),
+            7,
+            Some(&confirmation)
+        ));
+        assert!(!matches(
+            &token,
+            11,
+            20,
+            &repository.cache_key(),
+            7,
+            Some(&confirmation)
+        ));
+        assert!(!matches(
+            &token,
+            10,
+            21,
+            &repository.cache_key(),
+            7,
+            Some(&confirmation)
+        ));
+        assert!(!matches(
+            &token,
+            10,
+            20,
+            "other-account",
+            7,
+            Some(&confirmation)
+        ));
+        assert!(!matches(
+            &token,
+            10,
+            20,
+            &repository.cache_key(),
+            8,
+            Some(&confirmation)
+        ));
+        let repeated_payload = NativeConfirmation::PendingFileComment {
+            generation: 31,
+            draft_id: "file-draft-1".into(),
+            body: "Whole-file rationale".into(),
+            target: target.clone(),
+            source: source.clone(),
+        };
+        assert!(!matches(
+            &token,
+            10,
+            20,
+            &repository.cache_key(),
+            7,
+            Some(&repeated_payload)
+        ));
+        let mut changed_source = source;
+        changed_source.current_head_sha = "3".repeat(40);
+        let changed_witness = NativeConfirmation::PendingFileComment {
+            generation: 30,
+            draft_id: "file-draft-1".into(),
+            body: "Whole-file rationale".into(),
+            target,
+            source: changed_source,
+        };
+        assert!(!matches(
+            &token,
+            10,
+            20,
+            &repository.cache_key(),
+            7,
+            Some(&changed_witness)
+        ));
+        assert!(!matches(&token, 10, 20, &repository.cache_key(), 7, None));
     }
 
     #[test]

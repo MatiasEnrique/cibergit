@@ -5,12 +5,13 @@ use super::*;
 use $crate::{
     domain::{
         Account, ChangedFile, Comparison, MergeAction, MergeExecutionRequest, MergeMethod,
-        ProviderMutationOutcome, Repository, ReviewAuxiliaryAction, ReviewAuxiliaryRequest,
-        Revision,
+        PendingFileCommentSource, ProviderCoordinates, ProviderMutationOutcome, Repository,
+        ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewSubject, Revision,
     },
     participation::{
         CanonicalPublishedPatch, DiffSide, DraftStore, LineSelection, LoadOutcome,
-        ReviewComposition, ReviewEvent, ReviewKey, ReviewOperationStatus, validate_coordinate,
+        ReviewComposition, ReviewEvent, ReviewKey, ReviewOperationStatus,
+        map_file_to_canonical_published, validate_coordinate,
     },
     review::{ComparisonMetadata, ReviewSession, file_key},
 };
@@ -90,6 +91,83 @@ fn composition_with_draft() -> (ReviewComposition, Comparison, String) {
         .id
         .clone();
     (composition, comparison, id)
+}
+
+fn coordinates(remote_id: &str) -> ProviderCoordinates {
+    ProviderCoordinates {
+        provider: "github".into(),
+        host: "github.com".into(),
+        owner: "owner".into(),
+        repository: "repo".into(),
+        pull_request: 7,
+        remote_id: remote_id.into(),
+    }
+}
+
+fn composition_with_file_draft() -> (ReviewComposition, PendingFileCommentSource, String) {
+    let mut canonical = comparison(HEAD);
+    canonical.files[0].previous_path = Some("src/old-lib.rs".into());
+    canonical.files[0].patch = None;
+    canonical.files[0].patch_complete = false;
+    let session = ReviewSession::new(canonical.clone());
+    let file = map_file_to_canonical_published(
+        &session,
+        &file_key(&canonical.files[0]),
+        CanonicalPublishedPatch::new(&canonical, &ComparisonMetadata::default()).unwrap(),
+    )
+    .unwrap();
+    let mut composition = ReviewComposition::new(key("alice"), canonical.revision).unwrap();
+    let draft_id = composition
+        .add_file_draft(file, "exact whole-file comment")
+        .unwrap()
+        .id
+        .clone();
+    let source = PendingFileCommentSource {
+        viewer_login: "alice".into(),
+        repository: repo("alice"),
+        pull_request: coordinates("PR_node"),
+        pull_request_state: "OPEN".into(),
+        current_base_sha: OLD.into(),
+        current_head_sha: HEAD.into(),
+        review: coordinates("REVIEW_pending"),
+        review_author: "alice".into(),
+        review_commit_sha: HEAD.into(),
+    };
+    (composition, source, draft_id)
+}
+
+fn pending_file_preflight(head: &str, author: &str, review_id: &str) -> Value {
+    json!({"data": {
+        "viewer": {"login": "alice"},
+        "repository": {"nameWithOwner": "owner/repo", "pullRequest": {
+            "id": "PR_node", "number": 7,
+            "url": "https://github.com/owner/repo/pull/7", "state": "OPEN",
+            "baseRefOid": OLD, "headRefOid": head,
+            "reviews": {"nodes": [{
+                "id": review_id, "state": "PENDING", "submittedAt": null,
+                "author": {"login": author}, "commit": {"oid": HEAD}
+            }], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+        }}
+    }})
+}
+
+fn pending_file_ack(operation_id: &str, subject: &str, body: &str, review_id: &str) -> Value {
+    json!({"data": {"addPendingFileReviewThread": {
+        "clientMutationId": operation_id,
+        "thread": {
+            "id": "THREAD_new", "path": "src/lib.rs", "subjectType": subject,
+            "comments": {"totalCount": 1, "nodes": [{
+                "id": "COMMENT_new", "body": body, "path": "src/lib.rs",
+                "subjectType": subject, "author": {"login": "alice"},
+                "pullRequestReview": {
+                    "id": review_id, "state": "PENDING", "submittedAt": null,
+                    "author": {"login": "alice"}, "commit": {"oid": HEAD},
+                    "pullRequest": {"id": "PR_node", "number": 7,
+                        "repository": {"nameWithOwner": "owner/repo"}}
+                }
+            }], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+        }
+    }}})
 }
 
 fn context(head: &str, state: &str) -> Value {
@@ -241,6 +319,11 @@ else:
         assert 'addPullRequestReview(input: { pullRequestId: $pullRequestId, commitOID: $commitOID, event: $event, body: $body, threads: $threads, clientMutationId: $clientMutationId })' in query
     if 'mutation AddReviewThread(' in query:
         assert 'addPullRequestReviewThread(input: { pullRequestReviewId: $pullRequestReviewId, body: $body, path: $path, line: $line, side: $side, startLine: $startLine, startSide: $startSide, clientMutationId: $clientMutationId })' in query
+    if 'mutation AddPendingFileReviewThread(' in query:
+        assert 'subjectType: $subjectType' in query
+        mutation_input = query.split('addPendingFileReviewThread: addPullRequestReviewThread(input:', 1)[1].split('})', 1)[0]
+        for forbidden in ['line:', 'side:', 'startLine:', 'startSide:', 'pullRequestId:', 'event:']:
+            assert forbidden not in mutation_input
     if 'mutation UpdateReviewComment(' in query:
         assert 'updatePullRequestReviewComment(input: { pullRequestReviewCommentId: $commentId, body: $body, clientMutationId: $clientMutationId })' in query
     if 'mutation SubmitReview(' in query:
@@ -434,6 +517,178 @@ fn first_pending_payload_is_durably_dispatched_and_acknowledged() {
         restored.operations[0].status,
         ReviewOperationStatus::Acknowledged { .. }
     ));
+}
+
+#[test]
+fn exact_pending_file_comment_uses_file_subject_without_fake_line_and_saves_ack() {
+    let (mut composition, source, draft_id) = composition_with_file_draft();
+    let intent = composition
+        .prepare_pending_file_comment(&draft_id, &source)
+        .unwrap();
+    let variables = json!({
+        "pullRequestReviewId": "REVIEW_pending",
+        "body": "exact whole-file comment",
+        "path": "src/lib.rs",
+        "subjectType": "FILE",
+        "clientMutationId": intent.operation_id,
+    });
+    let (dir, provider) = fixture(
+        "alice",
+        vec![
+            step(
+                "query PendingFileCommentPreflight",
+                json!({"owner":"owner","name":"repo","number":7}),
+                pending_file_preflight(HEAD, "alice", "REVIEW_pending"),
+            ),
+            step(
+                "mutation AddPendingFileReviewThread",
+                variables,
+                pending_file_ack(
+                    &intent.operation_id,
+                    "FILE",
+                    "exact whole-file comment",
+                    "REVIEW_pending",
+                ),
+            ),
+        ],
+        Duration::from_secs(30),
+    );
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = DraftStore::open(store_dir.path()).unwrap();
+    let outcome = provider.execute_review_operation(
+        &repo("alice"),
+        &mut composition,
+        &store,
+        &intent.operation_id,
+        "file-attempt-1",
+    );
+    let ProviderMutationOutcome::Acknowledged(ack) = outcome else {
+        panic!("exact file acknowledgement was not accepted")
+    };
+    assert_eq!(ack.review_id.as_deref(), Some("REVIEW_pending"));
+    assert_eq!(ack.thread_id.as_deref(), Some("THREAD_new"));
+    assert_eq!(ack.comment_id.as_deref(), Some("COMMENT_new"));
+    assert_eq!(count(&dir), 2);
+    let LoadOutcome::Loaded(restored) = store.load(&key("alice")).unwrap() else {
+        panic!("file operation was not durable")
+    };
+    let draft = restored.file_draft(&draft_id).unwrap();
+    assert!(!draft.dirty);
+    assert_eq!(
+        draft.remote.as_ref().map(|remote| remote.comment_id.as_str()),
+        Some("COMMENT_new")
+    );
+    assert!(matches!(
+        restored.operations[0].status,
+        ReviewOperationStatus::Acknowledged { .. }
+    ));
+}
+
+#[test]
+fn pending_file_comment_rejects_changed_head_foreign_or_missing_pending_before_write() {
+    for response in [
+        pending_file_preflight(NEW, "alice", "REVIEW_pending"),
+        pending_file_preflight(HEAD, "mallory", "REVIEW_pending"),
+        json!({"data": {
+            "viewer": {"login": "alice"},
+            "repository": {"nameWithOwner": "owner/repo", "pullRequest": {
+                "id": "PR_node", "number": 7,
+                "url": "https://github.com/owner/repo/pull/7", "state": "OPEN",
+                "baseRefOid": OLD, "headRefOid": HEAD,
+                "reviews": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+            }}
+        }}),
+    ] {
+        let (mut composition, source, draft_id) = composition_with_file_draft();
+        let intent = composition
+            .prepare_pending_file_comment(&draft_id, &source)
+            .unwrap();
+        let (dir, provider) = fixture(
+            "alice",
+            vec![step(
+                "query PendingFileCommentPreflight",
+                json!({"owner":"owner","name":"repo","number":7}),
+                response,
+            )],
+            Duration::from_secs(30),
+        );
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(store_dir.path()).unwrap();
+        assert!(matches!(
+            provider.execute_review_operation(
+                &repo("alice"),
+                &mut composition,
+                &store,
+                &intent.operation_id,
+                "file-preflight-reject"
+            ),
+            ProviderMutationOutcome::PreflightRejected { .. }
+        ));
+        assert_eq!(count(&dir), 1, "a mutation must not follow failed preflight");
+        assert_eq!(composition.file_draft(&draft_id).unwrap().body, "exact whole-file comment");
+    }
+}
+
+#[test]
+fn pending_file_ack_mismatch_is_uncertain_and_cannot_replay() {
+    for acknowledgement in [
+        pending_file_ack("wrong-operation", "FILE", "exact whole-file comment", "REVIEW_pending"),
+        pending_file_ack("operation-1", "LINE", "exact whole-file comment", "REVIEW_pending"),
+        pending_file_ack("operation-1", "FILE", "different body", "REVIEW_pending"),
+        pending_file_ack("operation-1", "FILE", "exact whole-file comment", "REVIEW_other"),
+    ] {
+        let (mut composition, source, draft_id) = composition_with_file_draft();
+        let intent = composition
+            .prepare_pending_file_comment(&draft_id, &source)
+            .unwrap();
+        let (dir, provider) = fixture(
+            "alice",
+            vec![
+                step(
+                    "query PendingFileCommentPreflight",
+                    json!({"owner":"owner","name":"repo","number":7}),
+                    pending_file_preflight(HEAD, "alice", "REVIEW_pending"),
+                ),
+                step(
+                    "mutation AddPendingFileReviewThread",
+                    json!({
+                        "pullRequestReviewId":"REVIEW_pending",
+                        "body":"exact whole-file comment",
+                        "path":"src/lib.rs",
+                        "subjectType":"FILE",
+                        "clientMutationId":intent.operation_id,
+                    }),
+                    acknowledgement,
+                ),
+            ],
+            Duration::from_secs(30),
+        );
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(store_dir.path()).unwrap();
+        assert!(matches!(
+            provider.execute_review_operation(
+                &repo("alice"),
+                &mut composition,
+                &store,
+                &intent.operation_id,
+                "file-uncertain"
+            ),
+            ProviderMutationOutcome::Uncertain { .. }
+        ));
+        assert_eq!(count(&dir), 2);
+        assert!(matches!(
+            provider.execute_review_operation(
+                &repo("alice"),
+                &mut composition,
+                &store,
+                &intent.operation_id,
+                "file-replay"
+            ),
+            ProviderMutationOutcome::PreflightRejected { .. }
+        ));
+        assert_eq!(count(&dir), 2, "uncertain file writes must never replay");
+        assert!(composition.file_draft(&draft_id).unwrap().remote.is_none());
+    }
 }
 
 #[test]
@@ -1297,6 +1552,31 @@ fn pending_import_links_only_provider_reported_review_comments_and_reports_cap()
     assert_eq!(pending.review.coordinates.remote_id, "REVIEW_1");
     assert_eq!(pending.comments[0].pull_request_review_id, "REVIEW_1");
     assert!(!pending.comments_complete);
+    assert_eq!(count(&dir), 1);
+}
+
+#[test]
+fn complete_pending_import_exposes_fresh_file_source_and_explicit_subject() {
+    let response: Value = serde_json::from_str(&format!(
+        r#"{{"data":{{"viewer":{{"login":"alice"}},"repository":{{"nameWithOwner":"owner/repo","pullRequest":{{"id":"PR_node","number":7,"url":"https://github.com/owner/repo/pull/7","state":"OPEN","baseRefOid":"{OLD}","headRefOid":"{HEAD}","reviews":{{"nodes":[{{"id":"REVIEW_1","author":{{"login":"alice"}},"body":"draft summary","state":"PENDING","submittedAt":null,"commit":{{"oid":"{HEAD}"}},"url":"u","comments":{{"nodes":[{{"id":"COMMENT_1","author":{{"login":"alice"}},"body":"whole file","createdAt":"a","updatedAt":"b","url":"u","path":"src/lib.rs","subjectType":"FILE","line":null,"originalLine":null,"startLine":null,"originalStartLine":null,"diffHunk":"","outdated":false,"commit":{{"oid":"{HEAD}"}},"originalCommit":{{"oid":"{HEAD}"}},"pullRequestReview":{{"id":"REVIEW_1"}}}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}"#
+    ))
+    .unwrap();
+    let (dir, provider) = fixture(
+        "alice",
+        vec![step(
+            "query PendingReview",
+            json!({"owner":"owner","name":"repo","number":7}),
+            response,
+        )],
+        Duration::from_secs(30),
+    );
+    let pending = provider.pending_review(&repo("alice"), 7).unwrap().unwrap();
+    assert_eq!(pending.comments[0].comment.subject, ReviewSubject::File);
+    let source = pending.file_comment_source.expect("fresh complete source");
+    assert_eq!(source.pull_request.remote_id, "PR_node");
+    assert_eq!(source.review.remote_id, "REVIEW_1");
+    assert_eq!(source.current_base_sha, OLD);
+    assert_eq!(source.current_head_sha, HEAD);
     assert_eq!(count(&dir), 1);
 }
 
