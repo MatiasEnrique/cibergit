@@ -4,7 +4,7 @@ use cibergit::{
         BoundaryProof, EffectiveBoundary, EffectiveBoundarySource, NativeStackAvailability,
         NativeStackRead, PERSONAL_CORRECTIONS_SCHEMA_VERSION, PersonalStackCorrections, StackEdge,
         StackEdgeProvenance, StackLayer, StackLayerState, StackPullRequestId, StackRef,
-        StackRepository, resolve_stack, select_local_stack_net,
+        StackRepository, choose_tip, resolve_stack, select_local_stack_net, selectable_tips,
     },
 };
 use std::{fs, path::Path, process::Command};
@@ -167,6 +167,240 @@ fn inference_uses_repository_identity_and_allows_sibling_tips() {
     )
     .unwrap();
     assert!(disconnected.edges.is_empty());
+}
+
+#[test]
+fn forked_graph_offers_every_descendant_tip_and_chooses_none_of_them() {
+    let root = layer(1, "root", "main", oid('a'), oid('b'), StackLayerState::Open);
+    let left = layer(2, "left", "root", oid('b'), oid('c'), StackLayerState::Open);
+    let right = layer(
+        3,
+        "right",
+        "root",
+        oid('b'),
+        oid('d'),
+        StackLayerState::Open,
+    );
+    let deep = layer(4, "deep", "left", oid('c'), oid('e'), StackLayerState::Open);
+    let resolved = inferred(&[root, left, right, deep], 1);
+
+    let tips = selectable_tips(&resolved, &id(1)).unwrap();
+    assert_eq!(
+        tips.tips
+            .iter()
+            .map(|tip| tip.id.number)
+            .collect::<Vec<_>>(),
+        vec![3, 4],
+        "only leaves are offered, in a stable order"
+    );
+    assert_eq!(tips.tips[1].branch, "deep");
+    assert_eq!(tips.tips[1].path_layers, 3, "#1 -> #2 -> #4");
+    assert!(tips.excluded.is_empty());
+
+    // Two candidates, so nothing is inferred.
+    let pending = choose_tip(&tips, None);
+    assert!(pending.tip.is_none());
+    assert!(pending.notice.unwrap().contains("Choose one explicitly"));
+
+    // An explicit choice is honoured exactly.
+    assert_eq!(choose_tip(&tips, Some(&id(4))).tip, Some(id(4)));
+
+    // Opening Stack from a mid-layer narrows the scope to its descendants.
+    let from_left = selectable_tips(&resolved, &id(2)).unwrap();
+    assert_eq!(
+        from_left
+            .tips
+            .iter()
+            .map(|tip| tip.id.number)
+            .collect::<Vec<_>>(),
+        vec![4],
+        "#3 does not descend from #2"
+    );
+    assert_eq!(choose_tip(&from_left, None).tip, Some(id(4)));
+}
+
+#[test]
+fn a_single_tip_stack_is_unchanged_and_merged_ancestors_stay_selectable() {
+    let lower = layer(
+        1,
+        "lower",
+        "main",
+        oid('a'),
+        oid('b'),
+        StackLayerState::Merged,
+    );
+    let upper = layer(
+        2,
+        "upper",
+        "lower",
+        oid('b'),
+        oid('c'),
+        StackLayerState::Open,
+    );
+    let resolved = inferred(&[lower, upper], 2);
+    let tips = selectable_tips(&resolved, &id(2)).unwrap();
+    assert_eq!(tips.tips.len(), 1);
+    assert_eq!(tips.tips[0].id, id(2));
+    assert_eq!(
+        tips.tips[0].path_layers, 2,
+        "the merged ancestor is on the path"
+    );
+
+    // One candidate and no prior request: chosen without asking, as before.
+    let choice = choose_tip(&tips, None);
+    assert_eq!(choice.tip, Some(id(2)));
+    assert!(choice.notice.is_none());
+}
+
+#[test]
+fn a_removed_selection_is_reported_and_never_replaced_by_another_tip() {
+    let root = layer(1, "root", "main", oid('a'), oid('b'), StackLayerState::Open);
+    let left = layer(2, "left", "root", oid('b'), oid('c'), StackLayerState::Open);
+    let right = layer(
+        3,
+        "right",
+        "root",
+        oid('b'),
+        oid('d'),
+        StackLayerState::Open,
+    );
+    let both = selectable_tips(&inferred(&[root.clone(), left.clone(), right], 1), &id(1)).unwrap();
+    assert_eq!(choose_tip(&both, Some(&id(3))).tip, Some(id(3)));
+
+    // #3 disappears; #2 is now the only candidate but is not substituted.
+    let remaining = selectable_tips(&inferred(&[root, left], 1), &id(1)).unwrap();
+    assert_eq!(remaining.tips.len(), 1);
+    let choice = choose_tip(&remaining, Some(&id(3)));
+    assert!(choice.tip.is_none());
+    assert!(
+        choice
+            .notice
+            .unwrap()
+            .contains("Selected tip #3 is no longer a candidate")
+    );
+}
+
+#[test]
+fn ambiguous_cyclic_and_partial_graphs_never_produce_a_silent_tip() {
+    // Two candidate parents on the same target branch remain a closed failure;
+    // the tip picker is never reached.
+    let root_a = layer(
+        1,
+        "shared",
+        "main",
+        oid('a'),
+        oid('b'),
+        StackLayerState::Open,
+    );
+    let root_b = layer(
+        2,
+        "shared",
+        "main",
+        oid('a'),
+        oid('c'),
+        StackLayerState::Open,
+    );
+    let child = layer(
+        3,
+        "child",
+        "shared",
+        oid('b'),
+        oid('d'),
+        StackLayerState::Open,
+    );
+    let error = resolve_stack(
+        &repo(),
+        &id(3),
+        &[root_a, root_b, child],
+        &NativeStackRead::not_member(),
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("multiple candidate parents"), "{error}");
+
+    // A hand-built cycle is refused by tip enumeration rather than walked.
+    let one = layer(1, "one", "two", oid('a'), oid('b'), StackLayerState::Open);
+    let two = layer(2, "two", "one", oid('b'), oid('a'), StackLayerState::Open);
+    let cyclic = cibergit::stacks::StackResolution {
+        repository_key: repo().cache_key(),
+        selected: id(1),
+        layers: vec![one, two],
+        edges: vec![
+            StackEdge {
+                parent: id(1),
+                child: id(2),
+                provenance: StackEdgeProvenance::Inferred,
+            },
+            StackEdge {
+                parent: id(2),
+                child: id(1),
+                provenance: StackEdgeProvenance::Inferred,
+            },
+        ],
+        native: None,
+        complete: true,
+        notice: None,
+    };
+    let tips = selectable_tips(&cyclic, &id(1)).unwrap();
+    assert!(tips.tips.is_empty(), "a cycle has no leaf to offer");
+    assert!(choose_tip(&tips, None).tip.is_none());
+
+    // An incomplete snapshot is refused outright.
+    let mut partial = cyclic;
+    partial.complete = false;
+    assert!(selectable_tips(&partial, &id(1)).is_err());
+}
+
+#[test]
+fn an_unprovable_tip_path_is_withheld_with_a_visible_reason() {
+    // #3 is a leaf but carries two parents, so its path cannot be proven. It
+    // must not be offered, and its exclusion must stay visible.
+    let root = layer(1, "root", "main", oid('a'), oid('b'), StackLayerState::Open);
+    let left = layer(2, "left", "root", oid('b'), oid('c'), StackLayerState::Open);
+    let merge_ish = layer(3, "both", "left", oid('c'), oid('d'), StackLayerState::Open);
+    let ambiguous = cibergit::stacks::StackResolution {
+        repository_key: repo().cache_key(),
+        selected: id(1),
+        layers: vec![root, left, merge_ish],
+        edges: vec![
+            StackEdge {
+                parent: id(1),
+                child: id(2),
+                provenance: StackEdgeProvenance::Inferred,
+            },
+            StackEdge {
+                parent: id(1),
+                child: id(3),
+                provenance: StackEdgeProvenance::Inferred,
+            },
+            StackEdge {
+                parent: id(2),
+                child: id(3),
+                provenance: StackEdgeProvenance::Personal,
+            },
+        ],
+        native: None,
+        complete: true,
+        notice: None,
+    };
+    let tips = selectable_tips(&ambiguous, &id(1)).unwrap();
+    assert!(tips.tips.iter().all(|tip| tip.id != id(3)));
+    let excluded = tips
+        .excluded
+        .iter()
+        .find(|excluded| excluded.id == id(3))
+        .expect("#3 is reported, not silently dropped");
+    assert!(
+        excluded.reason.contains("multiple parents"),
+        "{}",
+        excluded.reason
+    );
+
+    // The reason reaches the person even alongside an offered tip.
+    let notice = choose_tip(&tips, None).notice.unwrap();
+    assert!(notice.contains("#3"), "{notice}");
+    assert!(notice.contains("unproven"), "{notice}");
 }
 
 #[test]

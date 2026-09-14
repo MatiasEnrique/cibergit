@@ -53,6 +53,7 @@ actions!(
         OpenStackView,
         RefreshStackView,
         ToggleStackRelationships,
+        SelectNextStackTip,
         ReturnToPullRequest,
     ]
 );
@@ -141,7 +142,8 @@ fn parse_startup() -> Result<Startup, String> {
     if std::env::var_os("CIBERGIT_SMOKE_DIR").is_some()
         && (std::env::var_os("CIBERGIT_SMOKE_ACTIONS_JOBS_LOGS").is_some()
             || std::env::var_os("CIBERGIT_SMOKE_SIDEBAR").is_some()
-            || std::env::var_os("CIBERGIT_SMOKE_PR_LAYOUT").is_some())
+            || std::env::var_os("CIBERGIT_SMOKE_PR_LAYOUT").is_some()
+            || std::env::var_os("CIBERGIT_SMOKE_STACK_TIPS").is_some())
     {
         startup.provider_reads_disabled = true;
     }
@@ -229,6 +231,7 @@ fn main() {
             KeyBinding::new("cmd-shift-s", OpenStackView, None),
             KeyBinding::new("cmd-alt-r", RefreshStackView, Some("StackView")),
             KeyBinding::new("cmd-alt-l", ToggleStackRelationships, Some("StackView")),
+            KeyBinding::new("cmd-alt-t", SelectNextStackTip, Some("StackView")),
             KeyBinding::new("escape", ReturnToPullRequest, Some("StackView")),
             KeyBinding::new("up", FileTreeUp, Some("FileTree")),
             KeyBinding::new("down", FileTreeDown, Some("FileTree")),

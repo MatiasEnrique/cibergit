@@ -542,6 +542,205 @@ fn selected_path(
     Ok((layers, edges))
 }
 
+/// One explicitly selectable leaf of the stack, described by the identity a
+/// person can recognise before choosing it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackTipOption {
+    pub id: StackPullRequestId,
+    pub branch: String,
+    pub head_sha: String,
+    pub state: StackLayerState,
+    /// Layers on the proven dependency path that ends at this tip, including
+    /// the tip itself.
+    pub path_layers: usize,
+}
+
+/// A candidate whose dependency path could not be proven. It is never offered
+/// and never silently repaired, but its exact reason stays visible so the
+/// offered list cannot imply a complete valid stack.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackTipExclusion {
+    pub id: StackPullRequestId,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackTipCandidates {
+    /// The pull request that opened Stack. Every offered tip descends from it.
+    pub opened: StackPullRequestId,
+    pub tips: Vec<StackTipOption>,
+    pub excluded: Vec<StackTipExclusion>,
+}
+
+impl StackTipCandidates {
+    pub fn contains(&self, id: &StackPullRequestId) -> bool {
+        self.tips.iter().any(|tip| tip.id == *id)
+    }
+}
+
+/// Enumerate the leaves of the descendant closure of the pull request that
+/// opened Stack. Restricting to descendants-or-self guarantees the opening
+/// pull request is on every offered path; sibling branches that do not contain
+/// it are never offered. A leaf whose path is ambiguous or cyclic is excluded
+/// with its exact reason rather than repaired.
+pub fn selectable_tips(
+    stack: &StackResolution,
+    opened: &StackPullRequestId,
+) -> Result<StackTipCandidates> {
+    ensure!(stack.complete, "Stack relationship snapshot is incomplete");
+    let by_id: HashMap<_, _> = stack
+        .layers
+        .iter()
+        .map(|layer| (&layer.id, layer))
+        .collect();
+    ensure!(
+        by_id.len() == stack.layers.len(),
+        "Stack layers repeat a pull request"
+    );
+    ensure!(
+        by_id.contains_key(opened),
+        "The pull request that opened Stack is absent from the resolved stack"
+    );
+    let mut children: HashMap<&StackPullRequestId, Vec<&StackPullRequestId>> = HashMap::new();
+    for edge in &stack.edges {
+        children.entry(&edge.parent).or_default().push(&edge.child);
+    }
+    let mut closure = HashSet::new();
+    let mut pending = vec![opened];
+    while let Some(current) = pending.pop() {
+        if !closure.insert(current.clone()) {
+            continue;
+        }
+        ensure!(
+            closure.len() <= MAX_STACK_LAYERS,
+            "Stack descendants exceed the bounded limit"
+        );
+        pending.extend(children.get(current).into_iter().flatten().copied());
+    }
+    let mut leaves = closure
+        .iter()
+        .filter(|id| {
+            children
+                .get(*id)
+                .is_none_or(|children| children.iter().all(|child| !closure.contains(*child)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    // Deterministic order so a provider reordering its read does not reorder
+    // the offered list under the person's pointer.
+    leaves.sort_by_key(|id| id.number);
+
+    let mut tips = Vec::new();
+    let mut excluded = Vec::new();
+    for leaf in leaves {
+        match selected_path(stack, &leaf) {
+            Ok((layers, _)) if !layers.iter().any(|layer| layer.id == *opened) => {
+                excluded.push(StackTipExclusion {
+                    id: leaf,
+                    reason: "Its proven path does not contain the pull request that opened Stack."
+                        .into(),
+                });
+            }
+            Ok((layers, _)) => {
+                let layer = by_id.get(&leaf).context("Selectable tip is unknown")?;
+                tips.push(StackTipOption {
+                    id: leaf,
+                    branch: layer.source.branch.clone(),
+                    head_sha: layer.revision.head_sha.clone(),
+                    state: layer.state,
+                    path_layers: layers.len(),
+                });
+            }
+            Err(error) => excluded.push(StackTipExclusion {
+                id: leaf,
+                reason: format!("{error:#}"),
+            }),
+        }
+    }
+    Ok(StackTipCandidates {
+        opened: opened.clone(),
+        tips,
+        excluded,
+    })
+}
+
+/// The tip a load should compare, plus the exact reason when none is chosen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TipChoice {
+    pub tip: Option<StackPullRequestId>,
+    pub notice: Option<String>,
+}
+
+/// Resolve the effective tip without ever inferring one among siblings. A
+/// single candidate is chosen only when nothing was requested; once an explicit
+/// choice has been made and then removed, a replacement is never substituted
+/// for it.
+pub fn choose_tip(
+    candidates: &StackTipCandidates,
+    requested: Option<&StackPullRequestId>,
+) -> TipChoice {
+    let excluded = excluded_notice(candidates);
+    let join = |head: String| -> Option<String> {
+        Some(match &excluded {
+            Some(excluded) => format!("{head} {excluded}"),
+            None => head,
+        })
+    };
+    match requested {
+        Some(requested) if candidates.contains(requested) => TipChoice {
+            tip: Some(requested.clone()),
+            notice: excluded,
+        },
+        Some(requested) => TipChoice {
+            tip: None,
+            notice: join(format!(
+                "Selected tip #{} is no longer a candidate in this stack, so no comparison is shown. Choose a tip explicitly.",
+                requested.number
+            )),
+        },
+        None => match candidates.tips.as_slice() {
+            [] => TipChoice {
+                tip: None,
+                notice: join(
+                    "This stack has no selectable tip that descends from this pull request.".into(),
+                ),
+            },
+            [only] => TipChoice {
+                tip: Some(only.id.clone()),
+                notice: excluded,
+            },
+            tips => TipChoice {
+                tip: None,
+                notice: join(format!(
+                    "This stack has {} tips that descend from this pull request. Choose one explicitly to compare its path.",
+                    tips.len()
+                )),
+            },
+        },
+    }
+}
+
+fn excluded_notice(candidates: &StackTipCandidates) -> Option<String> {
+    if candidates.excluded.is_empty() {
+        return None;
+    }
+    let detail = candidates
+        .excluded
+        .iter()
+        .map(|excluded| format!("#{}: {}", excluded.id.number, excluded.reason))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!(
+        "{} tip{} cannot be offered because its dependency path is unproven: {detail}",
+        candidates.excluded.len(),
+        if candidates.excluded.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StackNetPlan {
     pub selected_tip: StackPullRequestId,

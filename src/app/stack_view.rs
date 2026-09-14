@@ -10,13 +10,13 @@ use cibergit::{
         EffectiveBoundary, NativeStackAvailability, NativeStackRead,
         PERSONAL_CORRECTIONS_SCHEMA_VERSION, PersonalStackCorrections, StackEdge,
         StackEdgeProvenance, StackLayer, StackNetSelection, StackPullRequestId, StackRepository,
-        StackResolution, resolve_stack, select_local_stack_net,
+        StackResolution, StackTipCandidates, choose_tip, resolve_stack, select_local_stack_net,
+        selectable_tips,
     },
 };
 use gpui::{ListAlignment, ListState, ScrollHandle, px};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
     ffi::c_int,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -99,7 +99,11 @@ pub(crate) struct LoadedStack {
     pub native: NativeStackRead,
     pub candidates: Vec<StackLayer>,
     pub resolution: StackResolution,
-    pub selection: StackNetSelection,
+    pub tips: StackTipCandidates,
+    /// `None` until one tip among several is explicitly chosen. No path and no
+    /// comparison are shown while a choice is outstanding.
+    pub selection: Option<StackNetSelection>,
+    pub tip_notice: Option<String>,
     pub corrections: CorrectionSnapshot,
 }
 
@@ -140,6 +144,11 @@ pub(crate) struct StackViewController {
     pub correction_editor_open: bool,
     pub narrow_relationships_open: bool,
     pub feedback: Option<String>,
+    pub tip_notice: Option<String>,
+    pub tip_scroll: gpui::UniformListScrollHandle,
+    /// The explicitly chosen tip, held as an exact identity rather than an
+    /// index so a provider reordering its read cannot move the selection.
+    requested_tip: Option<StackPullRequestId>,
     store: PersonalCorrectionStore,
 }
 
@@ -165,8 +174,28 @@ impl StackViewController {
             correction_editor_open: false,
             narrow_relationships_open: false,
             feedback: None,
+            tip_notice: None,
+            tip_scroll: gpui::UniformListScrollHandle::new(),
+            requested_tip: None,
             store: PersonalCorrectionStore::new(data_root),
         }
+    }
+
+    pub fn requested_tip(&self) -> Option<StackPullRequestId> {
+        self.requested_tip.clone()
+    }
+
+    /// Activating a tip supersedes every outstanding refresh and lazy patch
+    /// read, so a reply for the previous tip can never install its diff here.
+    pub fn begin_tip_selection(
+        &mut self,
+        repository: &Repository,
+        tip: StackPullRequestId,
+    ) -> StackRequestToken {
+        self.requested_tip = Some(tip);
+        let token = self.begin_refresh(repository);
+        self.state = StackLoadState::Loading("Comparing the selected tip path…".into());
+        token
     }
 
     pub fn begin_refresh(&mut self, repository: &Repository) -> StackRequestToken {
@@ -223,8 +252,8 @@ impl StackViewController {
                     .map(|session| session.revision().head_sha.clone());
                 let next_head = loaded
                     .selection
-                    .comparison
                     .as_ref()
+                    .and_then(|selection| selection.comparison.as_ref())
                     .map(|comparison| comparison.revision.head_sha.clone());
                 self.feedback = previous_head
                     .zip(next_head.as_ref())
@@ -236,7 +265,19 @@ impl StackViewController {
                             short_sha(next)
                         )
                     });
-                self.session = loaded.selection.comparison.clone().map(ReviewSession::new);
+                self.session = loaded
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| selection.comparison.clone())
+                    .map(ReviewSession::new);
+                // Remember exactly what this load proved. An outstanding or
+                // invalidated choice clears the request so the next refresh
+                // asks again instead of repeating a stale identity.
+                self.requested_tip = loaded
+                    .selection
+                    .as_ref()
+                    .map(|selection| selection.selected_tip.clone());
+                self.tip_notice = loaded.tip_notice.clone();
                 self.loaded = Some(loaded);
                 self.state = StackLoadState::Ready;
                 self.rebuild(wide);
@@ -336,6 +377,27 @@ impl StackViewController {
             DiffMode::SideBySide => DiffMode::Auto,
         });
         self.rebuild(wide);
+    }
+
+    /// The tip after the one in effect, for keyboard activation. Returns `None`
+    /// when there is nothing to choose between.
+    pub fn next_tip_choice(&self) -> Option<StackPullRequestId> {
+        let loaded = self.loaded.as_ref()?;
+        let tips = &loaded.tips.tips;
+        // With one candidate there is nothing to cycle between unless that one
+        // candidate is still waiting to be activated.
+        if tips.is_empty() || (tips.len() < 2 && loaded.selection.is_some()) {
+            return None;
+        }
+        let current = self
+            .requested_tip
+            .as_ref()
+            .and_then(|tip| tips.iter().position(|option| option.id == *tip));
+        let next = match current {
+            Some(position) => (position + 1) % tips.len(),
+            None => 0,
+        };
+        Some(tips[next].id.clone())
     }
 
     pub fn correction_choices(&self) -> Vec<StackPullRequestId> {
@@ -481,6 +543,7 @@ pub(crate) fn load_stack(
     repository: &Repository,
     selected_pull_request: u64,
     store: &PersonalCorrectionStore,
+    requested_tip: Option<StackPullRequestId>,
 ) -> Result<LoadedStack, String> {
     let native = provider
         .native_stack(repository, selected_pull_request)
@@ -511,83 +574,29 @@ pub(crate) fn load_stack(
         Some(&corrections.corrections),
     )
     .map_err(|error| format!("Stack relationships are unavailable: {error:#}"))?;
-    let tip = unique_linear_tip(&resolution, &selected)?;
-    let selection = if let Some(path) = repository.local_path.as_deref() {
-        select_local_stack_net(path, &resolution, &tip)
-    } else {
-        provider.select_stack_net(repository, &resolution, &tip)
-    }
-    .map_err(|error| format!("Net remaining comparison is unavailable: {error:#}"))?;
+    let tips = selectable_tips(&resolution, &selected)
+        .map_err(|error| format!("Stack tips are unavailable: {error:#}"))?;
+    let choice = choose_tip(&tips, requested_tip.as_ref());
+    let selection = match &choice.tip {
+        None => None,
+        Some(tip) => Some(
+            if let Some(path) = repository.local_path.as_deref() {
+                select_local_stack_net(path, &resolution, tip)
+            } else {
+                provider.select_stack_net(repository, &resolution, tip)
+            }
+            .map_err(|error| format!("Net remaining comparison is unavailable: {error:#}"))?,
+        ),
+    };
     Ok(LoadedStack {
         native,
         candidates,
         resolution,
+        tips,
         selection,
+        tip_notice: choice.notice,
         corrections,
     })
-}
-
-fn unique_linear_tip(
-    resolution: &StackResolution,
-    selected: &StackPullRequestId,
-) -> Result<StackPullRequestId, String> {
-    let ids: HashSet<_> = resolution
-        .layers
-        .iter()
-        .map(|layer| layer.id.clone())
-        .collect();
-    if !ids.contains(selected) {
-        return Err("Selected pull request is absent from the resolved stack.".into());
-    }
-    let mut adjacent: HashMap<StackPullRequestId, Vec<StackPullRequestId>> = HashMap::new();
-    let mut children: HashMap<StackPullRequestId, Vec<StackPullRequestId>> = HashMap::new();
-    for edge in &resolution.edges {
-        adjacent
-            .entry(edge.parent.clone())
-            .or_default()
-            .push(edge.child.clone());
-        adjacent
-            .entry(edge.child.clone())
-            .or_default()
-            .push(edge.parent.clone());
-        children
-            .entry(edge.parent.clone())
-            .or_default()
-            .push(edge.child.clone());
-    }
-    let mut component = HashSet::new();
-    let mut pending = VecDeque::from([selected.clone()]);
-    while let Some(id) = pending.pop_front() {
-        if !component.insert(id.clone()) {
-            continue;
-        }
-        pending.extend(adjacent.get(&id).into_iter().flatten().cloned());
-    }
-    if component
-        .iter()
-        .any(|id| children.get(id).is_some_and(|children| children.len() > 1))
-    {
-        return Err(
-            "This stack has sibling paths. Choosing one tip is pending a product decision; no path was selected."
-                .into(),
-        );
-    }
-    let tips = component
-        .iter()
-        .filter(|id| {
-            children
-                .get(*id)
-                .is_none_or(|children| children.iter().all(|child| !component.contains(child)))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if tips.len() != 1 {
-        return Err(
-            "This stack needs an explicit tip selection. That multiple-tip choice is not available yet."
-                .into(),
-        );
-    }
-    Ok(tips[0].clone())
 }
 
 #[derive(Clone, Debug)]
@@ -881,6 +890,181 @@ pub(crate) fn boundary_label(boundary: &EffectiveBoundary) -> String {
     }
 }
 
+/// Disposable forked fixture for the multiple-tip picker: one root pull request
+/// with two sibling descendant tips. Provider reads are never used.
+#[cfg(feature = "ui-smoke")]
+pub(crate) struct TipSmokeFixture {
+    pub repository: Repository,
+    pub pull_request: cibergit::domain::PullRequest,
+    pub layers: Vec<StackLayer>,
+    pub report: String,
+}
+
+#[cfg(feature = "ui-smoke")]
+pub(crate) fn synthetic_stack_tip_fixture() -> Result<TipSmokeFixture, String> {
+    use std::process::Command;
+
+    let repository_path =
+        std::env::temp_dir().join(format!("cibergit-native-stack-tips-{}", std::process::id()));
+    if repository_path.exists() {
+        fs::remove_dir_all(&repository_path)
+            .map_err(|error| format!("Cannot replace disposable tip fixture: {error}"))?;
+    }
+    fs::create_dir_all(&repository_path)
+        .map_err(|error| format!("Cannot create disposable tip fixture: {error}"))?;
+    let git = |arguments: &[&str]| -> Result<String, String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repository_path)
+            .args(arguments)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .map_err(|error| format!("Cannot run disposable Git fixture: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Disposable Git fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let commit = |name: &str, contents: &str, message: &str| -> Result<String, String> {
+        fs::write(repository_path.join(name), contents).map_err(|error| error.to_string())?;
+        git(&["add", name])?;
+        git(&[
+            "-c",
+            "user.name=cibergit smoke",
+            "-c",
+            "user.email=smoke@example.invalid",
+            "commit",
+            "-m",
+            message,
+        ])?;
+        git(&["rev-parse", "HEAD"])
+    };
+    git(&["init", "-b", "main"])?;
+    let base = commit("README.md", "tip fixture base\n", "base")?;
+    git(&["checkout", "-b", "lower"])?;
+    let lower = commit("lower.txt", "shared dependency\n", "lower")?;
+    git(&["checkout", "-b", "left"])?;
+    let left = commit("left.txt", "left tip only\n", "left")?;
+    git(&["checkout", "lower"])?;
+    git(&["checkout", "-b", "right"])?;
+    let right = commit("right.txt", "right tip only\n", "right")?;
+
+    let repository = Repository {
+        host: "github.com".into(),
+        owner: "cibergit-smoke".into(),
+        name: "forked-stack".into(),
+        account: Account {
+            host: "github.com".into(),
+            login: "synthetic-read-only".into(),
+        },
+        local_path: Some(repository_path),
+    };
+    let stack_repository = StackRepository::from_repository(&repository);
+    let layer = |number, source: &str, target: &str, base_sha: &str, head_sha: &str| StackLayer {
+        id: StackPullRequestId {
+            repository: stack_repository.clone(),
+            number,
+        },
+        native_entry_id: None,
+        native_position: None,
+        source: cibergit::stacks::StackRef {
+            repository: Some(stack_repository.clone()),
+            branch: source.into(),
+            oid: head_sha.into(),
+        },
+        target: cibergit::stacks::StackRef {
+            repository: Some(stack_repository.clone()),
+            branch: target.into(),
+            oid: base_sha.into(),
+        },
+        revision: cibergit::domain::Revision {
+            base_sha: base_sha.into(),
+            head_sha: head_sha.into(),
+        },
+        state: cibergit::stacks::StackLayerState::Open,
+        merged_commit_oid: None,
+    };
+    let layers = vec![
+        layer(40, "lower", "main", &base, &lower),
+        layer(41, "left", "lower", &lower, &left),
+        layer(42, "right", "lower", &lower, &right),
+    ];
+    let pull_request = cibergit::domain::PullRequest {
+        number: 40,
+        title: "Synthetic forked stack, two descendant tips".into(),
+        source_branch: "lower".into(),
+        target_branch: "main".into(),
+        state: "OPEN".into(),
+        base_sha: base.clone(),
+        head_sha: lower.clone(),
+        url: "https://github.com/cibergit-smoke/forked-stack/pull/40".into(),
+        ..Default::default()
+    };
+    let report = format!(
+        "Synthetic temporary Git proof: base={base}, lower={lower}, left={left}, right={right}\nStack opens from #40; #41 and #42 are sibling descendant tips.\n"
+    );
+    Ok(TipSmokeFixture {
+        repository,
+        pull_request,
+        layers,
+        report,
+    })
+}
+
+/// Build one tip-picker state from the disposable fixture. `present` selects
+/// which pull requests the read reports, so a removed tip can be shown.
+#[cfg(feature = "ui-smoke")]
+pub(crate) fn synthetic_stack_tip_load(
+    fixture: &TipSmokeFixture,
+    store: &PersonalCorrectionStore,
+    present: &[u64],
+    requested: Option<&StackPullRequestId>,
+) -> Result<LoadedStack, String> {
+    let layers: Vec<_> = fixture
+        .layers
+        .iter()
+        .filter(|layer| present.contains(&layer.id.number))
+        .cloned()
+        .collect();
+    let opened = fixture.layers[0].id.clone();
+    let native = NativeStackRead::not_member();
+    let corrections = store.load(&fixture.repository)?;
+    let resolution = resolve_stack(
+        &fixture.repository,
+        &opened,
+        &layers,
+        &native,
+        Some(&corrections.corrections),
+    )
+    .map_err(|error| error.to_string())?;
+    let tips = selectable_tips(&resolution, &opened).map_err(|error| error.to_string())?;
+    let choice = choose_tip(&tips, requested);
+    let selection = match &choice.tip {
+        None => None,
+        Some(tip) => Some(
+            select_local_stack_net(
+                fixture.repository.local_path.as_deref().expect("fixture"),
+                &resolution,
+                tip,
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+    };
+    Ok(LoadedStack {
+        native,
+        candidates: layers,
+        resolution,
+        tips,
+        selection,
+        tip_notice: choice.notice,
+        corrections,
+    })
+}
+
 #[cfg(feature = "ui-smoke")]
 pub(crate) fn synthetic_stack_smoke(
     data_root: PathBuf,
@@ -1024,7 +1208,13 @@ pub(crate) fn synthetic_stack_smoke(
         Some(&first_corrections.corrections),
     )
     .map_err(|error| error.to_string())?;
-    let first_tip = unique_linear_tip(&first_resolution, &selected)?;
+    let first_tips =
+        selectable_tips(&first_resolution, &selected).map_err(|error| error.to_string())?;
+    let first_choice = choose_tip(&first_tips, None);
+    let first_tip = first_choice
+        .tip
+        .clone()
+        .ok_or_else(|| "Synthetic linear stack offered no tip.".to_owned())?;
     let first_selection = select_local_stack_net(
         repository.local_path.as_deref().expect("fixture path"),
         &first_resolution,
@@ -1039,7 +1229,9 @@ pub(crate) fn synthetic_stack_smoke(
             native: native.clone(),
             candidates: layers.clone(),
             resolution: first_resolution,
-            selection: first_selection,
+            tips: first_tips,
+            selection: Some(first_selection),
+            tip_notice: first_choice.notice,
             corrections: first_corrections,
         }),
         true,
@@ -1064,7 +1256,12 @@ pub(crate) fn synthetic_stack_smoke(
     {
         return Err("Synthetic correction did not remain visibly Personal.".into());
     }
-    let tip = unique_linear_tip(&resolution, &selected)?;
+    let tips = selectable_tips(&resolution, &selected).map_err(|error| error.to_string())?;
+    let choice = choose_tip(&tips, None);
+    let tip = choice
+        .tip
+        .clone()
+        .ok_or_else(|| "Synthetic corrected stack offered no tip.".to_owned())?;
     let selection = select_local_stack_net(
         repository.local_path.as_deref().expect("fixture path"),
         &resolution,
@@ -1078,7 +1275,9 @@ pub(crate) fn synthetic_stack_smoke(
             native,
             candidates: layers,
             resolution,
-            selection,
+            tips,
+            selection: Some(selection),
+            tip_notice: choice.notice,
             corrections,
         }),
         true,
@@ -1169,19 +1368,23 @@ mod tests {
             state: cibergit::stacks::StackLayerState::Open,
             merged_commit_oid: None,
         };
+        let resolution = StackResolution {
+            repository_key: repo.cache_key(),
+            selected: selected.clone(),
+            layers: vec![layer.clone()],
+            edges: Vec::new(),
+            native: None,
+            complete: true,
+            notice: None,
+        };
+        let tips = selectable_tips(&resolution, &selected).unwrap();
         LoadedStack {
             native: NativeStackRead::not_member(),
             candidates: vec![layer.clone()],
-            resolution: StackResolution {
-                repository_key: repo.cache_key(),
-                selected: selected.clone(),
-                layers: vec![layer.clone()],
-                edges: Vec::new(),
-                native: None,
-                complete: true,
-                notice: None,
-            },
-            selection: StackNetSelection {
+            resolution,
+            tips,
+            tip_notice: None,
+            selection: Some(StackNetSelection {
                 selected_tip: selected,
                 frozen_layers: vec![layer],
                 frozen_edges: Vec::new(),
@@ -1196,7 +1399,7 @@ mod tests {
                     proof: cibergit::stacks::BoundaryProof::LocalDirectAncestor,
                 },
                 comparison: Some(comparison),
-            },
+            }),
             corrections: store.load(repo).unwrap(),
         }
     }
@@ -1254,60 +1457,286 @@ mod tests {
         assert!(controller.accept_correction(&outcome.token, &outcome.result));
     }
 
-    #[test]
-    fn branched_component_never_chooses_a_tip() {
-        let repo = repository(None, "alice");
-        let ids = (1..=3)
-            .map(|number| StackPullRequestId {
-                repository: StackRepository::from_repository(&repo),
+    /// Root #1 with sibling children #2 and #3. Stack is opened from #1.
+    fn forked(repo: &Repository, present: &[u64]) -> StackResolution {
+        let make = |number: u64, target: &str, base: char, head: char| StackLayer {
+            id: StackPullRequestId {
+                repository: StackRepository::from_repository(repo),
                 number,
+            },
+            native_entry_id: None,
+            native_position: None,
+            source: cibergit::stacks::StackRef {
+                repository: Some(StackRepository::from_repository(repo)),
+                branch: format!("b{number}"),
+                oid: head.to_string().repeat(40),
+            },
+            target: cibergit::stacks::StackRef {
+                repository: Some(StackRepository::from_repository(repo)),
+                branch: target.into(),
+                oid: base.to_string().repeat(40),
+            },
+            revision: Revision {
+                base_sha: base.to_string().repeat(40),
+                head_sha: head.to_string().repeat(40),
+            },
+            state: cibergit::stacks::StackLayerState::Open,
+            merged_commit_oid: None,
+        };
+        let all = vec![
+            make(1, "main", 'a', 'b'),
+            make(2, "b1", 'b', 'c'),
+            make(3, "b1", 'b', 'd'),
+        ];
+        let layers: Vec<_> = all
+            .into_iter()
+            .filter(|layer| present.contains(&layer.id.number))
+            .collect();
+        let root = layers[0].id.clone();
+        let edges = layers
+            .iter()
+            .filter(|layer| layer.id != root)
+            .map(|layer| StackEdge {
+                parent: root.clone(),
+                child: layer.id.clone(),
+                provenance: StackEdgeProvenance::Inferred,
             })
-            .collect::<Vec<_>>();
-        let resolution = StackResolution {
+            .collect();
+        StackResolution {
             repository_key: repo.cache_key(),
-            selected: ids[0].clone(),
-            layers: ids
-                .iter()
-                .map(|id| StackLayer {
-                    id: id.clone(),
-                    native_entry_id: None,
-                    native_position: None,
-                    source: cibergit::stacks::StackRef {
-                        repository: Some(id.repository.clone()),
-                        branch: format!("b{}", id.number),
-                        oid: format!("{:040x}", id.number + 10),
-                    },
-                    target: cibergit::stacks::StackRef {
-                        repository: Some(id.repository.clone()),
-                        branch: "main".into(),
-                        oid: format!("{:040x}", id.number),
-                    },
-                    revision: Revision {
-                        base_sha: format!("{:040x}", id.number),
-                        head_sha: format!("{:040x}", id.number + 10),
-                    },
-                    state: cibergit::stacks::StackLayerState::Open,
-                    merged_commit_oid: None,
-                })
-                .collect(),
-            edges: vec![
-                StackEdge {
-                    parent: ids[0].clone(),
-                    child: ids[1].clone(),
-                    provenance: StackEdgeProvenance::Native,
-                },
-                StackEdge {
-                    parent: ids[0].clone(),
-                    child: ids[2].clone(),
-                    provenance: StackEdgeProvenance::Native,
-                },
-            ],
+            selected: root,
+            layers,
+            edges,
             native: None,
             complete: true,
             notice: None,
+        }
+    }
+
+    fn forked_load(
+        repo: &Repository,
+        store: &PersonalCorrectionStore,
+        present: &[u64],
+        requested: Option<&StackPullRequestId>,
+    ) -> LoadedStack {
+        let resolution = forked(repo, present);
+        let opened = resolution.selected.clone();
+        let tips = selectable_tips(&resolution, &opened).unwrap();
+        let choice = choose_tip(&tips, requested);
+        let selection = choice.tip.clone().map(|tip| {
+            let layers = resolution
+                .layers
+                .iter()
+                .filter(|layer| layer.id == opened || layer.id == tip)
+                .cloned()
+                .collect::<Vec<_>>();
+            let head = layers.last().unwrap().revision.head_sha.clone();
+            StackNetSelection {
+                selected_tip: tip,
+                frozen_layers: layers,
+                frozen_edges: resolution.edges.clone(),
+                effective_boundary: EffectiveBoundary::Proven {
+                    sha: "a".repeat(40),
+                    source: cibergit::stacks::EffectiveBoundarySource::RootTarget {
+                        layer: opened.clone(),
+                    },
+                    proof: cibergit::stacks::BoundaryProof::LocalDirectAncestor,
+                },
+                comparison: Some(Comparison {
+                    revision: Revision {
+                        base_sha: "a".repeat(40),
+                        head_sha: head,
+                    },
+                    files: Vec::new(),
+                    complete: true,
+                    notice: None,
+                }),
+            }
+        });
+        LoadedStack {
+            native: NativeStackRead::not_member(),
+            candidates: resolution.layers.clone(),
+            resolution,
+            tips,
+            selection,
+            tip_notice: choice.notice,
+            corrections: store.load(repo).unwrap(),
+        }
+    }
+
+    #[test]
+    fn forked_stack_waits_for_an_explicit_tip_and_never_infers_one() {
+        let root = tempdir().unwrap();
+        let repo = repository(None, "alice");
+        let mut controller = StackViewController::new(root.path().to_owned(), &repo, 1);
+        let store = controller.store();
+        let token = controller.begin_refresh(&repo);
+        assert!(controller.accept(
+            &token,
+            Ok(forked_load(&repo, &store, &[1, 2, 3], None)),
+            true
+        ));
+
+        // Two descendants, so nothing is compared until a person chooses.
+        assert!(controller.session.is_none());
+        assert!(controller.requested_tip().is_none());
+        let loaded = controller.loaded.as_ref().unwrap();
+        assert!(loaded.selection.is_none());
+        assert_eq!(
+            loaded
+                .tips
+                .tips
+                .iter()
+                .map(|tip| tip.id.number)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        let notice = controller.tip_notice.clone().unwrap();
+        assert!(
+            notice.contains("2 tips that descend from this pull request"),
+            "{notice}"
+        );
+        assert!(notice.contains("Choose one explicitly"), "{notice}");
+    }
+
+    #[test]
+    fn selecting_a_tip_fences_the_previous_tip_refresh_and_lazy_patch_replies() {
+        let root = tempdir().unwrap();
+        let repo = repository(None, "alice");
+        let mut controller = StackViewController::new(root.path().to_owned(), &repo, 1);
+        let store = controller.store();
+        let open = controller.begin_refresh(&repo);
+        assert!(controller.accept(
+            &open,
+            Ok(forked_load(&repo, &store, &[1, 2, 3], None)),
+            true
+        ));
+
+        let first = StackPullRequestId {
+            repository: StackRepository::from_repository(&repo),
+            number: 2,
         };
-        let error = unique_linear_tip(&resolution, &ids[0]).unwrap_err();
-        assert!(error.contains("pending a product decision"));
+        let second = StackPullRequestId {
+            repository: StackRepository::from_repository(&repo),
+            number: 3,
+        };
+        let a_token = controller.begin_tip_selection(&repo, first.clone());
+        assert!(controller.accept(
+            &a_token,
+            Ok(forked_load(&repo, &store, &[1, 2, 3], Some(&first))),
+            true
+        ));
+        assert_eq!(controller.requested_tip().as_ref(), Some(&first));
+        assert_eq!(
+            controller.session.as_ref().unwrap().revision().head_sha,
+            "c".repeat(40)
+        );
+        // A lazy patch read issued while tip A was rendered.
+        let a_lazy = controller.current_token().unwrap();
+
+        let b_token = controller.begin_tip_selection(&repo, second.clone());
+        // The outstanding A refresh and its lazy patch read are both fenced.
+        assert!(!controller.accepts(&a_token));
+        assert!(!controller.accepts(&a_lazy));
+        assert!(!controller.accept(
+            &a_token,
+            Ok(forked_load(&repo, &store, &[1, 2, 3], Some(&first))),
+            true
+        ));
+        assert_eq!(
+            controller.session.as_ref().unwrap().revision().head_sha,
+            "c".repeat(40)
+        );
+
+        assert!(controller.accept(
+            &b_token,
+            Ok(forked_load(&repo, &store, &[1, 2, 3], Some(&second))),
+            true
+        ));
+        assert_eq!(controller.requested_tip().as_ref(), Some(&second));
+        assert_eq!(
+            controller.session.as_ref().unwrap().revision().head_sha,
+            "d".repeat(40)
+        );
+    }
+
+    #[test]
+    fn selection_survives_reorder_and_is_visibly_invalidated_when_removed() {
+        let root = tempdir().unwrap();
+        let repo = repository(None, "alice");
+        let mut controller = StackViewController::new(root.path().to_owned(), &repo, 1);
+        let store = controller.store();
+        let open = controller.begin_refresh(&repo);
+        assert!(controller.accept(
+            &open,
+            Ok(forked_load(&repo, &store, &[1, 2, 3], None)),
+            true
+        ));
+        let chosen = StackPullRequestId {
+            repository: StackRepository::from_repository(&repo),
+            number: 3,
+        };
+        let token = controller.begin_tip_selection(&repo, chosen.clone());
+        assert!(controller.accept(
+            &token,
+            Ok(forked_load(&repo, &store, &[1, 2, 3], Some(&chosen))),
+            true
+        ));
+
+        // A refresh that reports the same identities keeps the exact choice.
+        let refresh = controller.begin_refresh(&repo);
+        assert_eq!(controller.requested_tip().as_ref(), Some(&chosen));
+        assert!(controller.accept(
+            &refresh,
+            Ok(forked_load(
+                &repo,
+                &store,
+                &[1, 3, 2],
+                controller.requested_tip().as_ref()
+            )),
+            true
+        ));
+        assert_eq!(
+            controller
+                .loaded
+                .as_ref()
+                .unwrap()
+                .selection
+                .as_ref()
+                .unwrap()
+                .selected_tip,
+            chosen
+        );
+        assert!(controller.tip_notice.is_none());
+
+        // #3 disappears. #2 is the only remaining candidate and is still not
+        // substituted; the person must choose again.
+        let removed = controller.begin_refresh(&repo);
+        assert!(controller.accept(
+            &removed,
+            Ok(forked_load(
+                &repo,
+                &store,
+                &[1, 2],
+                controller.requested_tip().as_ref()
+            )),
+            true
+        ));
+        assert!(controller.session.is_none());
+        assert!(controller.requested_tip().is_none());
+        assert!(
+            controller
+                .tip_notice
+                .as_deref()
+                .unwrap()
+                .contains("Selected tip #3 is no longer a candidate")
+        );
+        // The person is asked to choose, so a way to choose must remain.
+        assert_eq!(
+            controller.next_tip_choice().map(|tip| tip.number),
+            Some(2),
+            "the remaining candidate stays explicitly activatable"
+        );
     }
 
     #[test]

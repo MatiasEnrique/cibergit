@@ -6,9 +6,10 @@ use crate::{
     FileTreeWider, MergePullRequest, NewPrDiscussion, NextFile, OpenPullRequestCreation,
     OpenRepositorySetup, OpenStackView, PostImmediateComment, PreviousFile, Refresh,
     RefreshStackView, ResetLayout, ReturnToPullRequest, Save, SaveReviewDraft,
-    SelectFullComparison, SelectNextComparisonCommit, SelectPreviousComparisonCommit,
-    SelectSinceLastReview, SidebarNarrower, SidebarWider, SubmitReview, ToggleComparisonPicker,
-    ToggleFileTree, ToggleInspector, TogglePalette, ToggleSidebar, ToggleStackRelationships,
+    SelectFullComparison, SelectNextComparisonCommit, SelectNextStackTip,
+    SelectPreviousComparisonCommit, SelectSinceLastReview, SidebarNarrower, SidebarWider,
+    SubmitReview, ToggleComparisonPicker, ToggleFileTree, ToggleInspector, TogglePalette,
+    ToggleSidebar, ToggleStackRelationships,
 };
 use cibergit::ui::{self, Density, TextRole};
 mod checks_view;
@@ -3778,6 +3779,10 @@ impl ReviewWorkspace {
         }
         if std::env::var_os("CIBERGIT_SMOKE_LOCAL_CHECKOUT").is_some() {
             local_checkout::start_smoke(cx.weak_entity(), output, window, cx);
+            return;
+        }
+        if std::env::var_os("CIBERGIT_SMOKE_STACK_TIPS").is_some() {
+            self.start_stack_tips_smoke(window, cx, output);
             return;
         }
         if std::env::var_os("CIBERGIT_SMOKE_STACK").is_some() {
@@ -9068,6 +9073,147 @@ impl ReviewWorkspace {
                     panic!("native notification UI smoke assertions failed: {fixture:?}");
                 }
                 let _ = window.update(|_, cx| cx.quit());
+            })
+            .detach();
+    }
+
+    /// Capture the three explicit tip-picker states from a disposable forked
+    /// fixture. No provider is read; every identity is synthetic.
+    #[cfg(feature = "ui-smoke")]
+    fn start_stack_tips_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+        output: PathBuf,
+    ) {
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                let _ = std::fs::create_dir_all(&output);
+                let fixture = match window
+                    .update(|_, _| stack_view::synthetic_stack_tip_fixture())
+                    .unwrap_or_else(|error| Err(error.to_string()))
+                {
+                    Ok(fixture) => fixture,
+                    Err(error) => {
+                        let _ = std::fs::write(
+                            output.join("native-stack-tips-smoke.txt"),
+                            format!("Smoke failed: {error}\n"),
+                        );
+                        panic!("native Stack tip smoke fixture failed: {error}");
+                    }
+                };
+                let data_root = output.join("stack-tips-smoke-state");
+                let repository = fixture.repository.clone();
+                let pull_request = fixture.pull_request.clone();
+                let installed = window
+                    .update(|window, cx| {
+                        weak.update(cx, |root, cx| {
+                            let Root::Review(this) = root else {
+                                return Err("Stack tip smoke left review workspace".to_owned());
+                            };
+                            this.install_tab(repository.clone(), pull_request, cx);
+                            let index = this.active_tab.expect("installed Stack tip smoke tab");
+                            this.tabs[index].stack = stack_view::StackViewController::new(
+                                data_root,
+                                &repository,
+                                40,
+                            );
+                            this.tabs[index].stack.visible = true;
+                            window.resize(size(px(1280.), px(820.)));
+                            cx.notify();
+                            Ok(())
+                        })
+                        .map_err(|error| error.to_string())?
+                    })
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                if let Err(error) = installed {
+                    panic!("native Stack tip smoke install failed: {error}");
+                }
+
+                let chosen = fixture.layers[2].id.clone();
+                let states: Vec<(&str, Vec<u64>, Option<cibergit::stacks::StackPullRequestId>)> = vec![
+                    ("multi-tip-unselected", vec![40, 41, 42], None),
+                    ("selected-path", vec![40, 41, 42], Some(chosen.clone())),
+                    ("removed-selection", vec![40, 41], Some(chosen)),
+                ];
+                let mut captured = Vec::new();
+                for (name, present, requested) in states {
+                    let applied = window
+                        .update(|_, cx| {
+                            weak.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    return Err("Stack tip smoke lost review workspace".to_owned());
+                                };
+                                let index =
+                                    this.active_tab.expect("installed Stack tip smoke tab");
+                                let store = this.tabs[index].stack.store();
+                                let loaded = stack_view::synthetic_stack_tip_load(
+                                    &fixture,
+                                    &store,
+                                    &present,
+                                    requested.as_ref(),
+                                )?;
+                                let token = match &requested {
+                                    Some(tip) => this.tabs[index]
+                                        .stack
+                                        .begin_tip_selection(&fixture.repository, tip.clone()),
+                                    None => {
+                                        this.tabs[index].stack.begin_refresh(&fixture.repository)
+                                    }
+                                };
+                                this.tabs[index].stack.accept(&token, Ok(loaded), true);
+                                this.status = format!("Synthetic forked Stack · {name}");
+                                cx.notify();
+                                Ok(())
+                            })
+                            .map_err(|error| error.to_string())?
+                        })
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
+                    if let Err(error) = applied {
+                        panic!("native Stack tip smoke state {name} failed: {error}");
+                    }
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(600))
+                        .await;
+                    let file = output.join(format!("native-stack-tips-{name}.png"));
+                    let saved = window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .and_then(|image| image.save(&file).map_err(Into::into))
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+                    captured.push(format!(
+                        "{name}: {}",
+                        if saved { "captured" } else { "FAILED" }
+                    ));
+                }
+                let notice = window
+                    .update(|_, cx| {
+                        weak.read_with(cx, |root, _| match root {
+                            Root::Review(this) => this
+                                .active_tab
+                                .and_then(|index| this.tabs[index].stack.tip_notice.clone())
+                                .unwrap_or_default(),
+                            Root::Editor(_) => String::new(),
+                        })
+                        .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                let _ = std::fs::write(
+                    output.join("native-stack-tips-smoke.txt"),
+                    format!(
+                        "{}{}\nFinal invalidation notice: {notice}\nNo provider read was performed.\n",
+                        fixture.report,
+                        captured.join("\n")
+                    ),
+                );
+                let _ = window.update(|window, _| window.remove_window());
             })
             .detach();
     }
@@ -19254,12 +19400,55 @@ impl ReviewWorkspace {
             return;
         };
         let repository = tab.repository.clone();
-        let number = tab.pull_request.number;
         let token = tab.stack.begin_refresh(&repository);
+        self.dispatch_stack_load(index, token, cx);
+    }
+
+    /// Explicitly compare one chosen tip. The new token supersedes every older
+    /// refresh and lazy patch reply, so a previous tip cannot install its diff.
+    fn select_stack_tip(
+        &mut self,
+        index: usize,
+        tip: cibergit::stacks::StackPullRequestId,
+        cx: &mut Context<Root>,
+    ) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        if !tab.stack.visible {
+            return;
+        }
+        let repository = tab.repository.clone();
+        let token = tab.stack.begin_tip_selection(&repository, tip);
+        self.status = "Comparing the selected stack tip path…".into();
+        self.dispatch_stack_load(index, token, cx);
+    }
+
+    fn select_next_stack_tip(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if !self.tabs[index].stack.visible {
+            return;
+        }
+        let Some(tip) = self.tabs[index].stack.next_tip_choice() else {
+            return;
+        };
+        self.select_stack_tip(index, tip, cx);
+    }
+
+    fn dispatch_stack_load(
+        &mut self,
+        index: usize,
+        token: stack_view::StackRequestToken,
+        cx: &mut Context<Root>,
+    ) {
+        let tab = &self.tabs[index];
+        let repository = tab.repository.clone();
+        let number = tab.pull_request.number;
         let store = tab.stack.store();
+        let requested_tip = tab.stack.requested_tip();
         let task = cx.background_spawn(async move {
             let provider = GithubProvider::new(repository.account.clone());
-            load_stack(&provider, &repository, number, &store)
+            load_stack(&provider, &repository, number, &store, requested_tip)
         });
         cx.spawn(async move |root, cx| {
             let result = task.await;
@@ -19273,7 +19462,11 @@ impl ReviewWorkspace {
                 };
                 if this.tabs[tab_index].stack.accept(&token, result, this.wide) {
                     this.status = match &this.tabs[tab_index].stack.state {
-                        StackLoadState::Ready => "Stack snapshot ready · read only".into(),
+                        StackLoadState::Ready => this.tabs[tab_index]
+                            .stack
+                            .tip_notice
+                            .clone()
+                            .unwrap_or_else(|| "Stack snapshot ready · read only".into()),
                         StackLoadState::Unavailable(reason) => {
                             format!("Stack unavailable · {reason}")
                         }
@@ -19865,6 +20058,11 @@ impl ReviewWorkspace {
             .on_action(cx.listener(|root, _: &RefreshStackView, _, cx| {
                 if let Root::Review(this) = root {
                     this.refresh_stack(cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &SelectNextStackTip, _, cx| {
+                if let Root::Review(this) = root {
+                    this.select_next_stack_tip(cx);
                 }
             }))
             .on_action(cx.listener(|root, _: &ToggleStackRelationships, _, cx| {
@@ -21994,7 +22192,8 @@ impl ReviewWorkspace {
         let boundary = stack
             .loaded
             .as_ref()
-            .map(|loaded| boundary_label(&loaded.selection.effective_boundary))
+            .and_then(|loaded| loaded.selection.as_ref())
+            .map(|selection| boundary_label(&selection.effective_boundary))
             .unwrap_or_else(|| "Net remaining stack".into());
         let native = stack.loaded.as_ref().map(|loaded| {
             let label = match loaded.native.availability {
@@ -22023,16 +22222,23 @@ impl ReviewWorkspace {
         });
         let relationship_summary = stack.loaded.as_ref().map(|loaded| {
             let selected = loaded.resolution.selected.clone();
-            let provenance = loaded
-                .selection
+            let Some(selection) = loaded.selection.as_ref() else {
+                return format!(
+                    "No tip chosen · {} selectable tip(s) below #{}",
+                    loaded.tips.tips.len(),
+                    selected.number
+                );
+            };
+            let provenance = selection
                 .frozen_edges
                 .iter()
                 .find(|edge| edge.child == selected)
                 .map(|edge| provenance_label(edge.provenance))
                 .unwrap_or("Root");
             format!(
-                "{} layers · selected #{}: {provenance}",
-                loaded.selection.frozen_layers.len(),
+                "{} layers · tip #{} · selected #{}: {provenance}",
+                selection.frozen_layers.len(),
+                selection.selected_tip.number,
                 selected.number
             )
         });
@@ -22175,6 +22381,18 @@ impl ReviewWorkspace {
                         .child(notice),
                 )
             })
+            .when_some(stack.tip_notice.clone(), |view, notice| {
+                view.child(
+                    div()
+                        .id("stack-tip-notice")
+                        .px(px(ui::PANEL_GUTTER))
+                        .py_2()
+                        .bg(colors.elevated)
+                        .ui_text(TextRole::Body)
+                        .text_color(colors.amber)
+                        .child(notice),
+                )
+            })
             .when_some(stack.feedback.clone(), |view, feedback| {
                 view.child(
                     div()
@@ -22214,12 +22432,14 @@ impl ReviewWorkspace {
         let layers = stack
             .loaded
             .as_ref()
-            .map(|loaded| loaded.selection.frozen_layers.clone())
+            .and_then(|loaded| loaded.selection.as_ref())
+            .map(|selection| selection.frozen_layers.clone())
             .unwrap_or_default();
         let edges = stack
             .loaded
             .as_ref()
-            .map(|loaded| loaded.selection.frozen_edges.clone())
+            .and_then(|loaded| loaded.selection.as_ref())
+            .map(|selection| selection.frozen_edges.clone())
             .unwrap_or_default();
         let choices = stack.correction_choices();
         let has_personal = stack.loaded.as_ref().is_some_and(|loaded| {
@@ -22249,6 +22469,7 @@ impl ReviewWorkspace {
             .border_r_1()
             .border_color(colors.border)
             .bg(colors.canvas)
+            .child(self.render_stack_tips(index, colors, cx))
             .child(
                 div()
                     .h(px(ui::DESKTOP_HIT))
@@ -22443,6 +22664,52 @@ impl ReviewWorkspace {
             })
     }
 
+    /// Explicit tip picker. It appears only when this pull request has more
+    /// than one selectable descendant tip, or when a candidate had to be
+    /// withheld, so a single-tip stack is unchanged.
+    fn render_stack_tips(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> impl IntoElement {
+        let stack = &self.tabs[index].stack;
+        let root = cx.entity();
+        stack_tip_panel(
+            index,
+            StackTipPicker {
+                tips: stack
+                    .loaded
+                    .as_ref()
+                    .map(|loaded| loaded.tips.tips.clone())
+                    .unwrap_or_default(),
+                excluded: stack
+                    .loaded
+                    .as_ref()
+                    .map(|loaded| loaded.tips.excluded.clone())
+                    .unwrap_or_default(),
+                current: stack
+                    .loaded
+                    .as_ref()
+                    .and_then(|loaded| loaded.selection.as_ref())
+                    .map(|selection| selection.selected_tip.clone()),
+                scroll: stack.tip_scroll.clone(),
+                choice_outstanding: stack
+                    .loaded
+                    .as_ref()
+                    .is_some_and(|loaded| loaded.selection.is_none()),
+            },
+            colors,
+            move |tip, cx| {
+                root.update(cx, |root, cx| {
+                    if let Root::Review(this) = root {
+                        this.select_stack_tip(index, tip.clone(), cx);
+                    }
+                });
+            },
+        )
+    }
+
     fn render_stack_files(
         &self,
         index: usize,
@@ -22632,7 +22899,11 @@ impl ReviewWorkspace {
                     .items_center()
                     .justify_center()
                     .text_color(colors.muted)
-                    .child("No text patch is available. Binary and media content is never loaded.")
+                    .child(if stack.session.is_none() {
+                        "Choose a tip to compare its path."
+                    } else {
+                        "No text patch is available. Binary and media content is never loaded."
+                    })
                     .into_any_element()
             } else {
                 div()
@@ -28501,6 +28772,174 @@ fn checks_page_button(
         .child(visible_label)
 }
 
+/// Everything the tip picker renders from.
+struct StackTipPicker {
+    tips: Vec<cibergit::stacks::StackTipOption>,
+    excluded: Vec<cibergit::stacks::StackTipExclusion>,
+    current: Option<cibergit::stacks::StackPullRequestId>,
+    scroll: gpui::UniformListScrollHandle,
+    /// True whenever tips exist but none is compared, so the picker never
+    /// disappears while asking for a choice.
+    choice_outstanding: bool,
+}
+
+/// The Stack tip picker panel. Data in, one choice callback out, so the exact
+/// shipped presentation can be rendered without a live review workspace.
+fn stack_tip_panel(
+    index: usize,
+    picker: StackTipPicker,
+    colors: Palette,
+    on_choose: impl Fn(&cibergit::stacks::StackPullRequestId, &mut App) + Clone + 'static,
+) -> impl IntoElement {
+    let StackTipPicker {
+        tips,
+        excluded,
+        current,
+        scroll,
+        choice_outstanding,
+    } = picker;
+    let tip_count = tips.len();
+    div().id("stack-tip-picker").when(
+        tip_count > 1 || !excluded.is_empty() || (choice_outstanding && tip_count > 0),
+        move |panel| {
+            panel
+                .flex()
+                .flex_col()
+                .border_b_1()
+                .border_color(colors.border)
+                .child(
+                    div()
+                        .h(px(ui::DESKTOP_HIT))
+                        .px(px(ui::CONTROL_INSET))
+                        .flex()
+                        .items_center()
+                        .child(format!("Tips below this PR  {tip_count}")),
+                )
+                .child(
+                    div()
+                        .px(px(ui::CONTROL_INSET))
+                        .pb_2()
+                        .ui_text(TextRole::Caption)
+                        .text_color(colors.muted)
+                        .child(
+                            "Only tips that descend from this pull request are listed. Choose one to compare its path; ⌥⌘T cycles.",
+                        ),
+                )
+                .when(tip_count > 0, |panel| {
+                    panel.child(
+                        div()
+                            .h(px(
+                                (ui::TWO_LINE_ROW * tip_count.min(4) as f32).max(ui::TWO_LINE_ROW)
+                            ))
+                            .min_h(px(ui::TWO_LINE_ROW))
+                            .relative()
+                            .child(
+                                uniform_list(
+                                    SharedString::from(format!("stack-tips-{index}")),
+                                    tip_count,
+                                    move |range: Range<usize>, _, _| {
+                                        range
+                                            .map(|row| {
+                                                let tip = tips[row].clone();
+                                                let selected = current.as_ref() == Some(&tip.id);
+                                                let choose = on_choose.clone();
+                                                let activate = tip.id.clone();
+                                                div()
+                                                    .w_full()
+                                                    .px(px(ui::CELL_INSET))
+                                                    .child(
+                                                        stack_tip_button(&tip, selected, colors)
+                                                            .on_click(move |_, _, cx| {
+                                                                choose(&activate, cx);
+                                                            }),
+                                                    )
+                                            })
+                                            .collect()
+                                    },
+                                )
+                                .track_scroll(&scroll)
+                                .w_full()
+                                .h_full(),
+                            )
+                            .child(
+                                div().absolute().inset_0().child(
+                                    Scrollbar::vertical(&scroll)
+                                        .id(SharedString::from(format!(
+                                            "stack-tip-scrollbar-{index}"
+                                        )))
+                                        .viewport_from_layout(),
+                                ),
+                            ),
+                    )
+                })
+                .children(excluded.into_iter().map(|excluded| {
+                    div()
+                        .px(px(ui::CELL_INSET))
+                        .py_1()
+                        .ui_text(TextRole::Caption)
+                        .text_color(colors.amber)
+                        .child(format!(
+                            "#{} withheld · {}",
+                            excluded.id.number, excluded.reason
+                        ))
+                }))
+        },
+    )
+}
+
+/// One explicitly selectable stack tip. Two lines on the shared 44px two-line
+/// row so the branch and the proven path length stay readable.
+fn stack_tip_button(
+    tip: &cibergit::stacks::StackTipOption,
+    selected: bool,
+    colors: Palette,
+) -> Button {
+    let number = tip.id.number;
+    Button::new(format!("stack-tip-{number}"))
+        .debug_selector(move || format!("stack-tip-{number}"))
+        .w_full()
+        .min_w_0()
+        .h(px(ui::TWO_LINE_ROW))
+        .px(px(ui::CELL_INSET))
+        .rounded(px(ui::CONTROL_RADIUS))
+        .flex()
+        .flex_col()
+        .justify_center()
+        .items_stretch()
+        .ui_text(TextRole::Body)
+        .cursor_pointer()
+        .selected(selected)
+        .aria_selected(selected)
+        .text_color(if selected { colors.text } else { colors.muted })
+        .when(selected, |row| row.bg(colors.selected))
+        .hover(|row| row.bg(colors.selected))
+        .accessibility_label(format!(
+            "Compare tip #{number} on branch {}, {:?}, {} layers on its path{}",
+            tip.branch,
+            tip.state,
+            tip.path_layers,
+            if selected { ", selected" } else { "" }
+        ))
+        .child(
+            div()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(format!("#{number}  {}", tip.branch)),
+        )
+        .child(
+            div()
+                .ui_text(TextRole::Caption)
+                .text_color(colors.faint)
+                .child(format!(
+                    "{:?} · {} layers · {}",
+                    tip.state,
+                    tip.path_layers,
+                    short_sha(&tip.head_sha)
+                )),
+        )
+}
+
 fn short_sha(sha: &str) -> &str {
     &sha[..sha.len().min(8)]
 }
@@ -30454,6 +30893,8 @@ impl EditorWorkspace {
 mod layout_tests {
     #[cfg(feature = "ui-smoke")]
     use super::ci_read::MemoryRead;
+    #[cfg(feature = "ui-smoke")]
+    use super::stack_tip_button;
     use super::submitted_review_drafts::{
         DraftSnapshot as SubmittedDraftStoreSnapshot, SubmittedSummaryDraft,
         same_review_coordinates,
@@ -31704,6 +32145,133 @@ mod layout_tests {
             .take(tail.len())
             .collect::<Vec<_>>();
         assert_eq!(rendered, ["FINAL-SENTINEL"]);
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn stack_tip_picker_row_exposes_selection_and_pointer_keyboard_activation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{
+            Context, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, Render, accesskit, canvas,
+            div, point, prelude::*, px,
+        };
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+
+        fn tip(number: u64, selected_branch: &str) -> cibergit::stacks::StackTipOption {
+            cibergit::stacks::StackTipOption {
+                id: cibergit::stacks::StackPullRequestId {
+                    repository: cibergit::stacks::StackRepository {
+                        host: "github.com".into(),
+                        owner: "owner".into(),
+                        name: "repo".into(),
+                    },
+                    number,
+                },
+                branch: selected_branch.into(),
+                head_sha: "c".repeat(40),
+                state: cibergit::stacks::StackLayerState::Open,
+                path_layers: 3,
+            }
+        }
+
+        struct Harness {
+            activations: Rc<Cell<usize>>,
+        }
+
+        impl Render for Harness {
+            fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+                let activations = self.activations.clone();
+                div().size(px(240.)).child(
+                    stack_tip_button(&tip(7, "feature-upper"), false, palette(false))
+                        .size_full()
+                        .on_click(move |_, _, _| activations.set(activations.get() + 1)),
+                )
+            }
+        }
+
+        type Captured = Rc<RefCell<Option<(Option<gpui::Role>, accesskit::Node, accesskit::Node)>>>;
+
+        struct Probe {
+            captured: Captured,
+        }
+
+        impl Render for Probe {
+            fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+                let captured = self.captured.clone();
+                canvas(
+                    move |_, window, cx| {
+                        let colors = palette(false);
+                        let describe =
+                            |selected: bool, window: &mut gpui::Window, cx: &mut gpui::App| {
+                                let element =
+                                    stack_tip_button(&tip(7, "feature-upper"), selected, colors)
+                                        .on_click(|_, _, _| {})
+                                        .render(window, cx)
+                                        .into_element();
+                                let role = element.a11y_role();
+                                let mut node =
+                                    accesskit::Node::new(role.unwrap_or(gpui::Role::Unknown));
+                                element.write_a11y_info(&mut node);
+                                (role, node)
+                            };
+                        let (role, unselected) = describe(false, window, cx);
+                        let (_, selected) = describe(true, window, cx);
+                        *captured.borrow_mut() = Some((role, unselected, selected));
+                    },
+                    |_, _, _, _| {},
+                )
+            }
+        }
+
+        cx.update(gpui_base::init);
+        let captured = Rc::new(RefCell::new(None));
+        let (_, probe_window) = cx.add_window_view({
+            let captured = captured.clone();
+            move |_, _| Probe { captured }
+        });
+        probe_window.update(|window, cx| window.draw(cx).clear(cx));
+        let (role, unselected, selected) = captured.borrow_mut().take().unwrap();
+
+        // A tip is a real button that states its identity, its proven path
+        // length, and whether it is the tip currently being compared.
+        assert_eq!(role, Some(gpui::Role::Button));
+        assert_eq!(
+            unselected.label(),
+            Some("Compare tip #7 on branch feature-upper, Open, 3 layers on its path")
+        );
+        assert_eq!(unselected.is_selected(), Some(false));
+        assert_eq!(
+            selected.label(),
+            Some("Compare tip #7 on branch feature-upper, Open, 3 layers on its path, selected")
+        );
+        assert_eq!(selected.is_selected(), Some(true));
+        assert!(unselected.supports_action(accesskit::Action::Click));
+
+        let activations = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let activations = activations.clone();
+            move |_, _| Harness { activations }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_click(point(px(12.), px(12.)), Modifiers::default());
+        for key in ["enter", "space"] {
+            let keystroke = Keystroke::parse(key).unwrap();
+            cx.simulate_event(KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(KeyUpEvent { keystroke });
+        }
+        assert_eq!(
+            activations.get(),
+            3,
+            "pointer, Enter and Space each choose the tip"
+        );
     }
 
     #[cfg(feature = "ui-smoke")]
