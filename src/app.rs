@@ -35168,16 +35168,10 @@ mod layout_tests {
         }
 
         // Each control tracks a caller-owned focus handle and accepts focus.
-        //
-        // Keyboard traversal and activation are deliberately NOT asserted,
-        // because they do not work for controls in this Checks section: neither
-        // `focus_next` nor Enter/Space on a focused button reaches them here.
-        // That is a known open gap in this subtree, not in these controls.
-        // Elsewhere in this window both work, and the pre-existing
-        // `checks-source-details` button is likewise painted every frame yet
-        // never enters the tab ring. The mechanism is unidentified; an earlier
-        // guess that the inspector declares no tab group was tested and
-        // disproved. Claiming keyboard evidence here would be false.
+        // Real traversal and Enter/Space activation are asserted separately by
+        // `actions_run_controls_are_tab_reachable_and_activate_on_enter_and_space`;
+        // this test stays pointer-only so the two kinds of evidence do not
+        // depend on each other.
         for (position, action) in RUN_CONTROLS.into_iter().enumerate() {
             cx.update(|window, cx| {
                 root.update(cx, |root, cx| {
@@ -35482,82 +35476,101 @@ mod layout_tests {
             }
         }
 
-        // The same for both confirmation controls, on a prepared request.
-        cx.update(|window, cx| {
-            root.update(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
-                this.install_synthetic_actions_confirmation(
-                    ActionsRunControlAction::RerunFailedJobs,
-                );
-            });
-            window.draw(cx).clear(cx);
-        });
+        // Both confirmation controls, and both keys on each. Cancel retires the
+        // frozen request, so the confirmation is reinstalled and focus
+        // reacquired by traversal before every activation rather than assuming
+        // either survives the previous one.
         for (selector, confirm) in [
             ("confirm-actions-run-control", true),
             ("cancel-actions-run-control", false),
         ] {
-            let handle = root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
-                if confirm {
-                    this.actions_control_focus.confirm.clone()
-                } else {
-                    this.actions_control_focus.cancel.clone()
-                }
-            });
-            assert!(
-                cx.debug_bounds(selector).is_some(),
-                "{selector} is not painted"
-            );
-            let mut reached = cx.update(|window, _| handle.is_focused(window));
-            for _ in 0..200 {
-                if reached {
-                    break;
-                }
-                cx.update(|window, cx| window.focus_next(cx));
-                cx.update(|window, cx| window.draw(cx).clear(cx));
-                reached = cx.update(|window, _| handle.is_focused(window));
-            }
-            assert!(reached, "Tab traversal must land on {selector}");
+            for key in ["enter", "space"] {
+                cx.update(|window, cx| {
+                    root.update(cx, |root, _| {
+                        let Root::Review(this) = root else {
+                            unreachable!()
+                        };
+                        this.install_synthetic_actions_confirmation(
+                            ActionsRunControlAction::RerunFailedJobs,
+                        );
+                        this.status = "sentinel".into();
+                    });
+                    window.draw(cx).clear(cx);
+                });
+                assert!(
+                    cx.debug_bounds(selector).is_some(),
+                    "{selector} is not painted before {key}"
+                );
 
-            cx.update(|_, cx| {
-                root.update(cx, |root, _| {
+                let handle = root.read_with(cx, |root, _| {
                     let Root::Review(this) = root else {
                         unreachable!()
                     };
-                    this.status = "sentinel".into();
+                    if confirm {
+                        this.actions_control_focus.confirm.clone()
+                    } else {
+                        this.actions_control_focus.cancel.clone()
+                    }
                 });
-            });
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-            press(cx, "enter");
-            root.read_with(cx, |root, _| {
+                let mut reached = cx.update(|window, _| handle.is_focused(window));
+                for _ in 0..200 {
+                    if reached {
+                        break;
+                    }
+                    cx.update(|window, cx| window.focus_next(cx));
+                    cx.update(|window, cx| window.draw(cx).clear(cx));
+                    reached = cx.update(|window, _| handle.is_focused(window));
+                }
+                assert!(
+                    reached,
+                    "Tab traversal must land on {selector} before {key}"
+                );
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                assert!(
+                    cx.update(|window, _| handle.is_focused(window)),
+                    "{selector} lost focus before {key}"
+                );
+
+                press(cx, key);
+                root.read_with(cx, |root, _| {
+                    let Root::Review(this) = root else {
+                        unreachable!()
+                    };
+                    if confirm {
+                        // Confirm reaches the dispatch path and stops at the
+                        // synthetic scene's zero-capability guard.
+                        assert!(
+                            this.status.contains("not dispatched")
+                                && this.status.contains("zero writes were sent"),
+                            "{key} on a focused Confirm did not reach the controller: {}",
+                            this.status
+                        );
+                        assert!(this.tabs[0].confirmation.is_some());
+                    } else {
+                        assert!(
+                            this.status.contains("retired"),
+                            "{key} on a focused Cancel did not retire the request: {}",
+                            this.status
+                        );
+                        assert!(this.tabs[0].confirmation.is_none());
+                    }
+                    assert!(!this.tabs[0].write_in_flight);
+                    assert!(this.tabs[0].ci_actions.in_flight.is_none());
+                });
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
+        }
+        // Leave no prepared request behind.
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
                 let Root::Review(this) = root else {
                     unreachable!()
                 };
-                if confirm {
-                    // Confirm reaches the dispatch path and stops at the
-                    // synthetic scene's zero-capability guard.
-                    assert!(
-                        this.status.contains("not dispatched")
-                            && this.status.contains("zero writes were sent"),
-                        "Enter on a focused Confirm did not reach the controller: {}",
-                        this.status
-                    );
-                    assert!(this.tabs[0].confirmation.is_some());
-                } else {
-                    assert!(
-                        this.status.contains("retired"),
-                        "Enter on a focused Cancel did not retire the request: {}",
-                        this.status
-                    );
-                    assert!(this.tabs[0].confirmation.is_none());
-                }
+                this.invalidate_actions_control_confirmation(0, "test teardown");
+                let _ = cx;
             });
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-        }
+            window.draw(cx).clear(cx);
+        });
         root.read_with(cx, |root, _| {
             let Root::Review(this) = root else {
                 unreachable!()

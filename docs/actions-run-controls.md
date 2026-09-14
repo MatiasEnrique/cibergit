@@ -74,6 +74,14 @@ Rate-limit and poll headers are safely parsed from every dispatch and installed 
 
 Both outcomes are recorded as observed movement, not as an effect caused by this attempt: GitHub records no per-request Actions control event. An unmoved run never proves the attempt was NotApplied, so it stays unresolved.
 
+## Keyboard
+
+Each control and both confirmation buttons track a caller-owned focus handle, are reachable by Tab traversal, and activate on Enter and on Space.
+
+Enter needed a fix to get there. It is bound to the pane-level shortcuts in the `ChecksPane` and `ChecksJobsPane` key contexts, and a key binding matches against the focused node's whole context stack, so every focusable control inside those panes inherited the pane binding: Enter matched the pane shortcut, propagation stopped, and the control's own activation never armed. Space had no such binding and always worked, which made one swallowed key look like a broken keyboard. Each pane shortcut now acts only while the pane itself holds focus and otherwise propagates, so a focused control answers its own Enter. The pane shortcuts still work when the pane is focused, and that is asserted.
+
+Native verification drives the real review window, reaches each control by traversal onto its own handle rather than by a pointer press, redraws between focusing and pressing because GPUI registers a focused element's key listeners only while painting it focused, and asserts controller state rather than a painted ring. Layout preconditions run first, so an offscreen control cannot masquerade as a keyboard defect. The assertions were confirmed to fail without the pane guards.
+
 ## Preserved behavior
 
 Controls never touch the displayed comparison, the pinned canonical revision, any local review draft, any pinned selection, or the memory-only Jobs and Log panes. A live pending-review start blocks a control, and another in-flight mutation in this tab blocks it.
@@ -85,6 +93,4 @@ Controls never touch the displayed comparison, the pinned canonical revision, an
 - A re-run creates a new attempt that this feature does not load, select, or follow.
 - Rate limiting installs an account floor; it never schedules a resend.
 - No live-provider fixture is part of automated verification. Every test uses a synthetic `gh` transport and disposable local state, and no test performs a real remote mutation.
-- The controls and both confirmation buttons track caller-owned focus handles and are verified to accept focus, but keyboard operation is not verified and no keyboard-operability claim is made. Native verification covers pointer activation only.
-- The cause is a known open gap in the Checks section of the inspector, not in these controls. Elsewhere in this window Tab traversal and Enter/Space activation both work, and a pre-existing Checks button is likewise painted every frame yet never enters the tab ring. The mechanism is unidentified; an earlier guess that the inspector declares no tab group was tested and disproved.
 - This is not complete GitHub Actions parity. Workflow dispatch, job-level re-runs, run deletion, approval of deployments and of fork workflow runs, artifact and cache management, and Actions settings remain absent.
