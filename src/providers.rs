@@ -13,15 +13,15 @@ use crate::comparisons::{
 use crate::domain::{
     Account, ActionsLinkage, BranchDeletionAcknowledgement, BranchDeletionRequest, ChangedFile,
     CheckAppIdentity, CheckKind, CheckRepositoryIdentity, CheckShaClass, CheckSuiteIdentity,
-    Comparison, DismissalAuthority, FreshReviewDismissalCapability, FreshReactionCapability, IssueComment, LinkedReviewComment, MergeAcknowledgement,
-    MergeAction, MergeEligibility, MergeExecutionRequest, MergeMethod, MergePreparation,
-    MutationContext, PendingFileCommentSource, PendingReviewSnapshot, ProviderCoordinates,
-    ProviderMutationOutcome, PullRequest, PullRequestCheck, PullRequestCheckoutSource,
-    PullRequestDetails, PullRequestReview, ReactableKind, ReactionContent, ReactionGroupSnapshot,
-    ReactionSnapshot, ReactionSubjectSnapshot, Repository, ReviewAuxiliaryAcknowledgement,
-    ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewComment, ReviewSubject, ReviewThread,
-    ReviewWriteAcknowledgement, Revision, SelectedViewer, SubmittedReviewEditCapability,
-    WorkflowRunIdentity,
+    Comparison, DismissalAuthority, FreshReactionCapability, FreshReviewDismissalCapability,
+    IssueComment, LinkedReviewComment, MergeAcknowledgement, MergeAction, MergeEligibility,
+    MergeExecutionRequest, MergeMethod, MergePreparation, MutationContext,
+    PendingFileCommentSource, PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome,
+    PullRequest, PullRequestCheck, PullRequestCheckoutSource, PullRequestDetails,
+    PullRequestReview, ReactableKind, ReactionContent, ReactionGroupSnapshot, ReactionSnapshot,
+    ReactionSubjectSnapshot, Repository, ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryAction,
+    ReviewAuxiliaryRequest, ReviewComment, ReviewSubject, ReviewThread, ReviewWriteAcknowledgement,
+    Revision, SelectedViewer, SubmittedReviewEditCapability, WorkflowRunIdentity,
 };
 use crate::participation::{
     DraftStore, PendingCommentIntent, PendingFileCommentIntent, ReviewCommentTarget,
@@ -2325,10 +2325,12 @@ impl<'a> Session<'a> {
                 repo,
                 pull,
                 viewer,
-                viewer_can_administer,
-                response.partial,
-                page == 0,
-                cursors.checks.include,
+                DetailsPageContext {
+                    viewer_can_administer,
+                    partial: response.partial,
+                    first: page == 0,
+                    checks_requested: cursors.checks.include,
+                },
             )?;
             if next.done() {
                 return builder.finish(number);
@@ -5594,17 +5596,27 @@ impl Default for DetailsBuilder {
     }
 }
 
+struct DetailsPageContext {
+    viewer_can_administer: bool,
+    partial: bool,
+    first: bool,
+    checks_requested: bool,
+}
+
 impl DetailsBuilder {
     fn absorb(
         &mut self,
         repo: &Repository,
         pull: DetailsPull,
         viewer: DetailsViewer,
-        viewer_can_administer: bool,
-        partial: bool,
-        first: bool,
-        checks_requested: bool,
+        context: DetailsPageContext,
     ) -> Result<DetailsCursors> {
+        let DetailsPageContext {
+            viewer_can_administer,
+            partial,
+            first,
+            checks_requested,
+        } = context;
         let number = pull.number;
         let source_identity = DetailsSourceIdentity::from_pull(repo, &pull)?;
         if let Some(prior) = &self.source_identity {

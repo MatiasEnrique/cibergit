@@ -24995,8 +24995,9 @@ mod layout_tests {
     };
     #[cfg(feature = "ui-smoke")]
     use super::{
-        DismissalConfirmationToken, DismissalPreparationToken, InspectorSection, InstallTabOptions, LoadState, NextCheck, NextCheckPage, OpenChecks,
-        RepoRuntime, Root, Startup, ToggleCheckIdentity,
+        DismissalConfirmationToken, DismissalPreparationToken, InspectorSection, InstallTabOptions,
+        LoadState, NextCheck, NextCheckPage, OpenChecks, RepoRuntime, Root, Startup,
+        ToggleCheckIdentity,
     };
     use cibergit::domain::{
         Account, ActionsLinkage, CheckKind, CheckShaClass, MergeEligibility,
