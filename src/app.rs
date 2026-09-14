@@ -159,7 +159,7 @@ const MIN_FILE_TREE_WIDTH: f32 = 180.;
 const MIN_DETAILS_WIDTH: f32 = 220.;
 const MAX_PANEL_WIDTH: f32 = 460.;
 const COLLAPSED_PANEL_WIDTH: f32 = 34.;
-const SPLITTER_WIDTH: f32 = 6.;
+const SPLITTER_WIDTH: f32 = 8.;
 const MIN_SPLIT_DIFF_WIDTH: f32 = 560.;
 const PANEL_KEYBOARD_STEP: f32 = 16.;
 // Menlo at the diff's 12px text size advances about 7.225px per ASCII cell on
@@ -1351,6 +1351,7 @@ struct ReviewTab {
     file_tree_scroll: UniformListScrollHandle,
     inspector_section: InspectorSection,
     checks_selection: ChecksSelection,
+    checks_source_expanded: bool,
     ci_read: CiReadState,
     local_inventory: bool,
     session_persistence_error: Option<String>,
@@ -2062,6 +2063,7 @@ enum DiffRow {
 enum InspectorSection {
     Overview,
     Activity,
+    Commits,
     Checks,
 }
 
@@ -2197,7 +2199,7 @@ impl ReviewWorkspace {
     fn resolved_panel_widths(&self, window: &Window) -> (f32, f32, f32) {
         resolved_panel_widths_for(
             &self.panel_layout,
-            self.inspector_open,
+            false,
             window.bounds().size.width.as_f32(),
         )
     }
@@ -2205,7 +2207,7 @@ impl ReviewWorkspace {
     fn available_diff_width(&self, window: &Window) -> f32 {
         available_diff_width_for(
             &self.panel_layout,
-            self.inspector_open,
+            false,
             window.bounds().size.width.as_f32(),
         )
     }
@@ -3722,6 +3724,10 @@ impl ReviewWorkspace {
         let Some(output) = std::env::var_os("CIBERGIT_SMOKE_DIR").map(PathBuf::from) else {
             return;
         };
+        if std::env::var_os("CIBERGIT_SMOKE_PR_LAYOUT").is_some() {
+            self.start_pr_layout_smoke(window, cx, output);
+            return;
+        }
         if std::env::var_os("CIBERGIT_SMOKE_SIDEBAR").is_some() {
             self.start_sidebar_smoke(window, cx, output);
             return;
@@ -5233,6 +5239,177 @@ impl ReviewWorkspace {
             submitted_before.drafts.len(),
             journal_before.len(),
         ))
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn install_pr_layout_fixture(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+        assert!(self.provider_reads_disabled && self.tabs.is_empty());
+        let repository = Repository {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "workspace".into(),
+            account: cibergit::domain::Account {
+                host: "github.com".into(),
+                login: "maya".into(),
+            },
+            local_path: None,
+        };
+        let pull = PullRequest {
+            number: 203,
+            title: "Make pull request navigation easier to follow".into(),
+            author: "maya".into(),
+            state: "OPEN".into(),
+            source_branch: "feature/pr-navigation".into(),
+            target_branch: "main".into(),
+            base_sha: "1".repeat(40),
+            head_sha: "2".repeat(40),
+            ..Default::default()
+        };
+        self.repositories.push(RepoRuntime {
+            repository: repository.clone(),
+            pull_requests: vec![pull.clone()],
+            state: LoadState::Ready,
+            generation: 0,
+            refresh: RefreshGate::default(),
+        });
+        self.install_tab_with_restore(
+            repository,
+            pull,
+            None,
+            InstallTabOptions {
+                activate: true,
+                window: Some(window),
+                start_background_work: false,
+            },
+            cx,
+        );
+        self.setup_open = false;
+        self.status = "Synthetic PR preview · no remote requests".into();
+        let revision = Revision {
+            base_sha: "1".repeat(40),
+            head_sha: "2".repeat(40),
+        };
+        let session = ReviewSession::new(cibergit::domain::Comparison {
+            revision: revision.clone(), complete: true, notice: None,
+            files: ["src/navigation.rs", "src/sidebar.rs", "docs/reviewing.md"].into_iter().map(|path| cibergit::domain::ChangedFile {
+                path: path.into(), previous_path: None, raw_path: None, raw_previous_path: None,
+                status: "modified".into(), additions: 3, deletions: 1,
+                patch: Some("@@ -1,3 +1,5 @@\n pub fn review() {\n-    show_sidebar();\n+    show_conversation();\n+    show_checks();\n+    show_files();\n }\n".into()), patch_complete: true,
+            }).collect(),
+        });
+        let tab = &mut self.tabs[0];
+        tab.file_tree = FileTree::new(&session.comparison().files);
+        tab.session = Some(session.clone());
+        tab.canonical_session = Some(session);
+        tab.state = LoadState::Ready;
+        tab.canonical_full_revision = revision.clone();
+        tab.comparison_picker.install_inventory(
+            &revision,
+            cibergit::comparisons::CommitInventory {
+                full_revision: revision.clone(),
+                availability: cibergit::comparisons::InventoryAvailability::Complete,
+                notice: None,
+                commits: vec![cibergit::comparisons::CommitInventoryEntry {
+                    sha: "2".repeat(40),
+                    parent_shas: vec!["1".repeat(40)],
+                    message_headline: "Add PR tabs and make panel resizing follow the pointer"
+                        .into(),
+                    authored_at: "2026-09-14T10:00:00Z".into(),
+                    committed_at: "2026-09-14T10:00:00Z".into(),
+                }],
+            },
+        );
+        tab.details = Some(serde_json::from_value(serde_json::json!({
+            "number":203,
+            "body":"## A clearer place to review\n\nPull requests now have a dedicated space for the conversation, commits, checks, and changed files. Long descriptions stay readable instead of being squeezed into a narrow sidebar.\n\n### What changed\n\n- Keep discussion and review activity together.\n- Give the diff the full available width.\n- Resize navigation panels directly with the pointer.\n\n### Validation\n\nTested switching sections, retaining the selected file, and dragging both splitters. This preview uses synthetic data only.",
+            "requested_reviewers":["alex"], "labels":["interface"], "assignees":[],
+            "merge_eligibility":{"state":"OPEN","draft":false,"mergeable":"MERGEABLE","merge_state_status":"CLEAN","review_status":"REVIEW_REQUIRED","check_status":"SUCCESS","maintainer_can_modify":false,"can_rebase":false,"can_update_branch":false,"auto_merge_enabled":false,"in_merge_queue":false},
+            "issue_comments":[{"coordinates":{"provider":"github","host":"github.com","owner":"acme","repository":"workspace","pull_request":203,"remote_id":"COMMENT_preview"},"author":"alex","body":"The description is much easier to read here. Keeping the selected file when switching tabs also makes reviewing simpler.","created_at":"2026-09-14T10:15:00Z","updated_at":"2026-09-14T10:15:00Z","url":"https://github.com/acme/workspace/pull/203"}],"reviews":[],"review_threads":[],"checks":[],"activity_complete":true,"checks_complete":true,"notice":null
+        })).unwrap());
+        for (id, name) in [
+            ("CHECK_build", "Build and type check"),
+            ("CHECK_tests", "Unit tests"),
+            ("CHECK_lint", "Lint and formatting"),
+        ] {
+            tab.details.as_mut().unwrap().checks.push(serde_json::from_value(serde_json::json!({
+                "coordinates":{"provider":"github","host":"github.com","owner":"acme","repository":"workspace","pull_request":203,"remote_id":id},
+                "kind":"CHECK_RUN","name":name,"status":"COMPLETED","conclusion":"SUCCESS","description":null,"details_url":null,"started_at":null,"completed_at":null,"required":null
+            })).unwrap());
+        }
+        tab.details.as_mut().unwrap().checks_complete = false;
+        if let ControllerLoad::Ready(controller) = ReviewInteractionController::load(
+            &self.interaction_root,
+            &tab.repository,
+            203,
+            tab.session.as_ref().unwrap(),
+        )
+        .unwrap()
+        {
+            tab.interactions = InteractionState::Ready(controller);
+        }
+        tab.lifecycle_state =
+            LoadState::Cached("Synthetic preview · lifecycle actions are unavailable".into());
+        tab.details_state = LoadState::Ready;
+        tab.inspector_section = InspectorSection::Overview;
+        self.inspector_open = true;
+        self.rebuild_diff(0, self.wide);
+        cx.notify();
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn start_pr_layout_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+        output: PathBuf,
+    ) {
+        self.install_pr_layout_fixture(window, cx);
+        let root = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                std::fs::create_dir_all(&output).unwrap();
+                for (name, section) in [
+                    ("conversation", Some(InspectorSection::Overview)),
+                    ("commits", Some(InspectorSection::Commits)),
+                    ("checks", Some(InspectorSection::Checks)),
+                    ("files", None),
+                ] {
+                    window
+                        .update(|window, cx| {
+                            root.update(cx, |root, cx| {
+                                let Root::Review(this) = root else {
+                                    unreachable!()
+                                };
+                                this.inspector_open = section.is_some();
+                                if let Some(section) = section {
+                                    this.tabs[0].inspector_section = section;
+                                }
+                                this.tabs[0].comparison_picker.expanded =
+                                    section == Some(InspectorSection::Commits);
+                                this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                                this.refresh_auto_layout(window);
+                                cx.notify();
+                            })
+                            .unwrap()
+                        })
+                        .unwrap();
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(400))
+                        .await;
+                    window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .unwrap()
+                                .save(output.join(format!("{name}.png")))
+                                .unwrap()
+                        })
+                        .unwrap();
+                }
+                window.update(|_, cx| cx.quit()).unwrap();
+            })
+            .detach();
     }
 
     #[cfg(feature = "ui-smoke")]
@@ -13305,6 +13482,7 @@ impl ReviewWorkspace {
             file_tree_scroll: UniformListScrollHandle::new(),
             inspector_section: InspectorSection::Overview,
             checks_selection: ChecksSelection::default(),
+            checks_source_expanded: false,
             ci_read: CiReadState::default(),
             local_inventory,
             session_persistence_error,
@@ -18864,7 +19042,7 @@ impl ReviewWorkspace {
         }
     }
 
-    fn navigate_file(&mut self, next: bool, _window: &mut Window, cx: &mut Context<Root>) {
+    fn navigate_file(&mut self, next: bool, window: &mut Window, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         if self.tabs[index].stack.visible {
             if self.tabs[index].stack.navigate_file(next, self.wide) {
@@ -18886,6 +19064,8 @@ impl ReviewWorkspace {
         ) {
             return;
         }
+        self.inspector_open = false;
+        self.refresh_auto_layout(window);
         self.capture_scroll(index);
         let changed = self.tabs[index].session.as_mut().is_some_and(|session| {
             if next {
@@ -19569,12 +19749,14 @@ impl ReviewWorkspace {
                     cx.notify();
                 }
             }))
-            .on_action(cx.listener(|root, _: &ToggleComparisonPicker, _, cx| {
+            .on_action(cx.listener(|root, _: &ToggleComparisonPicker, window, cx| {
                 if let Root::Review(this) = root
                     && let Some(index) = this.active_tab
                 {
-                    this.tabs[index].comparison_picker.expanded =
-                        !this.tabs[index].comparison_picker.expanded;
+                    this.inspector_open = true;
+                    this.tabs[index].inspector_section = InspectorSection::Commits;
+                    this.tabs[index].comparison_picker.expanded = true;
+                    this.refresh_auto_layout(window);
                     cx.notify();
                 }
             }))
@@ -19950,14 +20132,16 @@ impl ReviewWorkspace {
             .w(px(SPLITTER_WIDTH))
             .h_full()
             .flex_none()
-            .cursor_move()
+            .cursor(gpui::CursorStyle::ResizeLeftRight)
             .bg(colors.canvas)
             .border_l_1()
             .border_r_1()
             .border_color(colors.border)
             .hover(|splitter| splitter.bg(colors.selected))
-            .on_drag(drag, |drag, position, _, cx| {
-                drag.start_x.set(Some(position.x.as_f32()));
+            .debug_selector(move || format!("splitter-{panel:?}"))
+            .on_drag(drag, |drag, _, window, cx| {
+                // GPUI supplies a local preview offset here, not a window position.
+                drag.start_x.set(Some(window.mouse_position().x.as_f32()));
                 cx.new(|_| SplitterDragPreview)
             })
             .on_drag_move(cx.listener(
@@ -21114,6 +21298,112 @@ impl ReviewWorkspace {
         )
     }
 
+    fn render_pr_tabs(&self, index: usize, colors: Palette, cx: &mut Context<Root>) -> Div {
+        let tab = &self.tabs[index];
+        let selected = if self.inspector_open {
+            Some(tab.inspector_section)
+        } else {
+            None
+        };
+        let choices = [
+            (
+                "pr-tab-conversation",
+                "Conversation".to_owned(),
+                Some(InspectorSection::Overview),
+            ),
+            (
+                "pr-tab-commits",
+                if tab.comparison_picker.inventory_ready() {
+                    format!("Commits  {}", tab.comparison_picker.commits().len())
+                } else {
+                    "Commits".into()
+                },
+                Some(InspectorSection::Commits),
+            ),
+            (
+                "pr-tab-checks",
+                "Checks".to_owned(),
+                Some(InspectorSection::Checks),
+            ),
+            (
+                "pr-tab-files",
+                format!(
+                    "Files changed  {}",
+                    tab.session
+                        .as_ref()
+                        .map(|session| session.comparison().files.len())
+                        .unwrap_or(0)
+                ),
+                None,
+            ),
+        ];
+        div()
+            .px_5()
+            .h(px(48.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(colors.surface)
+            .children(choices.into_iter().map(|(id, label, section)| {
+                let active = selected == section
+                    || (section == Some(InspectorSection::Overview)
+                        && selected == Some(InspectorSection::Activity));
+                div()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .border_b_2()
+                    .border_color(if active {
+                        colors.accent
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .child(
+                        Button::new(id)
+                            .child(label.clone())
+                            .selected(active)
+                            .accessibility_label(format!(
+                                "{label} tab{}",
+                                if active { ", selected" } else { "" }
+                            ))
+                            .debug_selector(move || id.to_owned())
+                            .h(px(34.))
+                            .px_3()
+                            .bg(if active {
+                                colors.elevated
+                            } else {
+                                colors.surface
+                            })
+                            .text_color(colors.text)
+                            .on_click(cx.listener(move |root, _, window, cx| {
+                                if let Root::Review(this) = root {
+                                    if let Some(section) = section {
+                                        this.inspector_open = true;
+                                        this.tabs[index].inspector_section = section;
+                                        if section == InspectorSection::Commits {
+                                            this.tabs[index].comparison_picker.expanded = true;
+                                        }
+                                        if section == InspectorSection::Checks {
+                                            this.open_checks(window, cx);
+                                        } else {
+                                            this.focus.focus(window, cx);
+                                        }
+                                    } else {
+                                        this.inspector_open = false;
+                                        this.focus.focus(window, cx);
+                                    }
+                                    this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                                    this.refresh_auto_layout(window);
+                                    cx.notify();
+                                }
+                            })),
+                    )
+            }))
+    }
+
     fn render_review(
         &self,
         index: usize,
@@ -21335,28 +21625,13 @@ impl ReviewWorkspace {
                                             this.cycle_diff(&CycleDiffMode, window, cx)
                                         }
                                     })),
-                            )
-                            .child(
-                                div()
-                                    .id("toggle-inspector")
-                                    .cursor_pointer()
-                                    .text_color(colors.accent)
-                                    .child(if self.inspector_open {
-                                        "Hide details"
-                                    } else {
-                                        "Show details"
-                                    })
-                                    .on_click(cx.listener(|root, _, window, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.inspector_open = !this.inspector_open;
-                                            this.refresh_auto_layout(window);
-                                            cx.notify();
-                                        }
-                                    })),
                             ),
                     ),
             )
-            .child(self.render_comparison_picker(index, colors, cx))
+            .child(self.render_pr_tabs(index, colors, cx))
+            .when(!self.inspector_open, |view| {
+                view.child(self.render_comparison_picker(index, colors, cx))
+            })
             .when_some(tab.state.notice(), |view, notice| {
                 view.child(
                     div()
@@ -21390,20 +21665,22 @@ impl ReviewWorkspace {
                         .child(notice),
                 )
             })
-            .child(
-                div()
-                    .id("file-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(self.render_files(index, colors, window, cx))
-                    .child(self.render_splitter(PanelKind::FileTree, colors, window, cx))
-                    .child(self.render_diff(index, colors, cx))
-                    .when(self.inspector_open, |body| {
-                        body.child(self.render_splitter(PanelKind::Details, colors, window, cx))
-                            .child(self.render_inspector(index, colors, window, cx))
-                    }),
-            )
+            .when(self.inspector_open, |view| {
+                view.child(self.render_inspector(index, colors, window, cx))
+            })
+            .when(!self.inspector_open, |view| {
+                view.child(
+                    div()
+                        .id("file-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .flex()
+                        .child(self.render_files(index, colors, window, cx))
+                        .child(self.render_splitter(PanelKind::FileTree, colors, window, cx))
+                        .child(self.render_diff(index, colors, cx)),
+                )
+            })
             .into_any_element()
     }
 
@@ -22355,12 +22632,19 @@ impl ReviewWorkspace {
                                 .text_color(colors.faint)
                                 .child(sha),
                         )
-                        .on_click(cx.listener(move |root, _, _, cx| {
+                        .on_click(cx.listener(move |root, _, window, cx| {
                             if let Root::Review(this) = root {
                                 if editing_mode == PickerMode::Range {
                                     this.select_picker_range_endpoint(index, commit_index, cx);
                                 } else {
                                     this.select_picker_commit(index, commit_index, cx);
+                                }
+                                if editing_mode != PickerMode::Range
+                                    || this.tabs[index].comparison_picker.range_last.is_some()
+                                {
+                                    this.inspector_open = false;
+                                    this.refresh_auto_layout(window);
+                                    cx.notify();
                                 }
                             }
                         }))
@@ -22372,7 +22656,7 @@ impl ReviewWorkspace {
                         "comparison-commit-list-{index}"
                     )))
                     .mt_2()
-                    .h(px(220.))
+                    .h(px((picker.commits().len() as f32 * 64.).clamp(64., 520.)))
                     .overflow_y_scroll()
                     .rounded_md()
                     .border_1()
@@ -22992,9 +23276,10 @@ impl ReviewWorkspace {
                 ))
         };
         let mut panel = div()
-            .mt_4()
-            .pt_3()
-            .border_t_1()
+            .p_5()
+            .rounded_lg()
+            .bg(colors.surface)
+            .border_1()
             .border_color(colors.border)
             .child(
                 div()
@@ -23145,12 +23430,10 @@ impl ReviewWorkspace {
             );
         } else {
             panel = panel
-                .child(compact_detail("Title", &snapshot.title, colors))
-                .child(compact_detail("Base", &snapshot.base_branch, colors))
                 .when(!snapshot.body.is_empty(), |panel| {
                     panel.child(markdown_detail(
                         format!("lifecycle-body-{}", tab.pull_request.number),
-                        "Body",
+                        "Description",
                         &snapshot.body,
                         colors,
                     ))
@@ -24009,13 +24292,13 @@ impl ReviewWorkspace {
         content
     }
 
-    fn render_inspector(
+    fn render_pr_section_content(
         &self,
         index: usize,
+        current: InspectorSection,
         colors: Palette,
-        window: &Window,
         cx: &mut Context<Root>,
-    ) -> impl IntoElement {
+    ) -> Vec<AnyElement> {
         let tab = &self.tabs[index];
         let cached_observation = if tab.details.is_none() {
             tab.cached_collaboration.as_ref()
@@ -24026,43 +24309,9 @@ impl ReviewWorkspace {
             .details
             .as_ref()
             .or_else(|| cached_observation.map(|observation| &observation.details));
-        let confirmation_open = tab.confirmation.is_some();
-        let current = tab.inspector_section;
         let root = cx.entity();
-        let section_root = root.clone();
-        let section = move |name: &'static str, value: InspectorSection| {
-            let root = section_root.clone();
-            side_control(name, current == value, colors)
-                .id(SharedString::from(format!("inspector-{name}")))
-                .debug_selector(move || format!("inspector-section-{name}"))
-                .on_click(move |_, window, cx| {
-                    root.update(cx, |root, cx| {
-                        if let Root::Review(this) = root
-                            && let Some(index) = this.active_tab
-                        {
-                            this.tabs[index].inspector_section = value;
-                            if value == InspectorSection::Checks {
-                                let tab = &mut this.tabs[index];
-                                let checks = tab
-                                    .details
-                                    .as_ref()
-                                    .or_else(|| {
-                                        tab.cached_collaboration
-                                            .as_ref()
-                                            .map(|cached| &cached.details)
-                                    })
-                                    .map(|details| details.checks.as_slice())
-                                    .unwrap_or_default();
-                                tab.checks_selection.reconcile(checks);
-                                this.scroll_selected_check_into_view(index);
-                                this.focus_current_ci_pane(index, window, cx);
-                            }
-                            cx.notify();
-                        }
-                    });
-                })
-        };
-        let content = match current {
+        match current {
+            InspectorSection::Commits => vec![self.render_comparison_picker(index, colors, cx)],
             InspectorSection::Overview => {
                 let mut fields = vec![
                     detail("Author", &tab.pull_request.author, colors),
@@ -24083,14 +24332,6 @@ impl ReviewWorkspace {
                     ),
                 ];
                 if let Some(details) = displayed_details {
-                    if cached_observation.is_some() && !details.body.trim().is_empty() {
-                        fields.push(markdown_detail(
-                            format!("pr-description-{}", tab.pull_request.number),
-                            "Description",
-                            &details.body,
-                            colors,
-                        ));
-                    }
                     fields.push(detail(
                         "Requested reviewers",
                         if details.requested_reviewers.is_empty() {
@@ -24113,19 +24354,11 @@ impl ReviewWorkspace {
                         ),
                         colors,
                     ));
-                    if cached_observation.is_none()
-                        && tab.lifecycle.snapshot.is_none()
-                        && !details.body.trim().is_empty()
-                    {
-                        fields.push(markdown_detail(
-                            format!("pr-description-{}", tab.pull_request.number),
-                            "Description",
-                            &details.body,
-                            colors,
-                        ));
-                    }
                 }
-                let lifecycle = self.render_lifecycle_overview(index, colors, cx);
+                let fallback_description = displayed_details.filter(|details| {
+                    !details.body.trim().is_empty()
+                        && (cached_observation.is_some() || tab.lifecycle.snapshot.is_none())
+                });
                 let pr_reactions = render_reaction_row(
                     displayed_details.and_then(|details| {
                         details
@@ -24138,19 +24371,31 @@ impl ReviewWorkspace {
                     colors,
                     &root,
                 );
-                vec![if cached_observation.is_some() {
+                vec![
                     div()
-                        .children(fields)
+                        .w_full()
+                        .min_w_0()
+                        .when_some(fallback_description, |page, details| {
+                            page.child(
+                                div()
+                                    .p_5()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .bg(colors.surface)
+                                    .child(markdown_detail(
+                                        format!("pr-description-{}", tab.pull_request.number),
+                                        "Description",
+                                        &details.body,
+                                        colors,
+                                    )),
+                            )
+                        })
+                        .child(self.render_lifecycle_overview(index, colors, cx))
                         .child(pr_reactions)
-                        .child(lifecycle)
-                        .into_any_element()
-                } else {
-                    div()
-                        .child(lifecycle)
-                        .child(pr_reactions)
-                        .children(fields)
-                        .into_any_element()
-                }]
+                        .child(div().mt_5().flex().flex_wrap().gap_6().children(fields))
+                        .into_any_element(),
+                ]
             }
             InspectorSection::Activity => {
                 let mut activity = Vec::new();
@@ -25915,7 +26160,36 @@ impl ReviewWorkspace {
                                     .text_color(colors.muted)
                                     .child("Observed Checks source identity is unavailable.")
                             });
-                        checks.push(source_identity.into_any_element());
+                        checks.push(
+                            div()
+                                .mb_3()
+                                .child(
+                                    Button::new("checks-source-details")
+                                        .child(if tab.checks_source_expanded {
+                                            "Hide revision details"
+                                        } else {
+                                            "Revision details"
+                                        })
+                                        .selected(tab.checks_source_expanded)
+                                        .accessibility_label(if tab.checks_source_expanded {
+                                            "Revision details, expanded"
+                                        } else {
+                                            "Revision details, collapsed"
+                                        })
+                                        .debug_selector(|| "checks-source-details".to_owned())
+                                        .on_click(cx.listener(move |root, _, _, cx| {
+                                            if let Root::Review(this) = root {
+                                                this.tabs[index].checks_source_expanded =
+                                                    !this.tabs[index].checks_source_expanded;
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                                .when(tab.checks_source_expanded, |section| {
+                                    section.child(source_identity)
+                                })
+                                .into_any_element(),
+                        );
                         if self.selected_actions_locator(index).is_ok() {
                             let jobs_root = root.clone();
                             checks.push(
@@ -26138,30 +26412,59 @@ impl ReviewWorkspace {
                     }
                 }
             }
+        }
+    }
+
+    fn render_inspector(
+        &self,
+        index: usize,
+        colors: Palette,
+        _window: &Window,
+        cx: &mut Context<Root>,
+    ) -> impl IntoElement {
+        let tab = &self.tabs[index];
+        let cached_observation = if tab.details.is_none() {
+            tab.cached_collaboration.as_ref()
+        } else {
+            None
         };
-        let (_, _, details_width) = self.resolved_panel_widths(window);
+        let confirmation_open = tab.confirmation.is_some();
+        let current = tab.inspector_section;
+        let content = if matches!(
+            current,
+            InspectorSection::Overview | InspectorSection::Activity
+        ) {
+            let mut content =
+                self.render_pr_section_content(index, InspectorSection::Overview, colors, cx);
+            content.push(
+                div()
+                    .mt_6()
+                    .mb_4()
+                    .text_size(px(17.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Conversation")
+                    .into_any_element(),
+            );
+            content.extend(self.render_pr_section_content(
+                index,
+                InspectorSection::Activity,
+                colors,
+                cx,
+            ));
+            content
+        } else {
+            self.render_pr_section_content(index, current, colors, cx)
+        };
         div()
-            .w(px(details_width))
-            .min_w(px(details_width))
+            .id("pr-section-page")
+            .debug_selector(|| "pr-section-page".to_owned())
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
             .h_full()
             .flex()
             .flex_col()
-            .border_l_1()
-            .border_color(colors.border)
             .bg(colors.canvas)
-            .child(
-                div()
-                    .h(px(38.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .child(section("Overview", InspectorSection::Overview))
-                    .child(section("Activity", InspectorSection::Activity))
-                    .child(section("Checks", InspectorSection::Checks)),
-            )
             .when_some(cached_observation, |panel, observation| {
                 let details = &observation.details;
                 panel.child(
@@ -26212,7 +26515,13 @@ impl ReviewWorkspace {
             .child(
                 div()
                     .id("inspector-scroll")
-                    .p_4()
+                    .debug_selector(|| "pr-content-scroll".to_owned())
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .px_6()
+                    .py_5()
+                    .text_size(px(14.))
                     .overflow_y_scroll()
                     .when_some(
                         self.render_confirmation(index, colors, cx),
@@ -26222,7 +26531,16 @@ impl ReviewWorkspace {
                         self.render_lifecycle_confirmation(index, colors, cx),
                         |panel, confirmation| panel.child(confirmation),
                     )
-                    .when(!confirmation_open, |panel| panel.children(content))
+                    .when(!confirmation_open, |panel| {
+                        if matches!(
+                            current,
+                            InspectorSection::Overview | InspectorSection::Activity
+                        ) {
+                            panel.child(div().w_full().max_w(px(960.)).mx_auto().children(content))
+                        } else {
+                            panel.children(content)
+                        }
+                    })
                     .when(
                         current == InspectorSection::Checks && tab.ci_read.pane == CiPane::Checks,
                         |panel| {
@@ -27254,6 +27572,8 @@ impl ReviewWorkspace {
                                 if let Root::Review(this) = root
                                     && let Some(index) = this.active_tab
                                 {
+                                    this.inspector_open = true;
+                                    this.tabs[index].inspector_section = InspectorSection::Commits;
                                     this.tabs[index].comparison_picker.expanded = true;
                                     this.command_palette = false;
                                     cx.notify();
@@ -27288,7 +27608,7 @@ impl ReviewWorkspace {
                             })),
                     )
                     .child(
-                        command_row("Toggle PR details", "⇧⌘I", colors)
+                        command_row("Switch between files and PR details", "⇧⌘I", colors)
                             .id("command-details")
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
@@ -28152,7 +28472,7 @@ fn markdown_detail(id: String, label: &str, body: &str, colors: Palette) -> Div 
         .child(
             div()
                 .mt_1()
-                .child(markdown_text(id, body, colors).text_size(px(12.))),
+                .child(markdown_text(id, body, colors).text_size(px(14.))),
         )
 }
 
@@ -28175,7 +28495,7 @@ fn activity_item(id: String, author: &str, body: &str, timestamp: &str, colors: 
         .child(
             div()
                 .mt_1()
-                .child(markdown_text(id, body, colors).text_size(px(12.))),
+                .child(markdown_text(id, body, colors).text_size(px(14.))),
         )
 }
 
@@ -29665,6 +29985,128 @@ mod layout_tests {
 
     #[cfg(feature = "ui-smoke")]
     #[gpui::test]
+    fn pr_tabs_and_splitters_follow_real_pointer_input(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.install_pr_layout_fixture(window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        for id in ["pr-tab-commits", "pr-tab-checks", "pr-tab-conversation"] {
+            let bounds = cx.debug_bounds(id).unwrap();
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let page = cx.debug_bounds("pr-section-page").unwrap();
+            assert!(
+                page.size.width > px(800.),
+                "PR content is squeezed into a sidebar"
+            );
+            if id == "pr-tab-checks" {
+                let disclosure = cx.debug_bounds("checks-source-details").unwrap();
+                cx.simulate_click(disclosure.center(), Modifiers::default());
+                root.read_with(cx, |root, _| {
+                    let Root::Review(this) = root else {
+                        unreachable!()
+                    };
+                    assert!(this.tabs[0].checks_source_expanded);
+                });
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                let disclosure = cx.debug_bounds("checks-source-details").unwrap();
+                cx.simulate_click(disclosure.center(), Modifiers::default());
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
+        }
+        let files = cx.debug_bounds("pr-tab-files").unwrap();
+        cx.simulate_click(files.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for (selector, panel) in [
+            ("splitter-Sidebar", super::PanelKind::Sidebar),
+            ("splitter-FileTree", super::PanelKind::FileTree),
+        ] {
+            let bounds = cx.debug_bounds(selector).unwrap();
+            let start = bounds.center();
+            let before = root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.panel_layout.width(panel, false)
+            });
+            cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::default());
+            cx.simulate_mouse_move(
+                start + point(px(10.), px(0.)),
+                gpui::MouseButton::Left,
+                Modifiers::default(),
+            );
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.simulate_mouse_move(
+                start + point(px(70.), px(0.)),
+                gpui::MouseButton::Left,
+                Modifiers::default(),
+            );
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let enlarged = root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.panel_layout.width(panel, false)
+            });
+            assert!(
+                (enlarged - before - 60.).abs() < 2.,
+                "{selector}: {before} -> {enlarged}"
+            );
+            // Reverse while held, far beyond the original six-pixel hit target.
+            cx.simulate_mouse_move(
+                start + point(px(30.), px(0.)),
+                gpui::MouseButton::Left,
+                Modifiers::default(),
+            );
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let reversed = root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                this.panel_layout.width(panel, false)
+            });
+            assert!((reversed - before - 20.).abs() < 2.);
+            cx.simulate_mouse_up(
+                start + point(px(30.), px(0.)),
+                gpui::MouseButton::Left,
+                Modifiers::default(),
+            );
+            cx.simulate_mouse_move(start + point(px(90.), px(0.)), None, Modifiers::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            root.read_with(cx, |root, _| {
+                let Root::Review(this) = root else {
+                    unreachable!()
+                };
+                assert_eq!(this.panel_layout.width(panel, false), reversed);
+                let session = this.tabs[0].session.as_ref().unwrap();
+                assert_eq!(session.revision().head_sha, "2".repeat(40));
+                assert_eq!(session.selected_file().unwrap().path, "src/navigation.rs");
+                assert!(!this.tabs[0].write_in_flight);
+            });
+        }
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
     fn repository_setup_picker_and_manual_submission_report_errors(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_base::init);
         let data = tempdir().unwrap();
@@ -30901,7 +31343,7 @@ mod layout_tests {
             });
             window.draw(cx).clear(cx);
         });
-        let checks_section = cx.debug_bounds("inspector-section-Checks").unwrap();
+        let checks_section = cx.debug_bounds("pr-tab-checks").unwrap();
         cx.simulate_click(checks_section.center(), Modifiers::default());
         cx.update(|window, cx| {
             root.read_with(cx, |root, _| {
