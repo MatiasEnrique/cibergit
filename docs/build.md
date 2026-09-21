@@ -146,6 +146,8 @@ to see what Git reports. Stage, commit, push, branch, and rebase from Local chan
   composer, Control-Option-Shift-Return applies it, and Control-Option-Escape cancels the active
   lifecycle/discussion edit or confirmation. Dirty text remains per tab through polls and tab
   switches; late completions require the exact repository, PR, generation, and operation identity.
+  A frozen action's confirmation is pinned above the scrolling page, so it stays in view no matter
+  how far down the conversation the composer that prepared it sits.
 - Activity separates unresolved review-composition writes from auxiliary/merge journal actions,
   with independent counts and read-only reconciliation controls. Review reconciliation runs fresh
   selected-account details and pending-review reads under the same per-PR authority and durable CAS

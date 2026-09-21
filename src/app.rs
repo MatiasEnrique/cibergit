@@ -32,6 +32,7 @@ mod local_checkout;
 mod local_workspace;
 mod notifications_view;
 mod open_with;
+mod page_window;
 mod pr_browser;
 mod pr_creation;
 mod pr_lifecycle;
@@ -1947,6 +1948,9 @@ pub struct ReviewWorkspace {
     panel_layout: PanelLayout,
     view_editor_scroll: ScrollHandle,
     inspector_scroll: ScrollHandle,
+    /// What the conversation page measured last frame, so a redraw only builds
+    /// the rows near the reader.
+    page_window: page_window::PageWindow,
     /// The open tabs can outrun the strip long before the window is narrow, so
     /// the strip scrolls and the activated tab is revealed into it.
     tab_strip_scroll: ScrollHandle,
@@ -2801,6 +2805,7 @@ impl ReviewWorkspace {
             panel_layout: PanelLayout::default(),
             view_editor_scroll: ScrollHandle::new(),
             inspector_scroll: ScrollHandle::new(),
+            page_window: page_window::PageWindow::default(),
             tab_strip_scroll: ScrollHandle::new(),
             checks_focus,
             checks_details_focus,
@@ -2971,17 +2976,16 @@ impl ReviewWorkspace {
         let discussion_changes =
             cx.subscribe(&this.discussion_input, |root, _, event: &InputEvent, cx| {
                 let this = &mut root.review;
+                // A pending restore means the textarea still holds the tab it
+                // is being moved away from; anything else typed here belongs
+                // to the active tab's composer. This deliberately carries no
+                // owner test: the discussion composer has no owner, and the
+                // dismissal reason's one used to be tested here, which left
+                // every keystroke unstaged and text typed during a write
+                // silently discarded when it finished.
                 if matches!(event, InputEvent::Change)
                     && let Some(index) = this.active_tab
                     && this.active_tab_input_restore.is_none()
-                    && this
-                        .dismissal_reason_input_owner
-                        .as_ref()
-                        .is_some_and(|owner| {
-                            this.tabs
-                                .get(index)
-                                .is_some_and(|tab| owner.matches(this.workspace_instance, tab))
-                        })
                 {
                     let body = this.discussion_input.read(cx).value().to_string();
                     this.tabs[index].lifecycle.stage_discussion_body(body);
@@ -27567,6 +27571,11 @@ impl ReviewWorkspace {
             InspectorSection::Activity => {
                 let avatars = self.claim_avatars(displayed_details, cx);
                 let mut activity = Vec::new();
+                // Rows that hold a text cursor or a control mid-use are never
+                // stood in for while the rest of the page is windowed: a
+                // spacer would take the composer out of the element tree, and
+                // the next keystroke would go nowhere.
+                let mut in_use: Vec<usize> = Vec::new();
                 if displayed_details.is_none() {
                     if let Some(error) = tab.submitted_summary_editor.persistence_error() {
                         activity.push(
@@ -27655,6 +27664,7 @@ impl ReviewWorkspace {
                             )),
                         ));
                     }
+                    in_use.push(activity.len());
                     activity.push(composer);
                 }
                 match &tab.interactions {
@@ -28240,6 +28250,9 @@ impl ReviewWorkspace {
                                 );
                             }
                         }
+                        // The pending review card carries the review
+                        // summary textarea.
+                        in_use.push(activity.len());
                         activity.push(pending_card);
                         if !journal_unresolved.is_empty() {
                             let mut journal_card = layout::section("Reconciliation", colors)
@@ -28685,6 +28698,8 @@ impl ReviewWorkspace {
                         .take(review_range.len())
                     {
                         let submitted_at = review.submitted_at.as_deref().unwrap_or("Pending");
+                        // Set when this review's card opens a textarea, below.
+                        let mut editing_here = false;
                         let mut card = layout::block().child(
                             div()
                                 .ui_text(TextRole::Caption)
@@ -28802,6 +28817,7 @@ impl ReviewWorkspace {
                                 })
                             {
                                 let root = cx.entity();
+                                editing_here = true;
                                 card = card
                                     .child(
                                         layout::text_area(3, colors)
@@ -28931,6 +28947,7 @@ impl ReviewWorkspace {
                                 )
                             });
                             if active {
+                                editing_here = true;
                                 card = card
                                 .when(source_changed, |card| {
                                     card.child(
@@ -28955,6 +28972,9 @@ impl ReviewWorkspace {
                                     ),
                                 ));
                             }
+                        }
+                        if editing_here {
+                            in_use.push(activity.len());
                         }
                         activity.push(activity_item(
                             ActivityEntry {
@@ -29153,6 +29173,23 @@ impl ReviewWorkspace {
                             .child("No activity returned for this pull request."),
                     );
                 }
+                // Row three of another conversation is a different comment of a
+                // different height, so the remembered geometry is keyed by
+                // everything that decides which entry a position holds — the
+                // pull request, the comment and review pages, and the shape of
+                // what was read — and not by the position alone.
+                let page = format!(
+                    "{}/{}#{} c{} r{} {} {} {} {}",
+                    tab.repository.full_name(),
+                    tab.repository.account.login,
+                    tab.pull_request.number,
+                    tab.issue_comment_page,
+                    tab.review_page,
+                    displayed_details.map_or(0, |details| details.issue_comments.len()),
+                    displayed_details.map_or(0, |details| details.reviews.len()),
+                    displayed_details.map_or(0, |details| details.review_threads.len()),
+                    activity.len(),
+                );
                 vec![
                     div()
                         .w_full()
@@ -29174,9 +29211,21 @@ impl ReviewWorkspace {
                                 .flex()
                                 .flex_col()
                                 .gap(px(ui::GAP_PAGE))
+                                // Only the rows near the reader are built; see
+                                // `page_window`. A row holding a text cursor
+                                // stays whole wherever the page has scrolled.
                                 .children(activity.into_iter().enumerate().map(
                                     |(position, item)| {
-                                        item.debug_selector(move || {
+                                        let row = if in_use.contains(&position) {
+                                            item
+                                        } else {
+                                            self.page_window.row(
+                                                SharedString::from(format!("{page}-{position}")),
+                                                &self.inspector_scroll,
+                                                item,
+                                            )
+                                        };
+                                        row.debug_selector(move || {
                                             format!("conversation-item-{position}")
                                         })
                                     },
@@ -29871,6 +29920,28 @@ impl ReviewWorkspace {
             .flex_col()
             // Freshness and completeness now ride in the tab row's notice
             // icon; see `render_tab_notices`.
+            //
+            // A confirmation sits above the scrolling page rather than in it.
+            // Preparing a comment from the composer at the foot of a long
+            // conversation used to insert the card at the top of the same
+            // scroll, hundreds of pixels above the reader, so the click that
+            // asked for the confirmation looked like it had done nothing.
+            .children(
+                [
+                    self.render_confirmation(index, colors, cx),
+                    self.render_lifecycle_confirmation(index, colors, cx),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|confirmation| {
+                    div()
+                        .w_full()
+                        .px(px(ui::PANEL_GUTTER))
+                        .pt(px(ui::PANEL_GUTTER))
+                        .ui_text(TextRole::Body)
+                        .child(confirmation)
+                }),
+            )
             .child(
                 div()
                     .id("inspector-scroll")
@@ -29888,14 +29959,6 @@ impl ReviewWorkspace {
                     .gap(px(ui::GAP_GROUP))
                     .ui_text(TextRole::Body)
                     .overflow_y_scroll()
-                    .when_some(
-                        self.render_confirmation(index, colors, cx),
-                        |panel, confirmation| panel.child(confirmation),
-                    )
-                    .when_some(
-                        self.render_lifecycle_confirmation(index, colors, cx),
-                        |panel, confirmation| panel.child(confirmation),
-                    )
                     .when(!confirmation_open, |panel| {
                         if conversation {
                             panel.child(
@@ -33156,8 +33219,59 @@ fn render_reaction_row(
     )
 }
 
+/// The most prose the sanitized-body cache holds before it starts over. One
+/// conversation's comments and reviews are a few hundred kilobytes, so this
+/// leaves room for several open tabs without letting a long session keep the
+/// prose of every pull request it has ever opened.
+const SANITIZED_MARKDOWN_BUDGET: usize = 8 * 1024 * 1024;
+
+/// Every body that has been sanitized, keyed by the element that shows it, with
+/// the source it was sanitized from so a changed body is noticed.
+#[derive(Default)]
+struct SanitizedMarkdown {
+    bytes: usize,
+    bodies: HashMap<String, (String, SharedString)>,
+}
+
+/// The media-free form of one rich-text body, reused between frames.
+///
+/// Every scroll wheel tick redraws the window, and a redraw rebuilds the whole
+/// conversation page. Sanitizing one body is cheap; sanitizing every comment
+/// and review on the page again for each of sixty frames a second is not, and
+/// an agent's review is tens of kilobytes of prose on its own. So each body is
+/// scanned once and kept until its source changes.
+fn sanitized_markdown(id: &str, source: &str) -> SharedString {
+    thread_local! {
+        static SANITIZED: std::cell::RefCell<SanitizedMarkdown> =
+            std::cell::RefCell::new(SanitizedMarkdown::default());
+    }
+    SANITIZED.with_borrow_mut(|cache| {
+        if let Some((cached, sanitized)) = cache.bodies.get(id)
+            && cached == source
+        {
+            return sanitized.clone();
+        }
+        if cache.bytes > SANITIZED_MARKDOWN_BUDGET {
+            cache.bodies.clear();
+            cache.bytes = 0;
+        }
+        let sanitized = SharedString::from(media_free_markdown(source));
+        cache.bytes += source.len() + sanitized.len();
+        if let Some((replaced_source, replaced)) = cache
+            .bodies
+            .insert(id.to_owned(), (source.to_owned(), sanitized.clone()))
+        {
+            cache.bytes = cache
+                .bytes
+                .saturating_sub(replaced_source.len() + replaced.len());
+        }
+        sanitized
+    })
+}
+
 fn markdown_text(id: String, source: &str, colors: Palette) -> TextView {
-    TextView::markdown(SharedString::from(id), media_free_markdown(source))
+    let sanitized = sanitized_markdown(&id, source);
+    TextView::markdown(SharedString::from(id), sanitized)
         .style(
             TextViewStyle::default()
                 .with_foreground(colors.muted.into())
@@ -36723,6 +36837,212 @@ mod layout_tests {
                 assert_eq!(pair[1].top() - pair[0].bottom(), px(cibergit::ui::GAP_PAGE));
             }
         }
+    }
+
+    /// Preparing a comment has to put its confirmation somewhere the reader can
+    /// see. The composer sits at the foot of the conversation, and the card
+    /// used to be inserted at the top of the same scrolling page, so on any
+    /// real pull request the click that asked for the confirmation appeared to
+    /// do nothing at all.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn a_prepared_comment_shows_its_confirmation_wherever_the_page_is_scrolled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(620.)));
+            window.bounds_changed(cx);
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.install_pr_layout_fixture(window, cx);
+                let repository = this.tabs[0].repository.clone();
+                let pull = this.tabs[0].pull_request.clone();
+                let capability = ProviderCapability {
+                    available: true,
+                    reason: None,
+                };
+                this.tabs[0]
+                    .lifecycle
+                    .install_snapshot(PullRequestLifecycleSnapshot {
+                        repository: repository.clone(),
+                        pull_request: ProviderCoordinates {
+                            provider: "github".into(),
+                            host: repository.host.clone(),
+                            owner: repository.owner.clone(),
+                            repository: repository.name.clone(),
+                            pull_request: pull.number,
+                            remote_id: "PR_203".into(),
+                        },
+                        updated_at: "2026-09-14T00:00:00Z".into(),
+                        state: pull.state.clone(),
+                        head_sha: pull.head_sha.clone(),
+                        title: pull.title.clone(),
+                        body: "An observed body.".into(),
+                        base_branch: pull.target_branch.clone(),
+                        draft: false,
+                        reviewers: Vec::new(),
+                        assignees: Vec::new(),
+                        labels: Vec::new(),
+                        viewer_login: repository.account.login.clone(),
+                        viewer_permission: Some("WRITE".into()),
+                        can_update_metadata: capability.clone(),
+                        can_change_state: capability.clone(),
+                        can_change_draft: capability.clone(),
+                        can_request_reviewers: capability.clone(),
+                        can_change_labels: capability.clone(),
+                        can_change_assignees: capability.clone(),
+                        can_comment: capability,
+                        values_complete: true,
+                        capabilities_complete: true,
+                        notice: None,
+                    })
+                    .expect("the fixture snapshot targets the fixture pull request");
+                // A page long enough that its foot is well out of the viewport.
+                let template = this.tabs[0].details.as_ref().unwrap().issue_comments[0].clone();
+                let details = this.tabs[0].details.as_mut().unwrap();
+                for position in 0..12 {
+                    let mut comment = template.clone();
+                    comment.coordinates.remote_id = format!("COMMENT_long_{position}");
+                    comment.body = "A paragraph of remark.\n\n".repeat(8);
+                    details.issue_comments.push(comment);
+                }
+                this.tabs[0].inspector_section = InspectorSection::Overview;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.begin_comment_create(window, cx);
+                this.discussion_input.update(cx, |input, cx| {
+                    input.set_value("@coderabbitai review this PR", window, cx)
+                });
+                this.apply_discussion(cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        root.update(cx, |root, _| {
+            assert!(
+                root.review.tabs[0].lifecycle.confirmation.is_some(),
+                "the comment must be frozen for confirmation: {}",
+                root.review.status
+            );
+        });
+        // Scrolled to the foot of the conversation, which is where a reader
+        // who has just used the composer is.
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.review
+                    .inspector_scroll
+                    .set_offset(point(px(0.), px(-100_000.)));
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let pane = cx.debug_bounds("pr-section-page").unwrap();
+        let confirm = cx
+            .debug_bounds("action-Confirm")
+            .expect("the confirmation must be painted");
+        assert!(
+            confirm.top() >= pane.top() && confirm.bottom() <= pane.bottom(),
+            "the confirmation is painted outside the visible pane: {confirm:?} in {pane:?}"
+        );
+        let page = cx.debug_bounds("pr-content-scroll").unwrap();
+        assert!(
+            confirm.bottom() <= page.top(),
+            "the confirmation must sit above the scrolling page rather than in it"
+        );
+    }
+
+    /// Every scroll wheel tick redraws the window, so a conversation that
+    /// rebuilds all of itself on each redraw shapes every comment on the page
+    /// sixty times a second. Once the page has been measured, a redraw must
+    /// only build the rows near the reader.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn a_redrawn_conversation_builds_only_the_rows_near_the_reader(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(620.)));
+            window.bounds_changed(cx);
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.install_pr_layout_fixture(window, cx);
+                let template = this.tabs[0].details.as_ref().unwrap().issue_comments[0].clone();
+                let details = this.tabs[0].details.as_mut().unwrap();
+                details.issue_comments.clear();
+                // A page several screens long, the shape a review by a coding
+                // agent arrives in.
+                for position in 0..20 {
+                    let mut comment = template.clone();
+                    comment.coordinates.remote_id = format!("COMMENT_long_{position}");
+                    comment.body = "A paragraph of remark.\n\n".repeat(30);
+                    details.issue_comments.push(comment);
+                }
+                this.tabs[0].inspector_section = InspectorSection::Overview;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let mut rows = 0;
+        while cx
+            .debug_bounds(Box::leak(
+                format!("conversation-item-{rows}").into_boxed_str(),
+            ))
+            .is_some()
+        {
+            rows += 1;
+        }
+        assert!(rows >= 20, "the fixture must fill the page: {rows} rows");
+        let (measured, page_height) = root.update(cx, |root, _| {
+            (
+                root.review.page_window.built_rows(),
+                root.review.inspector_scroll.max_offset().y,
+            )
+        });
+        assert!(
+            page_height > px(620.) + px(900.),
+            "the page must be longer than the viewport and its overdraw for \
+             any row to be far enough away to stand in: {page_height:?}"
+        );
+        cx.update(|window, cx| {
+            root.update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear(cx);
+        });
+        let rebuilt = root.update(cx, |root, _| root.review.page_window.built_rows()) - measured;
+        // The viewport plus a screen of overdraw either side is about 2400px of
+        // a page over 20000px long, and these rows are roughly 1100px each.
+        assert!(
+            rebuilt <= 5,
+            "a redraw built {rebuilt} of the conversation's {rows} rows; only \
+             the handful within the viewport and its overdraw should be built"
+        );
     }
 
     #[cfg(feature = "ui-smoke")]
@@ -42369,6 +42689,23 @@ mod layout_tests {
         assert!(safe.contains("```sh"));
         assert!(safe.contains("[Image omitted: unsafe]"));
         assert!(!safe.contains("!["));
+    }
+
+    /// Sanitized prose is kept between frames so a redraw does not rescan every
+    /// comment on the page. An edited comment reuses its element, so serving
+    /// the kept copy for it would show the body the comment used to have — and
+    /// would keep showing media a body had stopped declaring.
+    #[test]
+    fn a_changed_body_is_sanitized_again_rather_than_served_from_the_cache() {
+        let first = super::sanitized_markdown("comment-1", "![unsafe](https://example.test/a.png)");
+        assert!(first.contains("[Image omitted: unsafe]"));
+        let second = super::sanitized_markdown("comment-1", "Plain prose now.");
+        assert_eq!(second.as_ref(), "Plain prose now.");
+        assert_eq!(
+            super::sanitized_markdown("comment-1", "Plain prose now."),
+            second,
+            "an unchanged body must come back identical"
+        );
     }
 
     #[test]
