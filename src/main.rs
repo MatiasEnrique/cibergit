@@ -36,6 +36,7 @@ actions!(
         OpenRepositorySetup,
         OpenSettings,
         OpenHistory,
+        OpenPullRequestBrowser,
         ComposeInlineComment,
         SaveReviewDraft,
         AddPendingComment,
@@ -206,6 +207,7 @@ fn main() {
             KeyBinding::new("cmd-o", OpenRepositorySetup, None),
             KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("cmd-shift-h", OpenHistory, None),
+            KeyBinding::new("cmd-shift-l", OpenPullRequestBrowser, None),
             KeyBinding::new("cmd-shift-n", OpenPullRequestCreation, None),
             KeyBinding::new("cmd-enter", PreparePullRequestCreation, Some("PrCreation")),
             KeyBinding::new(

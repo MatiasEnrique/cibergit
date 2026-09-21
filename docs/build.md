@@ -112,6 +112,15 @@ to see what Git reports. Stage, commit, push, branch, and rebase from Local chan
   stops; exceptionally long lines are split into bounded UTF-8-safe shaping chunks without
   removing source text.
 - Command-Shift-I toggles pull-request details.
+- **Browse all pull requests** in the sidebar, Command-Shift-L, or the command palette opens the
+  repository's pull-request index as a page in the tab strip, newest activity first. Open, Closed
+  and All select which ones; Closed includes merged, as GitHub's index does, and each row's state
+  pill distinguishes them. Pages are read one at a time through **Load more** rather than
+  enumerated, and the filter box narrows what is already loaded — GitHub's index endpoint has no
+  text query, so it is not a repository-wide search. Clicking a row opens that pull request as an
+  ordinary review tab whatever its state; a merged or closed one reads exactly like an open one,
+  minus the write actions the provider refuses. Command-R re-reads from the first page. The page
+  is session-only and is not restored on the next launch.
 - Click a selectable diff line to open an inline composer; Shift-click another line on the same
   side extends the exact range. Press `c` with the diff focused to choose the first selectable
   line. Text changes are locally autosaved after a short debounce; Command-Return forces a local

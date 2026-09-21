@@ -60,21 +60,30 @@ pub(super) fn field(label: &str, colors: Palette) -> Div {
 ///
 /// The caller adds the click handler and, where it applies, the disabled
 /// presentation.
+///
+/// `id` must be unique among the chips in one row. Siblings sharing an element
+/// id share the element's identity, and a press then lands on whichever of them
+/// the framework reached first — the row still paints correctly and simply
+/// stops answering. Rows whose chips come from a list have to vary it.
 pub(super) fn chip(
-    id: &'static str,
+    id: impl Into<SharedString>,
     label: &str,
     count: Option<usize>,
     selected: bool,
     colors: Palette,
 ) -> Button {
+    let id: SharedString = id.into();
+    let group = id.clone();
+    let hover = id.clone();
+    let selector = id.clone();
     let spoken = match count {
         Some(count) => format!("{label}  {count}"),
         None => label.to_owned(),
     };
     let label = label.to_owned();
     Button::new(id)
-        .debug_selector(move || id.to_owned())
-        .group(id)
+        .debug_selector(move || selector.to_string())
+        .group(group)
         .h_full()
         .px_0()
         .py_0()
@@ -103,7 +112,7 @@ pub(super) fn chip(
                 .text_color(if selected { colors.text } else { colors.muted })
                 .when(selected, |chip| chip.bg(colors.elevated))
                 .when(!selected, |chip| {
-                    chip.group_hover(id, |chip| chip.bg(colors.selected))
+                    chip.group_hover(hover, |chip| chip.bg(colors.selected))
                 })
                 .child(label)
                 .when_some(count, |chip, count| {

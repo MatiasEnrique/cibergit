@@ -1,6 +1,6 @@
 use cibergit::domain::{
     Account, CheckKind, MergeEligibility, ProviderCoordinates, PullRequest, PullRequestCheck,
-    PullRequestDetails, Repository,
+    PullRequestDetails, PullRequestSummary, PullRequestSummaryPage, Repository,
 };
 use cibergit::providers::GithubProvider;
 use serde_json::json;
@@ -115,5 +115,51 @@ fn details_types_are_provider_independent_and_revision_free() {
     let provider = GithubProvider::new(account);
     let call: fn(&GithubProvider, &Repository, u64) -> anyhow::Result<PullRequestDetails> =
         GithubProvider::details;
+    let _ = (provider, repo, call);
+}
+
+#[test]
+fn pull_request_summaries_are_provider_independent_and_revision_free() {
+    let summary: PullRequestSummary = serde_json::from_value(json!({
+        "number": 7,
+        "title": "Compact the chrome above the diff",
+        "author": "ada",
+        "source_branch": "feature",
+        "target_branch": "main",
+        "labels": ["ui"],
+        "draft": false,
+        "state": "MERGED",
+        "updated_at": "2026-09-12T12:00:00Z",
+        "url": "https://github.com/owner/repo/pull/7"
+    }))
+    .unwrap();
+    assert_eq!(summary.state, "MERGED");
+    assert_eq!(summary.labels, ["ui"]);
+
+    // A summary lists a pull request; it can never stand in for one being
+    // reviewed, so it carries no revision to pin a comparison with.
+    let encoded = serde_json::to_value(&summary).unwrap();
+    for absent in ["revision", "base_sha", "head_sha", "body"] {
+        assert!(encoded.get(absent).is_none(), "summary carries {absent}");
+    }
+
+    let account = Account {
+        host: "github.com".into(),
+        login: "selected-account".into(),
+    };
+    let repo = Repository {
+        host: "github.com".into(),
+        owner: "owner".into(),
+        name: "repo".into(),
+        account: account.clone(),
+        local_path: None,
+    };
+    let provider = GithubProvider::new(account);
+    let call: fn(
+        &GithubProvider,
+        &Repository,
+        &str,
+        usize,
+    ) -> anyhow::Result<PullRequestSummaryPage> = GithubProvider::list_pull_request_summaries;
     let _ = (provider, repo, call);
 }

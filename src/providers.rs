@@ -19,7 +19,7 @@ use crate::domain::{
     PendingFileCommentSource, PendingFileReviewAbsence, PendingReviewObservation,
     PendingReviewSnapshot, ProviderCoordinates, ProviderMutationOutcome, PullRequest,
     PullRequestCheck, PullRequestCheckoutSource, PullRequestDetails, PullRequestReview,
-    ReactableKind, ReactionContent, ReactionGroupSnapshot, ReactionSnapshot,
+    PullRequestSummary, PullRequestSummaryPage, ReactableKind, ReactionContent, ReactionGroupSnapshot, ReactionSnapshot,
     ReactionSubjectSnapshot, Repository, ReviewAuxiliaryAcknowledgement, ReviewAuxiliaryAction,
     ReviewAuxiliaryRequest, ReviewComment, ReviewSubject, ReviewThread, ReviewWriteAcknowledgement,
     Revision, SelectedViewer, SubmittedReviewEditCapability, WorkflowRunIdentity,
@@ -75,6 +75,10 @@ const HOST: &str = "github.com";
 const API_VERSION: &str = "X-GitHub-Api-Version: 2026-03-10";
 const PAGE_SIZE: usize = 100;
 const MAX_PR_PAGES: usize = 100;
+/// One page of the pull-request index. Smaller than `PAGE_SIZE`: this page is
+/// read on demand while someone is looking at it, so it trades a shorter first
+/// paint against more presses of Load more.
+const BROWSE_PAGE_SIZE: usize = 50;
 const MAX_FILE_PAGES: usize = 30;
 const MAX_COMMIT_INVENTORY_PAGES: usize = 10;
 /// Enough pages to reach `MAX_HISTORY_COMMITS` at `PAGE_SIZE` each, and no more.
@@ -232,6 +236,60 @@ impl GithubProvider {
             }
         }
         bail!("PR pagination limit reached; list is incomplete")
+    }
+
+    /// Read one page of the repository's pull-request index, most recently
+    /// updated first.
+    ///
+    /// This is the browsing read, and it is deliberately not
+    /// `list_pull_requests`. That one enumerates every page and hydrates each
+    /// with a GraphQL round trip, which is affordable for a repository's open
+    /// pull requests and ruinous for its entire history. A summary carries no
+    /// review decision, check rollup or revision, so a page here costs exactly
+    /// one request and can never be mistaken for something reviewable.
+    ///
+    /// `state` is open, closed or all. Closed includes merged, as GitHub's own
+    /// index does; each summary's own state distinguishes them.
+    pub fn list_pull_request_summaries(
+        &self,
+        repo: &Repository,
+        state: &str,
+        page: usize,
+    ) -> Result<PullRequestSummaryPage> {
+        self.validate_repo(repo)?;
+        let state = state.to_ascii_lowercase();
+        ensure!(
+            ["open", "closed", "all"].contains(&state.as_str()),
+            "Unsupported PR state"
+        );
+        ensure!(
+            (1..=MAX_PR_PAGES).contains(&page),
+            "PR index page is out of range"
+        );
+        let pulls: Vec<ApiPullRequest> = Session::new(self).get(&format!(
+            "repos/{}/pulls?state={state}&sort=updated&direction=desc&per_page={BROWSE_PAGE_SIZE}&page={page}",
+            repo.full_name()
+        ))?;
+        ensure!(
+            pulls.len() <= BROWSE_PAGE_SIZE,
+            "Invalid PR pagination response"
+        );
+        let has_more = pulls.len() == BROWSE_PAGE_SIZE;
+        let mut seen = HashSet::new();
+        let mut summaries = Vec::with_capacity(pulls.len());
+        for pull in pulls {
+            pull.validate(repo, None)?;
+            ensure!(
+                seen.insert(pull.number),
+                "PR index page repeated a pull request; refresh to retry"
+            );
+            summaries.push(pull.into_summary());
+        }
+        Ok(PullRequestSummaryPage {
+            summaries,
+            page,
+            has_more,
+        })
     }
 
     pub fn pull_request(&self, repo: &Repository, number: u64) -> Result<PullRequest> {
@@ -7512,7 +7570,39 @@ impl ApiPullRequest {
         validate_sha(&self.base.sha)?;
         validate_sha(&self.head.sha)
     }
+    /// A merged pull request is reported by the REST list as `closed`; only
+    /// `merged_at` tells the two apart, and the sidebar, the index page and the
+    /// state pill must all agree on which is which.
+    fn resolved_state(&self) -> &'static str {
+        if self.merged_at.is_some() {
+            "MERGED"
+        } else if self.state == "open" {
+            "OPEN"
+        } else {
+            "CLOSED"
+        }
+    }
+
+    /// Index-page projection. This deliberately drops the revision: a summary
+    /// can identify a pull request but never stand in for one being reviewed.
+    fn into_summary(self) -> PullRequestSummary {
+        let state = self.resolved_state().to_owned();
+        PullRequestSummary {
+            number: self.number,
+            title: self.title,
+            author: self.user.map(|u| u.login).unwrap_or_default(),
+            source_branch: self.head.branch,
+            target_branch: self.base.branch,
+            labels: self.labels.into_iter().map(|l| l.name).collect(),
+            draft: self.draft,
+            state,
+            updated_at: self.updated_at,
+            url: self.html_url,
+        }
+    }
+
     fn into_domain(self) -> PullRequest {
+        let state = self.resolved_state().to_owned();
         PullRequest {
             number: self.number,
             title: self.title,
@@ -7536,14 +7626,7 @@ impl ApiPullRequest {
             participants_complete: false,
             participants_notice: Some("Participant metadata has not been hydrated.".into()),
             draft: self.draft,
-            state: if self.merged_at.is_some() {
-                "MERGED"
-            } else if self.state == "open" {
-                "OPEN"
-            } else {
-                "CLOSED"
-            }
-            .into(),
+            state,
             // These are replaced by the account-isolated GraphQL metadata read.
             review_status: "UNKNOWN".into(),
             check_status: "UNKNOWN".into(),
@@ -8114,6 +8197,94 @@ else:
         );
         assert!(pulls[0].participants_complete);
         exhausted(&dir, 4);
+    }
+
+    #[test]
+    fn pr_index_page_reads_newest_first_and_costs_one_request() {
+        let full: Vec<_> = (1..=BROWSE_PAGE_SIZE as u64).map(|n| pull(n, 1)).collect();
+        let (dir, provider) = fixture(
+            "alice",
+            vec![step(
+                "repos/owner/repo/pulls?state=closed&sort=updated&direction=desc&per_page=50&page=2",
+                json!(full),
+            )],
+        );
+        let page = provider
+            .list_pull_request_summaries(&repo("alice"), "CLOSED", 2)
+            .unwrap();
+        assert_eq!(page.page, 2);
+        assert_eq!(page.summaries.len(), BROWSE_PAGE_SIZE);
+        assert!(page.has_more, "a full page may be followed by another");
+        assert_eq!(page.summaries[0].author, "author");
+        assert_eq!(page.summaries[0].source_branch, "feature");
+        assert_eq!(page.summaries[0].target_branch, "main");
+        assert_eq!(page.summaries[0].labels, ["bug"]);
+        assert_eq!(page.summaries[0].updated_at, "2026-09-12T12:00:00Z");
+        // One REST call and no GraphQL hydration: the index never pays for a
+        // review decision or a check rollup it does not show.
+        exhausted(&dir, 1);
+    }
+
+    #[test]
+    fn pr_index_reports_merged_apart_from_closed_and_ends_on_a_short_page() {
+        let mut merged = pull(9, 1);
+        merged["state"] = json!("closed");
+        merged["merged_at"] = json!("2026-09-12T12:00:00Z");
+        let mut closed = pull(8, 1);
+        closed["state"] = json!("closed");
+        let (dir, provider) = fixture(
+            "alice",
+            vec![step(
+                "repos/owner/repo/pulls?state=all&sort=updated&direction=desc&per_page=50&page=1",
+                json!([merged, closed, pull(7, 1)]),
+            )],
+        );
+        let page = provider
+            .list_pull_request_summaries(&repo("alice"), "all", 1)
+            .unwrap();
+        assert!(!page.has_more, "a short page is the end of the index");
+        let states: Vec<_> = page
+            .summaries
+            .iter()
+            .map(|summary| summary.state.as_str())
+            .collect();
+        assert_eq!(states, ["MERGED", "CLOSED", "OPEN"]);
+        exhausted(&dir, 1);
+    }
+
+    #[test]
+    fn pr_index_refuses_unsupported_state_out_of_range_page_and_repeated_numbers() {
+        let (_dir, provider) = fixture("alice", vec![]);
+        for state in ["merged", "open&state=all", ""] {
+            assert!(
+                provider
+                    .list_pull_request_summaries(&repo("alice"), state, 1)
+                    .is_err(),
+                "accepted {state}"
+            );
+        }
+        for page in [0, MAX_PR_PAGES + 1] {
+            assert!(
+                provider
+                    .list_pull_request_summaries(&repo("alice"), "open", page)
+                    .is_err(),
+                "accepted page {page}"
+            );
+        }
+        let (_dir, provider) = fixture(
+            "alice",
+            vec![step(
+                "repos/owner/repo/pulls?state=open&sort=updated&direction=desc&per_page=50&page=1",
+                json!([pull(4, 1), pull(4, 1)]),
+            )],
+        );
+        assert!(
+            provider
+                .list_pull_request_summaries(&repo("alice"), "open", 1)
+                .unwrap_err()
+                .to_string()
+                .contains("repeated")
+        );
     }
 
     #[test]
