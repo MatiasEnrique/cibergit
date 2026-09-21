@@ -30918,7 +30918,7 @@ impl ReviewWorkspace {
     /// hand-typed glyphs; those are the drift this table exists to avoid
     /// repeating.
     fn diff_command_rows(&self, colors: Palette, cx: &mut Context<Root>) -> Vec<AnyElement> {
-        let commands: [DiffCommand; 9] = [
+        let commands: [DiffCommand; 10] = [
             (
                 "command-cursor-down",
                 "Next diff row",
@@ -30969,6 +30969,12 @@ impl ReviewWorkspace {
                 "Mark viewed and go to next unviewed",
                 "\u{21e7}\u{2318}V",
                 || Box::new(MarkViewedAndAdvance),
+            ),
+            (
+                "command-fold-all",
+                "Collapse or expand every file",
+                "\u{21e7}\u{2318}J",
+                || Box::new(ToggleAllFileSections),
             ),
         ];
         commands

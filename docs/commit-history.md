@@ -22,6 +22,8 @@ The diff is the comparison between the commit and its **first parent**, which is
 
 Changed files are listed without their patches, and the patch for a file loads when you select it. Binary and media content is never loaded. Unified and side-by-side views work as they do in a review, and long lines scroll horizontally.
 
+A commit's diff streams every file it touched, each behind its own header, and each header folds the file it names; one control on the page header folds or opens all of them. Because History reads one patch at a time, a file whose patch has not been read yet shows its header alone and says so, rather than showing nothing and reading as a file that changed nothing.
+
 The diff reads by keyboard here exactly as it does in a review: `⌘↓` and `⌘↑` move the cursor a row at a time, `⌥↓` and `⌥↑` jump between hunks, and `⌘Home` and `⌘End` go to the ends of the patch. `←`, `→`, `Home` and `End` scroll a long line sideways — those four are bound to every diff pane and, until this page took the shared one, History's diff was the one that answered none of them. The comment-thread jumps exist in the same keymap but have nothing to find here, because a commit's diff carries no threads.
 
 ## Repositories with no local clone
