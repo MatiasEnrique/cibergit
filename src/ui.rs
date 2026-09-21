@@ -34,23 +34,24 @@ pub const POPOVER_RADIUS: f32 = 10.;
 pub const DESKTOP_HIT: f32 = 40.;
 pub const TOUCH_HIT: f32 = 44.;
 
-/// The type ladder runs above the stock weights: at 11-13px over translucent
-/// chrome, Regular goes thin and grey. Running text stays at Medium, because
-/// paragraphs of Semibold turn the panels into one grey slab; the step up goes
-/// to the roles that are meant to carry it. Every role and every local emphasis
-/// reads from these three so the whole app moves together. Bold is the ceiling
-/// — IBM Plex Sans ships no heavier face — so emphasis and strong share a
-/// weight and the kicker's tracking is what tells them apart.
-pub const WEIGHT_TEXT: FontWeight = FontWeight::MEDIUM;
-pub const WEIGHT_EMPHASIS: FontWeight = FontWeight::BOLD;
-pub const WEIGHT_STRONG: FontWeight = FontWeight::BOLD;
+/// One step per job, and the ladder stays light: Inter and Geist are dark
+/// enough at Regular that running text needs no help, so Regular reads, Medium
+/// carries emphasis, and SemiBold is the ceiling the kicker sits at. Every role
+/// and every local emphasis reads from these three so the whole app moves
+/// together — and a screen of Bold is what made the panels one grey slab.
+pub const WEIGHT_TEXT: FontWeight = FontWeight::NORMAL;
+pub const WEIGHT_EMPHASIS: FontWeight = FontWeight::MEDIUM;
+pub const WEIGHT_STRONG: FontWeight = FontWeight::SEMIBOLD;
+/// Headings stay at Regular. Size and family already separate them from the
+/// text around them, so weight has nothing left to do up there.
+pub const WEIGHT_HEADING: FontWeight = FontWeight::NORMAL;
 
-/// Two families, split by job. IBM Plex Sans holds the headings: its flat
-/// terminals and narrow set give the app its voice at display sizes. DM Sans
-/// holds everything you actually read — at the 11-13px the rails, tables and
-/// diffs live at, Plex turns cold and cramped, and DM Sans stays open.
-pub const TITLE_FONT: &str = "IBM Plex Sans";
-pub const TEXT_FONT: &str = "DM Sans";
+/// Two families, split by job. Geist holds the headings: its wide, even
+/// letterforms give the app its voice at display sizes. Inter holds everything
+/// you actually read — at the 11-13px the rails, tables and diffs live at, its
+/// tall x-height keeps small text legible over translucent chrome.
+pub const TITLE_FONT: &str = "Geist";
+pub const TEXT_FONT: &str = "Inter";
 
 #[derive(Clone, Copy)]
 pub enum TextRole {
@@ -65,8 +66,8 @@ pub enum TextRole {
 impl TextRole {
     pub const fn metrics(self) -> (f32, f32, FontWeight) {
         match self {
-            Self::Display => (24., 28., WEIGHT_EMPHASIS),
-            Self::Title => (15., 20., WEIGHT_EMPHASIS),
+            Self::Display => (24., 28., WEIGHT_HEADING),
+            Self::Title => (15., 20., WEIGHT_HEADING),
             Self::Subtitle => (13., 18., WEIGHT_EMPHASIS),
             Self::Body => (12., 18., WEIGHT_TEXT),
             Self::Label => (12., 16., WEIGHT_EMPHASIS),

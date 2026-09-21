@@ -67,8 +67,8 @@ def main():
         (contents / "MacOS").mkdir(parents=True)
         resources.mkdir()
         shutil.copy2(executable, contents / "MacOS/cibergit")
-        for source in ("LICENSE", "THIRD_PARTY_NOTICES.md", "assets/fonts/IBM-Plex-LICENSE.txt",
-                       "assets/fonts/DM-Sans-LICENSE.txt", "assets/icons/cibergit.icns"):
+        for source in ("LICENSE", "THIRD_PARTY_NOTICES.md", "assets/fonts/Geist-LICENSE.txt",
+                       "assets/fonts/Inter-LICENSE.txt", "assets/icons/cibergit.icns"):
             shutil.copy2(root / source, resources / Path(source).name)
         info = {
             "CFBundleExecutable": "cibergit", "CFBundleIdentifier": "dev.cibergit.cibergit",

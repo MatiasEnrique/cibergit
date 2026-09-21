@@ -1,25 +1,24 @@
 # Dense desktop UI guidelines
 
-Cibergit's sizing and spacing follow this scale. Reuse `cibergit::ui` and the shared component helpers when adding or updating UI; do not introduce independent Tailwind text sizes or control geometry. IBM Plex Sans is the heading face and DM Sans the reading face; Menlo remains the code face. Roles name their own family, so a heading is Plex wherever it appears and the reading roles inherit — which is what lets a diff surface set Menlo once and keep it. Values are logical pixels, independent of display scale.
+Cibergit's sizing and spacing follow this scale. Reuse `cibergit::ui` and the shared component helpers when adding or updating UI; do not introduce independent Tailwind text sizes or control geometry. Geist is the heading face and Inter the reading face; Menlo remains the code face. Roles name their own family, so a heading is Geist wherever it appears and the reading roles inherit — which is what lets a diff surface set Menlo once and keep it. Values are logical pixels, independent of display scale.
 
 | Text role | Size | Line height | Weight | Face |
 | --- | ---: | ---: | --- | --- |
-| Display | 24 | 28 | Bold | Plex |
-| Title | 15 | 20 | Bold | Plex |
-| Subtitle | 13 | 18 | Bold | Plex |
-| Body | 12 | 18 | Medium | DM Sans |
-| Label / table header | 12 | 16 | Bold | DM Sans |
-| Caption / help | 11 | 16 | Medium | DM Sans |
-| Kicker | 11 | 16 | Bold; uppercase; 0.08em tracking | Plex |
+| Display | 24 | 28 | Regular | Geist |
+| Title | 15 | 20 | Regular | Geist |
+| Subtitle | 13 | 18 | Medium | Geist |
+| Body | 12 | 18 | Regular | Inter |
+| Label / table header | 12 | 16 | Medium | Inter |
+| Caption / help | 11 | 16 | Regular | Inter |
+| Kicker | 11 | 16 | SemiBold; uppercase; 0.08em tracking | Geist |
 
-The ladder runs above the stock weights, because 11-13px text over translucent
-chrome goes thin and grey at Regular. Running text stays at Medium — paragraphs
-of Semibold read as one grey slab — and the step up goes to the roles meant to
-carry it. Take weights from
-`ui::WEIGHT_TEXT` / `WEIGHT_EMPHASIS` / `WEIGHT_STRONG` rather than naming a
-`FontWeight` at the call site. Bold is the ceiling: IBM Plex Sans ships no
-heavier face, so emphasis and strong share a weight and the kicker's tracking
-is what separates them.
+The ladder is light and it only has three rungs: Regular reads, Medium
+emphasises, SemiBold is the ceiling. Only three weights per family are bundled,
+so anything heavier has nothing to resolve to. Headings take Regular — size and
+family already set them apart, and 24px of Bold was what made the panels one
+grey slab. Take weights from `ui::WEIGHT_TEXT` / `WEIGHT_EMPHASIS` /
+`WEIGHT_STRONG` / `WEIGHT_HEADING` rather than naming a `FontWeight` at the
+call site.
 
 `Density::ui_text` sets all three metrics together. Use `ui::kicker` for tracked uppercase text; GPUI lacks a native letter-spacing style, so it renders individually spaced glyphs under a single accessible label. User-authored Markdown retains heading hierarchy using the display/title/subtitle scale; source code keeps its monospace face.
 

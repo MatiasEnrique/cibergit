@@ -240,15 +240,12 @@ fn conflict_source_fixture(prefix: &str) -> String {
 
 fn load_fonts(cx: &gpui::App) {
     let fonts = vec![
-        Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Medium.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Bold.ttf").as_slice()),
-        // The reading face. Cut from the upstream variable font by
-        // scripts/build-text-font.py; see assets/fonts/manifest.json.
-        Cow::Borrowed(include_bytes!("../assets/fonts/DMSans-Regular.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../assets/fonts/DMSans-Medium.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../assets/fonts/DMSans-Bold.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Geist-Regular.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Geist-Medium.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Geist-SemiBold.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Regular.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Medium.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Inter-SemiBold.ttf").as_slice()),
     ];
     cx.text_system().add_fonts(fonts).expect("load UI fonts");
 }

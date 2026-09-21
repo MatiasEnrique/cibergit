@@ -180,16 +180,16 @@ fn parse_startup() -> Result<Startup, String> {
 }
 
 fn load_interface_fonts(cx: &gpui::App) {
+    // Three weights per family, which is the whole ladder in src/ui.rs: Regular
+    // reads, Medium emphasises, SemiBold is the ceiling. Upstream revisions and
+    // checksums are in assets/fonts/manifest.json.
     let fonts = vec![
-        Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Medium.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Bold.ttf").as_slice()),
-        // The reading face. Cut from the upstream variable font by
-        // scripts/build-text-font.py; see assets/fonts/manifest.json.
-        Cow::Borrowed(include_bytes!("../assets/fonts/DMSans-Regular.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../assets/fonts/DMSans-Medium.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../assets/fonts/DMSans-Bold.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Geist-Regular.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Geist-Medium.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Geist-SemiBold.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Regular.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Medium.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Inter-SemiBold.ttf").as_slice()),
     ];
     if let Err(error) = cx.text_system().add_fonts(fonts) {
         eprintln!("Cannot load bundled interface fonts: {error:#}");
