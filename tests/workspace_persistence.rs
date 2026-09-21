@@ -2,7 +2,10 @@ use cibergit::domain::{Account, Comparison, PullRequest, Repository, Revision};
 use cibergit::review::{ComparisonMetadata, ComparisonMode, DiffMode, ReviewSession};
 use cibergit::{
     comparisons::{ComparisonRequest, LocalFileLoadPlan},
-    workspace::{PersistedComparisonContext, PersistedComparisonSession, Store, WorkspaceState},
+    workspace::{
+        PersistedComparisonContext, PersistedComparisonSession, SidebarMaterial, Store,
+        WorkspaceState,
+    },
 };
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
@@ -422,6 +425,39 @@ fn workspace_round_trip_keeps_saved_views_and_tabs() {
     assert_eq!(loaded.views[0].name, "Needs review");
     assert_eq!(loaded.tabs[0].selected_file.as_deref(), Some("src/lib.rs"));
     assert_eq!(loaded.active_tab, Some(0));
+}
+
+#[test]
+fn preferences_round_trip_and_a_workspace_saved_before_them_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let mut state = WorkspaceState::default();
+    assert_eq!(
+        state.preferences.sidebar_material,
+        SidebarMaterial::ClearGlass,
+        "the default material is the one the sidebar installs with no saved choice"
+    );
+    state.preferences.sidebar_material = SidebarMaterial::Frosted;
+    store.save_workspace(&state).unwrap();
+    assert_eq!(
+        store.load_workspace().unwrap().preferences.sidebar_material,
+        SidebarMaterial::Frosted
+    );
+
+    // Every workspace saved before preferences existed lacks the key entirely.
+    // Such a file is ordinary data at the current schema version, not the
+    // unsupported data the store is required to refuse.
+    let path = dir.path().join("workspace.json");
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut legacy = saved.as_object().unwrap().clone();
+    assert!(legacy.remove("preferences").is_some());
+    fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let loaded = store.load_workspace().unwrap();
+    assert_eq!(
+        loaded.preferences.sidebar_material,
+        SidebarMaterial::ClearGlass
+    );
+    assert_eq!(loaded.schema_version, state.schema_version);
 }
 
 #[test]

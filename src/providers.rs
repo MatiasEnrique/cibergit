@@ -24,6 +24,9 @@ use crate::domain::{
     ReviewAuxiliaryRequest, ReviewComment, ReviewSubject, ReviewThread, ReviewWriteAcknowledgement,
     Revision, SelectedViewer, SubmittedReviewEditCapability, WorkflowRunIdentity,
 };
+use crate::history::{
+    HistoryCommit, HistoryScope, MAX_HISTORY_COMMITS, RefKind, RefLabel, RepositoryHistory,
+};
 use crate::participation::{
     DraftStore, PendingCommentIntent, PendingFileCommentIntent, ReviewCommentTarget,
     ReviewComposition, ReviewEvent, ReviewOperationPayload, ReviewOperationStatus,
@@ -33,7 +36,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::{Read, Write},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
@@ -74,6 +77,8 @@ const PAGE_SIZE: usize = 100;
 const MAX_PR_PAGES: usize = 100;
 const MAX_FILE_PAGES: usize = 30;
 const MAX_COMMIT_INVENTORY_PAGES: usize = 10;
+/// Enough pages to reach `MAX_HISTORY_COMMITS` at `PAGE_SIZE` each, and no more.
+const MAX_HISTORY_PAGES: usize = MAX_HISTORY_COMMITS.div_ceil(PAGE_SIZE);
 const PARTICIPANT_LIMIT: usize = 100;
 const MAX_DETAILS_PAGES: usize = 20;
 const MAX_OPERATION_BYTES: usize = 64 * 1024 * 1024;
@@ -1181,6 +1186,199 @@ impl GithubProvider {
             InventoryAvailability::Incomplete,
             format!("Commit inventory reached the {MAX_COMMIT_INVENTORY_PAGES}-page remote limit."),
         ))
+    }
+
+    /// Read a repository's commit history through GraphQL, for repositories
+    /// with no local clone.
+    ///
+    /// GraphQL has no equivalent of `git log --all`: `history` walks one ref's
+    /// ancestry. So a remote read is always scoped to a single branch, and an
+    /// `AllRefs` request resolves to the default branch and says so in its
+    /// notice rather than implying it drew the whole repository. Branch tips
+    /// are read alongside and attached as decorations, which is what lets the
+    /// page still show where the other branches are.
+    pub fn repository_history(
+        &self,
+        repo: &Repository,
+        scope: &HistoryScope,
+    ) -> Result<RepositoryHistory> {
+        self.validate_repo(repo)?;
+        let (reference, whole_repository) = match scope {
+            HistoryScope::AllRefs => (String::new(), true),
+            HistoryScope::Ref(name) => {
+                ensure!(
+                    !name.is_empty() && name.len() <= 255 && !name.contains(['\n', '\r', '\0']),
+                    "Invalid Git ref name"
+                );
+                (name.clone(), false)
+            }
+        };
+        let unavailable = |availability, notice: String| RepositoryHistory {
+            scope: scope.clone(),
+            commits: Vec::new(),
+            availability,
+            notice: Some(notice),
+        };
+
+        let mut session = Session::new(self);
+        let mut after: Option<String> = None;
+        let mut commits: Vec<HistoryCommit> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut decorations: HashMap<String, Vec<RefLabel>> = HashMap::new();
+        let mut resolved = None;
+
+        for page in 1..=MAX_HISTORY_PAGES {
+            let response: GraphqlResult<HistoryData> = session.graphql(
+                REPOSITORY_HISTORY_QUERY,
+                json!({
+                    "owner": repo.owner,
+                    "name": repo.name,
+                    "ref": reference,
+                    "after": after,
+                    "useDefault": whole_repository,
+                }),
+            )?;
+            let Some(repository) = response.data.repository else {
+                return Ok(unavailable(
+                    InventoryAvailability::Unavailable,
+                    "GitHub did not return the selected repository for its history.".into(),
+                ));
+            };
+            ensure!(
+                repository
+                    .name_with_owner
+                    .eq_ignore_ascii_case(&repo.full_name()),
+                "GitHub history repository identity mismatch"
+            );
+            if response.partial {
+                return Ok(unavailable(
+                    if page == 1 {
+                        InventoryAvailability::Unavailable
+                    } else {
+                        InventoryAvailability::Incomplete
+                    },
+                    "GitHub returned a partial history; it is not shown.".into(),
+                ));
+            }
+            let selected = if whole_repository {
+                repository.default_branch_ref
+            } else {
+                repository.reference
+            };
+            let Some(selected) = selected else {
+                return Ok(unavailable(
+                    InventoryAvailability::Unavailable,
+                    if whole_repository {
+                        "This repository has no default branch to read a history from.".into()
+                    } else {
+                        format!("GitHub has no branch named {reference}.")
+                    },
+                ));
+            };
+            // The ref must not move underneath the pagination, or the pages
+            // would be stitched together from two different histories.
+            match &resolved {
+                None => resolved = Some(selected.name.clone()),
+                Some(previous) => ensure!(
+                    *previous == selected.name,
+                    "GitHub history ref changed during pagination"
+                ),
+            }
+            let Some(history) = selected.target.and_then(|target| target.history) else {
+                return Ok(unavailable(
+                    InventoryAvailability::Unavailable,
+                    format!("{} does not point at a commit.", selected.name),
+                ));
+            };
+
+            if page == 1 {
+                for node in repository.refs.into_iter().flat_map(|refs| refs.nodes) {
+                    let Some(node) = node else { continue };
+                    let Some(target) = node.target else { continue };
+                    validate_sha(&target.oid)?;
+                    decorations.entry(target.oid).or_default().push(RefLabel {
+                        kind: if node.name == selected.name {
+                            RefKind::Head
+                        } else {
+                            RefKind::LocalBranch
+                        },
+                        name: node.name,
+                    });
+                }
+            }
+
+            ensure!(
+                history.nodes.len() <= PAGE_SIZE,
+                "Invalid GitHub history page size"
+            );
+            if history.page_info.has_next_page && history.nodes.len() != PAGE_SIZE {
+                return Ok(unavailable(
+                    InventoryAvailability::Incomplete,
+                    "GitHub returned a truncated history page; it is not shown.".into(),
+                ));
+            }
+            for node in history.nodes {
+                let Some(node) = node else {
+                    return Ok(unavailable(
+                        InventoryAvailability::Incomplete,
+                        "GitHub omitted a commit from the history; it is not shown.".into(),
+                    ));
+                };
+                validate_sha(&node.oid)?;
+                ensure!(
+                    seen.insert(node.oid.clone()),
+                    "Repeated commit in GitHub history"
+                );
+                // A commit with more parents than the page asked for would
+                // produce a graph missing an edge, which reads as a branch that
+                // was never merged. Refuse rather than draw that.
+                ensure!(
+                    node.parents.total_count <= node.parents.nodes.len(),
+                    "A commit has more parents than its bounded parent page"
+                );
+                let parent_shas = node
+                    .parents
+                    .nodes
+                    .into_iter()
+                    .map(|parent| {
+                        let parent = parent.context("GitHub omitted a commit parent")?;
+                        validate_sha(&parent.oid)?;
+                        Ok(parent.oid)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let (author_name, author_login) = match node.author {
+                    Some(author) => (
+                        author.name.unwrap_or_default(),
+                        author.user.map(|user| user.login),
+                    ),
+                    None => (String::new(), None),
+                };
+                commits.push(HistoryCommit {
+                    refs: decorations.get(&node.oid).cloned().unwrap_or_default(),
+                    sha: node.oid,
+                    parent_shas,
+                    message_headline: node.message_headline,
+                    author_name,
+                    author_login,
+                    authored_at: node.authored_date,
+                    committed_at: node.committed_date,
+                });
+                if commits.len() == MAX_HISTORY_COMMITS {
+                    return Ok(bounded_history(scope, commits, whole_repository, true));
+                }
+            }
+            if !history.page_info.has_next_page {
+                return Ok(bounded_history(scope, commits, whole_repository, false));
+            }
+            after = Some(
+                history
+                    .page_info
+                    .end_cursor
+                    .filter(|cursor| !cursor.is_empty())
+                    .context("GitHub history omitted its continuation cursor")?,
+            );
+        }
+        Ok(bounded_history(scope, commits, whole_repository, true))
     }
 
     /// Fetch an exact direct-tree pair through GitHub's compare API. Because the
@@ -3358,8 +3556,14 @@ struct CommitParentConnection {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GraphqlActor {
     login: String,
+    /// Only the details query asks for this; every other actor selection
+    /// leaves it absent, which reads as "no picture observed" rather than as
+    /// a malformed response.
+    #[serde(default)]
+    avatar_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3597,6 +3801,149 @@ const COMMIT_INVENTORY_QUERY: &str = r#"query PullRequestCommitInventory(
           }
         }
       }
+    }
+  }
+}"#;
+
+/// Finish a remote history read, attaching the notice that explains what a
+/// GraphQL read structurally cannot show.
+fn bounded_history(
+    scope: &HistoryScope,
+    commits: Vec<HistoryCommit>,
+    whole_repository: bool,
+    truncated: bool,
+) -> RepositoryHistory {
+    let mut notices = Vec::new();
+    if whole_repository {
+        notices.push(
+            "This repository has no local clone, so only the default branch's history was read. Other branches appear as labels on the commits they point at."
+                .to_owned(),
+        );
+    }
+    if truncated {
+        notices.push(format!(
+            "Showing the most recent {MAX_HISTORY_COMMITS} commits; this history is longer."
+        ));
+    }
+    RepositoryHistory {
+        scope: scope.clone(),
+        commits,
+        availability: if truncated || whole_repository {
+            InventoryAvailability::Incomplete
+        } else {
+            InventoryAvailability::Complete
+        },
+        notice: (!notices.is_empty()).then(|| notices.join(" ")),
+    }
+}
+
+#[derive(Deserialize)]
+struct HistoryData {
+    repository: Option<HistoryRepository>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryRepository {
+    name_with_owner: String,
+    #[serde(default)]
+    default_branch_ref: Option<HistoryRef>,
+    /// GraphQL's `ref` field. Named around Rust's keyword rather than raw.
+    #[serde(default, rename = "ref")]
+    reference: Option<HistoryRef>,
+    #[serde(default)]
+    refs: Option<HistoryRefConnection>,
+}
+
+#[derive(Deserialize)]
+struct HistoryRef {
+    name: String,
+    target: Option<HistoryTarget>,
+}
+
+/// A ref's target is any Git object. The query only selects `history` on a
+/// commit, so a ref pointing at a tag or tree leaves this empty.
+#[derive(Deserialize)]
+struct HistoryTarget {
+    #[serde(default)]
+    history: Option<HistoryConnection>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryConnection {
+    page_info: PageInfo,
+    nodes: Vec<Option<HistoryNode>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryNode {
+    oid: String,
+    message_headline: String,
+    authored_date: String,
+    committed_date: String,
+    author: Option<HistoryAuthor>,
+    parents: CommitParentConnection,
+}
+
+#[derive(Deserialize)]
+struct HistoryAuthor {
+    name: Option<String>,
+    user: Option<HistoryUser>,
+}
+
+#[derive(Deserialize)]
+struct HistoryUser {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct HistoryRefConnection {
+    nodes: Vec<Option<HistoryRefNode>>,
+}
+
+#[derive(Deserialize)]
+struct HistoryRefNode {
+    name: String,
+    target: Option<GraphqlOid>,
+}
+
+/// One page of a branch's ancestry, plus the branch tips used as decorations.
+///
+/// `useDefault` chooses between the default branch and a named one at the
+/// server rather than costing a second round trip to resolve the name first.
+/// Parents are bounded at three: an octopus merge wider than that is refused
+/// rather than drawn with a missing edge.
+const REPOSITORY_HISTORY_QUERY: &str = r#"query RepositoryHistory(
+  $owner: String!, $name: String!, $ref: String!, $after: String, $useDefault: Boolean!
+) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    refs(refPrefix: "refs/heads/", first: 100,
+         orderBy: {field: ALPHABETICAL, direction: ASC}) {
+      nodes { name target { oid } }
+    }
+    defaultBranchRef @include(if: $useDefault) {
+      name
+      target { ... on Commit { ...HistoryPage } }
+    }
+    ref(qualifiedName: $ref) @skip(if: $useDefault) {
+      name
+      target { ... on Commit { ...HistoryPage } }
+    }
+  }
+}
+fragment HistoryPage on Commit {
+  history(first: 100, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      oid
+      messageHeadline
+      authoredDate
+      committedDate
+      author { name user { login } }
+      parents(first: 3) { totalCount nodes { oid } }
     }
   }
 }"#;
@@ -5366,14 +5713,14 @@ const DETAILS_QUERY: &str = r#"query PullRequestDetails(
       labels(first: 100) { nodes { name } pageInfo { hasNextPage endCursor } }
       comments(first: 50, after: $commentsCursor) @include(if: $includeComments) {
         nodes {
-          id author { login } body createdAt updatedAt url viewerCanReact
+          id author { login avatarUrl(size: 64) } body createdAt updatedAt url viewerCanReact
           reactionGroups { content viewerHasReacted users { totalCount } }
         }
         pageInfo { hasNextPage endCursor }
       }
       reviews(first: 50, after: $reviewsCursor) @include(if: $includeReviews) {
         nodes {
-          id author { login } body state submittedAt commit { oid } url
+          id author { login avatarUrl(size: 64) } body state submittedAt commit { oid } url
           viewerDidAuthor viewerCanUpdate viewerCannotUpdateReasons
           viewerCanReact reactionGroups { content viewerHasReacted users { totalCount } }
         }
@@ -5385,7 +5732,7 @@ const DETAILS_QUERY: &str = r#"query PullRequestDetails(
           isResolved isOutdated
           comments(first: 100) {
             nodes {
-              id author { login } body createdAt updatedAt url path subjectType line originalLine
+              id author { login avatarUrl(size: 64) } body createdAt updatedAt url path subjectType line originalLine
               startLine originalStartLine diffHunk outdated commit { oid } originalCommit { oid }
               pullRequestReview { id }
               viewerCanReact reactionGroups { content viewerHasReacted users { totalCount } }
@@ -6044,6 +6391,23 @@ fn domain_repository(repository: &DetailsRepositoryIdentity) -> CheckRepositoryI
     }
 }
 
+/// Whether a returned avatar URL is one this app is willing to fetch later:
+/// plain HTTPS, on GitHub's own avatar host, with no embedded credentials and
+/// no room for a shell or filesystem surprise in the text itself.
+fn github_avatar_url(url: &str) -> bool {
+    const HOST_SUFFIX: &str = ".githubusercontent.com";
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if url.len() > 512 || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.contains(['@', ':'])
+        && authority.len() > HOST_SUFFIX.len()
+        && authority.to_ascii_lowercase().ends_with(HOST_SUFFIX)
+}
+
 struct DetailsBuilder {
     head_oid: Option<String>,
     source_identity: Option<DetailsSourceIdentity>,
@@ -6056,6 +6420,7 @@ struct DetailsBuilder {
     review_threads: Vec<ReviewThread>,
     reactions: Vec<ReactionSubjectSnapshot>,
     checks: Vec<PullRequestCheck>,
+    participant_avatars: BTreeMap<String, String>,
     activity_ids: HashSet<String>,
     thread_ids: HashSet<String>,
     check_ids: HashSet<String>,
@@ -6080,6 +6445,7 @@ impl Default for DetailsBuilder {
             review_threads: Vec::new(),
             reactions: Vec::new(),
             checks: Vec::new(),
+            participant_avatars: BTreeMap::new(),
             activity_ids: HashSet::new(),
             thread_ids: HashSet::new(),
             check_ids: HashSet::new(),
@@ -6100,6 +6466,24 @@ struct DetailsPageContext {
 }
 
 impl DetailsBuilder {
+    /// Keep the picture GitHub returned for an actor, under the login the
+    /// activity entries are rendered with. Only GitHub's own avatar host is
+    /// accepted: the response decides which picture is fetched, so it may not
+    /// also decide which server is reached. The first sighting of a login
+    /// wins, since every page returns the same URL for the same participant.
+    fn observe_avatar(&mut self, actor: Option<&GraphqlActor>) {
+        let Some(actor) = actor else { return };
+        let Some(url) = actor.avatar_url.as_deref() else {
+            return;
+        };
+        if !github_avatar_url(url) {
+            return;
+        }
+        self.participant_avatars
+            .entry(actor.login.clone())
+            .or_insert_with(|| url.to_owned());
+    }
+
     fn absorb(
         &mut self,
         repo: &Repository,
@@ -6287,6 +6671,7 @@ impl DetailsBuilder {
                     &selected_viewer,
                     !partial,
                 ));
+                self.observe_avatar(comment.author.as_ref());
                 self.issue_comments.push(comment.into_domain(repo, number));
             }
         }
@@ -6320,6 +6705,7 @@ impl DetailsBuilder {
                     pull_request: pull_request.clone(),
                     authority: dismissal_authority(&review.state, viewer_can_administer),
                 });
+                self.observe_avatar(review.author.as_ref());
                 self.reviews
                     .push(review.into_domain(repo, number, !partial, dismissal_capability));
             }
@@ -6347,6 +6733,7 @@ impl DetailsBuilder {
                     self.notice("Review thread comments contained unavailable entries; the activity snapshot is partial.");
                 }
                 for comment in thread.comments.nodes.iter().flatten() {
+                    self.observe_avatar(comment.author.as_ref());
                     let parent_review = comment
                         .pull_request_review
                         .as_ref()
@@ -6481,6 +6868,7 @@ impl DetailsBuilder {
             review_threads: self.review_threads,
             reactions: self.reactions,
             checks: self.checks,
+            participant_avatars: self.participant_avatars,
             activity_complete: self.activity_complete,
             checks_complete: self.checks_complete,
             notice: (!self.notices.is_empty()).then(|| self.notices.join(" ")),
@@ -8589,6 +8977,67 @@ else:
                     .is_some_and(|fresh| fresh.viewer.node_id == "U-alice")
         }));
         exhausted(&dir, 1);
+    }
+
+    #[test]
+    fn details_keep_github_hosted_participant_avatars_and_drop_every_other_url() {
+        let comment = |id: &str, author: Value| {
+            json!({
+                "id": id, "author": author, "body": "discussion",
+                "createdAt": "2026-09-12T10:00:00Z", "updatedAt": "2026-09-12T10:00:00Z",
+                "url": format!("https://github.com/owner/repo/pull/1#issuecomment-{id}"),
+                "viewerCanReact": true, "reactionGroups": []
+            })
+        };
+        let mut pull = details_overview();
+        pull["comments"] = json!({
+            "nodes": [
+                // A bot: GraphQL spells this login without the [bot] suffix
+                // REST uses, which is why the URL travels with it.
+                comment("IC-bot", json!({
+                    "login": "coderabbitai",
+                    "avatarUrl": "https://avatars.githubusercontent.com/in/347564?s=64"
+                })),
+                comment("IC-elsewhere", json!({
+                    "login": "elsewhere",
+                    "avatarUrl": "https://avatars.githubusercontent.com.example.invalid/u/9?s=64"
+                })),
+                comment("IC-plain", json!({"login": "plain"})),
+            ],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        });
+        let response = details_response(pull);
+        let (dir, provider) = fixture("alice", vec![details_step(response, json!({"number": 1}))]);
+        let details = provider.details(&repo("alice"), 1).unwrap();
+        assert_eq!(
+            details
+                .participant_avatars
+                .get("coderabbitai")
+                .map(String::as_str),
+            Some("https://avatars.githubusercontent.com/in/347564?s=64")
+        );
+        // A host that merely begins with GitHub's own is a different server.
+        assert!(!details.participant_avatars.contains_key("elsewhere"));
+        assert!(!details.participant_avatars.contains_key("plain"));
+        exhausted(&dir, 1);
+    }
+
+    #[test]
+    fn foreign_and_credentialed_avatar_urls_are_never_accepted() {
+        assert!(github_avatar_url(
+            "https://avatars.githubusercontent.com/u/1?s=64"
+        ));
+        assert!(!github_avatar_url(
+            "http://avatars.githubusercontent.com/u/1"
+        ));
+        assert!(!github_avatar_url(
+            "https://user:pass@avatars.githubusercontent.com/u/1"
+        ));
+        assert!(!github_avatar_url(
+            "https://evil.invalid/#.githubusercontent.com"
+        ));
+        assert!(!github_avatar_url("https://.githubusercontent.com/u/1"));
+        assert!(!github_avatar_url("file:///etc/passwd"));
     }
 
     #[test]

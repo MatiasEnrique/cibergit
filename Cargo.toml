@@ -17,6 +17,10 @@ required-features = ["ui-smoke"]
 gpui = { package = "gpui-pre", version = "=0.3.1" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.1", features = ["font-kit", "runtime_shaders"] }
 gpui-base = "=0.6.1"
+# The sidebar installs an AppKit glass/material view of its own; see src/glass.rs.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSGraphics", "NSResponder", "NSView", "NSVisualEffectView", "NSWindow"] }
+raw-window-handle = "0.6"
 anyhow = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"

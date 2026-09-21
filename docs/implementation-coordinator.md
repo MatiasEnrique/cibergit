@@ -18,7 +18,7 @@ Read applicable `AGENTS.md` files and relevant BB skills before using their work
 
 ## Fixed requirements
 
-- Build a native Rust application using GPUI and GPUI Kit's focused editor. Pin and validate the compatible dependency family before parallel application work.
+- Build a native Rust application using GPUI and GPUI Kit. Pin and validate the compatible dependency family before parallel application work. V1 ships no worktree-file editor.
 - Support macOS on Apple Silicon only. Do not spend V1 effort on Intel, Linux, or Windows.
 - License cibergit's original code under MIT and retain dependency notices. Do not copy Zed's GPL editor code.
 - Use installed Git and `gh`. GitHub.com is the V1 provider. Keep provider integration separable for future GitLab and other Git clouds.

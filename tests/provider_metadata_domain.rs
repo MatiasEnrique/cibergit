@@ -91,6 +91,7 @@ fn details_types_are_provider_independent_and_revision_free() {
             sha_class: Default::default(),
             actions_linkage: Default::default(),
         }],
+        participant_avatars: Default::default(),
         activity_complete: true,
         checks_complete: true,
         notice: None,

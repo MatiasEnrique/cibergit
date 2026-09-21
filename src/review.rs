@@ -741,6 +741,36 @@ pub fn validate_object_id(oid: &str) -> Result<()> {
     );
     Ok(())
 }
+/// The base a root commit's diff is taken against.
+///
+/// A root commit has no parent, so there is no commit to compare it with. Git
+/// always provides the empty tree, and asks it be addressed by OID; the OID
+/// depends on the repository's hash algorithm, so it is resolved here rather
+/// than hard-coded to the SHA-1 spelling.
+pub fn empty_tree_oid(path: &Path) -> Result<String> {
+    let oid = git(path, &["hash-object", "-t", "tree", "/dev/null"])?;
+    let oid = std::str::from_utf8(&oid)
+        .context("Invalid empty tree object ID")?
+        .trim()
+        .to_owned();
+    validate_object_id(&oid)?;
+    Ok(oid)
+}
+
+/// The base endpoint of a diff. Ordinarily a commit, but the empty tree is
+/// admitted so a root commit can be shown as the addition of every file in it.
+/// The head endpoint is never relaxed this way.
+fn validate_diff_base(path: &Path, oid: &str) -> Result<()> {
+    validate_object_id(oid)?;
+    let kind = git(path, &["cat-file", "-t", oid])
+        .with_context(|| format!("Revision object {oid} unavailable locally"))?;
+    ensure!(
+        kind == b"commit\n" || (kind == b"tree\n" && oid == empty_tree_oid(path)?),
+        "Revision object {oid} is not a commit"
+    );
+    Ok(())
+}
+
 fn validate_commit(path: &Path, oid: &str) -> Result<()> {
     validate_object_id(oid)?;
     let kind = git(path, &["cat-file", "-t", oid])
@@ -813,7 +843,7 @@ fn parse_raw(raw: &[u8]) -> Result<Vec<RawFile>> {
 }
 
 fn enumerate_local_files(path: &Path, revision: &Revision) -> Result<Vec<RawFile>> {
-    validate_commit(path, &revision.base_sha)?;
+    validate_diff_base(path, &revision.base_sha)?;
     validate_commit(path, &revision.head_sha)?;
     let common = [
         "diff",

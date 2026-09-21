@@ -154,6 +154,37 @@ pub struct WorkspaceRestorePlan {
     pub active_tab: Option<usize>,
     pub notices: Vec<WorkspaceRestoreNotice>,
 }
+/// What the sidebar column is filled with. The material is an AppKit view
+/// behind the renderer, so this chooses which one is installed rather than a
+/// colour; see `src/glass.rs`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SidebarMaterial {
+    /// macOS 26 glass without its legibility scrim: the sidebar takes its
+    /// colour from whatever is behind the window.
+    #[default]
+    ClearGlass,
+    /// macOS 26 glass with the scrim, which reads greyer and more even.
+    TintedGlass,
+    /// The pre-26 frosted sidebar material. Also what a system without glass
+    /// falls back to from either glass choice.
+    Frosted,
+    /// No material at all; the sidebar paints the opaque panel fill.
+    Solid,
+}
+
+/// Choices that belong to the person rather than to a repository or a review.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preferences {
+    #[serde(default)]
+    pub sidebar_material: SidebarMaterial,
+    /// Bundle identifier of the application Local changes last handed a
+    /// checkout to, so the control can show which one it will use. `None` until
+    /// the user has picked one; the empty string is the system default handler,
+    /// which has no bundle identifier of its own.
+    #[serde(default)]
+    pub preferred_editor: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceState {
     pub schema_version: u32,
@@ -162,6 +193,10 @@ pub struct WorkspaceState {
     pub selected_view: usize,
     pub tabs: Vec<TabState>,
     pub active_tab: Option<usize>,
+    /// Absent from every workspace saved before preferences existed, which
+    /// must keep loading rather than be reported as unsupported data.
+    #[serde(default)]
+    pub preferences: Preferences,
 }
 impl Default for WorkspaceState {
     fn default() -> Self {
@@ -172,6 +207,7 @@ impl Default for WorkspaceState {
             selected_view: 0,
             tabs: vec![],
             active_tab: None,
+            preferences: Preferences::default(),
         }
     }
 }

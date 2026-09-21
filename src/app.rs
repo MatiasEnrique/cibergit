@@ -1,27 +1,33 @@
+use crate::glass;
 use crate::{
     AddPendingComment, ApplyPrDiscussion, ApplyPrMetadata, CancelPrMutation, CloseTab,
     ComposeInlineComment, ConfirmPrMutation, CycleDiffMode, DetailsNarrower, DetailsWider,
     DiffScrollEnd, DiffScrollHome, DiffScrollLeft, DiffScrollRight, EditPrMetadata,
     FileTreeActivate, FileTreeDown, FileTreeLeft, FileTreeNarrower, FileTreeRight, FileTreeUp,
-    FileTreeWider, MergePullRequest, NewPrDiscussion, NextFile, OpenPullRequestCreation,
-    OpenRepositorySetup, OpenStackView, PostImmediateComment, PreviousFile, Refresh,
-    RefreshStackView, ResetLayout, ReturnToPullRequest, Save, SaveReviewDraft,
-    SelectFullComparison, SelectNextComparisonCommit, SelectNextStackTip,
-    SelectPreviousComparisonCommit, SelectSinceLastReview, SidebarNarrower, SidebarWider,
-    SubmitReview, ToggleComparisonPicker, ToggleFileTree, ToggleInspector, TogglePalette,
-    ToggleSidebar, ToggleStackRelationships,
+    FileTreeWider, MergePullRequest, NewPrDiscussion, NextFile, OpenHistory,
+    OpenPullRequestCreation, OpenRepositorySetup, OpenSettings, OpenStackView,
+    PostImmediateComment, PreviousFile, Refresh, RefreshStackView, ResetLayout,
+    ReturnToPullRequest, Save, SaveReviewDraft, SelectFullComparison, SelectNextComparisonCommit,
+    SelectNextStackTip, SelectPreviousComparisonCommit, SelectSinceLastReview, SidebarNarrower,
+    SidebarWider, SubmitReview, ToggleComparisonPicker, ToggleFileTree, ToggleInspector,
+    TogglePalette, ToggleSidebar, ToggleStackRelationships,
 };
 use cibergit::ui::{self, Density, TextRole};
+mod avatars;
 mod checks_view;
 mod ci_actions;
 mod ci_read;
 mod collaboration_cache;
 mod comparison_picker;
 mod file_tree;
+mod history_view;
+#[allow(dead_code)] // The vocabulary is complete by design; not every block exists yet.
+mod layout;
 mod local_checkout;
 #[allow(dead_code)] // Public component surface also serves standalone native verification.
 mod local_workspace;
 mod notifications_view;
+mod open_with;
 mod pr_creation;
 mod pr_lifecycle;
 mod read_sync;
@@ -31,10 +37,11 @@ mod submitted_review_drafts;
 mod view_editor;
 
 use checks_view::{
-    ChecksSelection, LoadSelectedJobLog, NextCheck, NextCheckPage, NextJob, NextJobPage,
-    OpenChecks, OpenSelectedCheckJobs, PreviousCheck, PreviousCheckPage, PreviousJob,
+    CheckState, ChecksSelection, LoadSelectedJobLog, NextCheck, NextCheckPage, NextJob,
+    NextJobPage, OpenChecks, OpenSelectedCheckJobs, PreviousCheck, PreviousCheckPage, PreviousJob,
     PreviousJobPage, RefreshSelectedCheckJobs, ReturnToChecks, ReturnToJobs, ToggleCheckIdentity,
-    checks_page, identity_fields, kind_label, linkage_label, required_label, sha_label,
+    check_state, checks_page, checks_tally, identity_fields, kind_label, linkage_label,
+    required_label, sha_label,
 };
 use ci_actions::{
     ActionsControlConfirmationToken, ActionsControlDisplay, ActionsControlOwnership,
@@ -70,6 +77,7 @@ use cibergit::{
         ReviewAuxiliaryAction, ReviewAuxiliaryRequest, Revision,
         SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
     },
+    history::{EdgeKind, GraphRow, HistoryCommit, HistoryScope, RefKind, RefLabel, local_history},
     participation::{
         DiffSide, LineSelection, PendingFileReviewStartIntent, ReviewCommentTarget, ReviewEvent,
         ReviewKey,
@@ -80,11 +88,11 @@ use cibergit::{
     },
     review::{
         AlignedRow, DiffLine, DiffLineKind, DiffMode, ParsedDiff, PatchStatus, ReviewSession,
-        file_key, load_local_file, local_pr_inventory, parse_file,
+        empty_tree_oid, file_key, load_local_file, local_inventory, local_pr_inventory, parse_file,
     },
     workspace::{
         Filter, GroupBy, PersistedComparisonContext, PersistedComparisonSession, PersonalFilter,
-        PollSchedule, Store, TabState, WorkspaceRestorePlan, WorkspaceState,
+        PollSchedule, SidebarMaterial, Store, TabState, WorkspaceRestorePlan, WorkspaceState,
     },
 };
 use collaboration_cache::{CachedObservation, CollaborationCache, PreparedWrite, now_unix_ms};
@@ -94,9 +102,10 @@ use comparison_picker::{
 use file_tree::{FileTree, TreeRowKind};
 use gpui::{prelude::*, *};
 use gpui_base::{
-    Button, HoverCard, Scrollbar, TextView, TextViewStyle,
+    Button, HoverCard, Popover, Scrollbar, TextView, TextViewStyle,
     input::{Input, InputEditorStyle, InputEvent, InputState, Textarea, TextareaState},
 };
+use history_view::HistoryController;
 use pr_lifecycle::{ChoiceKind, FrozenMutation, PrLifecycleController, reviewer};
 use review_interactions::{
     ActionJournal, ComposerState, ControllerLoad, InlineThread, JournalOperation, JournalRequest,
@@ -114,12 +123,12 @@ use stack_view::{
 use std::fs;
 use std::{
     cell::Cell,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ops::Range,
     path::PathBuf,
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -130,7 +139,6 @@ use submitted_review_drafts::{
 };
 use view_editor::{SidebarRow, ViewEditorController};
 
-const UI_FONT: &str = "IBM Plex Sans";
 const CODE_FONT: &str = "Menlo";
 const MAX_RENDERED_LOG_ROWS: usize = 128;
 /// How many tab stops the PR-layout smoke advances before capturing the
@@ -175,6 +183,36 @@ const CHOICE_MAX_WIDTH: f32 = 260.;
 /// Width of the centered repository-setup card. Capped to the window so the
 /// card and its controls stay whole on a narrow window.
 const SETUP_CARD_WIDTH: f32 = 560.;
+/// Settings read as a page rather than a card, so its measure is the one that
+/// keeps a paragraph of explanation readable, not a dialog width.
+const SETTINGS_PAGE_WIDTH: f32 = 620.;
+/// What the sidebar can be filled with, in the order the page offers them:
+/// most transparent first, none at all last.
+const SIDEBAR_MATERIAL_CHOICES: [(SidebarMaterial, &str, &str); 4] = [
+    (
+        SidebarMaterial::ClearGlass,
+        "Clear glass",
+        "macOS 26 glass without its legibility scrim. The sidebar takes its colour from whatever is behind the window.",
+    ),
+    (
+        SidebarMaterial::TintedGlass,
+        "Tinted glass",
+        "The same glass with the scrim underneath. Greyer and more even, and steadier over a busy desktop.",
+    ),
+    (
+        SidebarMaterial::Frosted,
+        "Frosted",
+        "The material macOS used before 26: blurred rather than refracted. Also what a system without glass falls back to.",
+    ),
+    (
+        SidebarMaterial::Solid,
+        "Solid",
+        "No material. The sidebar paints an opaque panel fill and nothing shows through it.",
+    ),
+];
+/// A material is an AppKit view behind the renderer, and the window server
+/// composites it. Saying so beats letting a reader conclude the setting failed.
+const SIDEBAR_MATERIAL_LIMIT: &str = "Glass is drawn by macOS behind the window, so it shows what is behind the window rather than a colour of its own. Both glass choices need macOS 26; an earlier system uses Frosted whichever is selected here.";
 const DEFAULT_SIDEBAR_WIDTH: f32 = 292.;
 const DEFAULT_FILE_TREE_WIDTH: f32 = 250.;
 const DEFAULT_DETAILS_WIDTH: f32 = 274.;
@@ -183,10 +221,17 @@ const MIN_FILE_TREE_WIDTH: f32 = 180.;
 const MIN_DETAILS_WIDTH: f32 = 220.;
 const MAX_PANEL_WIDTH: f32 = 460.;
 const COLLAPSED_PANEL_WIDTH: f32 = 34.;
+// The splitter's drag band. It is painted and hit at this width but takes no
+// width in layout: an 8px column between the panes cut every diff line in half
+// at the file tree's edge. The tree already carries its own right hairline, so
+// the two panes meet on that and the band rides over the seam.
 const SPLITTER_WIDTH: f32 = 8.;
-// The PR page's tab row: a 24px chip painted inside a full-row pointer
-// target, with the row itself kept close to the title above it.
-const PR_TAB_ROW_HEIGHT: f32 = 36.;
+// The conversation's metadata rail, sized like GitHub's: wide enough for a
+// login and a label chip, narrow enough to leave the discussion the page.
+const CONVERSATION_RAIL_WIDTH: f32 = 256.;
+// Below this the rail would be taking the discussion's width rather than its
+// own, so the conversation drops back to a single column.
+const CONVERSATION_RAIL_MIN_PAGE: f32 = 760.;
 const MIN_SPLIT_DIFF_WIDTH: f32 = 560.;
 const PANEL_KEYBOARD_STEP: f32 = 16.;
 // Menlo at the diff's 12px text size advances about 7.225px per ASCII cell on
@@ -230,15 +275,7 @@ const SMOKE_OFFLINE_DRAFT: &str =
 const SMOKE_SUBMITTED_DRAFT: &str = "Synthetic requested submitted summary. Confirmation and cancellation only; zero update mutation transport.";
 
 #[derive(Clone, Debug, Default)]
-pub enum LaunchMode {
-    #[default]
-    Review,
-    Edit(PathBuf),
-}
-
-#[derive(Clone, Debug, Default)]
 pub struct Startup {
-    pub mode: LaunchMode,
     pub repository: Option<String>,
     pub account: Option<String>,
     pub pull_request: Option<u64>,
@@ -248,24 +285,19 @@ pub struct Startup {
     pub provider_reads_disabled: bool,
 }
 
-pub enum Root {
-    Review(Box<ReviewWorkspace>),
-    Editor(EditorWorkspace),
+pub struct Root {
+    review: Box<ReviewWorkspace>,
 }
 
 impl Root {
     pub fn review(window: &mut Window, cx: &mut Context<Self>, startup: Startup) -> Self {
-        Self::Review(Box::new(ReviewWorkspace::new(window, cx, startup)))
-    }
-
-    pub fn editor(window: &mut Window, cx: &mut Context<Self>, path: PathBuf) -> Self {
-        Self::Editor(EditorWorkspace::new(window, cx, path))
+        Self {
+            review: Box::new(ReviewWorkspace::new(window, cx, startup)),
+        }
     }
 
     pub(crate) fn system_notification_response(&mut self, tag: &str, cx: &mut Context<Self>) {
-        if let Self::Review(workspace) = self {
-            workspace.handle_system_notification_response(tag, cx);
-        }
+        self.review.handle_system_notification_response(tag, cx);
     }
 
     /// Presentation-only integration point for the separately owned local
@@ -277,9 +309,7 @@ impl Root {
         pull_request: u64,
         view: AnyView,
     ) -> bool {
-        let Self::Review(workspace) = self else {
-            return false;
-        };
+        let workspace = &mut self.review;
         let Some(tab) = workspace.tabs.iter_mut().find(|tab| {
             tab.repository.cache_key() == repository_key && tab.pull_request.number == pull_request
         }) else {
@@ -291,10 +321,7 @@ impl Root {
 
     #[allow(dead_code)] // Consumed by the parent-owned local-workspace embedding commit.
     pub fn pr_local_workspace(&self, repository_key: &str, pull_request: u64) -> Option<AnyView> {
-        let Self::Review(workspace) = self else {
-            return None;
-        };
-        workspace
+        self.review
             .tabs
             .iter()
             .find(|tab| {
@@ -307,19 +334,35 @@ impl Root {
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        match self {
-            Self::Review(workspace) => workspace.render(window, cx).into_any_element(),
-            Self::Editor(editor) => editor.render(window, cx).into_any_element(),
-        }
+        self.review.render(window, cx)
     }
 }
 
 /// Surfaces stay on this app's own neutrals; every colour that carries meaning
 /// comes from GitHub's Primer tokens, so a diff, a branch and a state read the
 /// same here as on the pull request page they came from.
+///
+/// The neutral ramp aims at quiet separation, not at contrast for its own sake.
+/// `canvas` is the one deliberate exception: it carries the window behind the
+/// main section's frame, so it steps about 1.10:1 off `surface` — enough for the
+/// frame to have an edge without the two reading as different materials. The
+/// other surfaces sit closer, and a hairline lands near 1.40:1 against the
+/// surface behind it — enough to find an edge, not enough to draw a box. Text is
+/// the exception and is held to real thresholds, so `faint`, the lowest-ranked
+/// text this app writes, clears 4.5:1 on `canvas`, `surface` and `elevated`. An
+/// earlier ramp left `faint` at 3.15:1, which is unreadable rather than subtle.
+///
+/// Every neutral is cool, never warm. An earlier ramp tinted the surfaces warm
+/// while the text stayed cool, which is invisible when the steps are tiny and
+/// turns to a dirty yellow cast the moment they are not: a warm canvas beside a
+/// pure-white panel reads as stained paper, and it fights both Primer's cool
+/// semantic tokens and the AppKit material behind the sidebar.
 #[derive(Clone, Copy)]
 struct Palette {
+    /// The page a panel's content sits on. Recedes from `surface` so a card
+    /// laid on it reads as a card without needing a heavy outline.
     canvas: Rgba,
+    /// Panels and cards: the lightest step in light mode, a raised step in dark.
     surface: Rgba,
     sidebar: Rgba,
     elevated: Rgba,
@@ -354,15 +397,15 @@ struct Palette {
 fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            canvas: rgba(0x18191bff),
-            surface: rgba(0x202124ff),
+            canvas: rgba(0x111417ff),
+            surface: rgba(0x1b1f24ff),
             sidebar: rgba(0x484848e0),
-            elevated: rgba(0x292b2fff),
-            text: rgba(0xf1f2f3ff),
-            muted: rgba(0xb8bbc1ff),
-            faint: rgba(0x777b83ff),
-            border: rgba(0x36383dff),
-            selected: rgba(0xffffff13),
+            elevated: rgba(0x22272dff),
+            text: rgba(0xf0f6fcff),
+            muted: rgba(0xb7bfc8ff),
+            faint: rgba(0x8b949eff),
+            border: rgba(0x373e47ff),
+            selected: rgba(0xffffff14),
             accent: rgba(0x4493f8ff),
             accent_subtle: rgba(0x388bfd1a),
             green: rgba(0x3fb950ff),
@@ -381,15 +424,15 @@ fn palette(dark: bool) -> Palette {
         }
     } else {
         Palette {
-            canvas: rgba(0xfafaf9ff),
+            canvas: rgba(0xf2f4f7ff),
             surface: rgba(0xffffffff),
-            sidebar: rgba(0xf6f6f5f0),
-            elevated: rgba(0xf2f2f0ff),
-            text: rgba(0x202124ff),
-            muted: rgba(0x56595eff),
-            faint: rgba(0x8b8e93ff),
-            border: rgba(0xdedfdcff),
-            selected: rgba(0x0000000a),
+            sidebar: rgba(0xf1f4f7f0),
+            elevated: rgba(0xeef1f4ff),
+            text: rgba(0x1f2328ff),
+            muted: rgba(0x59636eff),
+            faint: rgba(0x666f79ff),
+            border: rgba(0xccd3dbff),
+            selected: rgba(0x0000000f),
             accent: rgba(0x0969daff),
             accent_subtle: rgba(0xddf4ffff),
             green: rgba(0x1a7f37ff),
@@ -407,6 +450,58 @@ fn palette(dark: bool) -> Palette {
             dark,
         }
     }
+}
+
+/// The graph's lane colours, in the order lanes are handed out.
+///
+/// GitHub's own answer for "colours that tell series in a graph apart" is
+/// Primer's data-visualization scale — `--data-<hue>-color-emphasis`, which
+/// resolves to index 5 of each display hue. These are those values, light and
+/// dark, ordered so that neighbouring lanes never land on adjacent hues.
+///
+/// They are deliberately not the semantic colours in `Palette`. Primer is
+/// explicit that the data scale is for visualizations and the semantic scale
+/// is for meaning: a lane drawn in `red` would read as a failure rather than
+/// as the fourth branch.
+const LANE_COLORS_LIGHT: [u32; 12] = [
+    0x006edb, // blue
+    0x2c8141, // green
+    0x894ceb, // purple
+    0xb8500f, // orange
+    0xce2c85, // pink
+    0x127e81, // teal
+    0xdf0c24, // red
+    0x946a00, // yellow
+    0x5a61e7, // indigo
+    0xd43511, // coral
+    0x527a29, // lime
+    0xa830e8, // plum
+];
+
+const LANE_COLORS_DARK: [u32; 12] = [
+    0x0576ff, // blue
+    0x388f3f, // green
+    0x975bf1, // purple
+    0xc46212, // orange
+    0xd34591, // pink
+    0x158a8a, // teal
+    0xeb3342, // red
+    0xaa7109, // yellow
+    0x7070e1, // indigo
+    0xe1430e, // coral
+    0x5f892f, // lime
+    0xb643ef, // plum
+];
+
+/// The colour for one lane. `index` comes from the layout, which already keeps
+/// it inside the palette, so this wraps rather than trusting that from afar.
+fn lane_color(index: usize, dark: bool) -> Rgba {
+    let scale = if dark {
+        LANE_COLORS_DARK
+    } else {
+        LANE_COLORS_LIGHT
+    };
+    rgba((scale[index % scale.len()] << 8) | 0xff)
 }
 
 fn is_dark(window: &Window) -> bool {
@@ -684,6 +779,10 @@ impl PanelLayout {
     }
 }
 
+/// What the main section's frame costs its content horizontally: `GAP_GROUP` of
+/// margin plus a one-pixel border on each side.
+const FRAME_CHROME: f32 = 2. * (ui::GAP_GROUP + 1.);
+
 fn resolved_panel_widths_for(
     layout: &PanelLayout,
     inspector_open: bool,
@@ -692,8 +791,9 @@ fn resolved_panel_widths_for(
     let mut sidebar = layout.width(PanelKind::Sidebar, inspector_open);
     let mut tree = layout.width(PanelKind::FileTree, inspector_open);
     let mut details = layout.width(PanelKind::Details, inspector_open);
-    let splitter_count = 2. + if inspector_open { 1. } else { 0. };
-    let panel_budget = (window_width - 360. - splitter_count * SPLITTER_WIDTH).max(0.);
+    // Splitters overlay the seam rather than occupying a column, so they take
+    // nothing out of the panel budget.
+    let panel_budget = (window_width - 360.).max(0.);
     let minimum_sidebar = if layout.sidebar_collapsed {
         COLLAPSED_PANEL_WIDTH
     } else {
@@ -724,8 +824,7 @@ fn resolved_panel_widths_for(
 
 fn available_diff_width_for(layout: &PanelLayout, inspector_open: bool, window_width: f32) -> f32 {
     let (sidebar, tree, details) = resolved_panel_widths_for(layout, inspector_open, window_width);
-    let splitter_count = 2. + if inspector_open { 1. } else { 0. };
-    (window_width - sidebar - tree - details - splitter_count * SPLITTER_WIDTH).max(0.)
+    (window_width - sidebar - tree - details).max(0.)
 }
 
 #[derive(Clone)]
@@ -1476,6 +1575,9 @@ struct ReviewTab {
     #[allow(dead_code)] // Reserved opaque presentation slot; this slice does not provision it.
     local_workspace: Option<AnyView>,
     local_visible: bool,
+    local_popover_open: bool,
+    /// Kept alive so the checkout can ask this tab for the full surface.
+    _local_subscription: Option<Subscription>,
     stack: StackViewController,
 }
 
@@ -2175,13 +2277,30 @@ pub struct ReviewWorkspace {
     dismissal_reason_input_owner: Option<DismissalReasonInputOwner>,
     dismissal_reason_subscription: Option<Subscription>,
     setup_open: bool,
+    /// The Settings chip is in the tab strip.
+    settings_open: bool,
+    /// ...and is the selected tab.
+    settings_active: bool,
+    /// History keeps a chip in the tab strip on the same terms as Settings.
+    history_open: bool,
+    history_active: bool,
+    /// Provisioned on first use, because a history read costs a subprocess or
+    /// a network round trip and most sessions never open the page.
+    history: Option<HistoryController>,
     repository_setup_state: LoadState,
     repository_setup_generation: u64,
     repository_picker_open: bool,
     sidebar_search_generation: u64,
     sidebar_search_open: bool,
     sidebar_cache: std::cell::RefCell<view_editor::SidebarCache>,
+    /// Participant pictures for the conversation. Rendering is what discovers
+    /// which ones are wanted, and rendering only has `&self`, so this holds
+    /// the same interior mutability the sidebar cache above does.
+    avatars: std::cell::RefCell<avatars::AvatarCache>,
     sidebar_scroll: UniformListScrollHandle,
+    /// Applications the Local changes control can launch. Probed once: the list
+    /// is read by every header render, and the probe touches the filesystem.
+    editors: Vec<open_with::ExternalApp>,
     #[cfg(feature = "ui-smoke")]
     sidebar_materializations: Cell<usize>,
     command_palette: bool,
@@ -2196,6 +2315,9 @@ pub struct ReviewWorkspace {
     panel_layout: PanelLayout,
     view_editor_scroll: ScrollHandle,
     inspector_scroll: ScrollHandle,
+    /// The open tabs can outrun the strip long before the window is narrow, so
+    /// the strip scrolls and the activated tab is revealed into it.
+    tab_strip_scroll: ScrollHandle,
     checks_focus: FocusHandle,
     actions_control_focus: ActionsControlFocus,
     /// Caller-owned handle for the Checks revision-details disclosure. Owning
@@ -2260,13 +2382,16 @@ impl ReviewWorkspace {
         self.next_request_generation
     }
 
-    fn edit_locally(&mut self, window: &mut Window, cx: &mut Context<Root>) {
+    /// Opens the Local changes popover, provisioning the checkout controller on
+    /// first use so its read-only detection can start immediately. The full
+    /// Local Changes surface is only shown once the popover asks for it.
+    fn open_local_changes(&mut self, window: &mut Window, cx: &mut Context<Root>) {
         use std::os::unix::ffi::OsStringExt;
         let Some(index) = self.active_tab else { return };
         self.capture_scroll(index);
         let tab = &mut self.tabs[index];
         let Some(session) = &tab.session else {
-            self.status = "Load a published revision before opening local editing.".into();
+            self.status = "Load a published revision before opening Local Changes.".into();
             cx.notify();
             return;
         };
@@ -2277,7 +2402,7 @@ impl ReviewWorkspace {
         if let Some(view) = tab.local_workspace.clone()
             && let Ok(local) = view.downcast::<local_checkout::LocalCheckout>()
         {
-            local.update(cx, |local, cx| local.open_relative_path(path, window, cx));
+            local.update(cx, |local, cx| local.select_relative_path(path, cx));
         } else {
             let repository = tab.repository.clone();
             let pull = tab.pull_request.clone();
@@ -2292,26 +2417,54 @@ impl ReviewWorkspace {
                     repository, pull, revision, path, root, window, cx,
                 )
             });
+            // Tab order is not stable across a session, so the request is
+            // matched back to this exact repository and pull request.
+            let key = self.tabs[index].repository.cache_key();
+            let number = self.tabs[index].pull_request.number;
+            let subscription = cx.subscribe(
+                &local,
+                move |root, _, event: &local_checkout::LocalCheckoutEvent, cx| {
+                    let this = &mut root.review;
+                    // A launch closes the popover and is remembered, but it does
+                    // not open the Local Changes surface: the user asked for the
+                    // other application, not for this one. It also leaves an
+                    // already-open surface alone.
+                    let opening =
+                        matches!(event, local_checkout::LocalCheckoutEvent::OpenWorkspace);
+                    if let local_checkout::LocalCheckoutEvent::Launched(preference) = event {
+                        this.remember_editor(preference.clone());
+                    }
+                    if let Some(tab) = this.tabs.iter_mut().find(|tab| {
+                        tab.repository.cache_key() == key && tab.pull_request.number == number
+                    }) {
+                        tab.local_visible = tab.local_visible || opening;
+                        tab.local_popover_open = false;
+                    }
+                    cx.notify();
+                },
+            );
+            let tab = &mut self.tabs[index];
             tab.local_workspace = Some(local.into());
+            tab._local_subscription = Some(subscription);
         }
-        tab.local_visible = true;
+        self.tabs[index].local_popover_open = true;
         cx.notify();
     }
 
+    /// The width the panels actually get. The main section's frame insets its
+    /// content by a margin and a hairline on each side, so budgeting from the
+    /// raw window width overdraws by exactly that much and the rightmost panel
+    /// spills past the frame's border and over its rounded corners.
+    fn panel_budget_width(&self, window: &Window) -> f32 {
+        (window.bounds().size.width.as_f32() - FRAME_CHROME).max(0.)
+    }
+
     fn resolved_panel_widths(&self, window: &Window) -> (f32, f32, f32) {
-        resolved_panel_widths_for(
-            &self.panel_layout,
-            false,
-            window.bounds().size.width.as_f32(),
-        )
+        resolved_panel_widths_for(&self.panel_layout, false, self.panel_budget_width(window))
     }
 
     fn available_diff_width(&self, window: &Window) -> f32 {
-        available_diff_width_for(
-            &self.panel_layout,
-            false,
-            window.bounds().size.width.as_f32(),
-        )
+        available_diff_width_for(&self.panel_layout, false, self.panel_budget_width(window))
     }
 
     fn refresh_auto_layout(&mut self, window: &Window) {
@@ -2682,7 +2835,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let (read_token, token, (result, cache, directive)) = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let current = this.ci_completion_is_current(&token);
                 let disposition = this.general_reads.complete(
                     &read_token,
@@ -2796,7 +2949,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let (read_token, token, (result, cache, directive)) = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let current = this.ci_completion_is_current(&token);
                 let disposition = this.general_reads.complete(
                     &read_token,
@@ -2841,20 +2994,14 @@ impl ReviewWorkspace {
                 .join("Library/Application Support/cibergit")
         });
         let interaction_root = data_root.join("review-interactions");
+        let avatar_root = data_root.join("avatars");
         let collaboration_cache = CollaborationCache::new(data_root.clone());
         let submitted_draft_store = SubmittedReviewDraftStore::new(data_root.clone());
         let workspace_instance = WORKSPACE_INSTANCE.fetch_add(1, Ordering::Relaxed) + 1;
         let notifications = notifications_view::NotificationController::new(data_root.clone());
         cx.bind_keys([
-            KeyBinding::new("cmd-shift-e", local_checkout::EditLocally, None),
+            KeyBinding::new("cmd-shift-e", local_checkout::OpenLocalChanges, None),
             KeyBinding::new("cmd-alt-shift-e", local_checkout::ReturnToReview, None),
-            KeyBinding::new("cmd-s", local_workspace::LocalSave, Some("LocalWorkspace")),
-            KeyBinding::new("cmd-f", local_workspace::LocalFind, Some("LocalWorkspace")),
-            KeyBinding::new(
-                "cmd-alt-f",
-                local_workspace::LocalReplace,
-                Some("LocalWorkspace"),
-            ),
             KeyBinding::new("cmd-shift-c", OpenChecks, None),
             KeyBinding::new("up", PreviousCheck, Some("ChecksPane")),
             KeyBinding::new("down", NextCheck, Some("ChecksPane")),
@@ -2989,13 +3136,20 @@ impl ReviewWorkspace {
             dismissal_reason_input_owner: None,
             dismissal_reason_subscription: None,
             setup_open: startup.repository.is_none() && !startup_restore_pending,
+            settings_open: false,
+            settings_active: false,
+            history_open: false,
+            history_active: false,
+            history: None,
             repository_setup_state: LoadState::Ready,
             repository_setup_generation: 0,
             repository_picker_open: false,
             sidebar_search_generation: 0,
             sidebar_search_open: false,
             sidebar_cache: Default::default(),
+            avatars: std::cell::RefCell::new(avatars::AvatarCache::new(avatar_root)),
             sidebar_scroll: UniformListScrollHandle::new(),
+            editors: open_with::installed_apps(),
             #[cfg(feature = "ui-smoke")]
             sidebar_materializations: Cell::new(0),
             command_palette: false,
@@ -3010,6 +3164,7 @@ impl ReviewWorkspace {
             panel_layout: PanelLayout::default(),
             view_editor_scroll: ScrollHandle::new(),
             inspector_scroll: ScrollHandle::new(),
+            tab_strip_scroll: ScrollHandle::new(),
             checks_focus,
             checks_details_focus,
             jobs_first_row_focus,
@@ -3065,7 +3220,7 @@ impl ReviewWorkspace {
         };
         this.wide = this.available_diff_width(window) >= MIN_SPLIT_DIFF_WIDTH;
         let activation = cx.observe_window_activation(window, |root, window, cx| {
-            let Root::Review(this) = root else { return };
+            let this = &mut root.review;
             this.focused = window.is_window_active();
             if this.focused {
                 this.refresh_all(cx);
@@ -3075,7 +3230,7 @@ impl ReviewWorkspace {
             cx.notify();
         });
         let appearance = cx.observe_window_appearance(window, |root, window, cx| {
-            let Root::Review(this) = root else { return };
+            let this = &mut root.review;
             let style = input_style(palette(is_dark(window)));
             for editor in [
                 &this.query,
@@ -3105,7 +3260,7 @@ impl ReviewWorkspace {
             cx.notify();
         });
         let bounds = cx.observe_window_bounds(window, |root, window, cx| {
-            let Root::Review(this) = root else { return };
+            let this = &mut root.review;
             let wide = this.available_diff_width(window) >= MIN_SPLIT_DIFF_WIDTH;
             if wide != this.wide {
                 this.wide = wide;
@@ -3125,7 +3280,7 @@ impl ReviewWorkspace {
         });
         let composer_changes =
             cx.subscribe(&this.composer_input, |root, _, event: &InputEvent, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if !matches!(event, InputEvent::Change) {
                     return;
                 }
@@ -3135,7 +3290,7 @@ impl ReviewWorkspace {
                 cx.spawn(async move |root, cx| {
                     executor.timer(Duration::from_millis(450)).await;
                     let _ = root.update(cx, |root, cx| {
-                        let Root::Review(this) = root else { return };
+                        let this = &mut root.review;
                         if this.composer_edit_generation != generation {
                             return;
                         }
@@ -3156,9 +3311,8 @@ impl ReviewWorkspace {
         let lifecycle_title_changes = cx.subscribe(
             &this.metadata_title_input,
             |root, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change)
-                    && let Root::Review(this) = root
-                {
+                if matches!(event, InputEvent::Change) {
+                    let this = &mut root.review;
                     this.stage_active_metadata_inputs(cx);
                 }
             },
@@ -3166,9 +3320,8 @@ impl ReviewWorkspace {
         let lifecycle_body_changes = cx.subscribe(
             &this.metadata_body_input,
             |root, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change)
-                    && let Root::Review(this) = root
-                {
+                if matches!(event, InputEvent::Change) {
+                    let this = &mut root.review;
                     this.stage_active_metadata_inputs(cx);
                 }
             },
@@ -3176,17 +3329,16 @@ impl ReviewWorkspace {
         let lifecycle_base_changes = cx.subscribe(
             &this.metadata_base_input,
             |root, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change)
-                    && let Root::Review(this) = root
-                {
+                if matches!(event, InputEvent::Change) {
+                    let this = &mut root.review;
                     this.stage_active_metadata_inputs(cx);
                 }
             },
         );
         let discussion_changes =
             cx.subscribe(&this.discussion_input, |root, _, event: &InputEvent, cx| {
+                let this = &mut root.review;
                 if matches!(event, InputEvent::Change)
-                    && let Root::Review(this) = root
                     && let Some(index) = this.active_tab
                     && this.active_tab_input_restore.is_none()
                     && this
@@ -3205,8 +3357,8 @@ impl ReviewWorkspace {
         let submitted_summary_changes = cx.subscribe(
             &this.submitted_summary_input,
             |root, _, event: &InputEvent, cx| {
+                let this = &mut root.review;
                 if matches!(event, InputEvent::Change)
-                    && let Root::Review(this) = root
                     && let Some(index) = this.active_tab
                 {
                     let body = this.submitted_summary_input.read(cx).value().to_string();
@@ -3222,9 +3374,8 @@ impl ReviewWorkspace {
         let dismissal_reason_changes = cx.subscribe(
             &this.dismissal_reason_input,
             |root, input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change)
-                    && let Root::Review(this) = root
-                {
+                if matches!(event, InputEvent::Change) {
+                    let this = &mut root.review;
                     this.stage_dismissal_reason_change(&input, cx);
                 }
             },
@@ -3232,7 +3383,7 @@ impl ReviewWorkspace {
         this.dismissal_reason_subscription = Some(dismissal_reason_changes);
         this._subscriptions.push(
             cx.subscribe(&this.query, |root, _, event: &InputEvent, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 match event {
                     InputEvent::PressEnter { .. } => {
                         this.apply_filter(this.workspace.view().filter.personal, cx);
@@ -3245,9 +3396,8 @@ impl ReviewWorkspace {
                                 .timer(Duration::from_millis(180))
                                 .await;
                             let _ = root.update(cx, |root, cx| {
-                                if let Root::Review(this) = root
-                                    && this.sidebar_search_generation == generation
-                                {
+                                let this = &mut root.review;
+                                if this.sidebar_search_generation == generation {
                                     this.apply_filter(this.workspace.view().filter.personal, cx);
                                 }
                             });
@@ -3262,10 +3412,8 @@ impl ReviewWorkspace {
         for input in [&this.repository_input, &this.pr_input] {
             this._subscriptions
                 .push(cx.subscribe(input, |root, _, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. })
-                        && let Root::Review(this) = root
-                        && this.setup_open
-                    {
+                    let this = &mut root.review;
+                    if matches!(event, InputEvent::PressEnter { .. }) && this.setup_open {
                         this.submit_repository_setup(cx);
                     }
                 }));
@@ -3354,7 +3502,7 @@ impl ReviewWorkspace {
         self.creation_subscription = Some(cx.subscribe(
             &dialog,
             |root, dialog, event: &pr_creation::OpenAcknowledgedPr, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.creation_dialog.as_ref() != Some(&dialog) || !dialog.read(cx).is_closed() {
                     return;
                 }
@@ -3392,7 +3540,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let plan = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if !token.matches(
                     this.workspace_instance,
                     this.startup_restore_generation,
@@ -3532,7 +3680,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 match result {
                     Ok(mut accounts) => {
                         if let Some(login) = requested.as_ref()
@@ -3594,7 +3742,7 @@ impl ReviewWorkspace {
                     .await;
                 if root
                     .update(cx, |root, cx| {
-                        let Root::Review(this) = root else { return };
+                        let this = &mut root.review;
                         tick += 1;
                         this.resume_general_read_followups(cx);
                         let active_due = this.active_tab.is_some_and(|index| {
@@ -3639,7 +3787,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let completion = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.notifications.complete_bootstrap(completion) {
                     this.refresh_notifications(cx);
                 }
@@ -3693,7 +3841,7 @@ impl ReviewWorkspace {
             cx.spawn(async move |root, cx| {
                 let completion = task.await;
                 let _ = root.update(cx, |root, cx| {
-                    let Root::Review(this) = root else { return };
+                    let this = &mut root.review;
                     let released = this.notifications.release_poll(&completion);
                     if !this.notifications.accepts_poll(&completion) {
                         if released {
@@ -3713,7 +3861,7 @@ impl ReviewWorkspace {
                         cx.spawn(async move |root, cx| {
                             let completion = task.await;
                             let _ = root.update(cx, |root, cx| {
-                                let Root::Review(this) = root else { return };
+                                let this = &mut root.review;
                                 if this.notifications.complete_admission(completion) {
                                     #[cfg(feature = "ui-smoke")]
                                     let requested = this
@@ -3761,7 +3909,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let completion = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 this.notifications.complete_consent(completion);
                 cx.notify();
             });
@@ -3783,7 +3931,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let completion = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.notifications.complete_mark_displayed(completion) {
                     this.status =
                         "Only the exact displayed event IDs were marked read locally.".into();
@@ -3845,6 +3993,10 @@ impl ReviewWorkspace {
         };
         if std::env::var_os("CIBERGIT_SMOKE_PR_LAYOUT").is_some() {
             self.start_pr_layout_smoke(window, cx, output);
+            return;
+        }
+        if std::env::var_os("CIBERGIT_SMOKE_HISTORY").is_some() {
+            self.start_history_smoke(window, cx, output);
             return;
         }
         if std::env::var_os("CIBERGIT_SMOKE_SIDEBAR").is_some() {
@@ -3923,7 +4075,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.smoke_ready())
+                                matches!(&root.review, this if this.smoke_ready())
                             })
                             .unwrap_or(false)
                         })
@@ -3942,7 +4094,8 @@ impl ReviewWorkspace {
                 } else {
                     let _ = window.update(|window, cx| {
                         let _ = weak.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
+                            {
+                                let this = &mut root.review;
                                 this.panel_layout.sidebar_collapsed = true;
                                 this.panel_layout.file_tree_collapsed = true;
                                 this.inspector_open = false;
@@ -3960,7 +4113,7 @@ impl ReviewWorkspace {
                         .update(|window, cx| {
                             let split = weak
                                 .read_with(cx, |root, _| {
-                                    matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| this.tabs[index].diff_rows.iter().any(|row| matches!(row, DiffRow::Split(_)))))
+                                    matches!(&root.review, this if this.active_tab.is_some_and(|index| this.tabs[index].diff_rows.iter().any(|row| matches!(row, DiffRow::Split(_)))))
                                 })
                                 .unwrap_or(false);
                             split
@@ -3976,7 +4129,8 @@ impl ReviewWorkspace {
                         .unwrap_or(false);
                     let _ = window.update(|window, cx| {
                         let _ = weak.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
+                            {
+                                let this = &mut root.review;
                                 this.panel_layout = PanelLayout::default();
                                 this.inspector_open = true;
                                 this.refresh_auto_layout(window);
@@ -3998,7 +4152,7 @@ impl ReviewWorkspace {
                     window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                matches!(&root.review, this if this.active_tab.is_some_and(|index| {
                                     this.wide
                                         && this.tabs[index].session.as_ref().is_some_and(|session| session.diff_mode() == DiffMode::Unified)
                                         && this.tabs[index].diff_rows.iter().all(|row| !matches!(row, DiffRow::Split(_)))
@@ -4013,8 +4167,8 @@ impl ReviewWorkspace {
                 } else {
                     let _ = window.update(|_, cx| {
                         let _ = weak.update(cx, |root, cx| {
-                            if let Root::Review(this) = root
-                                && let Some(index) = this.active_tab
+                            let this = &mut root.review;
+                            if let Some(index) = this.active_tab
                             {
                                 if let Some(session) = this.tabs[index].session.as_mut() {
                                     session.set_diff_mode(DiffMode::Auto);
@@ -4034,7 +4188,7 @@ impl ReviewWorkspace {
                     let narrow = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                matches!(&root.review, this if this.active_tab.is_some_and(|index| {
                                     !this.wide
                                         && this.tabs[index].diff_horizontal.bounds().size.width
                                             < px(MIN_SPLIT_DIFF_WIDTH)
@@ -4055,7 +4209,7 @@ impl ReviewWorkspace {
                     let wide = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                matches!(&root.review, this if this.active_tab.is_some_and(|index| {
                                     this.wide
                                         && effective_diff_viewport_width(&this.tabs[index].diff_rows, &this.tabs[index].diff_horizontal)
                                             >= MIN_SPLIT_DIFF_WIDTH
@@ -4071,9 +4225,7 @@ impl ReviewWorkspace {
                 let actions = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err("smoke started outside review workspace".to_owned());
-                            };
+                            let this = &mut root.review;
                             this.run_primary_smoke_actions(
                                 second_pr,
                                 expect_restore,
@@ -4097,7 +4249,7 @@ impl ReviewWorkspace {
                         let ready = window
                             .update(|_, cx| {
                                 weak.read_with(cx, |root, _| {
-                                    matches!(root, Root::Review(this) if this.tabs.len() >= 2 && this.smoke_ready())
+                                    matches!(&root.review, this if this.tabs.len() >= 2 && this.smoke_ready())
                                 })
                                 .unwrap_or(false)
                             })
@@ -4112,9 +4264,7 @@ impl ReviewWorkspace {
                     Ok(mut actions) => window
                         .update(|window, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 this.run_tab_smoke_actions(
                                     second_pr,
                                     &mut actions,
@@ -4147,6 +4297,63 @@ impl ReviewWorkspace {
                             .is_ok()
                     })
                     .unwrap_or(false);
+                // The PR tab row and the Compare bar under it are chrome that
+                // every tab shares, and they have drifted apart twice. Capture
+                // each tab so the shared rows have evidence of their own rather
+                // than only ever being seen on Conversation.
+                let mut tabs_captured = Vec::new();
+                for (section, open, name) in [
+                    (InspectorSection::Commits, true, "native-pr-tab-commits.png"),
+                    (InspectorSection::Checks, true, "native-pr-tab-checks.png"),
+                    (InspectorSection::Overview, false, "native-pr-tab-files.png"),
+                ] {
+                    let switched = window
+                        .update(|window, cx| {
+                            weak.update(cx, |root, cx| {
+                                let this = &mut root.review;
+                                let Some(index) = this.active_tab else {
+                                    return false;
+                                };
+                                this.inspector_open = open;
+                                this.tabs[index].inspector_section = section;
+                                if section == InspectorSection::Commits {
+                                    this.tabs[index].comparison_picker.expanded = true;
+                                }
+                                this.refresh_auto_layout(window);
+                                cx.notify();
+                                true
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                    let captured = switched
+                        && window
+                            .update(|window, _| {
+                                window
+                                    .render_to_image()
+                                    .and_then(|image| {
+                                        image.save(output.join(name)).map_err(Into::into)
+                                    })
+                                    .is_ok()
+                            })
+                            .unwrap_or(false);
+                    tabs_captured.push(format!("{name}: {captured}"));
+                }
+                let _ = window.update(|window, cx| {
+                    weak.update(cx, |root, cx| {
+                        let this = &mut root.review;
+                        this.inspector_open = true;
+                        if let Some(index) = this.active_tab {
+                            this.tabs[index].inspector_section = InspectorSection::Overview;
+                        }
+                        this.refresh_auto_layout(window);
+                        cx.notify();
+                    })
+                });
                 let _ = window.update(|window, _| {
                     window.resize(size(px(1040.), px(900.)));
                 });
@@ -4154,9 +4361,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|window, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 this.install_review_interaction_smoke(
                                     DiffMode::Unified,
                                     window,
@@ -4176,7 +4381,8 @@ impl ReviewWorkspace {
                 if interaction_unified_installed {
                     let _ = window.update(|_, cx| {
                         let _ = weak.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
+                            {
+                                let this = &mut root.review;
                                 this.scroll_diff_horizontally(None, cx);
                             }
                         });
@@ -4191,9 +4397,7 @@ impl ReviewWorkspace {
                         .update(|window, cx| {
                             let verified = weak
                                 .read_with(cx, |root, _| {
-                                    let Root::Review(this) = root else {
-                                        return Err("smoke left review workspace".to_owned());
-                                    };
+                                    let this = &root.review;
                                     this.validate_review_interaction_smoke(DiffMode::Unified)
                                 })
                                 .unwrap_or_else(|error| {
@@ -4217,9 +4421,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|window, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 this.install_review_interaction_smoke(
                                     DiffMode::SideBySide,
                                     window,
@@ -4239,7 +4441,8 @@ impl ReviewWorkspace {
                 if interaction_split_installed {
                     let _ = window.update(|_, cx| {
                         let _ = weak.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
+                            {
+                                let this = &mut root.review;
                                 this.scroll_diff_horizontally(None, cx);
                             }
                         });
@@ -4254,9 +4457,7 @@ impl ReviewWorkspace {
                         .update(|window, cx| {
                             let verified = weak
                                 .read_with(cx, |root, _| {
-                                    let Root::Review(this) = root else {
-                                        return Err("smoke left review workspace".to_owned());
-                                    };
+                                    let this = &root.review;
                                     this.validate_review_interaction_smoke(DiffMode::SideBySide)
                                 })
                                 .unwrap_or_else(|error| {
@@ -4280,9 +4481,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 this.install_review_reconciliation_smoke(false, cx)?;
                                 this.validate_review_reconciliation_presentation(false)
                             })
@@ -4317,9 +4516,7 @@ impl ReviewWorkspace {
                     let details_installed = window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 let index = this.active_tab.ok_or_else(|| {
                                     "reconciliation smoke has no active tab".to_owned()
                                 })?;
@@ -4358,9 +4555,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 this.install_review_reconciliation_smoke(true, cx)?;
                                 this.validate_review_reconciliation_presentation(false)
                             })
@@ -4393,9 +4588,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|window, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 this.install_submission_confirmation_smoke(window, cx)
                             })
                             .unwrap_or_else(|error| {
@@ -4425,7 +4618,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &mut root.review;
                                 if let Some(index) = this.active_tab {
                                     this.tabs[index].confirmation = None;
                                     if let Some(newer) = this.tabs[index]
@@ -4448,9 +4641,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 this.install_merge_confirmation_smoke(cx)
                             })
                             .unwrap_or_else(|error| {
@@ -4478,7 +4669,8 @@ impl ReviewWorkspace {
                         .unwrap_or(false);
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             this.inspector_scroll.scroll_to_bottom();
                             cx.notify();
                         }
@@ -4510,7 +4702,8 @@ impl ReviewWorkspace {
                 });
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             this.panel_layout.details_width = DEFAULT_DETAILS_WIDTH;
                             this.inspector_scroll.set_offset(point(px(0.), px(0.)));
                             cx.notify();
@@ -4521,9 +4714,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 this.install_long_line_smoke(DiffMode::Unified, cx)
                             })
                             .unwrap_or_else(|error| {
@@ -4540,9 +4731,7 @@ impl ReviewWorkspace {
                     window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 this.scroll_long_line_smoke_to_end(cx)
                             })
                             .unwrap_or_else(|error| {
@@ -4561,9 +4750,7 @@ impl ReviewWorkspace {
                     window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &root.review;
                                 this.validate_long_line_smoke(*maximum, DiffMode::Unified)
                             })
                             .unwrap_or_else(|error| {
@@ -4590,9 +4777,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 this.install_long_line_smoke(DiffMode::SideBySide, cx)
                             })
                             .unwrap_or_else(|error| {
@@ -4609,9 +4794,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &root.review;
                                 this.validate_split_long_line_start()
                             })
                             .unwrap_or_else(|error| {
@@ -4637,9 +4820,7 @@ impl ReviewWorkspace {
                     window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 this.scroll_long_line_smoke_to_end(cx)
                             })
                             .unwrap_or_else(|error| {
@@ -4659,9 +4840,7 @@ impl ReviewWorkspace {
                         window
                             .update(|_, cx| {
                                 weak.read_with(cx, |root, _| {
-                                    let Root::Review(this) = root else {
-                                        return Err("smoke left review workspace".to_owned());
-                                    };
+                                    let this = &root.review;
                                     this.validate_long_line_smoke(*maximum, DiffMode::SideBySide)
                                 })
                                 .unwrap_or_else(|error| {
@@ -4686,7 +4865,8 @@ impl ReviewWorkspace {
                         .unwrap_or(false);
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             this.restore_real_diff_after_long_line(cx);
                         }
                     });
@@ -4698,9 +4878,7 @@ impl ReviewWorkspace {
                 let editor_opened = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return false;
-                            };
+                            let this = &mut root.review;
                             this.open_view_editor(window, cx);
                             true
                         })
@@ -4727,9 +4905,7 @@ impl ReviewWorkspace {
                 let editor_scrolled = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return false;
-                            };
+                            let this = &mut root.review;
                             this.view_editor_scroll.scroll_to_bottom();
                             cx.notify();
                             true
@@ -4744,9 +4920,7 @@ impl ReviewWorkspace {
                 let _ = window.update(|window, cx| {
                     let validation = actions.and_then(|mut actions| {
                         weak.update(cx, |root, _| {
-                            let Root::Review(this) = root else {
-                                return Err("smoke left review workspace".to_owned());
-                            };
+                            let this = &mut root.review;
                             this.validate_smoke_persistence(&actions.expectations)?;
                             actions.report.push_str(
                                 "Persistence: selected/viewed state read back after queued two-tab saves\n",
@@ -4840,7 +5014,7 @@ impl ReviewWorkspace {
                         .map(|actions| actions.report)
                         .unwrap_or_else(|error| format!("Smoke failed: {error}\n"));
                     let report = format!(
-                        "{details}Programmatic native actions: {}\nInitial split review scene capture: {}\nReview scene capture: {}\nInline review unified capture: {}\nInline review split capture: {}\nAmbiguous reconciliation capture: {}\nExpanded recovery detail capture: {}\nResolved reconciliation capture: {}\nSubmission confirmation capture: {}\nMerge confirmation capture: {}\nMerge confirmation controls capture: {}\nUnified long-line end scene capture: {}\nSplit long-line start scene capture: {}\nSplit long-line end scene capture: {}\nFilter editor scene capture: {}\nGrouping editor scene capture: {}\nNative backdrop blending and physical input: not established by in-process capture\nRemote writes: none\n",
+                        "{details}Programmatic native actions: {}\nInitial split review scene capture: {}\nReview scene capture: {}\nPR tab captures: {}\nInline review unified capture: {}\nInline review split capture: {}\nAmbiguous reconciliation capture: {}\nExpanded recovery detail capture: {}\nResolved reconciliation capture: {}\nSubmission confirmation capture: {}\nMerge confirmation capture: {}\nMerge confirmation controls capture: {}\nUnified long-line end scene capture: {}\nSplit long-line start scene capture: {}\nSplit long-line end scene capture: {}\nFilter editor scene capture: {}\nGrouping editor scene capture: {}\nNative backdrop blending and physical input: not established by in-process capture\nRemote writes: none\n",
                         if passed { "passed" } else { "failed" },
                         if expect_restore {
                             "covered by fresh light run"
@@ -4854,6 +5028,7 @@ impl ReviewWorkspace {
                         } else {
                             "failed"
                         },
+                        tabs_captured.join(" · "),
                         if interaction_unified_captured {
                             "native-review-interactions-unified.png"
                         } else {
@@ -4951,7 +5126,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.smoke_ready()
+                                matches!(&root.review, this if this.smoke_ready()
                                     && this.active_tab.is_some_and(|index| {
                                         this.general_reads
                                             .selected_account_readiness_at(
@@ -4975,8 +5150,9 @@ impl ReviewWorkspace {
                     let _ = std::fs::create_dir_all(&output);
                     let diagnostic = window
                         .update(|_, cx| {
-                            weak.read_with(cx, |root, _| match root {
-                                Root::Review(this) => {
+                            weak.read_with(cx, |root, _| {
+                                let this = &root.review;
+                                {
                                     let readiness = this.active_tab.map(|index| {
                                         this.general_reads.selected_account_readiness_at(
                                             &this.tabs[index].repository.account,
@@ -4988,10 +5164,6 @@ impl ReviewWorkspace {
                                         this.smoke_ready(),
                                         this.active_tab,
                                     )
-                                }
-                                Root::Editor(_) => {
-                                    "General-sync readiness timed out outside the review workspace.\n"
-                                        .into()
                                 }
                             })
                             .unwrap_or_else(|error| {
@@ -5013,9 +5185,7 @@ impl ReviewWorkspace {
                 let root_fixture = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err("general-sync smoke left the review workspace".into());
-                            };
+                            let this = &mut root.review;
                             this.install_general_sync_smoke_fixture(cx)
                         })
                         .unwrap_or_else(|error| {
@@ -5046,7 +5216,7 @@ impl ReviewWorkspace {
                     .update(|window, cx| {
                         let visible = weak
                             .read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.status == read_sync::RATE_DEFERRED_NOTICE)
+                                matches!(&root.review, this if this.status == read_sync::RATE_DEFERRED_NOTICE)
                             })
                             .unwrap_or(false);
                         visible
@@ -5060,7 +5230,8 @@ impl ReviewWorkspace {
                     .unwrap_or(false);
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             if let Some(index) = this.active_tab {
                                 this.tabs[index]
                                     .metadata_refresh
@@ -5080,7 +5251,7 @@ impl ReviewWorkspace {
                     .update(|window, cx| {
                         let visible = weak
                             .read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.status == read_sync::POLL_DEFERRED_NOTICE)
+                                matches!(&root.review, this if this.status == read_sync::POLL_DEFERRED_NOTICE)
                             })
                             .unwrap_or(false);
                         visible
@@ -5094,7 +5265,8 @@ impl ReviewWorkspace {
                     .unwrap_or(false);
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             this.status = general_read_failure_notice(Some(
                                 GeneralReadFailureKind::Unavailable,
                             ))
@@ -5113,7 +5285,7 @@ impl ReviewWorkspace {
                     .update(|window, cx| {
                         let visible = weak
                             .read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.status == read_sync::PROVIDER_UNAVAILABLE_NOTICE)
+                                matches!(&root.review, this if this.status == read_sync::PROVIDER_UNAVAILABLE_NOTICE)
                             })
                             .unwrap_or(false);
                         visible
@@ -5396,6 +5568,163 @@ impl ReviewWorkspace {
         ))
     }
 
+    /// The History page over a known graph, wide and narrow.
+    ///
+    /// The graph is the one part of this window whose correctness is visual:
+    /// a lane that steps sideways between two rows, or a merge whose second
+    /// parent never arrives, is invisible to an assertion about state and
+    /// obvious in a capture.
+    #[cfg(feature = "ui-smoke")]
+    fn start_history_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Root>,
+        output: PathBuf,
+    ) {
+        self.install_history_fixture(cx);
+        let selected = "b".repeat(40);
+        let root = cx.weak_entity();
+        window
+            .spawn(cx, async move |window| {
+                std::fs::create_dir_all(&output).unwrap();
+                for (name, select) in [("history", None), ("history-commit", Some(selected))] {
+                    window
+                        .update(|window, cx| {
+                            root.update(cx, |root, cx| {
+                                let this = &mut root.review;
+                                if let (Some(sha), Some(history)) =
+                                    (select.as_deref(), this.history.as_mut())
+                                {
+                                    history.select(sha);
+                                }
+                                this.refresh_auto_layout(window);
+                                cx.notify();
+                            })
+                            .unwrap()
+                        })
+                        .unwrap();
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(400))
+                        .await;
+                    window
+                        .update(|window, _| {
+                            window
+                                .render_to_image()
+                                .unwrap()
+                                .save(output.join(format!("{name}.png")))
+                                .unwrap()
+                        })
+                        .unwrap();
+                }
+                // The narrow capture is where the commit column and the diff
+                // compete for width, which no wide capture can show.
+                window
+                    .update(|window, _| window.resize(size(px(1040.), px(620.))))
+                    .unwrap();
+                window
+                    .background_executor()
+                    .timer(Duration::from_millis(400))
+                    .await;
+                window
+                    .update(|window, _| {
+                        window
+                            .render_to_image()
+                            .unwrap()
+                            .save(output.join("history-narrow.png"))
+                            .unwrap()
+                    })
+                    .unwrap();
+            })
+            .detach();
+    }
+
+    /// A History page with a known graph and no reads of any kind.
+    ///
+    /// The shape is the smallest one that exercises every drawing case: a
+    /// merge with two parents, a side branch that occupies a second lane and
+    /// crosses the rows between, decorations of each kind, and a root commit
+    /// that ends its lane.
+    #[cfg(feature = "ui-smoke")]
+    fn install_history_fixture(&mut self, cx: &mut Context<Root>) {
+        assert!(self.provider_reads_disabled);
+        let repository = Repository {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "workspace".into(),
+            account: cibergit::domain::Account {
+                host: "github.com".into(),
+                login: "maya".into(),
+            },
+            local_path: None,
+        };
+        if self.repositories.is_empty() {
+            self.repositories.push(RepoRuntime {
+                repository: repository.clone(),
+                pull_requests: Arc::new(Vec::new()),
+                state: LoadState::Ready,
+                generation: 0,
+                refresh: RefreshGate::default(),
+            });
+        }
+        let sha = |seed: char| std::iter::repeat_n(seed, 40).collect::<String>();
+        let commit =
+            |seed: char, parents: &[char], headline: &str, refs: Vec<RefLabel>| HistoryCommit {
+                sha: sha(seed),
+                parent_shas: parents.iter().copied().map(sha).collect(),
+                message_headline: headline.into(),
+                author_name: "Maya".into(),
+                author_login: Some("maya".into()),
+                authored_at: "2026-09-14T16:59:12-03:00".into(),
+                committed_at: "2026-09-14T16:59:12-03:00".into(),
+                refs,
+            };
+        let history = cibergit::history::RepositoryHistory {
+            scope: HistoryScope::AllRefs,
+            availability: cibergit::comparisons::InventoryAvailability::Complete,
+            notice: None,
+            commits: vec![
+                commit(
+                    'm',
+                    &['b', 's'],
+                    "Merge the side branch",
+                    vec![RefLabel {
+                        name: "main".into(),
+                        kind: RefKind::Head,
+                    }],
+                ),
+                commit('b', &['a'], "Work on the mainline", Vec::new()),
+                commit(
+                    's',
+                    &['a'],
+                    "Work on the side",
+                    vec![RefLabel {
+                        name: "feature/side".into(),
+                        kind: RefKind::LocalBranch,
+                    }],
+                ),
+                commit(
+                    'a',
+                    &[],
+                    "First commit",
+                    vec![RefLabel {
+                        name: "v1.0".into(),
+                        kind: RefKind::Tag,
+                    }],
+                ),
+            ],
+        };
+        let mut controller =
+            HistoryController::new(repository.cache_key(), repository.account.clone());
+        controller.install(history);
+        self.history = Some(controller);
+        self.history_open = true;
+        self.history_active = true;
+        self.setup_open = false;
+        self.status = "Synthetic history preview · no remote requests".into();
+        cx.notify();
+    }
+
     #[cfg(feature = "ui-smoke")]
     fn install_pr_layout_fixture(&mut self, window: &mut Window, cx: &mut Context<Root>) {
         assert!(self.provider_reads_disabled && self.tabs.is_empty());
@@ -5481,14 +5810,53 @@ impl ReviewWorkspace {
             "merge_eligibility":{"state":"OPEN","draft":false,"mergeable":"MERGEABLE","merge_state_status":"CLEAN","review_status":"REVIEW_REQUIRED","check_status":"SUCCESS","maintainer_can_modify":false,"can_rebase":false,"can_update_branch":false,"auto_merge_enabled":false,"in_merge_queue":false},
             "issue_comments":[{"coordinates":{"provider":"github","host":"github.com","owner":"acme","repository":"workspace","pull_request":203,"remote_id":"COMMENT_preview"},"author":"alex","body":"The description is much easier to read here. Keeping the selected file when switching tabs also makes reviewing simpler.","created_at":"2026-09-14T10:15:00Z","updated_at":"2026-09-14T10:15:00Z","url":"https://github.com/acme/workspace/pull/203"}],"reviews":[],"review_threads":[],"checks":[],"activity_complete":true,"checks_complete":true,"notice":null
         })).unwrap());
-        for (id, name) in [
-            ("CHECK_build", "Build and type check"),
-            ("CHECK_tests", "Unit tests"),
-            ("CHECK_lint", "Lint and formatting"),
+        // Every check state the display can draw, so a capture shows the whole
+        // icon and colour vocabulary rather than one happy column of ticks.
+        for (id, kind, name, status, conclusion, description) in [
+            (
+                "CHECK_build",
+                "CHECK_RUN",
+                "Build and type check",
+                "COMPLETED",
+                Some("SUCCESS"),
+                None,
+            ),
+            (
+                "CHECK_tests",
+                "CHECK_RUN",
+                "Unit tests",
+                "COMPLETED",
+                Some("FAILURE"),
+                None,
+            ),
+            (
+                "CHECK_lint",
+                "CHECK_RUN",
+                "Lint and formatting",
+                "IN_PROGRESS",
+                None,
+                None,
+            ),
+            (
+                "CHECK_docs",
+                "CHECK_RUN",
+                "Docs preview",
+                "COMPLETED",
+                Some("SKIPPED"),
+                None,
+            ),
+            (
+                "STATUS_deploy",
+                "COMMIT_STATUS",
+                "deploy/preview",
+                "PENDING",
+                None,
+                Some("Deployment queued behind one build"),
+            ),
         ] {
             tab.details.as_mut().unwrap().checks.push(serde_json::from_value(serde_json::json!({
                 "coordinates":{"provider":"github","host":"github.com","owner":"acme","repository":"workspace","pull_request":203,"remote_id":id},
-                "kind":"CHECK_RUN","name":name,"status":"COMPLETED","conclusion":"SUCCESS","description":null,"details_url":null,"started_at":null,"completed_at":null,"required":null
+                "kind":kind,"name":name,"status":status,"conclusion":conclusion,"description":description,"details_url":null,"started_at":null,"completed_at":null,"required":null
             })).unwrap());
         }
         tab.details.as_mut().unwrap().checks_complete = false;
@@ -5754,9 +6122,7 @@ impl ReviewWorkspace {
                     window
                         .update(|window, cx| {
                             root.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    unreachable!()
-                                };
+                                let this = &mut root.review;
                                 this.inspector_open = section.is_some();
                                 if let Some(section) = section {
                                     this.tabs[0].inspector_section = section;
@@ -5797,9 +6163,7 @@ impl ReviewWorkspace {
                     window
                         .update(|window, cx| {
                             root.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    unreachable!()
-                                };
+                                let this = &mut root.review;
                                 this.inspector_open = section.is_some();
                                 if let Some(section) = section {
                                     this.tabs[0].inspector_section = section;
@@ -5898,7 +6262,7 @@ impl ReviewWorkspace {
             for &populated in scenes {
                 window.update(|_, cx| {
                     root.update(cx, |root, cx| {
-                        let Root::Review(this) = root else { unreachable!() };
+                        let this = &mut root.review;
                         this.setup_open = false;
                         if populated {
                             let repository = Repository {
@@ -5950,12 +6314,7 @@ impl ReviewWorkspace {
                     .update(|window, cx| {
                         window.resize(size(px(1440.), px(900.)));
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err(
-                                    "Actions Jobs/Logs smoke started outside the review workspace"
-                                        .to_owned(),
-                                );
-                            };
+                            let this = &mut root.review;
                             this.install_actions_jobs_logs_smoke_fixture(window, cx)?;
                             if !this.start_actions_jobs(0, cx) {
                                 return Err(
@@ -5993,7 +6352,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this)
+                                matches!(&root.review, this
                                     if this.tabs.first().is_some_and(|tab| {
                                         tab.ci_read.pane == CiPane::Jobs
                                             && matches!(tab.ci_read.jobs, MemoryRead::Fresh(_))
@@ -6030,7 +6389,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &mut root.review;
                                 this.start_actions_log(0, cx)
                             })
                             .unwrap_or(false)
@@ -6048,7 +6407,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this)
+                                matches!(&root.review, this
                                     if this.tabs.first().is_some_and(|tab| {
                                         tab.ci_read.pane == CiPane::Log
                                             && matches!(tab.ci_read.log, MemoryRead::Fresh(_))
@@ -6074,7 +6433,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|window, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &mut root.review;
                                 let Some(tab) = this.tabs.first_mut() else {
                                     return false;
                                 };
@@ -6116,9 +6475,7 @@ impl ReviewWorkspace {
                 ) = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
-                            let Root::Review(this) = root else {
-                                return (false, 0, 0., false);
-                            };
+                            let this = &root.review;
                             let Some(tab) = this.tabs.first() else {
                                 return (false, 0, 0., false);
                             };
@@ -6162,7 +6519,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &mut root.review;
                                 let Some(tab) = this.tabs.first_mut() else {
                                     return false;
                                 };
@@ -6195,7 +6552,7 @@ impl ReviewWorkspace {
                 let right_offset_reached = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
-                            matches!(root, Root::Review(this) if this.tabs.first().is_some_and(
+                            matches!(&root.review, this if this.tabs.first().is_some_and(
                                 |tab| (-tab.log_horizontal.offset().x.as_f32()
                                     - horizontal_maximum)
                                     .abs()
@@ -6208,7 +6565,7 @@ impl ReviewWorkspace {
                 let (jobs_dispatches, log_dispatches, final_materializations) = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
-                            let Root::Review(this) = root else { return (0, 0, 0) };
+                            let this = &root.review;
                             this.actions_read_fixture.as_ref().map_or((0, 0, 0), |fixture| {
                                 (
                                     fixture.jobs_dispatches.load(Ordering::Relaxed),
@@ -6377,6 +6734,7 @@ impl ReviewWorkspace {
             review_threads: Vec::new(),
             reactions: Vec::new(),
             checks: vec![check],
+            participant_avatars: Default::default(),
             activity_complete: true,
             checks_complete: true,
             notice: Some("SYNTHETIC identity fixture · no live read".into()),
@@ -6497,7 +6855,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.checks_smoke_ready())
+                                matches!(&root.review, this if this.checks_smoke_ready())
                             })
                             .unwrap_or(false)
                         })
@@ -6515,9 +6873,7 @@ impl ReviewWorkspace {
                 let setup = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err("Checks smoke left the review workspace".to_owned());
-                            };
+                            let this = &mut root.review;
                             this.install_checks_smoke_fixture(cx)
                         })
                         .unwrap_or_else(|error| Err(format!("Checks smoke entity unavailable: {error:#}")))
@@ -6549,7 +6905,7 @@ impl ReviewWorkspace {
                 let actions_ready = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             let Some(index) = this.active_tab else { return false };
                             let ready = {
                                 let tab = &mut this.tabs[index];
@@ -6586,9 +6942,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return false;
-                                };
+                                let this = &mut root.review;
                                 let viewport = this.inspector_scroll.bounds();
                                 let Some(row) = this.inspector_scroll.bounds_for_item(2) else {
                                     return false;
@@ -6628,7 +6982,7 @@ impl ReviewWorkspace {
                 let status_ready = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             let Some(index) = this.active_tab else { return false };
                             let ready = {
                                 let tab = &mut this.tabs[index];
@@ -6840,7 +7194,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.smoke_ready())
+                                matches!(&root.review, this if this.smoke_ready())
                             })
                             .unwrap_or(false)
                         })
@@ -6854,9 +7208,7 @@ impl ReviewWorkspace {
                 let opened = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err("pending-file smoke left the review workspace".to_owned());
-                            };
+                            let this = &mut root.review;
                             this.open_file_composer(window, cx);
                             let index = this
                                 .active_tab
@@ -6887,7 +7239,7 @@ impl ReviewWorkspace {
                     let durable = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &root.review;
                                 let Some(index) = this.active_tab else { return false };
                                 matches!(
                                     this.tabs[index].interactions,
@@ -6909,9 +7261,7 @@ impl ReviewWorkspace {
                     window
                         .update(|window, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("pending-file smoke left the review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 let index = this
                                     .active_tab
                                     .ok_or_else(|| "pending-file smoke has no tab".to_owned())?;
@@ -7050,9 +7400,7 @@ impl ReviewWorkspace {
                     Ok((token, draft_id, target, _)) => window
                         .update(|window, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("pending-file smoke left the review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 let index = this
                                     .active_tab
                                     .ok_or_else(|| "pending-file smoke has no tab".to_owned())?;
@@ -7093,7 +7441,7 @@ impl ReviewWorkspace {
                     let durable = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &root.review;
                                 let Some(index) = this.active_tab else { return false };
                                 matches!(
                                     this.tabs[index].interactions,
@@ -7115,7 +7463,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|window, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &mut root.review;
                                 this.composer_input.update(cx, |input, cx| {
                                     input.set_value(body, window, cx);
                                 });
@@ -7135,7 +7483,7 @@ impl ReviewWorkspace {
                         let restored = window
                             .update(|_, cx| {
                                 weak.read_with(cx, |root, _| {
-                                    let Root::Review(this) = root else { return false };
+                                    let this = &root.review;
                                     let Some(index) = this.active_tab else { return false };
                                     matches!(
                                         this.tabs[index].interactions,
@@ -7160,9 +7508,7 @@ impl ReviewWorkspace {
                     Ok((_first_token, draft_id, original_target, readonly_target)) => window
                         .update(|window, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("pending-file smoke left the review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 let index = this
                                     .active_tab
                                     .ok_or_else(|| "pending-file smoke has no tab".to_owned())?;
@@ -7333,7 +7679,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &root.review;
                                 let Some(index) = this.active_tab else { return false };
                                 this.tabs[index].details.is_some()
                                     && !this.tabs[index].details_refresh.active
@@ -7359,9 +7705,7 @@ impl ReviewWorkspace {
                 let (repository, number, real_review) = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
-                            let Root::Review(this) = root else {
-                                return Err("dismissal smoke left review workspace".to_owned());
-                            };
+                            let this = &root.review;
                             let index = this
                                 .active_tab
                                 .ok_or_else(|| "dismissal smoke has no active tab".to_owned())?;
@@ -7508,9 +7852,7 @@ impl ReviewWorkspace {
                 let setup = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err("dismissal smoke left review workspace".to_owned());
-                            };
+                            let this = &mut root.review;
                             let index = this
                                 .active_tab
                                 .ok_or_else(|| "dismissal smoke has no active tab".to_owned())?;
@@ -7890,14 +8232,13 @@ impl ReviewWorkspace {
                 let continuation_scrolled = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             let maximum = this.inspector_scroll.max_offset().y;
                             this.inspector_scroll
                                 .set_offset(point(px(0.), -maximum));
                             cx.notify();
                             maximum > px(0.)
-                        } else {
-                            false
                         }
                     })
                     .unwrap_or(false)
@@ -7968,7 +8309,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &root.review;
                                 let Some(index) = this.active_tab else { return false };
                                 this.tabs[index].details.is_some()
                                     && !this.tabs[index].details_refresh.active
@@ -7994,9 +8335,7 @@ impl ReviewWorkspace {
                 let setup = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err("reaction smoke left review workspace".to_owned());
-                            };
+                            let this = &mut root.review;
                             let index = this
                                 .active_tab
                                 .ok_or_else(|| "reaction smoke has no active tab".to_owned())?;
@@ -8444,7 +8783,8 @@ impl ReviewWorkspace {
                     .unwrap_or(false);
                 let _ = window.update(|window, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             this.tabs[setup.0].inspector_section = InspectorSection::Activity;
                             this.inspector_scroll.set_offset(point(px(0.), px(0.)));
                             this.refresh_auto_layout(window);
@@ -8472,7 +8812,8 @@ impl ReviewWorkspace {
                     .unwrap_or(false);
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             let middle = this.inspector_scroll.max_offset().y / 2.;
                             this.inspector_scroll
                                 .set_offset(point(px(0.), -middle));
@@ -8500,7 +8841,8 @@ impl ReviewWorkspace {
                     .unwrap_or(false);
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             this.inspector_scroll.scroll_to_bottom();
                             cx.notify();
                         }
@@ -8528,7 +8870,7 @@ impl ReviewWorkspace {
                 let stale_paths = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             let index = setup.0;
                             let repository_key = this.tabs[index].repository.cache_key();
                             let current = ReactionCompletionToken {
@@ -8614,7 +8956,7 @@ impl ReviewWorkspace {
                 let handler_started = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             this.dispatch_reaction(
                                 setup.1.clone(),
                                 ReactionContent::Rocket,
@@ -8633,7 +8975,7 @@ impl ReviewWorkspace {
                         let settled = window
                             .update(|_, cx| {
                                 weak.read_with(cx, |root, _| {
-                                    matches!(root, Root::Review(this)
+                                    matches!(&root.review, this
                                         if !this.tabs[setup.0].write_in_flight
                                             && this.tabs[setup.0].reaction_in_flight.is_none()
                                             && this.status.contains("Reaction was not sent"))
@@ -8655,7 +8997,7 @@ impl ReviewWorkspace {
                 let preserved = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &root.review;
                             let tab = &this.tabs[setup.0];
                             let composition = match &tab.interactions {
                                 InteractionState::Ready(controller) => Some((
@@ -8745,7 +9087,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &root.review;
                                 let Some(index) = this.active_tab else { return false };
                                 let tab = &this.tabs[index];
                                 match phase.as_str() {
@@ -8799,9 +9141,7 @@ impl ReviewWorkspace {
                     let setup = window
                         .update(|window, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 let index = this
                                     .active_tab
                                     .ok_or_else(|| "smoke has no active tab".to_owned())?;
@@ -8839,7 +9179,7 @@ impl ReviewWorkspace {
                         let draft_saved = window
                             .update(|_, cx| {
                                 weak.read_with(cx, |root, _| {
-                                    let Root::Review(this) = root else { return false };
+                                    let this = &root.review;
                                     let Some(index) = this.active_tab else { return false };
                                     matches!(&this.tabs[index].interactions, InteractionState::Ready(controller)
                                         if controller.durable_composition.as_ref().is_some_and(|composition| {
@@ -8867,9 +9207,7 @@ impl ReviewWorkspace {
                     let late_baseline = window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 let index = this
                                     .active_tab
                                     .ok_or_else(|| "smoke has no active tab".to_owned())?;
@@ -8902,7 +9240,7 @@ impl ReviewWorkspace {
                         let result = window
                             .update(|_, cx| {
                                 weak.read_with(cx, |root, _| {
-                                    let Root::Review(this) = root else { return false };
+                                    let this = &root.review;
                                     let Some(index) = this.active_tab else { return false };
                                     let durable = match &this.tabs[index].interactions {
                                         InteractionState::Ready(controller) => {
@@ -8979,9 +9317,7 @@ impl ReviewWorkspace {
                     let state = window
                         .update(|window, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("smoke left review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 let index = this
                                     .active_tab
                                     .ok_or_else(|| "smoke has no active tab".to_owned())?;
@@ -9094,9 +9430,7 @@ impl ReviewWorkspace {
                 let state = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err("smoke left review workspace".to_owned());
-                            };
+                            let this = &mut root.review;
                             let index = this
                                 .active_tab
                                 .ok_or_else(|| "smoke has no active tab".to_owned())?;
@@ -9185,7 +9519,8 @@ impl ReviewWorkspace {
                     .await;
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             this.inspector_scroll.set_offset(point(px(0.), px(0.)));
                             cx.notify();
                         }
@@ -9208,8 +9543,8 @@ impl ReviewWorkspace {
                     .unwrap_or(false);
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root
-                            && let Some(index) = this.active_tab
+                        let this = &mut root.review;
+                        if let Some(index) = this.active_tab
                         {
                             this.inspector_scroll.set_offset(point(px(0.), px(0.)));
                             this.tabs[index].inspector_section = InspectorSection::Activity;
@@ -9223,7 +9558,8 @@ impl ReviewWorkspace {
                     .await;
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             this.inspector_scroll.set_offset(point(px(0.), px(0.)));
                             cx.notify();
                         }
@@ -9246,8 +9582,8 @@ impl ReviewWorkspace {
                     .unwrap_or(false);
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root
-                            && let Some(index) = this.active_tab
+                        let this = &mut root.review;
+                        if let Some(index) = this.active_tab
                         {
                             this.inspector_scroll.set_offset(point(px(0.), px(0.)));
                             this.tabs[index].inspector_section = InspectorSection::Checks;
@@ -9261,7 +9597,8 @@ impl ReviewWorkspace {
                     .await;
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             this.inspector_scroll.set_offset(point(px(0.), px(0.)));
                             cx.notify();
                         }
@@ -9285,8 +9622,8 @@ impl ReviewWorkspace {
 
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root
-                            && let Some(index) = this.active_tab
+                        let this = &mut root.review;
+                        if let Some(index) = this.active_tab
                         {
                             this.refresh_details(index, cx);
                         }
@@ -9297,7 +9634,7 @@ impl ReviewWorkspace {
                     let result = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &root.review;
                                 let Some(index) = this.active_tab else { return false };
                                 this.collaboration_read_attempts.load(Ordering::Acquire) > state.7
                                     && !this.tabs[index].details_refresh.active
@@ -9362,7 +9699,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.notifications.is_ready())
+                                matches!(&root.review, this if this.notifications.is_ready())
                             })
                             .unwrap_or(false)
                         })
@@ -9378,9 +9715,7 @@ impl ReviewWorkspace {
                 let fixture = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err("smoke left review workspace".to_owned());
-                            };
+                            let this = &mut root.review;
                             let report = this.notifications.install_smoke_fixture()?;
                             cx.notify();
                             Ok(report)
@@ -9453,9 +9788,7 @@ impl ReviewWorkspace {
                 let installed = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err("Stack tip smoke left review workspace".to_owned());
-                            };
+                            let this = &mut root.review;
                             this.install_tab(repository.clone(), pull_request, cx);
                             let index = this.active_tab.expect("installed Stack tip smoke tab");
                             this.tabs[index].stack = stack_view::StackViewController::new(
@@ -9487,9 +9820,7 @@ impl ReviewWorkspace {
                     let applied = window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err("Stack tip smoke lost review workspace".to_owned());
-                                };
+                                let this = &mut root.review;
                                 let index =
                                     this.active_tab.expect("installed Stack tip smoke tab");
                                 let store = this.tabs[index].stack.store();
@@ -9539,12 +9870,11 @@ impl ReviewWorkspace {
                 }
                 let notice = window
                     .update(|_, cx| {
-                        weak.read_with(cx, |root, _| match root {
-                            Root::Review(this) => this
+                        weak.read_with(cx, |root, _| {
+                            root.review
                                 .active_tab
-                                .and_then(|index| this.tabs[index].stack.tip_notice.clone())
-                                .unwrap_or_default(),
-                            Root::Editor(_) => String::new(),
+                                .and_then(|index| root.review.tabs[index].stack.tip_notice.clone())
+                                .unwrap_or_default()
                         })
                         .unwrap_or_default()
                     })
@@ -9571,10 +9901,7 @@ impl ReviewWorkspace {
                 let account = loop {
                     let account = window
                         .update(|_, cx| {
-                            weak.read_with(cx, |root, _| match root {
-                                Root::Review(this) => this.accounts.first().cloned(),
-                                Root::Editor(_) => None,
-                            })
+                            weak.read_with(cx, |root, _| root.review.accounts.first().cloned())
                             .ok()
                             .flatten()
                         })
@@ -9625,9 +9952,7 @@ impl ReviewWorkspace {
                 let installed = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err("Stack smoke left review workspace".to_owned());
-                            };
+                            let this = &mut root.review;
                             this.install_tab(repository, pull_request, cx);
                             let index = this.active_tab.expect("installed Stack smoke tab");
                             this.tabs[index].stack = controller;
@@ -9682,8 +10007,8 @@ impl ReviewWorkspace {
                 let _ = window.update(|window, cx| {
                     window.resize(size(px(1040.), px(720.)));
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root
-                            && let Some(index) = this.active_tab
+                        let this = &mut root.review;
+                        if let Some(index) = this.active_tab
                         {
                             if let Some(session) = this.tabs[index].stack.session.as_mut() {
                                 session.set_diff_mode(DiffMode::Auto);
@@ -9712,7 +10037,7 @@ impl ReviewWorkspace {
                 let narrow_layers_opened = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             this.toggle_stack_relationships(cx);
                             this.active_tab.is_some_and(|index| {
                                 this.tabs[index].stack.narrow_relationships_open
@@ -9740,7 +10065,7 @@ impl ReviewWorkspace {
                 let narrow_returned = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             this.toggle_stack_relationships(cx);
                             this.active_tab.is_some_and(|index| {
                                 !this.tabs[index].stack.narrow_relationships_open
@@ -9762,7 +10087,7 @@ impl ReviewWorkspace {
                 let maximum = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return 0. };
+                            let this = &mut root.review;
                             let Some(index) = this.active_tab else { return 0. };
                             let maximum = this.tabs[index]
                                 .stack
@@ -11049,7 +11374,7 @@ impl ReviewWorkspace {
                         primary_number = window
                             .update(|_, cx| {
                                 weak.read_with(cx, |root, _| {
-                                    let Root::Review(this) = root else { return 0 };
+                                    let this = &root.review;
                                     this.active_tab
                                         .and_then(|index| this.tabs.get(index))
                                         .map(|tab| tab.pull_request.number)
@@ -11065,7 +11390,7 @@ impl ReviewWorkspace {
                         second_requested = window
                             .update(|_, cx| {
                                 weak.update(cx, |root, cx| {
-                                    let Root::Review(this) = root else { return false };
+                                    let this = &mut root.review;
                                     let Some(repository_key) = this
                                         .tabs
                                         .iter()
@@ -11091,7 +11416,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.smoke_ready()
+                                matches!(&root.review, this if this.smoke_ready()
                                     && [Some(primary_number), second_pr]
                                         .into_iter()
                                         .flatten()
@@ -11121,9 +11446,7 @@ impl ReviewWorkspace {
                     let readiness = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                let Root::Review(this) = root else {
-                                    return "workspace=not-review".to_owned();
-                                };
+                                let this = &root.review;
                                 [Some(primary_number), second_pr]
                                     .into_iter()
                                     .flatten()
@@ -11161,8 +11484,8 @@ impl ReviewWorkspace {
                 }
                 let _ = window.update(|window, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root
-                            && let Some(primary) = this.tabs.iter().position(|tab| {
+                        let this = &mut root.review;
+                        if let Some(primary) = this.tabs.iter().position(|tab| {
                                 tab.pull_request.number == primary_number
                             })
                         {
@@ -11173,9 +11496,7 @@ impl ReviewWorkspace {
                 let before = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
-                            let Root::Review(this) = root else {
-                                return Err("lifecycle smoke left review workspace".to_owned());
-                            };
+                            let this = &root.review;
                             let index = this
                                 .active_tab
                                 .ok_or_else(|| "lifecycle smoke has no tab".to_owned())?;
@@ -11199,7 +11520,8 @@ impl ReviewWorkspace {
                     .unwrap_or_else(|error| Err(format!("smoke window unavailable: {error:#}")));
                 let _ = window.update(|_, cx| {
                     let _ = weak.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             this.inspector_scroll.set_offset(point(px(0.), px(0.)));
                             cx.notify();
                         }
@@ -11226,9 +11548,7 @@ impl ReviewWorkspace {
                 let restored_draft_witness = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
-                            let Root::Review(this) = root else {
-                                return false;
-                            };
+                            let this = &root.review;
                             let Some(index) = this.active_tab else {
                                 return false;
                             };
@@ -11257,8 +11577,8 @@ impl ReviewWorkspace {
                 {
                     let _ = window.update(|_, cx| {
                         let _ = weak.update(cx, |root, cx| {
-                            if let Root::Review(this) = root
-                                && let Some(index) = this.active_tab
+                            let this = &mut root.review;
+                            if let Some(index) = this.active_tab
                             {
                                 this.tabs[index].inspector_section = InspectorSection::Activity;
                                 this.inspector_scroll.set_offset(point(px(0.), px(0.)));
@@ -11289,9 +11609,7 @@ impl ReviewWorkspace {
                 let metadata_scene = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err("lifecycle smoke left review workspace".to_owned());
-                            };
+                            let this = &mut root.review;
                             let index = this.active_tab.ok_or_else(|| "no active tab".to_owned())?;
                             let mut synthetic_snapshot = this.tabs[index]
                                 .lifecycle
@@ -11363,9 +11681,7 @@ impl ReviewWorkspace {
                 let activity_scene = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err("lifecycle smoke left review workspace".to_owned());
-                            };
+                            let this = &mut root.review;
                             let index = this.active_tab.ok_or_else(|| "no active tab".to_owned())?;
                             this.tabs[index].lifecycle.cancel_metadata();
                             this.tabs[index].lifecycle.cancel_confirmation();
@@ -11450,9 +11766,7 @@ impl ReviewWorkspace {
                 let submitted_scene = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else {
-                                return Err("submitted-review smoke left review workspace".to_owned());
-                            };
+                            let this = &mut root.review;
                             let index = this.active_tab.ok_or_else(|| "no active tab".to_owned())?;
                             this.tabs[index].lifecycle.cancel_confirmation();
                             let repository = this.tabs[index].repository.clone();
@@ -11577,7 +11891,7 @@ impl ReviewWorkspace {
                     let durable = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &root.review;
                                 this.active_tab.is_some_and(|index| {
                                     this.tabs[index]
                                         .submitted_summary_editor
@@ -11606,11 +11920,7 @@ impl ReviewWorkspace {
                     window
                         .update(|window, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else {
-                                    return Err(
-                                        "submitted-review smoke left review workspace".to_owned()
-                                    );
-                                };
+                                let this = &mut root.review;
                                 let index = this
                                     .active_tab
                                     .ok_or_else(|| "no active submitted-review tab".to_owned())?;
@@ -11695,7 +12005,7 @@ impl ReviewWorkspace {
                     && window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &mut root.review;
                                 let maximum = this.inspector_scroll.max_offset().y;
                                 let continuation_offset = maximum.min(px(420.));
                                 this.inspector_scroll
@@ -11729,7 +12039,7 @@ impl ReviewWorkspace {
                     window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &mut root.review;
                                 this.cancel_submitted_summary_confirmation(token, cx)
                             })
                             .unwrap_or(false)
@@ -11744,7 +12054,7 @@ impl ReviewWorkspace {
                     window
                         .update(|_, cx| {
                             weak.update(cx, |root, cx| {
-                                let Root::Review(this) = root else { return false };
+                                let this = &mut root.review;
                                 let Some(index) = this.active_tab else { return false };
                                 this.prepare_submitted_summary_confirmation(cx);
                                 let Some(NativeConfirmation::UpdateSubmittedSummary {
@@ -11803,7 +12113,7 @@ impl ReviewWorkspace {
                 let submitted_draft_retained = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &root.review;
                             let Some(index) = this.active_tab else { return false };
                             this.tabs[index].confirmation.is_none()
                                 && this.tabs[index]
@@ -11819,7 +12129,7 @@ impl ReviewWorkspace {
                 let changed_source_draft_retained = window
                     .update(|window, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             let Some(index) = this.active_tab else { return false };
                             let Some(details) = this.tabs[index].details.as_mut() else {
                                 return false;
@@ -11862,7 +12172,7 @@ impl ReviewWorkspace {
                 let unchanged = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &root.review;
                             let Some(index) = this.active_tab else { return false };
                             let Ok((canonical, selected, ..)) = &before else {
                                 return false;
@@ -11881,7 +12191,7 @@ impl ReviewWorkspace {
                 let late_journal_callback_fenced = window
                     .update(|_, cx| {
                         weak.update(cx, |root, _| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             let Some(index) = this.active_tab else { return false };
                             let workspace_instance = this.workspace_instance;
                             let tab_instance = this.tabs[index].instance_generation;
@@ -12053,7 +12363,7 @@ impl ReviewWorkspace {
             let result = paths.await;
             let _ = window.update(|window, cx| {
                 root.update(cx, |root, cx| {
-                    let Root::Review(this) = root else { return };
+                    let this = &mut root.review;
                     if this.repository_setup_generation != generation {
                         return;
                     }
@@ -12147,7 +12457,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.repository_setup_generation != generation {
                     return;
                 }
@@ -12223,7 +12533,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.smoke_ready() && this.active_tab.is_some_and(|index| {
+                                matches!(&root.review, this if this.smoke_ready() && this.active_tab.is_some_and(|index| {
                                     !this.tabs[index].comparison_picker.inventory_loading
                                         && this.tabs[index].comparison_picker.inventory_ready()
                                 }))
@@ -12241,7 +12551,7 @@ impl ReviewWorkspace {
                         .update(|window, cx| {
                             let valid = weak
                                 .read_with(cx, |root, _| {
-                                    matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                    matches!(&root.review, this if this.active_tab.is_some_and(|index| {
                                         matches!(this.tabs[index].comparison_picker.request, ComparisonRequest::CommitRange { .. })
                                             && this.tabs[index].session.as_ref().is_some_and(|session| session.revision() != &this.tabs[index].canonical_full_revision)
                                     }))
@@ -12273,7 +12583,7 @@ impl ReviewWorkspace {
                 let full_installed = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             let Some(index) = this.active_tab else { return false };
                             this.tabs[index].comparison_picker.expanded = true;
                             this.tabs[index].comparison_picker.editing_mode = PickerMode::Commit;
@@ -12303,7 +12613,7 @@ impl ReviewWorkspace {
                 let commit_started = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             let Some(index) = this.active_tab else { return false };
                             this.select_picker_commit(index, 0, cx);
                             true
@@ -12319,7 +12629,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                matches!(&root.review, this if this.active_tab.is_some_and(|index| {
                                     matches!(this.tabs[index].comparison_picker.request, ComparisonRequest::Commit { .. })
                                         && !matches!(this.tabs[index].state, LoadState::Loading(_))
                                 }))
@@ -12346,7 +12656,7 @@ impl ReviewWorkspace {
                 let range_started = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             let Some(index) = this.active_tab else { return false };
                             let count = this.tabs[index].comparison_picker.commits().len();
                             if count < 2
@@ -12372,7 +12682,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                matches!(&root.review, this if this.active_tab.is_some_and(|index| {
                                     matches!(this.tabs[index].comparison_picker.request, ComparisonRequest::CommitRange { .. })
                                         && !matches!(this.tabs[index].state, LoadState::Loading(_))
                                 }))
@@ -12399,7 +12709,7 @@ impl ReviewWorkspace {
                 let since_started = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             let Some(index) = this.active_tab else { return false };
                             this.select_comparison_request(
                                 index,
@@ -12423,7 +12733,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.active_tab.is_some_and(|index| {
+                                matches!(&root.review, this if this.active_tab.is_some_and(|index| {
                                     matches!(this.tabs[index].comparison_picker.request, ComparisonRequest::SinceLastReview { .. })
                                         && !matches!(this.tabs[index].state, LoadState::Loading(_))
                                 }))
@@ -12450,7 +12760,7 @@ impl ReviewWorkspace {
                 let full_returned = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             let Some(index) = this.active_tab else { return false };
                             this.restore_full_comparison(index, cx);
                             true
@@ -12477,7 +12787,7 @@ impl ReviewWorkspace {
                 let poll_indicator_installed = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return false };
+                            let this = &mut root.review;
                             let Some(index) = this.active_tab else { return false };
                             let mut newer = this.tabs[index].canonical_full_revision.clone();
                             newer.head_sha = "f".repeat(40);
@@ -12513,7 +12823,8 @@ impl ReviewWorkspace {
                 let tabs_captured = if let Some(second) = second_pr {
                     let _ = window.update(|_, cx| {
                         let _ = weak.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
+                            {
+                                let this = &mut root.review;
                                 this.open_pr(0, second, cx);
                             }
                         });
@@ -12526,7 +12837,7 @@ impl ReviewWorkspace {
                         let ready = window
                             .update(|_, cx| {
                                 weak.read_with(cx, |root, _| {
-                                    matches!(root, Root::Review(this) if this.tabs.len() >= 2 && this.smoke_ready())
+                                    matches!(&root.review, this if this.tabs.len() >= 2 && this.smoke_ready())
                                 })
                                 .unwrap_or(false)
                             })
@@ -12553,7 +12864,7 @@ impl ReviewWorkspace {
                 let final_started = window
                     .update(|_, cx| {
                         weak.update(cx, |root, cx| {
-                            let Root::Review(this) = root else { return None };
+                            let this = &mut root.review;
                             let primary = this
                                 .tabs
                                 .iter()
@@ -12589,7 +12900,7 @@ impl ReviewWorkspace {
                     let ready = window
                         .update(|_, cx| {
                             weak.read_with(cx, |root, _| {
-                                matches!(root, Root::Review(this) if this.tabs.iter().any(|tab| {
+                                matches!(&root.review, this if this.tabs.iter().any(|tab| {
                                     tab.pull_request.number == 14130
                                         && matches!(tab.comparison_picker.request, ComparisonRequest::CommitRange { .. })
                                         && !matches!(tab.state, LoadState::Loading(_))
@@ -12605,7 +12916,7 @@ impl ReviewWorkspace {
                 let final_state = window
                     .update(|_, cx| {
                         weak.read_with(cx, |root, _| {
-                            let Root::Review(this) = root else { return None };
+                            let this = &root.review;
                             let tab = this
                                 .tabs
                                 .iter()
@@ -12794,7 +13105,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if let Err(error) = result
                     && let Some(tab) = this.tabs.iter_mut().find(|tab| {
                         tab.repository.cache_key() == key && tab.pull_request.number == number
@@ -12870,7 +13181,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let inventory = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(tab) = this.tabs.iter_mut().find(|tab| {
                     token.matches(
                         &tab.repository.cache_key(),
@@ -13056,7 +13367,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(tab_index) = this.tabs.iter().position(|tab| {
                     token.matches(
                         &tab.repository.cache_key(),
@@ -13291,7 +13602,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(tab_index) = this.tabs.iter().position(|tab| {
                     token.matches(
                         &tab.repository.cache_key(),
@@ -13468,7 +13779,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let (read_token, outcome) = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let (result, cache, directive, failure) = outcome.into_parts();
                 if !general_read_callback_is_current(
                     read_workspace_instance,
@@ -13619,7 +13930,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let current = this
                     .tabs
                     .iter()
@@ -13776,6 +14087,7 @@ impl ReviewWorkspace {
                 }
             }
             self.active_tab = Some(index);
+            self.tab_strip_scroll.scroll_to_item(index);
             if let Some(key) = self.tabs[index]
                 .session
                 .as_ref()
@@ -13788,6 +14100,7 @@ impl ReviewWorkspace {
                     .scroll_to_item(row, gpui::ScrollStrategy::Nearest);
             }
             self.setup_open = false;
+            self.settings_active = false;
             cx.notify();
             true
         } else {
@@ -13805,7 +14118,7 @@ impl ReviewWorkspace {
         let restoration_root = weak.clone();
         cx.defer(move |cx| {
             let _ = weak.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.active_tab_input_restore.as_ref() != Some(&token)
                     || this.workspace_instance != token.workspace_instance
                 {
@@ -14155,6 +14468,8 @@ impl ReviewWorkspace {
             review_page: 0,
             local_workspace: None,
             local_visible: false,
+            local_popover_open: false,
+            _local_subscription: None,
         });
         let index = self.tabs.len() - 1;
         if activate {
@@ -14215,7 +14530,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |entity, cx| {
             let result = task.await;
             let _ = entity.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == identity
                         && tab.pull_request.number == number
@@ -14306,9 +14621,8 @@ impl ReviewWorkspace {
         let subscription = cx.subscribe(&input, move |input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 let _ = root.update(cx, |root, cx| {
-                    if let Root::Review(this) = root {
-                        this.stage_dismissal_reason_change(&input, cx);
-                    }
+                    let this = &mut root.review;
+                    this.stage_dismissal_reason_change(&input, cx);
                 });
             }
         });
@@ -14712,7 +15026,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == identity
                         && tab.pull_request.number == number
@@ -14884,7 +15198,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let (composition, durable, outcome) = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == identity && tab.pull_request.number == number
                 }) else {
@@ -14999,7 +15313,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == identity && tab.pull_request.number == number
                 }) else {
@@ -15138,7 +15452,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let (composition, durable, outcome) = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == identity && tab.pull_request.number == number
                 }) else {
@@ -15260,7 +15574,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let (outcome, preference) = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == identity && tab.pull_request.number == number
                 }) else {
@@ -15340,7 +15654,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 this.apply_submitted_draft_load_completion(
                     &token,
                     captured_edit_generation,
@@ -15488,7 +15802,7 @@ impl ReviewWorkspace {
                 .timer(Duration::from_millis(350))
                 .await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.workspace_instance != workspace_instance {
                     return;
                 }
@@ -15559,7 +15873,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 this.apply_submitted_draft_save_completion(&token, result, cx);
             });
         })
@@ -15705,7 +16019,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 this.apply_submitted_draft_clear_completion(&token, &clear.captured, result, cx);
             });
         })
@@ -16071,7 +16385,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(index) = this.apply_dismissal_preparation(&token, result) else {
                     return;
                 };
@@ -16248,7 +16562,7 @@ impl ReviewWorkspace {
                 Ok(outcome) | Err(outcome) => outcome,
             };
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(index) = this.apply_dismissal_completion(&token, outcome) else {
                     return;
                 };
@@ -16489,7 +16803,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this
                     .apply_actions_control_preparation(&token, result)
                     .is_some()
@@ -16665,7 +16979,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let outcome = match result {
                     Ok(dispatch) => {
                         // A mutation never admits a read, but the server's own
@@ -17340,7 +17654,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.workspace_instance != token.workspace_instance
                     || completion_latest.load(Ordering::Acquire) != sequence
                 {
@@ -17523,7 +17837,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.workspace_instance != token.workspace_instance
                     || completion_latest.load(Ordering::Acquire) != sequence
                 {
@@ -17774,7 +18088,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.workspace_instance != token.workspace_instance
                     || completion_latest.load(Ordering::Acquire) != sequence
                 {
@@ -17880,7 +18194,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.workspace_instance != token.workspace_instance
                     || completion_latest.load(Ordering::Acquire) != sequence
                 {
@@ -17990,7 +18304,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.workspace_instance != token.workspace_instance
                     || completion_latest.load(Ordering::Acquire) != sequence
                 {
@@ -18141,7 +18455,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let (composition, durable, outcome) = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.workspace_instance != workspace_instance
                     || completion_latest.load(Ordering::Acquire) != sequence
                 {
@@ -18273,7 +18587,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let outcome = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.workspace_instance != workspace_instance {
                     return;
                 }
@@ -18432,7 +18746,7 @@ impl ReviewWorkspace {
                 Ok(outcome) | Err(outcome) => outcome,
             };
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(index) = this.apply_reaction_completion(&token, outcome, cx) else {
                     return;
                 };
@@ -18666,7 +18980,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await.map_err(|error| format!("{error:#}"));
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(index) = this.apply_action_journal_completion(&completion, result) else {
                     return;
                 };
@@ -18782,7 +19096,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == identity
                         && tab.pull_request.number == number
@@ -18887,7 +19201,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(tab_index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == key
                         && tab.pull_request.number == number
@@ -19053,7 +19367,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let (read_token, outcome) = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let (result, cache, directive, failure) = outcome.into_parts();
                 if !general_read_callback_is_current(
                     read_workspace_instance,
@@ -19183,7 +19497,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let (read_token, outcome) = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let (result, cache, directive, failure) = outcome.into_parts();
                 if !general_read_callback_is_current(
                     read_workspace_instance,
@@ -19518,7 +19832,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == identity
                         && tab.pull_request.number == number
@@ -19573,7 +19887,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(tab_index) = this.tabs.iter().position(|tab| token.matches(this, tab))
                 else {
                     return;
@@ -19660,7 +19974,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 if this.workspace_instance != workspace_instance {
                     return;
                 }
@@ -19790,7 +20104,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let (read_token, outcome) = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let (result, cache, directive, failure) = outcome.into_parts();
                 if !general_read_callback_is_current(
                     read_workspace_instance,
@@ -19960,7 +20274,7 @@ impl ReviewWorkspace {
                             cx.spawn(async move |root, cx| {
                                 let result = task.await;
                                 let _ = root.update(cx, |root, cx| {
-                                    let Root::Review(this) = root else { return };
+                                    let this = &mut root.review;
                                     let Some(index) = this.tabs.iter().position(|tab| {
                                         tab.repository.cache_key() == saved_key
                                             && tab.pull_request.number == number
@@ -20248,7 +20562,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(tab_index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == token.repository_key()
                         && tab.pull_request.number == token.selected_pull_request()
@@ -20305,7 +20619,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(tab_index) = this.tabs.iter().position(|tab| {
                     tab.stack.accepts(&token)
                         && tab
@@ -20423,7 +20737,7 @@ impl ReviewWorkspace {
         cx.spawn(async move |root, cx| {
             let outcome = task.await;
             let _ = root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { return };
+                let this = &mut root.review;
                 let Some(tab_index) = this
                     .tabs
                     .iter()
@@ -20463,6 +20777,26 @@ impl ReviewWorkspace {
         }
         self.refresh_all(cx);
         self.refresh_active(cx);
+    }
+
+    /// Closes one named tab, which is how the strip's close affordance differs
+    /// from the keyboard action. Every draft and in-flight-write barrier the
+    /// action enforces is written against the shared inputs, and those hold the
+    /// active tab's text, so a background tab is brought forward first and then
+    /// closed through the same path rather than removed behind those checks.
+    fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Root>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if self.active_tab != Some(index) {
+            self.activate_tab(index, window, cx);
+            if self.active_tab != Some(index) {
+                // The transition refused and set its own status; leave the tab
+                // open rather than closing one the inputs do not describe.
+                return;
+            }
+        }
+        self.close_tab(&CloseTab, window, cx);
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Root>) {
@@ -20824,84 +21158,70 @@ impl ReviewWorkspace {
             .id("review-workspace")
             .track_focus(&self.focus)
             .on_action(
-                cx.listener(|root, _: &local_checkout::EditLocally, window, cx| {
-                    if let Root::Review(this) = root {
-                        this.edit_locally(window, cx);
-                    }
+                cx.listener(|root, _: &local_checkout::OpenLocalChanges, window, cx| {
+                    let this = &mut root.review;
+                    this.open_local_changes(window, cx);
                 }),
             )
             .on_action(
                 cx.listener(|root, _: &local_checkout::ReturnToReview, _, cx| {
-                    if let Root::Review(this) = root {
-                        if let Some(index) = this.active_tab {
-                            this.tabs[index].local_visible = false;
-                        }
-                        cx.notify();
+                    let this = &mut root.review;
+                    if let Some(index) = this.active_tab {
+                        this.tabs[index].local_visible = false;
                     }
+                    cx.notify();
                 }),
             )
             .on_action(cx.listener(|root, action: &Refresh, window, cx| {
-                if let Root::Review(this) = root {
-                    this.refresh(action, window, cx)
-                }
+                let this = &mut root.review;
+                this.refresh(action, window, cx)
             }))
             .on_action(cx.listener(|root, _: &OpenStackView, _, cx| {
-                if let Root::Review(this) = root {
-                    this.open_stack(cx);
-                }
+                let this = &mut root.review;
+                this.open_stack(cx);
             }))
             .on_action(cx.listener(|root, _: &RefreshStackView, _, cx| {
-                if let Root::Review(this) = root {
-                    this.refresh_stack(cx);
-                }
+                let this = &mut root.review;
+                this.refresh_stack(cx);
             }))
             .on_action(cx.listener(|root, _: &SelectNextStackTip, _, cx| {
-                if let Root::Review(this) = root {
-                    this.select_next_stack_tip(cx);
-                }
+                let this = &mut root.review;
+                this.select_next_stack_tip(cx);
             }))
             .on_action(cx.listener(|root, _: &ToggleStackRelationships, _, cx| {
-                if let Root::Review(this) = root {
-                    this.toggle_stack_relationships(cx);
-                }
+                let this = &mut root.review;
+                this.toggle_stack_relationships(cx);
             }))
             .on_action(cx.listener(|root, _: &ReturnToPullRequest, _, cx| {
-                if let Root::Review(this) = root {
-                    this.return_to_pull_request(cx);
-                }
+                let this = &mut root.review;
+                this.return_to_pull_request(cx);
             }))
             .on_action(cx.listener(|root, action: &NextFile, window, cx| {
-                if let Root::Review(this) = root {
-                    this.next_file(action, window, cx)
-                }
+                let this = &mut root.review;
+                this.next_file(action, window, cx)
             }))
             .on_action(cx.listener(|root, action: &PreviousFile, window, cx| {
-                if let Root::Review(this) = root {
-                    this.previous_file(action, window, cx)
-                }
+                let this = &mut root.review;
+                this.previous_file(action, window, cx)
             }))
             .on_action(cx.listener(|root, action: &CloseTab, window, cx| {
-                if let Root::Review(this) = root {
-                    this.close_tab(action, window, cx)
-                }
+                let this = &mut root.review;
+                this.close_tab(action, window, cx)
             }))
             .on_action(cx.listener(|root, _: &Save, window, cx| {
-                if let Root::Review(this) = root
-                    && this.view_editor.is_open()
-                {
+                let this = &mut root.review;
+                if this.view_editor.is_open() {
                     this.commit_view_editor(false, window, cx);
                 }
             }))
             .on_action(cx.listener(|root, _: &TogglePalette, _, cx| {
-                if let Root::Review(this) = root {
-                    this.command_palette = !this.command_palette;
-                    cx.notify();
-                }
+                let this = &mut root.review;
+                this.command_palette = !this.command_palette;
+                cx.notify();
             }))
             .on_action(cx.listener(|root, _: &ToggleComparisonPicker, window, cx| {
-                if let Root::Review(this) = root
-                    && let Some(index) = this.active_tab
-                {
+                let this = &mut root.review;
+                if let Some(index) = this.active_tab {
                     this.inspector_open = true;
                     this.tabs[index].inspector_section = InspectorSection::Commits;
                     this.tabs[index].comparison_picker.expanded = true;
@@ -20910,62 +21230,52 @@ impl ReviewWorkspace {
                 }
             }))
             .on_action(cx.listener(|root, _: &SelectFullComparison, _, cx| {
-                if let Root::Review(this) = root
-                    && let Some(index) = this.active_tab
-                {
+                let this = &mut root.review;
+                if let Some(index) = this.active_tab {
                     this.restore_full_comparison(index, cx);
                 }
             }))
             .on_action(cx.listener(|root, _: &SelectSinceLastReview, _, cx| {
-                if let Root::Review(this) = root
-                    && let Some(index) = this.active_tab
-                {
+                let this = &mut root.review;
+                if let Some(index) = this.active_tab {
                     this.select_since_last_review(index, cx);
                 }
             }))
             .on_action(
                 cx.listener(|root, _: &SelectPreviousComparisonCommit, _, cx| {
-                    if let Root::Review(this) = root {
-                        this.step_comparison_commit(-1, cx);
-                    }
+                    let this = &mut root.review;
+                    this.step_comparison_commit(-1, cx);
                 }),
             )
             .on_action(cx.listener(|root, _: &SelectNextComparisonCommit, _, cx| {
-                if let Root::Review(this) = root {
-                    this.step_comparison_commit(1, cx);
-                }
+                let this = &mut root.review;
+                this.step_comparison_commit(1, cx);
             }))
             .on_action(cx.listener(|root, _: &ToggleInspector, window, cx| {
-                if let Root::Review(this) = root {
-                    this.inspector_open = !this.inspector_open;
-                    this.refresh_auto_layout(window);
-                    cx.notify();
-                }
+                let this = &mut root.review;
+                this.inspector_open = !this.inspector_open;
+                this.refresh_auto_layout(window);
+                cx.notify();
             }))
             .on_action(cx.listener(|root, _: &OpenChecks, window, cx| {
-                if let Root::Review(this) = root {
-                    this.open_checks(window, cx);
-                }
+                let this = &mut root.review;
+                this.open_checks(window, cx);
             }))
             .on_action(cx.listener(|root, _: &PreviousCheck, window, cx| {
-                if let Root::Review(this) = root {
-                    this.move_check_selection(-1, window, cx);
-                }
+                let this = &mut root.review;
+                this.move_check_selection(-1, window, cx);
             }))
             .on_action(cx.listener(|root, _: &NextCheck, window, cx| {
-                if let Root::Review(this) = root {
-                    this.move_check_selection(1, window, cx);
-                }
+                let this = &mut root.review;
+                this.move_check_selection(1, window, cx);
             }))
             .on_action(cx.listener(|root, _: &PreviousCheckPage, window, cx| {
-                if let Root::Review(this) = root {
-                    this.move_checks_page(-1, window, cx);
-                }
+                let this = &mut root.review;
+                this.move_checks_page(-1, window, cx);
             }))
             .on_action(cx.listener(|root, _: &NextCheckPage, window, cx| {
-                if let Root::Review(this) = root {
-                    this.move_checks_page(1, window, cx);
-                }
+                let this = &mut root.review;
+                this.move_checks_page(1, window, cx);
             }))
             // Enter is bound to this pane-level shortcut in the ChecksPane
             // context, so every focusable control inside the pane inherits the
@@ -20974,17 +21284,16 @@ impl ReviewWorkspace {
             // only while the pane itself holds focus; once focus moves onto a
             // control, Enter is that control's to answer.
             .on_action(cx.listener(|root, _: &ToggleCheckIdentity, window, cx| {
-                if let Root::Review(this) = root {
-                    if !this.checks_focus.is_focused(window) {
-                        cx.propagate();
-                        return;
-                    }
-                    this.toggle_selected_check(cx);
+                let this = &mut root.review;
+                if !this.checks_focus.is_focused(window) {
+                    cx.propagate();
+                    return;
                 }
+                this.toggle_selected_check(cx);
             }))
             .on_action(cx.listener(|root, _: &OpenSelectedCheckJobs, window, cx| {
-                if let Root::Review(this) = root
-                    && let Some(index) = this.active_tab
+                let this = &mut root.review;
+                if let Some(index) = this.active_tab
                     && this.start_actions_jobs(index, cx)
                 {
                     this.focus_current_ci_pane(index, window, cx);
@@ -20992,8 +21301,8 @@ impl ReviewWorkspace {
             }))
             .on_action(
                 cx.listener(|root, _: &RefreshSelectedCheckJobs, window, cx| {
-                    if let Root::Review(this) = root
-                        && let Some(index) = this.active_tab
+                    let this = &mut root.review;
+                    if let Some(index) = this.active_tab
                         && this.start_actions_jobs(index, cx)
                     {
                         this.focus_current_ci_pane(index, window, cx);
@@ -21001,24 +21310,20 @@ impl ReviewWorkspace {
                 }),
             )
             .on_action(cx.listener(|root, _: &PreviousJob, window, cx| {
-                if let Root::Review(this) = root {
-                    this.move_job_selection(-1, window, cx);
-                }
+                let this = &mut root.review;
+                this.move_job_selection(-1, window, cx);
             }))
             .on_action(cx.listener(|root, _: &NextJob, window, cx| {
-                if let Root::Review(this) = root {
-                    this.move_job_selection(1, window, cx);
-                }
+                let this = &mut root.review;
+                this.move_job_selection(1, window, cx);
             }))
             .on_action(cx.listener(|root, _: &PreviousJobPage, window, cx| {
-                if let Root::Review(this) = root {
-                    this.move_jobs_page(-1, window, cx);
-                }
+                let this = &mut root.review;
+                this.move_jobs_page(-1, window, cx);
             }))
             .on_action(cx.listener(|root, _: &NextJobPage, window, cx| {
-                if let Root::Review(this) = root {
-                    this.move_jobs_page(1, window, cx);
-                }
+                let this = &mut root.review;
+                this.move_jobs_page(1, window, cx);
             }))
             // Enter is bound to this pane-level shortcut in the ChecksJobsPane
             // context, and a key binding matches against the focused node's
@@ -21026,111 +21331,102 @@ impl ReviewWorkspace {
             // never answer its own Enter: the pane shortcut would load the
             // already-selected job's log instead of selecting the focused row.
             .on_action(cx.listener(|root, _: &LoadSelectedJobLog, window, cx| {
-                if let Root::Review(this) = root {
-                    if !this.jobs_focus.is_focused(window) {
-                        cx.propagate();
-                        return;
-                    }
-                    if let Some(index) = this.active_tab
-                        && this.start_actions_log(index, cx)
-                    {
-                        this.focus_current_ci_pane(index, window, cx);
-                    }
+                let this = &mut root.review;
+                if !this.jobs_focus.is_focused(window) {
+                    cx.propagate();
+                    return;
+                }
+                if let Some(index) = this.active_tab
+                    && this.start_actions_log(index, cx)
+                {
+                    this.focus_current_ci_pane(index, window, cx);
                 }
             }))
             .on_action(cx.listener(|root, _: &ReturnToChecks, window, cx| {
-                if let Root::Review(this) = root
-                    && let Some(index) = this.active_tab
-                {
+                let this = &mut root.review;
+                if let Some(index) = this.active_tab {
                     this.tabs[index].ci_read.pane = CiPane::Checks;
                     this.focus_current_ci_pane(index, window, cx);
                     cx.notify();
                 }
             }))
             .on_action(cx.listener(|root, _: &ReturnToJobs, window, cx| {
-                if let Root::Review(this) = root
-                    && let Some(index) = this.active_tab
-                {
+                let this = &mut root.review;
+                if let Some(index) = this.active_tab {
                     this.tabs[index].ci_read.pane = CiPane::Jobs;
                     this.focus_current_ci_pane(index, window, cx);
                     cx.notify();
                 }
             }))
             .on_action(cx.listener(|root, action: &CycleDiffMode, window, cx| {
-                if let Root::Review(this) = root {
-                    this.cycle_diff(action, window, cx)
-                }
+                let this = &mut root.review;
+                this.cycle_diff(action, window, cx)
             }))
             .on_action(cx.listener(|root, _: &OpenRepositorySetup, window, cx| {
-                if let Root::Review(this) = root {
-                    this.open_repository_picker(window, cx);
-                }
+                let this = &mut root.review;
+                this.open_repository_picker(window, cx);
+            }))
+            .on_action(cx.listener(|root, _: &OpenSettings, _, cx| {
+                let this = &mut root.review;
+                this.open_settings(cx);
+            }))
+            .on_action(cx.listener(|root, _: &OpenHistory, _, cx| {
+                let this = &mut root.review;
+                this.open_history(None, cx);
             }))
             .on_action(
                 cx.listener(|root, _: &OpenPullRequestCreation, window, cx| {
-                    if let Root::Review(this) = root {
-                        this.open_creation_dialog(window, cx);
-                    }
+                    let this = &mut root.review;
+                    this.open_creation_dialog(window, cx);
                 }),
             )
             .on_action(cx.listener(|root, _: &ComposeInlineComment, window, cx| {
-                if let Root::Review(this) = root {
-                    this.compose_first_selectable(window, cx);
-                }
+                let this = &mut root.review;
+                this.compose_first_selectable(window, cx);
             }))
             .on_action(cx.listener(|root, _: &SaveReviewDraft, _, cx| {
-                if let Root::Review(this) = root {
-                    this.persist_composer(cx);
-                }
+                let this = &mut root.review;
+                this.persist_composer(cx);
             }))
             .on_action(cx.listener(|root, _: &AddPendingComment, _, cx| {
-                if let Root::Review(this) = root {
-                    this.start_comment_write(false, cx);
-                }
+                let this = &mut root.review;
+                this.start_comment_write(false, cx);
             }))
             .on_action(cx.listener(|root, _: &PostImmediateComment, _, cx| {
-                if let Root::Review(this) = root {
-                    this.start_comment_write(true, cx);
-                }
+                let this = &mut root.review;
+                this.start_comment_write(true, cx);
             }))
             .on_action(cx.listener(|root, _: &SubmitReview, _, cx| {
-                if let Root::Review(this) = root {
-                    this.open_submit_confirmation(cx);
-                }
+                let this = &mut root.review;
+                this.open_submit_confirmation(cx);
             }))
             .on_action(cx.listener(|root, _: &MergePullRequest, _, cx| {
-                if let Root::Review(this) = root {
-                    this.prepare_merge_confirmation(cx);
-                }
+                let this = &mut root.review;
+                this.prepare_merge_confirmation(cx);
             }))
             .on_action(cx.listener(|root, _: &EditPrMetadata, window, cx| {
-                if let Root::Review(this) = root {
-                    this.begin_metadata_edit(window, cx);
-                }
+                let this = &mut root.review;
+                this.begin_metadata_edit(window, cx);
             }))
             .on_action(cx.listener(|root, _: &ApplyPrMetadata, _, cx| {
-                if let Root::Review(this) = root {
-                    this.apply_metadata_edit(cx);
-                }
+                let this = &mut root.review;
+                this.apply_metadata_edit(cx);
             }))
             .on_action(cx.listener(|root, _: &NewPrDiscussion, window, cx| {
-                if let Root::Review(this) = root {
-                    this.begin_comment_create(window, cx);
-                }
+                let this = &mut root.review;
+                this.begin_comment_create(window, cx);
             }))
             .on_action(cx.listener(|root, _: &ApplyPrDiscussion, _, cx| {
-                if let Root::Review(this) = root {
-                    this.apply_discussion(cx);
-                }
+                let this = &mut root.review;
+                this.apply_discussion(cx);
             }))
             .on_action(cx.listener(|root, _: &ConfirmPrMutation, _, cx| {
-                if let Root::Review(this) = root {
-                    this.confirm_lifecycle_mutation(cx);
-                }
+                let this = &mut root.review;
+                this.confirm_lifecycle_mutation(cx);
             }))
             .on_action(cx.listener(|root, _: &CancelPrMutation, _, cx| {
-                if let Root::Review(this) = root
-                    && let Some(index) = this.active_tab
+                let this = &mut root.review;
+                if let Some(index) = this.active_tab
                     && !this.tabs[index].write_in_flight
                 {
                     if this.tabs[index].lifecycle.confirmation.is_some() {
@@ -21145,93 +21441,76 @@ impl ReviewWorkspace {
                 }
             }))
             .on_action(cx.listener(|root, _: &FileTreeUp, window, cx| {
-                if let Root::Review(this) = root {
-                    this.move_file_tree_cursor(-1, window, cx);
-                }
+                let this = &mut root.review;
+                this.move_file_tree_cursor(-1, window, cx);
             }))
             .on_action(cx.listener(|root, _: &FileTreeDown, window, cx| {
-                if let Root::Review(this) = root {
-                    this.move_file_tree_cursor(1, window, cx);
-                }
+                let this = &mut root.review;
+                this.move_file_tree_cursor(1, window, cx);
             }))
             .on_action(cx.listener(|root, _: &FileTreeLeft, window, cx| {
-                if let Root::Review(this) = root {
-                    this.file_tree_left(window, cx);
-                }
+                let this = &mut root.review;
+                this.file_tree_left(window, cx);
             }))
             .on_action(cx.listener(|root, _: &FileTreeRight, window, cx| {
-                if let Root::Review(this) = root {
-                    this.file_tree_right(window, cx);
-                }
+                let this = &mut root.review;
+                this.file_tree_right(window, cx);
             }))
             .on_action(cx.listener(|root, _: &FileTreeActivate, window, cx| {
-                if let Root::Review(this) = root {
-                    this.activate_file_tree(window, cx);
-                }
+                let this = &mut root.review;
+                this.activate_file_tree(window, cx);
             }))
             .on_action(cx.listener(|root, _: &ToggleSidebar, window, cx| {
-                if let Root::Review(this) = root {
-                    this.panel_layout.sidebar_collapsed = !this.panel_layout.sidebar_collapsed;
-                    this.refresh_auto_layout(window);
-                    cx.notify();
-                }
+                let this = &mut root.review;
+                this.panel_layout.sidebar_collapsed = !this.panel_layout.sidebar_collapsed;
+                this.refresh_auto_layout(window);
+                cx.notify();
             }))
             .on_action(cx.listener(|root, _: &ToggleFileTree, window, cx| {
-                if let Root::Review(this) = root {
-                    this.panel_layout.file_tree_collapsed = !this.panel_layout.file_tree_collapsed;
-                    this.refresh_auto_layout(window);
-                    cx.notify();
-                }
+                let this = &mut root.review;
+                this.panel_layout.file_tree_collapsed = !this.panel_layout.file_tree_collapsed;
+                this.refresh_auto_layout(window);
+                cx.notify();
             }))
             .on_action(cx.listener(|root, _: &SidebarNarrower, window, cx| {
-                if let Root::Review(this) = root {
-                    this.adjust_panel(PanelKind::Sidebar, -PANEL_KEYBOARD_STEP, window, cx);
-                }
+                let this = &mut root.review;
+                this.adjust_panel(PanelKind::Sidebar, -PANEL_KEYBOARD_STEP, window, cx);
             }))
             .on_action(cx.listener(|root, _: &SidebarWider, window, cx| {
-                if let Root::Review(this) = root {
-                    this.adjust_panel(PanelKind::Sidebar, PANEL_KEYBOARD_STEP, window, cx);
-                }
+                let this = &mut root.review;
+                this.adjust_panel(PanelKind::Sidebar, PANEL_KEYBOARD_STEP, window, cx);
             }))
             .on_action(cx.listener(|root, _: &FileTreeNarrower, window, cx| {
-                if let Root::Review(this) = root {
-                    this.adjust_panel(PanelKind::FileTree, -PANEL_KEYBOARD_STEP, window, cx);
-                }
+                let this = &mut root.review;
+                this.adjust_panel(PanelKind::FileTree, -PANEL_KEYBOARD_STEP, window, cx);
             }))
             .on_action(cx.listener(|root, _: &FileTreeWider, window, cx| {
-                if let Root::Review(this) = root {
-                    this.adjust_panel(PanelKind::FileTree, PANEL_KEYBOARD_STEP, window, cx);
-                }
+                let this = &mut root.review;
+                this.adjust_panel(PanelKind::FileTree, PANEL_KEYBOARD_STEP, window, cx);
             }))
             .on_action(cx.listener(|root, _: &DetailsNarrower, window, cx| {
-                if let Root::Review(this) = root {
-                    this.adjust_panel(PanelKind::Details, -PANEL_KEYBOARD_STEP, window, cx);
-                }
+                let this = &mut root.review;
+                this.adjust_panel(PanelKind::Details, -PANEL_KEYBOARD_STEP, window, cx);
             }))
             .on_action(cx.listener(|root, _: &DetailsWider, window, cx| {
-                if let Root::Review(this) = root {
-                    this.adjust_panel(PanelKind::Details, PANEL_KEYBOARD_STEP, window, cx);
-                }
+                let this = &mut root.review;
+                this.adjust_panel(PanelKind::Details, PANEL_KEYBOARD_STEP, window, cx);
             }))
             .on_action(cx.listener(|root, _: &ResetLayout, window, cx| {
-                if let Root::Review(this) = root {
-                    this.reset_layout(window, cx);
-                }
+                let this = &mut root.review;
+                this.reset_layout(window, cx);
             }))
             .on_action(cx.listener(|root, _: &DiffScrollLeft, _, cx| {
-                if let Root::Review(this) = root {
-                    this.scroll_diff_horizontally(Some(-96.), cx);
-                }
+                let this = &mut root.review;
+                this.scroll_diff_horizontally(Some(-96.), cx);
             }))
             .on_action(cx.listener(|root, _: &DiffScrollRight, _, cx| {
-                if let Root::Review(this) = root {
-                    this.scroll_diff_horizontally(Some(96.), cx);
-                }
+                let this = &mut root.review;
+                this.scroll_diff_horizontally(Some(96.), cx);
             }))
             .on_action(cx.listener(|root, _: &DiffScrollHome, _, cx| {
-                if let Root::Review(this) = root
-                    && let Some(index) = this.active_tab
-                {
+                let this = &mut root.review;
+                if let Some(index) = this.active_tab {
                     let handle = if this.tabs[index].stack.visible {
                         &this.tabs[index].stack.horizontal
                     } else {
@@ -21242,22 +21521,19 @@ impl ReviewWorkspace {
                 }
             }))
             .on_action(cx.listener(|root, _: &DiffScrollEnd, _, cx| {
-                if let Root::Review(this) = root {
-                    this.scroll_diff_horizontally(None, cx);
-                }
+                let this = &mut root.review;
+                this.scroll_diff_horizontally(None, cx);
             }))
             .on_key_down(cx.listener(|root, event: &KeyDownEvent, window, cx| {
-                if let Root::Review(this) = root
-                    && this.view_editor.is_open()
-                    && event.keystroke.key == "escape"
-                {
+                let this = &mut root.review;
+                if this.view_editor.is_open() && event.keystroke.key == "escape" {
                     this.cancel_view_editor(window, cx);
                     cx.stop_propagation();
                 }
             }))
             .size_full()
             .flex()
-            .font_family(UI_FONT)
+            .font_family(ui::TEXT_FONT)
             .ui_text(TextRole::Body)
             .text_color(colors.text)
             .bg(rgba(0x00000000))
@@ -21296,57 +21572,60 @@ impl ReviewWorkspace {
             start_width,
             start_x: Rc::new(Cell::new(None)),
         };
-        div()
-            .id(SharedString::from(format!("splitter-{panel:?}")))
-            .w(px(SPLITTER_WIDTH))
-            .h_full()
-            .flex_none()
-            .cursor(gpui::CursorStyle::ResizeLeftRight)
-            .bg(colors.canvas)
-            .hover(|splitter| splitter.bg(colors.selected))
-            .debug_selector(move || format!("splitter-{panel:?}"))
-            .on_drag(drag, |drag, _, window, cx| {
-                // GPUI supplies a local preview offset here, not a window position.
-                drag.start_x.set(Some(window.mouse_position().x.as_f32()));
-                cx.new(|_| SplitterDragPreview)
-            })
-            .on_drag_move(cx.listener(
-                |root, event: &DragMoveEvent<PanelResizeDrag>, window, cx| {
-                    let Root::Review(this) = root else { return };
-                    let drag = event.drag(cx);
-                    let Some(start_x) = drag.start_x.get() else {
-                        return;
-                    };
-                    let mut delta = event.event.position.x.as_f32() - start_x;
-                    if drag.panel == PanelKind::Details {
-                        delta = -delta;
-                    }
-                    let width = (drag.start_width + delta).clamp(
+        div().w(px(0.)).h_full().flex_none().relative().child(
+            div()
+                .id(SharedString::from(format!("splitter-{panel:?}")))
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(-SPLITTER_WIDTH / 2.))
+                .w(px(SPLITTER_WIDTH))
+                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                .hover(|splitter| splitter.bg(colors.selected))
+                .debug_selector(move || format!("splitter-{panel:?}"))
+                .on_drag(drag, |drag, _, window, cx| {
+                    // GPUI supplies a local preview offset here, not a window position.
+                    drag.start_x.set(Some(window.mouse_position().x.as_f32()));
+                    cx.new(|_| SplitterDragPreview)
+                })
+                .on_drag_move(cx.listener(
+                    |root, event: &DragMoveEvent<PanelResizeDrag>, window, cx| {
+                        let this = &mut root.review;
+                        let drag = event.drag(cx);
+                        let Some(start_x) = drag.start_x.get() else {
+                            return;
+                        };
+                        let mut delta = event.event.position.x.as_f32() - start_x;
+                        if drag.panel == PanelKind::Details {
+                            delta = -delta;
+                        }
+                        let width = (drag.start_width + delta).clamp(
+                            match drag.panel {
+                                PanelKind::Sidebar => MIN_SIDEBAR_WIDTH,
+                                PanelKind::FileTree => MIN_FILE_TREE_WIDTH,
+                                PanelKind::Details => MIN_DETAILS_WIDTH,
+                            },
+                            MAX_PANEL_WIDTH,
+                        );
                         match drag.panel {
-                            PanelKind::Sidebar => MIN_SIDEBAR_WIDTH,
-                            PanelKind::FileTree => MIN_FILE_TREE_WIDTH,
-                            PanelKind::Details => MIN_DETAILS_WIDTH,
-                        },
-                        MAX_PANEL_WIDTH,
-                    );
-                    match drag.panel {
-                        PanelKind::Sidebar => {
-                            this.panel_layout.sidebar_width = width;
-                            this.panel_layout.sidebar_collapsed = false;
+                            PanelKind::Sidebar => {
+                                this.panel_layout.sidebar_width = width;
+                                this.panel_layout.sidebar_collapsed = false;
+                            }
+                            PanelKind::FileTree => {
+                                this.panel_layout.file_tree_width = width;
+                                this.panel_layout.file_tree_collapsed = false;
+                            }
+                            PanelKind::Details => {
+                                this.panel_layout.details_width = width;
+                                this.inspector_open = true;
+                            }
                         }
-                        PanelKind::FileTree => {
-                            this.panel_layout.file_tree_width = width;
-                            this.panel_layout.file_tree_collapsed = false;
-                        }
-                        PanelKind::Details => {
-                            this.panel_layout.details_width = width;
-                            this.inspector_open = true;
-                        }
-                    }
-                    this.refresh_auto_layout(window);
-                    cx.notify();
-                },
-            ))
+                        this.refresh_auto_layout(window);
+                        cx.notify();
+                    },
+                )),
+        )
     }
 
     fn render_sidebar_row(
@@ -21362,7 +21641,7 @@ impl ReviewWorkspace {
             SidebarRow::Group { depth, label } => div()
                 .h(px(ui::ROW_HEIGHT))
                 .pl(px(16. + *depth as f32 * 14.))
-                .pr_3()
+                .pr(px(ui::CELL_INSET))
                 .flex()
                 .items_center()
                 .gap(px(ui::GAP_ICON))
@@ -21423,7 +21702,7 @@ impl ReviewWorkspace {
                             .min_w_0()
                             .h(px(ui::ROW_HEIGHT))
                             .pl(px(30.))
-                            .pr_2()
+                            .pr(px(ui::CELL_INSET))
                             .rounded(px(ui::CONTROL_RADIUS))
                             .flex()
                             .items_center()
@@ -21467,11 +21746,10 @@ impl ReviewWorkspace {
                             )
                             .on_click(move |_, window, cx| {
                                 root.update(cx, |root, cx| {
-                                    if let Root::Review(this) = root
-                                        && this.repositories.get(repository_index).is_some_and(
-                                            |runtime| runtime.repository == click_repository,
-                                        )
-                                    {
+                                    let this = &mut root.review;
+                                    if this.repositories.get(repository_index).is_some_and(
+                                        |runtime| runtime.repository == click_repository,
+                                    ) {
                                         this.open_pr_in_window(
                                             repository_index,
                                             number,
@@ -21487,8 +21765,21 @@ impl ReviewWorkspace {
         }
     }
 
+    /// The material is composited behind the Metal layer, so any surface that
+    /// wants it has to stay unpainted for it to show, and `render_to_image`
+    /// cannot contain it either way. The smoke harness therefore takes the solid
+    /// fill, whose evidence its captures can actually carry.
+    fn window_material(&self) -> SidebarMaterial {
+        if cfg!(feature = "ui-smoke") {
+            SidebarMaterial::Solid
+        } else {
+            self.workspace.preferences.sidebar_material
+        }
+    }
+
     fn render_sidebar(&self, colors: Palette, window: &Window, cx: &mut Context<Root>) -> Div {
         let (sidebar_width, _, _) = self.resolved_panel_widths(window);
+        let glass = glass::sync_window(window, self.window_material());
         if self.panel_layout.sidebar_collapsed {
             return div()
                 .w(px(sidebar_width))
@@ -21496,21 +21787,20 @@ impl ReviewWorkspace {
                 .flex()
                 .flex_col()
                 .items_center()
-                .bg(colors.sidebar)
+                .when(!glass, |sidebar| sidebar.bg(colors.sidebar))
                 .child(
                     div()
                         .id("restore-sidebar")
-                        .mt_12()
+                        .mt(px(ui::GAP_PAGE))
                         .control()
                         .cursor_pointer()
                         .text_color(colors.accent)
                         .child("›")
                         .on_click(cx.listener(|root, _, window, cx| {
-                            if let Root::Review(this) = root {
-                                this.panel_layout.sidebar_collapsed = false;
-                                this.refresh_auto_layout(window);
-                                cx.notify();
-                            }
+                            let this = &mut root.review;
+                            this.panel_layout.sidebar_collapsed = false;
+                            this.refresh_auto_layout(window);
+                            cx.notify();
                         })),
                 );
         }
@@ -21528,9 +21818,8 @@ impl ReviewWorkspace {
                     colors,
                 )
                 .on_click(cx.listener(move |root, _, window, cx| {
-                    if let Root::Review(this) = root {
-                        this.select_view(index, window, cx)
-                    }
+                    let this = &mut root.review;
+                    this.select_view(index, window, cx)
                 }))
             });
         let inventories = self
@@ -21545,11 +21834,11 @@ impl ReviewWorkspace {
         let mut rows = Vec::new();
         if sidebar_rows.is_empty() {
             rows.push(
-                div()
-                    .px(px(ui::PANEL_GUTTER)).py_5()
-                    .child(div().ui_text(TextRole::Subtitle).font_weight(FontWeight::MEDIUM).text_color(colors.muted)
+                layout::lines()
+                    .px(px(ui::PANEL_GUTTER)).py(px(ui::PANEL_GUTTER))
+                    .child(div().ui_text(TextRole::Subtitle).font_weight(ui::WEIGHT_EMPHASIS).text_color(colors.muted)
                         .child(if self.repositories.is_empty() { "No repositories yet" } else { "No pull requests" }))
-                    .child(div().mt_1().ui_text(TextRole::Caption).text_color(colors.muted).line_height(px(18.))
+                    .child(div().ui_text(TextRole::Caption).text_color(colors.muted).line_height(px(18.))
                         .child(if self.repositories.is_empty() { "Add a repository to start reviewing." } else { "Nothing matches these filters. Try another view or clear your search." }))
                     .into_any_element(),
             );
@@ -21559,7 +21848,7 @@ impl ReviewWorkspace {
                 rows.push(
                     div()
                         .px(px(ui::PANEL_GUTTER))
-                        .py_1()
+                        .py(px(ui::GAP_ICON))
                         .ui_text(TextRole::Caption)
                         .text_color(colors.faint)
                         .child(notice)
@@ -21590,9 +21879,8 @@ impl ReviewWorkspace {
                 colors,
             )
             .on_click(cx.listener(move |root, _, _, cx| {
-                if let Root::Review(this) = root {
-                    this.apply_filter(personal.clone(), cx);
-                }
+                let this = &mut root.review;
+                this.apply_filter(personal.clone(), cx);
             }))
         });
         let unread = self.notifications.unread_count();
@@ -21626,16 +21914,19 @@ impl ReviewWorkspace {
             .h_full()
             .flex()
             .flex_col()
-            .bg(colors.sidebar)
+            .when(!glass, |sidebar| sidebar.bg(colors.sidebar))
             .child(
                 div()
                     .id("sidebar-titlebar")
                     .h(px(48.))
                     .flex_none()
                     .pl(px(88.))
-                    .pr_3()
+                    .pr(px(ui::CONTROL_INSET))
                     .flex()
                     .items_center()
+                    // Right-aligned so the toggle stacks directly above the
+                    // notifications bell rather than trailing the traffic lights.
+                    .justify_end()
                     .child(
                         sidebar_icon_button(
                             "collapse-sidebar",
@@ -21644,11 +21935,10 @@ impl ReviewWorkspace {
                             colors,
                         )
                         .on_click(cx.listener(|root, _, window, cx| {
-                            if let Root::Review(this) = root {
-                                this.panel_layout.sidebar_collapsed = true;
-                                this.refresh_auto_layout(window);
-                                cx.notify();
-                            }
+                            let this = &mut root.review;
+                            this.panel_layout.sidebar_collapsed = true;
+                            this.refresh_auto_layout(window);
+                            cx.notify();
                         })),
                     ),
             )
@@ -21664,9 +21954,9 @@ impl ReviewWorkspace {
                     .child(
                         div()
                             .flex_1()
-                            .pl_1()
+                            .pl(px(ui::GAP_ICON))
                             .ui_text(TextRole::Title)
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(ui::WEIGHT_EMPHASIS)
                             .child("cibergit"),
                     )
                     .child(
@@ -21677,15 +21967,14 @@ impl ReviewWorkspace {
                             colors,
                         )
                         .on_click(cx.listener(|root, _, window, cx| {
-                            if let Root::Review(this) = root {
-                                this.sidebar_search_open = !this.sidebar_search_open;
-                                if this.sidebar_search_open {
-                                    this.query.update(cx, |input, cx| input.focus(window, cx));
-                                } else {
-                                    window.focus(&this.focus, cx);
-                                }
-                                cx.notify();
+                            let this = &mut root.review;
+                            this.sidebar_search_open = !this.sidebar_search_open;
+                            if this.sidebar_search_open {
+                                this.query.update(cx, |input, cx| input.focus(window, cx));
+                            } else {
+                                window.focus(&this.focus, cx);
                             }
+                            cx.notify();
                         })),
                     )
                     .child(
@@ -21708,10 +21997,9 @@ impl ReviewWorkspace {
                             )
                         })
                         .on_click(cx.listener(|root, _, _, cx| {
-                            if let Root::Review(this) = root {
-                                this.notifications.toggle_open();
-                                cx.notify();
-                            }
+                            let this = &mut root.review;
+                            this.notifications.toggle_open();
+                            cx.notify();
                         })),
                     ),
             )
@@ -21719,15 +22007,9 @@ impl ReviewWorkspace {
                 self.sidebar_search_open || !view.filter.search.is_empty(),
                 |sidebar| {
                     sidebar.child(
-                        div()
-                            .mx_3()
-                            .mb_2()
-                            .h(px(ui::CONTROL_HEIGHT))
-                            .px(px(ui::CELL_INSET))
-                            .rounded(px(ui::CONTROL_RADIUS))
-                            .bg(colors.selected)
-                            .border_1()
-                            .border_color(colors.border)
+                        ui::text_field(colors.selected, colors.border)
+                            .mx(px(ui::CELL_INSET))
+                            .mb(px(ui::GAP_GROUP))
                             .child(Input::new(&self.query)),
                     )
                 },
@@ -21746,9 +22028,8 @@ impl ReviewWorkspace {
                             colors,
                         )
                         .on_click(cx.listener(|root, _, window, cx| {
-                            if let Root::Review(this) = root {
-                                this.open_creation_dialog(window, cx);
-                            }
+                            let this = &mut root.review;
+                            this.open_creation_dialog(window, cx);
                         })),
                     )
                     .children(filters),
@@ -21757,13 +22038,13 @@ impl ReviewWorkspace {
                 sidebar.child(
                     div()
                         .px(px(ui::CELL_INSET))
-                        .pt_4()
+                        .pt(px(ui::GAP_PAGE))
                         .flex()
                         .flex_col()
                         .child(
                             div()
                                 .px(px(ui::CELL_INSET))
-                                .pb_2()
+                                .pb(px(ui::GAP_GROUP))
                                 .text_color(colors.faint)
                                 .child("Saved views"),
                         )
@@ -21773,15 +22054,15 @@ impl ReviewWorkspace {
             .child(
                 div()
                     .px(px(ui::CONTROL_INSET))
-                    .pt_5()
-                    .pb_1()
+                    .pt(px(ui::GAP_PAGE))
+                    .pb(px(ui::GAP_ICON))
                     .flex_none()
                     .flex()
                     .items_center()
                     .gap(px(ui::GAP_ICON))
                     .child(
                         div()
-                            .pl_1()
+                            .pl(px(ui::GAP_ICON))
                             .flex_1()
                             .text_color(colors.muted)
                             .child("Repositories"),
@@ -21794,17 +22075,24 @@ impl ReviewWorkspace {
                             colors,
                         )
                         .on_click(cx.listener(|root, _, window, cx| {
-                            if let Root::Review(this) = root {
-                                this.open_view_editor(window, cx);
-                            }
+                            let this = &mut root.review;
+                            this.open_view_editor(window, cx);
                         })),
+                    )
+                    .child(
+                        // The fallback glyph is already a branch-and-merge
+                        // shape, which is exactly what this opens.
+                        sidebar_icon_button("open-history", "Commit history", "graph", colors)
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                let this = &mut root.review;
+                                this.open_history(None, cx);
+                            })),
                     )
                     .child(
                         sidebar_icon_button("add-repository", "Add repository", "plus", colors)
                             .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.open_repository_picker(window, cx);
-                                }
+                                let this = &mut root.review;
+                                this.open_repository_picker(window, cx);
                             })),
                     ),
             )
@@ -21815,7 +22103,7 @@ impl ReviewWorkspace {
                     sidebar.child(
                         div()
                             .px(px(ui::PANEL_GUTTER))
-                            .pb_2()
+                            .pb(px(ui::GAP_GROUP))
                             .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child(view_summary(&view)),
@@ -21826,7 +22114,7 @@ impl ReviewWorkspace {
                 sidebar.child(
                     div()
                         .px(px(ui::PANEL_GUTTER))
-                        .pb_2()
+                        .pb(px(ui::GAP_GROUP))
                         .ui_text(TextRole::Caption)
                         .text_color(colors.amber)
                         .child("Some participant information is unavailable."),
@@ -21851,9 +22139,7 @@ impl ReviewWorkspace {
                                         sidebar_rows.len(),
                                         move |range: Range<usize>, _, cx| {
                                             root.read_with(cx, |workspace, _| {
-                                                let Root::Review(this) = workspace else {
-                                                    return Vec::new();
-                                                };
+                                                let this = &workspace.review;
                                                 range
                                                     .map(|index| {
                                                         this.render_sidebar_row(
@@ -21882,13 +22168,23 @@ impl ReviewWorkspace {
                     .children(rows),
             )
             .child(
-                div()
+                // The account footer is where a person looks for their own
+                // settings, so it is the control that opens them rather than a
+                // label sitting next to one.
+                Button::new("open-settings")
+                    .debug_selector(|| "open-settings".into())
                     .h(px(48.))
                     .px(px(ui::PANEL_GUTTER))
                     .flex_none()
                     .flex()
                     .items_center()
                     .gap(px(ui::GAP_GROUP))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgba(0x00000000))
+                    .focus_ring(colors.accent, colors.selected)
+                    .hover(|footer| footer.bg(colors.selected))
+                    .accessibility_label(format!("Settings, signed in as {account_label}"))
                     .child(
                         div()
                             .size(px(22.))
@@ -21900,7 +22196,7 @@ impl ReviewWorkspace {
                             .bg(rgba(0x9165b5ff))
                             .text_color(rgba(0xffffffff))
                             .ui_text(TextRole::Caption)
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(ui::WEIGHT_EMPHASIS)
                             .child(initial),
                     )
                     .child(
@@ -21911,7 +22207,11 @@ impl ReviewWorkspace {
                             .text_ellipsis()
                             .text_color(colors.muted)
                             .child(account_label.to_owned()),
-                    ),
+                    )
+                    .on_click(cx.listener(|root, _, _, cx| {
+                        let this = &mut root.review;
+                        this.open_settings(cx);
+                    })),
             )
     }
 
@@ -21927,7 +22227,7 @@ impl ReviewWorkspace {
                 let uses_prefix = matches!(group, GroupBy::SourcePrefix(_));
                 div()
                     .id(SharedString::from(format!("view-group-{index}")))
-                    .py_2()
+                    .py(px(ui::GAP_GROUP))
                     .border_b_1()
                     .border_color(colors.border)
                     .child(
@@ -21960,14 +22260,13 @@ impl ReviewWorkspace {
                                 )
                                 .on_click(cx.listener(
                                     move |root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            let prefix = ViewEditorInputs::value(
-                                                &this.view_inputs.source_prefix,
-                                                cx,
-                                            );
-                                            this.view_editor.cycle_group(index, &prefix);
-                                            cx.notify();
-                                        }
+                                        let this = &mut root.review;
+                                        let prefix = ViewEditorInputs::value(
+                                            &this.view_inputs.source_prefix,
+                                            cx,
+                                        );
+                                        this.view_editor.cycle_group(index, &prefix);
+                                        cx.notify();
                                     },
                                 )),
                             )
@@ -21980,10 +22279,9 @@ impl ReviewWorkspace {
                                 )
                                 .on_click(cx.listener(
                                     move |root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.view_editor.move_group(index, -1);
-                                            cx.notify();
-                                        }
+                                        let this = &mut root.review;
+                                        this.view_editor.move_group(index, -1);
+                                        cx.notify();
                                     },
                                 )),
                             )
@@ -21996,10 +22294,9 @@ impl ReviewWorkspace {
                                 )
                                 .on_click(cx.listener(
                                     move |root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.view_editor.move_group(index, 1);
-                                            cx.notify();
-                                        }
+                                        let this = &mut root.review;
+                                        this.view_editor.move_group(index, 1);
+                                        cx.notify();
                                     },
                                 )),
                             )
@@ -22012,10 +22309,9 @@ impl ReviewWorkspace {
                                 )
                                 .on_click(cx.listener(
                                     move |root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.view_editor.remove_group(index);
-                                            cx.notify();
-                                        }
+                                        let this = &mut root.review;
+                                        this.view_editor.remove_group(index);
+                                        cx.notify();
                                     },
                                 )),
                             ),
@@ -22024,7 +22320,7 @@ impl ReviewWorkspace {
                         row.child(
                             div()
                                 .ml(px(30.))
-                                .mt_2()
+                                .mt(px(ui::GAP_GROUP))
                                 .flex()
                                 .items_center()
                                 .gap(px(ui::GAP_GROUP))
@@ -22034,11 +22330,9 @@ impl ReviewWorkspace {
                                             "source-group-exact-{index}"
                                         )))
                                         .on_click(cx.listener(move |root, _, _, cx| {
-                                            if let Root::Review(this) = root {
-                                                this.view_editor
-                                                    .set_source_group_prefix(index, None);
-                                                cx.notify();
-                                            }
+                                            let this = &mut root.review;
+                                            this.view_editor.set_source_group_prefix(index, None);
+                                            cx.notify();
                                         })),
                                 )
                                 .child(
@@ -22047,26 +22341,19 @@ impl ReviewWorkspace {
                                             "source-group-prefix-{index}"
                                         )))
                                         .on_click(cx.listener(move |root, _, _, cx| {
-                                            if let Root::Review(this) = root {
-                                                let prefix = ViewEditorInputs::value(
-                                                    &this.view_inputs.source_prefix,
-                                                    cx,
-                                                );
-                                                this.view_editor
-                                                    .set_source_group_prefix(index, Some(&prefix));
-                                                cx.notify();
-                                            }
+                                            let this = &mut root.review;
+                                            let prefix = ViewEditorInputs::value(
+                                                &this.view_inputs.source_prefix,
+                                                cx,
+                                            );
+                                            this.view_editor
+                                                .set_source_group_prefix(index, Some(&prefix));
+                                            cx.notify();
                                         })),
                                 )
                                 .child(
-                                    div()
+                                    layout::text_field(colors)
                                         .flex_1()
-                                        .h(px(ui::CONTROL_HEIGHT))
-                                        .px(px(ui::CELL_INSET))
-                                        .rounded(px(ui::CONTROL_RADIUS))
-                                        .border_1()
-                                        .border_color(colors.border)
-                                        .bg(colors.elevated)
                                         .child(Input::new(&self.view_inputs.source_prefix)),
                                 ),
                         )
@@ -22102,18 +22389,20 @@ impl ReviewWorkspace {
                     .child(
                         div()
                             .px(px(ui::PANEL_GUTTER))
-                            .py_4()
+                            .py(px(ui::PANEL_GUTTER))
                             .border_b_1()
                             .border_color(colors.border)
+                            .flex()
+                            .flex_col()
+                            .gap(px(ui::GAP_ICON))
                             .child(
                                 div()
                                     .ui_text(TextRole::Title)
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .font_weight(ui::WEIGHT_EMPHASIS)
                                     .child("Edit sidebar view"),
                             )
                             .child(
                                 div()
-                                    .mt_1()
                                     .ui_text(TextRole::Caption)
                                     .text_color(colors.muted)
                                     .child(
@@ -22129,7 +22418,10 @@ impl ReviewWorkspace {
                             .min_h_0()
                             .overflow_y_scroll()
                             .px(px(ui::PANEL_GUTTER))
-                            .py_4()
+                            .py(px(ui::PANEL_GUTTER))
+                            .flex()
+                            .flex_col()
+                            .gap(px(ui::GAP_COLUMNS))
                             .child(editor_field("View name", &self.view_inputs.name, colors))
                             .child(section_label("FILTERS", colors))
                             .child(
@@ -22255,19 +22547,16 @@ impl ReviewWorkspace {
                                     "Add grouping level",
                                     colors,
                                 )
-                                .mt_2()
                                 .on_click(cx.listener(
                                     |root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.view_editor.add_group();
-                                            cx.notify();
-                                        }
+                                        let this = &mut root.review;
+                                        this.view_editor.add_group();
+                                        cx.notify();
                                     },
                                 )),
                             )
                             .child(
                                 div()
-                                    .mt_3()
                                     .ui_text(TextRole::Caption)
                                     .text_color(colors.muted)
                                     .child(format!(
@@ -22283,7 +22572,7 @@ impl ReviewWorkspace {
                     .child(
                         div()
                             .px(px(ui::PANEL_GUTTER))
-                            .py_3()
+                            .py(px(ui::GAP_COLUMNS))
                             .flex()
                             .items_center()
                             .justify_between()
@@ -22292,9 +22581,8 @@ impl ReviewWorkspace {
                             .child(
                                 modal_button("delete-view", "Delete view", false, colors).on_click(
                                     cx.listener(|root, _, window, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.delete_current_view(window, cx);
-                                        }
+                                        let this = &mut root.review;
+                                        this.delete_current_view(window, cx);
                                     }),
                                 ),
                             )
@@ -22305,17 +22593,15 @@ impl ReviewWorkspace {
                                     .child(
                                         modal_button("cancel-view-editor", "Cancel", false, colors)
                                             .on_click(cx.listener(|root, _, window, cx| {
-                                                if let Root::Review(this) = root {
-                                                    this.cancel_view_editor(window, cx);
-                                                }
+                                                let this = &mut root.review;
+                                                this.cancel_view_editor(window, cx);
                                             })),
                                     )
                                     .child(
                                         modal_button("save-new-view", "Save as new", false, colors)
                                             .on_click(cx.listener(|root, _, window, cx| {
-                                                if let Root::Review(this) = root {
-                                                    this.commit_view_editor(true, window, cx);
-                                                }
+                                                let this = &mut root.review;
+                                                this.commit_view_editor(true, window, cx);
                                             })),
                                     )
                                     .child(
@@ -22327,9 +22613,8 @@ impl ReviewWorkspace {
                                         )
                                         .on_click(
                                             cx.listener(|root, _, window, cx| {
-                                                if let Root::Review(this) = root {
-                                                    this.commit_view_editor(false, window, cx);
-                                                }
+                                                let this = &mut root.review;
+                                                this.commit_view_editor(false, window, cx);
                                             }),
                                         ),
                                     ),
@@ -22344,34 +22629,79 @@ impl ReviewWorkspace {
         window: &Window,
         cx: &mut Context<Root>,
     ) -> impl IntoElement {
+        // Idempotent, and the sidebar asks the same question, so neither has to
+        // run first for both to agree.
+        let glass = glass::sync_window(window, self.window_material());
         div()
             .flex_1()
             .min_w_0()
             .h_full()
             .flex()
             .flex_col()
-            .bg(colors.canvas)
-            .child(self.render_tabs(colors, cx))
-            .child(if self.setup_open {
-                self.render_setup(colors, cx).into_any_element()
-            } else if let Some(index) = self.active_tab {
-                self.render_review(index, colors, window, cx)
-                    .into_any_element()
-            } else {
-                self.render_empty(colors, cx).into_any_element()
-            })
-            .child(self.render_status(colors))
+            // Nothing here paints over the window material except the frame
+            // below, so the sidebar, this margin, the tab strip and the status
+            // line are all one surface, as in the reference design.
+            .when(!glass, |main| main.bg(colors.canvas))
+            .child(self.render_tabs(colors, glass, cx))
+            .child(
+                // One container holds the whole main section, inset so the
+                // canvas frames it on every side. The tab strip above and the
+                // status line below sit on that canvas rather than inside the
+                // frame, which is what gives the content a top and bottom edge
+                // instead of letting it run into the window. Everything within
+                // shares this one fill; structure comes from hairlines, never
+                // from a second tone.
+                //
+                // This is a flex row, so every screen below sets `min_w_0`.
+                // Without it a screen's automatic minimum size is its
+                // content's, and narrowing the window stops narrowing the
+                // screen: it keeps its width and paints its right-hand side
+                // past the frame, where this `overflow_hidden` clips it and the
+                // pointer can no longer reach it.
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .mx(px(ui::GAP_GROUP))
+                    .mb(px(ui::GAP_GROUP))
+                    .overflow_hidden()
+                    .rounded(px(ui::WINDOW_RADIUS))
+                    // A content mask in this GPUI is a plain rectangle, so a
+                    // rounded container cannot clip what it holds: anything that
+                    // reaches the bottom edge paints straight over the two corner
+                    // arcs and squares them off. Keeping the arcs' own band clear
+                    // is what lets the radius survive contact with a scrolled list.
+                    .pb(px(ui::WINDOW_RADIUS))
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.surface)
+                    .child(if self.settings_active {
+                        self.render_settings(colors, cx).into_any_element()
+                    } else if self.history_active {
+                        self.render_history(colors, window, cx).into_any_element()
+                    } else if self.setup_open {
+                        self.render_setup(colors, cx).into_any_element()
+                    } else if let Some(index) = self.active_tab {
+                        self.render_review(index, colors, window, cx)
+                            .into_any_element()
+                    } else {
+                        self.render_empty(colors, cx).into_any_element()
+                    }),
+            )
+            .child(self.render_status(colors, glass))
     }
 
-    fn render_tabs(&self, colors: Palette, cx: &mut Context<Root>) -> impl IntoElement {
+    fn render_tabs(
+        &self,
+        colors: Palette,
+        glass: bool,
+        cx: &mut Context<Root>,
+    ) -> impl IntoElement {
         let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
             let active = self.active_tab == Some(index);
             let id = SharedString::from(format!("tab-{index}"));
             let close_id = SharedString::from(format!("close-tab-{index}"));
-            let close_label = format!(
-                "Close {} #{}",
-                tab.repository.name, tab.pull_request.number
-            );
+            let close_label = format!("Close {} #{}", tab.repository.name, tab.pull_request.number);
             // Open PRs read as rounded chips on the canvas. Dividers between
             // them and a rule under the strip would repeat what the active
             // chip's own fill already says. The chip is painted at control
@@ -22379,6 +22709,10 @@ impl ReviewWorkspace {
             // shrink with it.
             div()
                 .id(id.clone())
+                .debug_selector({
+                    let id = id.clone();
+                    move || id.to_string()
+                })
                 .group(id.clone())
                 .h_full()
                 .flex_none()
@@ -22419,7 +22753,7 @@ impl ReviewWorkspace {
                             Button::new(close_id.clone())
                                 .debug_selector({
                                     let close_id = close_id.clone();
-                                    move || close_id.clone()
+                                    move || close_id.to_string()
                                 })
                                 .group(close_id.clone())
                                 .size(px(ui::BADGE_HEIGHT))
@@ -22447,26 +22781,1198 @@ impl ReviewWorkspace {
                                     cx.stop_propagation();
                                 })
                                 .on_click(cx.listener(move |root, _, window, cx| {
-                                    if let Root::Review(this) = root {
-                                        this.close_tab_at(index, window, cx);
-                                    }
+                                    let this = &mut root.review;
+                                    this.close_tab_at(index, window, cx);
                                 })),
                         ),
                 )
                 .on_click(cx.listener(move |root, _, window, cx| {
-                    if let Root::Review(this) = root {
-                        this.activate_tab(index, window, cx);
-                    }
+                    let this = &mut root.review;
+                    this.activate_tab(index, window, cx);
                 }))
         });
+        let settings_active = self.settings_active;
+        let history_active = self.history_active;
         div()
+            .id("tab-strip")
+            .debug_selector(|| "tab-strip".to_owned())
             .h(px(ui::DESKTOP_HIT))
             .px(px(ui::GAP_FIELD))
             .flex()
             .items_center()
             .gap(px(ui::GAP_ICON))
-            .bg(colors.canvas)
+            // Tabs keep their own width rather than shrinking towards
+            // illegibility, so once they outrun the strip the strip scrolls.
+            // `activate_tab` reveals whatever it selected, which is what keeps
+            // the keyboard and the close shortcut usable past the edge.
+            .min_w_0()
+            .overflow_x_scroll()
+            .restrict_scroll_to_axis()
+            .track_scroll(&self.tab_strip_scroll)
+            .when(!glass, |strip| strip.bg(colors.canvas))
             .children(tabs)
+            // Settings and History keep chips of their own rather than
+            // replacing the open pull requests. Both are places you go back and
+            // forth from while reading a pull request — Settings because its
+            // choices change how the window looks, which can only be judged by
+            // returning to real content, and History because it is the other
+            // half of the question a diff is asking.
+            .when(self.settings_open, |strip| {
+                strip.child(utility_tab(
+                    "settings",
+                    "Settings",
+                    settings_active,
+                    colors,
+                    cx,
+                    |this, cx| this.open_settings(cx),
+                    |this, cx| this.close_settings(cx),
+                ))
+            })
+            .when(self.history_open, |strip| {
+                strip.child(utility_tab(
+                    "history",
+                    "History",
+                    history_active,
+                    colors,
+                    cx,
+                    |this, cx| this.open_history(None, cx),
+                    |this, cx| this.close_history(cx),
+                ))
+            })
+    }
+
+    /// The repository History opens against: the active pull request's, else
+    /// the first one configured. This is the same resolution the sidebar's
+    /// account footer uses, so the page opens on what the window is already
+    /// about.
+    fn default_history_repository(&self) -> Option<Repository> {
+        self.active_tab
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.repository.clone())
+            .or_else(|| {
+                self.repositories
+                    .first()
+                    .map(|runtime| runtime.repository.clone())
+            })
+    }
+
+    /// History opens as a page in the tab strip rather than as a sheet, for the
+    /// same reason Settings does: it is a place you go back and forth from
+    /// while reading a pull request, not something to dismiss before working.
+    fn open_history(&mut self, repository: Option<Repository>, cx: &mut Context<Root>) {
+        let Some(repository) = repository.or_else(|| self.default_history_repository()) else {
+            self.status = "Add a repository before opening its history.".into();
+            cx.notify();
+            return;
+        };
+        let key = repository.cache_key();
+        let account = repository.account.clone();
+        let fresh = match self.history.as_mut() {
+            Some(history) => history.retarget(key.clone(), account.clone()),
+            None => {
+                self.history = Some(HistoryController::new(key.clone(), account.clone()));
+                true
+            }
+        };
+        self.history_open = true;
+        self.history_active = true;
+        self.settings_active = false;
+        self.setup_open = false;
+        self.command_palette = false;
+        if fresh {
+            self.load_history(cx);
+        }
+        cx.notify();
+    }
+
+    fn close_history(&mut self, cx: &mut Context<Root>) {
+        self.history_open = false;
+        self.history_active = false;
+        // Dropping the controller releases the loaded commits and the diff
+        // rows with them; reopening reads afresh rather than showing a history
+        // that has since moved.
+        self.history = None;
+        self.setup_open =
+            !self.settings_active && self.tabs.is_empty() && self.startup_pr.is_none();
+        cx.notify();
+    }
+
+    fn history_repository(&self) -> Option<Repository> {
+        let history = self.history.as_ref()?;
+        let key = history.repository_key();
+        self.repositories
+            .iter()
+            .map(|runtime| &runtime.repository)
+            .chain(self.tabs.iter().map(|tab| &tab.repository))
+            .find(|repository| repository.cache_key() == key)
+            .cloned()
+    }
+
+    /// Read the repository's history. Local when there is a checkout — it is
+    /// faster, works offline, and is the only source that can show every
+    /// branch at once — and GitHub otherwise.
+    fn load_history(&mut self, cx: &mut Context<Root>) {
+        let generation = self.issue_request_generation();
+        let Some(repository) = self.history_repository() else {
+            if let Some(history) = self.history.as_mut() {
+                history.fail("This repository is no longer configured.".into());
+            }
+            cx.notify();
+            return;
+        };
+        let Some(history) = self.history.as_mut() else {
+            return;
+        };
+        #[cfg(feature = "ui-smoke")]
+        if self.provider_reads_disabled && repository.local_path.is_none() {
+            // A synthetic scene installs its own graph. Reaching the provider
+            // here would replace it with a transport failure.
+            return;
+        }
+        let token = history.begin_read(generation);
+        let scope = history.scope.clone();
+        let task = cx.background_spawn(async move {
+            if let Some(path) = repository.local_path.as_deref() {
+                return local_history(path, &scope).map_err(|error| format!("{error:#}"));
+            }
+            GithubProvider::new(repository.account.clone())
+                .repository_history(&repository, &scope)
+                .map_err(|error| format!("{error:#}"))
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                let Some(history) = this.history.as_mut().filter(|it| it.accepts(&token)) else {
+                    return;
+                };
+                match result {
+                    Ok(read) => history.install(read),
+                    Err(error) => history.fail(format!("History unavailable: {error}")),
+                }
+                // A history whose selection survived still has its diff; one
+                // that lost it has nothing to load.
+                if this
+                    .history
+                    .as_ref()
+                    .is_some_and(|history| history.selected.is_some())
+                {
+                    this.load_commit_diff(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn select_history_commit(&mut self, sha: &str, cx: &mut Context<Root>) {
+        let Some(history) = self.history.as_mut() else {
+            return;
+        };
+        if !history.select(sha) {
+            return;
+        }
+        self.load_commit_diff(cx);
+        cx.notify();
+    }
+
+    fn set_history_scope(&mut self, scope: HistoryScope, cx: &mut Context<Root>) {
+        let changed = self
+            .history
+            .as_mut()
+            .is_some_and(|history| history.set_scope(scope));
+        if changed {
+            self.load_history(cx);
+        }
+    }
+
+    /// Load the selected commit's changes.
+    ///
+    /// A commit's diff is the comparison between its first parent and itself,
+    /// which is the pair GitHub's own commit page shows for a merge too. A root
+    /// commit has no parent, so it is compared against the empty tree and reads
+    /// as the addition of everything in it.
+    fn load_commit_diff(&mut self, cx: &mut Context<Root>) {
+        let generation = self.issue_request_generation();
+        let Some(repository) = self.history_repository() else {
+            return;
+        };
+        let Some(history) = self.history.as_mut() else {
+            return;
+        };
+        let Some(commit) = history.selected_commit().cloned() else {
+            return;
+        };
+        #[cfg(feature = "ui-smoke")]
+        if self.provider_reads_disabled && repository.local_path.is_none() {
+            return;
+        }
+        let Some(token) = history.begin_diff(generation) else {
+            return;
+        };
+        let task = cx.background_spawn(async move {
+            let parent = commit.first_parent().map(str::to_owned);
+            match repository.local_path.as_deref() {
+                Some(path) => {
+                    let base = match parent {
+                        Some(parent) => parent,
+                        None => empty_tree_oid(path).map_err(|error| format!("{error:#}"))?,
+                    };
+                    let revision = Revision {
+                        base_sha: base,
+                        head_sha: commit.sha.clone(),
+                    };
+                    // The metadata-only enumeration: patches load per file as
+                    // they are selected, so opening a thousand-file commit does
+                    // not read a thousand patches first.
+                    local_inventory(path, &revision).map_err(|error| format!("{error:#}"))
+                }
+                None => {
+                    let parent = parent.ok_or_else(|| {
+                        "GitHub cannot compare a root commit against its absent parent. Clone this repository locally to read its first commit."
+                            .to_owned()
+                    })?;
+                    let revision = Revision {
+                        base_sha: parent,
+                        head_sha: commit.sha.clone(),
+                    };
+                    GithubProvider::new(repository.account.clone())
+                        .direct_comparison(&repository, &revision)
+                        .map_err(|error| format!("{error:#}"))
+                }
+            }
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                let wide = this.wide;
+                let Some(history) = this.history.as_mut().filter(|it| it.accepts_diff(&token))
+                else {
+                    return;
+                };
+                match result {
+                    Ok(comparison) => history.install_diff(ReviewSession::new(comparison), wide),
+                    Err(error) => {
+                        history.fail_diff(format!("This commit's changes are unavailable: {error}"))
+                    }
+                }
+                this.load_selected_history_file(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Hydrate the selected file's patch, which the enumeration left out.
+    /// `full_pr: false` keeps the exact revision pair: this is a commit's own
+    /// diff, not a pull request's, so there is no merge-base to rewrite to.
+    fn load_selected_history_file(&mut self, cx: &mut Context<Root>) {
+        let Some(repository) = self.history_repository() else {
+            return;
+        };
+        let Some(path) = repository.local_path.clone() else {
+            return;
+        };
+        let Some(history) = self.history.as_ref() else {
+            return;
+        };
+        let Some(session) = history.session.as_ref() else {
+            return;
+        };
+        let Some(file) = session.selected_file() else {
+            return;
+        };
+        if file.patch.is_some() {
+            return;
+        }
+        let repository_key = history.repository_key().to_owned();
+        let selected_sha = history.selected.clone();
+        let revision = session.revision().clone();
+        let selected_key = file_key(file);
+        let requested_key = selected_key.clone();
+        let task = cx.background_spawn(async move {
+            load_local_file(&path, &revision, &requested_key, false).map(|file| (revision, file))
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                let wide = this.wide;
+                let Some(history) = this.history.as_mut() else {
+                    return;
+                };
+                // The patch belongs to one repository, one commit and one file.
+                // Any of the three having moved on makes it the wrong patch.
+                let current = history.repository_key() == repository_key
+                    && history.selected == selected_sha
+                    && history
+                        .session
+                        .as_ref()
+                        .and_then(ReviewSession::selected_file)
+                        .is_some_and(|file| file_key(file) == selected_key);
+                if !current {
+                    return;
+                }
+                match result {
+                    Ok((revision, file)) => {
+                        let installed = history.session.as_mut().is_some_and(|session| {
+                            session.install_file_patch(&revision, file).is_ok()
+                        });
+                        if installed {
+                            history.rebuild(wide);
+                        }
+                    }
+                    Err(error) => {
+                        history.feedback =
+                            Some(format!("This file's patch is unavailable: {error:#}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Settings open as a page in the tab strip rather than as a sheet. What
+    /// they change is the window itself, and a modal covering the window is the
+    /// one place from which that cannot be judged.
+    fn open_settings(&mut self, cx: &mut Context<Root>) {
+        self.settings_open = true;
+        self.settings_active = true;
+        self.history_active = false;
+        self.setup_open = false;
+        self.command_palette = false;
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, cx: &mut Context<Root>) {
+        self.settings_open = false;
+        self.settings_active = false;
+        self.setup_open = !self.history_active && self.tabs.is_empty() && self.startup_pr.is_none();
+        cx.notify();
+    }
+
+    /// The material is installed on the next render, so the choice shows itself
+    /// immediately behind the page that made it.
+    fn set_sidebar_material(&mut self, material: SidebarMaterial, cx: &mut Context<Root>) {
+        if self.workspace.preferences.sidebar_material == material {
+            return;
+        }
+        self.workspace.preferences.sidebar_material = material;
+        self.save_workspace();
+        cx.notify();
+    }
+
+    /// The History page: one repository's commit graph, and the changes made by
+    /// whichever commit is selected.
+    fn render_history(&self, colors: Palette, window: &Window, cx: &mut Context<Root>) -> Div {
+        let dark = is_dark(window);
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(self.render_history_header(colors, cx))
+            .child(layout::rule(colors))
+            .child(
+                // Without `min_w_0` a flex row's minimum is its content's, so
+                // narrowing the window would stop narrowing this row and its
+                // right-hand side would paint past the frame that clips it.
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .flex()
+                    .child(self.render_history_commits(colors, dark, cx))
+                    .child(self.render_history_commit(colors, cx)),
+            )
+    }
+
+    fn render_history_header(&self, colors: Palette, cx: &mut Context<Root>) -> Div {
+        let repository = self.history_repository();
+        let title = repository
+            .as_ref()
+            .map(Repository::full_name)
+            .unwrap_or_else(|| "No repository".into());
+        let scope = self
+            .history
+            .as_ref()
+            .map(|history| history.scope.clone())
+            .unwrap_or(HistoryScope::AllRefs);
+        let choices = self
+            .history
+            .as_ref()
+            .map(HistoryController::scope_choices)
+            .unwrap_or_default();
+        let overflowed = self
+            .history
+            .as_ref()
+            .is_some_and(|history| history.overflowed);
+        let notice = self
+            .history
+            .as_ref()
+            .and_then(|history| history.state.notice());
+        let error = self
+            .history
+            .as_ref()
+            .is_some_and(|history| matches!(history.state, LoadState::Error(_)));
+        // Every repository in the window can be reached from here, so History
+        // is not tied to whichever pull request happened to be open.
+        let repositories: Vec<_> = self
+            .repositories
+            .iter()
+            .map(|runtime| runtime.repository.clone())
+            .collect();
+        let current_key = self
+            .history
+            .as_ref()
+            .map(|history| history.repository_key().to_owned());
+
+        div()
+            .flex_none()
+            .px(px(ui::PANEL_GUTTER))
+            .pt(px(ui::GAP_GROUP))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(ui::DESKTOP_HIT))
+                    .flex()
+                    .items_center()
+                    .gap(px(ui::GAP_GROUP))
+                    .child(
+                        div()
+                            .ui_text(TextRole::Title)
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(title),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("history-refresh")
+                            .debug_selector(|| "history-refresh".to_owned())
+                            .control()
+                            .bg(colors.elevated)
+                            .border_1()
+                            .border_color(rgba(0x00000000))
+                            .focus_ring(colors.accent, colors.selected)
+                            .cursor_pointer()
+                            .accessibility_label("Refresh history")
+                            .child("Refresh")
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                let this = &mut root.review;
+                                this.load_history(cx);
+                            })),
+                    ),
+            )
+            .when(repositories.len() > 1, |header| {
+                header.child(layout::chip_row().children(repositories.into_iter().map(
+                    |repository| {
+                        let key = repository.cache_key();
+                        let selected = current_key.as_deref() == Some(key.as_str());
+                        layout::chip(
+                            "history-repository",
+                            &repository.full_name(),
+                            None,
+                            selected,
+                            colors,
+                        )
+                        .on_click(cx.listener(move |root, _, _, cx| {
+                            let this = &mut root.review;
+                            this.open_history(Some(repository.clone()), cx);
+                        }))
+                    },
+                )))
+            })
+            .child(
+                layout::chip_row()
+                    .child(
+                        layout::chip(
+                            "history-scope-all",
+                            "All branches",
+                            None,
+                            scope == HistoryScope::AllRefs,
+                            colors,
+                        )
+                        .on_click(cx.listener(|root, _, _, cx| {
+                            let this = &mut root.review;
+                            this.set_history_scope(HistoryScope::AllRefs, cx);
+                        })),
+                    )
+                    .children(choices.into_iter().map(|name| {
+                        let selected = scope == HistoryScope::Ref(name.clone());
+                        let chosen = name.clone();
+                        layout::chip("history-scope", &name, None, selected, colors).on_click(
+                            cx.listener(move |root, _, _, cx| {
+                                let this = &mut root.review;
+                                this.set_history_scope(HistoryScope::Ref(chosen.clone()), cx);
+                            }),
+                        )
+                    })),
+            )
+            .when_some(notice, |header, notice| {
+                header.child(
+                    div()
+                        .pb(px(ui::GAP_GROUP))
+                        .ui_text(TextRole::Caption)
+                        .text_color(if error { colors.red } else { colors.muted })
+                        .child(notice),
+                )
+            })
+            .when(overflowed, |header| {
+                header.child(
+                    div()
+                        .pb(px(ui::GAP_GROUP))
+                        .ui_text(TextRole::Caption)
+                        .text_color(colors.amber)
+                        .child(
+                            "More branches are active than the graph has columns; \
+                             the rightmost ones share a column. Narrow to one branch to \
+                             read them apart.",
+                        ),
+                )
+            })
+    }
+
+    /// The commit list, with the graph drawn in its gutter.
+    fn render_history_commits(&self, colors: Palette, dark: bool, cx: &mut Context<Root>) -> Div {
+        let Some(history) = self.history.as_ref() else {
+            return div();
+        };
+        // Pointer copies, not a copy of the history: the list closure is built
+        // on every frame and the commits can number five hundred.
+        let commits = history.commits().clone();
+        let rows = history.rows().clone();
+        let lane_count = history.lane_count;
+        let selected = history.selected.clone();
+        let count = commits.len().min(rows.len());
+        let scroll = history.commit_scroll.clone();
+        let root = cx.entity();
+        let loading = matches!(history.state, LoadState::Loading(_));
+
+        div()
+            .w(px(HISTORY_COMMIT_COLUMN))
+            .min_w(px(240.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(colors.border)
+            .child(if count == 0 {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(ui::PANEL_GUTTER))
+                    .text_center()
+                    .text_color(colors.muted)
+                    .child(if loading {
+                        "Reading this repository's history…"
+                    } else {
+                        "No commits to show."
+                    })
+                    .into_any_element()
+            } else {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(
+                        uniform_list(
+                            "history-commits",
+                            count,
+                            move |range: Range<usize>, _, _| {
+                                range
+                                    .map(|index| {
+                                        let commit = &commits[index];
+                                        let row = &rows[index];
+                                        let chosen =
+                                            selected.as_deref() == Some(commit.sha.as_str());
+                                        let sha = commit.sha.clone();
+                                        let click_root = root.clone();
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "history-commit-{index}"
+                                            )))
+                                            .debug_selector(move || {
+                                                format!("history-commit-{index}")
+                                            })
+                                            .h(px(ui::TWO_LINE_ROW))
+                                            .w_full()
+                                            .px(px(ui::CONTROL_INSET))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(ui::GAP_FIELD))
+                                            .cursor_pointer()
+                                            .when(chosen, |row| row.bg(colors.selected))
+                                            .when(!chosen, |row| {
+                                                row.hover(|row| row.bg(colors.selected))
+                                            })
+                                            .child(history_graph_cell(
+                                                row,
+                                                lane_count,
+                                                ui::TWO_LINE_ROW,
+                                                dark,
+                                                colors,
+                                            ))
+                                            .child(
+                                                layout::lines()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap(px(ui::GAP_ICON))
+                                                            .child(
+                                                                div()
+                                                                    .min_w_0()
+                                                                    .flex_1()
+                                                                    .overflow_hidden()
+                                                                    .whitespace_nowrap()
+                                                                    .text_ellipsis()
+                                                                    .text_color(colors.text)
+                                                                    .child(
+                                                                        commit
+                                                                            .message_headline
+                                                                            .clone(),
+                                                                    ),
+                                                            )
+                                                            .children(commit.refs.iter().map(
+                                                                |label| {
+                                                                    history_ref_chip(label, colors)
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap(px(ui::GAP_FIELD))
+                                                            .ui_text(TextRole::Caption)
+                                                            .text_color(colors.faint)
+                                                            .child(
+                                                                div().font_family(CODE_FONT).child(
+                                                                    commit.short_sha().to_owned(),
+                                                                ),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .min_w_0()
+                                                                    .overflow_hidden()
+                                                                    .whitespace_nowrap()
+                                                                    .text_ellipsis()
+                                                                    .child(
+                                                                        commit.author_name.clone(),
+                                                                    ),
+                                                            )
+                                                            .child(div().child(history_day(
+                                                                &commit.authored_at,
+                                                            ))),
+                                                    ),
+                                            )
+                                            .on_click(move |_, _, cx| {
+                                                let sha = sha.clone();
+                                                click_root.update(cx, |root, cx| {
+                                                    root.review.select_history_commit(&sha, cx);
+                                                });
+                                            })
+                                    })
+                                    .collect::<Vec<_>>()
+                            },
+                        )
+                        .track_scroll(&scroll)
+                        .w_full()
+                        .h_full(),
+                    )
+                    .child(
+                        div().absolute().inset_0().child(
+                            Scrollbar::vertical(&scroll)
+                                .id("history-commits-scrollbar")
+                                .viewport_from_layout(),
+                        ),
+                    )
+                    .into_any_element()
+            })
+    }
+
+    /// The selected commit: what it says, who made it, and what it changed.
+    fn render_history_commit(&self, colors: Palette, cx: &mut Context<Root>) -> Div {
+        let Some(history) = self.history.as_ref() else {
+            return div().flex_1().min_w_0();
+        };
+        let Some(commit) = history.selected_commit() else {
+            return div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(colors.muted)
+                .child("Select a commit to read what it changed.");
+        };
+        let parents = commit.parent_shas.clone();
+        let diff_notice = history.diff_state.notice();
+        let diff_error = matches!(history.diff_state, LoadState::Error(_));
+        let feedback = history.feedback.clone();
+
+        div()
+            .flex_1()
+            // What this pane needs is its file list plus a readable diff. With
+            // `min_w_0` here instead, flexbox would happily squeeze the pane
+            // below that and let its two columns paint over the frame, because
+            // a zero minimum says the content has no width of its own.
+            .min_w(px(440.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_none()
+                    .min_w_0()
+                    .px(px(ui::PANEL_GUTTER))
+                    .py(px(ui::GAP_GROUP))
+                    .flex()
+                    .flex_col()
+                    .gap(px(ui::GAP_FIELD))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .ui_text(TextRole::Subtitle)
+                            .child(commit.message_headline.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .flex_wrap()
+                            .gap(px(ui::GAP_FIELD))
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.muted)
+                            .child(
+                                // A full object ID is 40 unbreakable
+                                // characters. It shrinks rather than holding
+                                // the whole pane open at its own width.
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .font_family(CODE_FONT)
+                                    .text_color(colors.text)
+                                    .child(commit.sha.clone()),
+                            )
+                            .child(div().child(format!(
+                                "{} committed {}",
+                                if commit.author_name.is_empty() {
+                                    "Someone".to_owned()
+                                } else {
+                                    commit.author_name.clone()
+                                },
+                                history_day(&commit.committed_at)
+                            )))
+                            .when_some(commit.author_login.clone(), |line, login| {
+                                line.child(div().child(format!("@{login}")))
+                            })
+                            .children(
+                                commit
+                                    .refs
+                                    .iter()
+                                    .map(|label| history_ref_chip(label, colors)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.faint)
+                            .child(match parents.len() {
+                                0 => "Root commit · compared against an empty tree".to_owned(),
+                                1 => format!("Parent {}", short_sha(&parents[0])),
+                                _ => format!(
+                                    "Merge · shown against its first parent {} · also {}",
+                                    short_sha(&parents[0]),
+                                    parents[1..]
+                                        .iter()
+                                        .map(|parent| short_sha(parent).to_owned())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                            }),
+                    )
+                    .when_some(diff_notice, |block, notice| {
+                        block.child(
+                            div()
+                                .ui_text(TextRole::Caption)
+                                .text_color(if diff_error { colors.red } else { colors.muted })
+                                .child(notice),
+                        )
+                    })
+                    .when_some(feedback, |block, feedback| {
+                        block.child(
+                            div()
+                                .ui_text(TextRole::Caption)
+                                .text_color(colors.amber)
+                                .child(feedback),
+                        )
+                    }),
+            )
+            .child(layout::rule(colors))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .flex()
+                    .child(self.render_history_files(colors, cx))
+                    .child(self.render_history_diff(colors)),
+            )
+    }
+
+    fn render_history_files(&self, colors: Palette, cx: &mut Context<Root>) -> Div {
+        let Some(history) = self.history.as_ref() else {
+            return div();
+        };
+        let files = history
+            .session
+            .as_ref()
+            .map(|session| session.comparison().files.clone())
+            .unwrap_or_default();
+        let selected = history
+            .session
+            .as_ref()
+            .and_then(ReviewSession::selected_file)
+            .map(file_key);
+        let count = files.len();
+        let scroll = history.file_scroll.clone();
+        let root = cx.entity();
+        div()
+            .w(px(220.))
+            .min_w(px(160.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(colors.border)
+            .child(
+                div()
+                    .h(px(ui::DESKTOP_HIT))
+                    .px(px(ui::CONTROL_INSET))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(format!("Changed files  {count}")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(
+                        uniform_list("history-files", count, move |range: Range<usize>, _, _| {
+                            range
+                                .map(|row| {
+                                    let file = &files[row];
+                                    let key = file_key(file);
+                                    let click_key = key.clone();
+                                    let click_root = root.clone();
+                                    div()
+                                        .id(SharedString::from(format!("history-file-{row}")))
+                                        .debug_selector(move || format!("history-file-{row}"))
+                                        .h(px(ui::TWO_LINE_ROW))
+                                        .px(px(ui::CONTROL_INSET))
+                                        .flex()
+                                        .flex_col()
+                                        .justify_center()
+                                        .gap(px(ui::GAP_ICON))
+                                        .cursor_pointer()
+                                        .when(selected.as_deref() == Some(key.as_str()), |row| {
+                                            row.bg(colors.selected)
+                                        })
+                                        .child(
+                                            div()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .child(file.path.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .ui_text(TextRole::Caption)
+                                                .text_color(if file.patch.is_some() {
+                                                    colors.muted
+                                                } else {
+                                                    colors.faint
+                                                })
+                                                .child(if file.patch.is_some() {
+                                                    format!(
+                                                        "+{} −{}",
+                                                        file.additions, file.deletions
+                                                    )
+                                                } else {
+                                                    "Metadata only · select to load".into()
+                                                }),
+                                        )
+                                        .on_click(move |_, _, cx| {
+                                            let click_key = click_key.clone();
+                                            click_root.update(cx, |root, cx| {
+                                                let this = &mut root.review;
+                                                let wide = this.wide;
+                                                let changed =
+                                                    this.history.as_mut().is_some_and(|history| {
+                                                        history.select_file(&click_key, wide)
+                                                    });
+                                                if changed {
+                                                    this.load_selected_history_file(cx);
+                                                    cx.notify();
+                                                }
+                                            });
+                                        })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .track_scroll(&scroll)
+                        .w_full()
+                        .h_full(),
+                    )
+                    .child(
+                        div().absolute().inset_0().child(
+                            Scrollbar::vertical(&scroll)
+                                .id("history-files-scrollbar")
+                                .viewport_from_layout(),
+                        ),
+                    ),
+            )
+    }
+
+    /// The selected file's patch, through the same read-only row renderer the
+    /// Stack view uses. There are no threads and no composer here, so the two
+    /// interactive row variants are never built and never rendered.
+    fn render_history_diff(&self, colors: Palette) -> Div {
+        let Some(history) = self.history.as_ref() else {
+            return div().flex_1().min_w_0();
+        };
+        let header = history
+            .session
+            .as_ref()
+            .and_then(ReviewSession::selected_file)
+            .map(|file| {
+                if file.patch.is_some() {
+                    format!("{}   +{} −{}", file.path, file.additions, file.deletions)
+                } else {
+                    format!("{}   metadata only", file.path)
+                }
+            })
+            .unwrap_or_else(|| "Select a changed file".into());
+        let rows = history.diff_rows.clone();
+        let count = rows.len();
+        let split = rows.iter().any(|row| matches!(row, DiffRow::Split(_)));
+        let vertical = history.diff_scroll.clone();
+        let horizontal = history.horizontal.clone();
+        let row_horizontal = horizontal.clone();
+        let text_width = if split {
+            split_text_content_width(&rows)
+        } else {
+            unified_text_content_width(&rows)
+        };
+        let waiting = matches!(history.diff_state, LoadState::Loading(_));
+        let unselected = history.selected.is_none();
+        let changed_files = history
+            .session
+            .as_ref()
+            .map(|session| session.comparison().files.len())
+            .unwrap_or_default();
+        div()
+            .flex_1()
+            // A real minimum rather than `min_w_0`. The diff is the only
+            // flexible column of the three, so with a zero minimum the commit
+            // list and the file list keep their full widths and leave it a
+            // strip too narrow to read. Declaring what it needs is what makes
+            // the other two yield.
+            .min_w(px(260.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(ui::DESKTOP_HIT))
+                    .px(px(ui::PANEL_GUTTER))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .font_family(CODE_FONT)
+                    .ui_text(TextRole::Body)
+                    .child(header),
+            )
+            .when(split, |pane| {
+                pane.child(
+                    div()
+                        .h(px(ui::ROW_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .font_family(CODE_FONT)
+                        .ui_text(TextRole::Caption)
+                        .text_color(colors.muted)
+                        .bg(colors.elevated)
+                        .border_b_1()
+                        .border_color(colors.border)
+                        .child(div().w_1_2().px(px(ui::CONTROL_INSET)).child("OLD"))
+                        .child(
+                            div()
+                                .w_1_2()
+                                .px(px(ui::CONTROL_INSET))
+                                .border_l_1()
+                                .border_color(colors.border)
+                                .child("NEW"),
+                        ),
+                )
+            })
+            .child(if count == 0 {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(ui::PANEL_GUTTER))
+                    .text_center()
+                    .text_color(colors.muted)
+                    .child(if unselected {
+                        "Select a commit to read what it changed."
+                    } else if waiting {
+                        "Loading this commit's changes…"
+                    } else if changed_files == 0 {
+                        "This commit changed no files."
+                    } else {
+                        "No text patch is available. Binary and media content is never loaded."
+                    })
+                    .into_any_element()
+            } else {
+                div()
+                    .id("history-diff-horizontal")
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(
+                        list(vertical, move |row, _, _| {
+                            render_read_only_diff_row(
+                                &rows[row],
+                                colors,
+                                &row_horizontal,
+                                text_width,
+                            )
+                        })
+                        .w_full()
+                        .h_full(),
+                    )
+                    // The stack diff already offsets its scrollbar id by 10,000
+                    // to clear the interactive diff's; History takes the next
+                    // band so the three can coexist in one window.
+                    .child(diff_horizontal_scrollbar(20_000, &horizontal))
+                    .into_any_element()
+            })
+    }
+
+    fn render_settings(&self, colors: Palette, cx: &mut Context<Root>) -> impl IntoElement {
+        let selected = self.workspace.preferences.sidebar_material;
+        let choices = SIDEBAR_MATERIAL_CHOICES
+            .iter()
+            .map(|(material, label, detail)| {
+                let material = *material;
+                let chosen = selected == material;
+                Button::new(SharedString::from(format!("sidebar-material-{label}")))
+                    .debug_selector(move || format!("sidebar-material-{label}"))
+                    .w_full()
+                    .px(px(ui::CELL_INSET))
+                    .py(px(ui::GAP_GROUP))
+                    .rounded(px(ui::CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(rgba(0x00000000))
+                    .focus_ring(colors.accent, colors.selected)
+                    .cursor_pointer()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap(px(ui::GAP_ICON))
+                    .selected(chosen)
+                    .when(chosen, |row| row.bg(colors.selected))
+                    .when(!chosen, |row| row.hover(|row| row.bg(colors.selected)))
+                    .accessibility_label(format!(
+                        "{label}{}",
+                        if chosen { ", selected" } else { "" }
+                    ))
+                    .child(
+                        div()
+                            .ui_text(TextRole::Label)
+                            .text_color(if chosen { colors.text } else { colors.muted })
+                            .child(*label),
+                    )
+                    .child(
+                        div()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.faint)
+                            .child(*detail),
+                    )
+                    .on_click(cx.listener(move |root, _, _, cx| {
+                        let this = &mut root.review;
+                        this.set_sidebar_material(material, cx);
+                    }))
+            });
+        layout::page()
+            .id("settings-page")
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .w(px(SETTINGS_PAGE_WIDTH))
+                    .max_w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(ui::GAP_PAGE))
+                    .child(
+                        layout::lines()
+                            .child(div().ui_text(TextRole::Display).child("Settings"))
+                            .child(
+                                div()
+                                    .ui_text(TextRole::Body)
+                                    .text_color(colors.muted)
+                                    .child("These choices are yours, not a repository's. They are saved with the workspace."),
+                            ),
+                    )
+                    .child(
+                        layout::section("Appearance", colors)
+                            .child(
+                                layout::field("Sidebar material", colors).child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(ui::GAP_ICON))
+                                        .children(choices),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .ui_text(TextRole::Caption)
+                                    .text_color(colors.faint)
+                                    .child(SIDEBAR_MATERIAL_LIMIT),
+                            ),
+                    ),
+            )
     }
 
     fn render_setup(&self, colors: Palette, cx: &mut Context<Root>) -> impl IntoElement {
@@ -22474,9 +23980,8 @@ impl ReviewWorkspace {
             side_control(&account.login, self.selected_account == index, colors)
                 .id(SharedString::from(format!("account-{index}")))
                 .on_click(cx.listener(move |root, _, _, cx| {
-                    if let Root::Review(this) = root
-                        && !matches!(this.repository_setup_state, LoadState::Loading(_))
-                    {
+                    let this = &mut root.review;
+                    if !matches!(this.repository_setup_state, LoadState::Loading(_)) {
                         this.selected_account = index;
                         cx.notify();
                     }
@@ -22488,6 +23993,7 @@ impl ReviewWorkspace {
             .unwrap_or_else(|| "Choose the gh identity used only for this repository".into());
         div()
             .flex_1()
+            .min_w_0()
             .flex()
             .items_center()
             .justify_center()
@@ -22496,88 +24002,96 @@ impl ReviewWorkspace {
                 div()
                     .w(px(SETUP_CARD_WIDTH))
                     .max_w_full()
-                    .p(px(ui::PANEL_GUTTER))
-                    .rounded(px(ui::WINDOW_RADIUS))
-                    .border_1()
-                    .border_color(colors.border)
-                    .bg(colors.surface)
-                    .child(div().ui_text(TextRole::Title).child("Add a repository"))
+                    .flex()
+                    .flex_col()
+                    .gap(px(ui::GAP_PAGE))
                     .child(
-                        div()
-                            .mt_1()
-                            .ui_text(TextRole::Body)
-                            .text_color(colors.muted)
-                            .child("Review without cloning. Existing local folders work too."),
+                        layout::lines()
+                            .child(div().ui_text(TextRole::Title).child("Add a repository"))
+                            .child(
+                                div()
+                                    .ui_text(TextRole::Body)
+                                    .text_color(colors.muted)
+                                    .child(
+                                        "Review without cloning. Existing local folders work too.",
+                                    ),
+                            ),
                     )
-                    .child(field_label("Repository", colors).mt(px(ui::GAP_PAGE)))
-                    .child(input_box(&self.repository_input, colors))
                     .child(
-                        Button::new("browse-repository")
-                            .control()
-                            .debug_selector(|| "browse-repository".into())
-                            .mt_2()
-                            .px(px(ui::CONTROL_INSET))
-                            .py_0()
-                            .rounded(px(ui::CONTROL_RADIUS))
-                            .bg(colors.elevated)
-                            .disabled_presentation()
-                            .disabled(
-                                self.repository_picker_open
-                                    || matches!(self.repository_setup_state, LoadState::Loading(_)),
+                        layout::field("Repository", colors)
+                            .child(input_box(&self.repository_input, colors))
+                            .child(
+                                Button::new("browse-repository")
+                                    .control()
+                                    .debug_selector(|| "browse-repository".into())
+                                    .px(px(ui::CONTROL_INSET))
+                                    .py_0()
+                                    .rounded(px(ui::CONTROL_RADIUS))
+                                    .bg(colors.elevated)
+                                    .disabled_presentation()
+                                    .disabled(
+                                        self.repository_picker_open
+                                            || matches!(
+                                                self.repository_setup_state,
+                                                LoadState::Loading(_)
+                                            ),
+                                    )
+                                    .accessibility_label("Choose a local repository folder")
+                                    .child("Choose folder…")
+                                    .on_click(cx.listener(|root, _, window, cx| {
+                                        let this = &mut root.review;
+                                        this.open_repository_picker(window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        layout::field("GitHub account", colors)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(ui::GAP_GROUP))
+                                    .children(accounts),
                             )
-                            .accessibility_label("Choose a local repository folder")
-                            .child("Choose folder…")
-                            .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.open_repository_picker(window, cx);
-                                }
-                            })),
-                    )
-                    .child(field_label("GitHub account", colors).mt(px(ui::GAP_PAGE)))
-                    .child(
-                        div()
-                            .mt_2()
-                            .flex()
-                            .flex_wrap()
-                            .gap(px(ui::GAP_GROUP))
-                            .children(accounts),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .ui_text(TextRole::Caption)
-                            .text_color(colors.faint)
-                            .child(account_status),
-                    )
-                    .child(
-                        Button::new("refresh-repository-accounts")
-                            .control()
-                            .mt_2()
-                            .bg(colors.elevated)
-                            .disabled_presentation()
-                            .disabled(
-                                matches!(self.accounts_state, LoadState::Loading(_))
-                                    || matches!(self.repository_setup_state, LoadState::Loading(_)),
+                            .child(
+                                div()
+                                    .ui_text(TextRole::Caption)
+                                    .text_color(colors.faint)
+                                    .child(account_status),
                             )
-                            .accessibility_label("Refresh GitHub accounts")
-                            .child("Refresh accounts")
-                            .on_click(cx.listener(|root, _, _, cx| {
-                                if let Root::Review(this) = root {
-                                    this.accounts_state =
-                                        LoadState::Loading("Discovering GitHub accounts…".into());
-                                    this.discover_accounts(None, cx);
-                                    cx.notify();
-                                }
-                            })),
+                            .child(
+                                Button::new("refresh-repository-accounts")
+                                    .control()
+                                    .bg(colors.elevated)
+                                    .disabled_presentation()
+                                    .disabled(
+                                        matches!(self.accounts_state, LoadState::Loading(_))
+                                            || matches!(
+                                                self.repository_setup_state,
+                                                LoadState::Loading(_)
+                                            ),
+                                    )
+                                    .accessibility_label("Refresh GitHub accounts")
+                                    .child("Refresh accounts")
+                                    .on_click(cx.listener(|root, _, _, cx| {
+                                        let this = &mut root.review;
+                                        this.accounts_state = LoadState::Loading(
+                                            "Discovering GitHub accounts…".into(),
+                                        );
+                                        this.discover_accounts(None, cx);
+                                        cx.notify();
+                                    })),
+                            ),
                     )
-                    .child(field_label("Open PR number · optional", colors).mt(px(ui::GAP_PAGE)))
-                    .child(div().w(px(160.)).child(input_box(&self.pr_input, colors)))
+                    .child(
+                        layout::field("Open PR number · optional", colors)
+                            .child(div().w(px(160.)).child(input_box(&self.pr_input, colors))),
+                    )
                     .when_some(self.repository_setup_state.notice(), |card, notice| {
                         card.child(
                             div()
                                 .id("repository-setup-notice")
                                 .debug_selector(|| "repository-setup-notice".into())
-                                .mt_3()
                                 .ui_text(TextRole::Body)
                                 .text_color(
                                     if matches!(self.repository_setup_state, LoadState::Error(_)) {
@@ -22591,7 +24105,6 @@ impl ReviewWorkspace {
                     })
                     .child(
                         div()
-                            .my(px(ui::GAP_GROUP))
                             .flex()
                             .justify_end()
                             .gap(px(ui::GAP_GROUP))
@@ -22599,14 +24112,13 @@ impl ReviewWorkspace {
                                 Button::new("cancel-setup")
                                     .control()
                                     .px(px(ui::PANEL_GUTTER))
-                                    .py_2()
+                                    .py_0()
                                     .rounded(px(ui::CONTROL_RADIUS))
                                     .cursor_pointer()
                                     .child("Cancel")
                                     .on_click(cx.listener(|root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.cancel_repository_setup(cx);
-                                        }
+                                        let this = &mut root.review;
+                                        this.cancel_repository_setup(cx);
                                     })),
                             )
                             .child(
@@ -22623,7 +24135,7 @@ impl ReviewWorkspace {
                                     )
                                     .accessibility_label("Add selected repository")
                                     .px(px(ui::PANEL_GUTTER))
-                                    .py_2()
+                                    .py_0()
                                     .rounded(px(ui::CONTROL_RADIUS))
                                     .bg(colors.text)
                                     .text_color(colors.canvas)
@@ -22639,9 +24151,8 @@ impl ReviewWorkspace {
                                         },
                                     )
                                     .on_click(cx.listener(|root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.submit_repository_setup(cx);
-                                        }
+                                        let this = &mut root.review;
+                                        this.submit_repository_setup(cx);
                                     })),
                             ),
                     ),
@@ -22649,40 +24160,49 @@ impl ReviewWorkspace {
     }
 
     fn render_empty(&self, colors: Palette, cx: &mut Context<Root>) -> impl IntoElement {
-        div().flex_1().flex().items_center().justify_center().child(
-            div()
-                .text_center()
-                .child(
-                    div()
-                        .ui_text(TextRole::Display)
-                        .font_weight(FontWeight::MEDIUM)
-                        .child("Repository-to-PR review"),
-                )
-                .child(
-                    div()
-                        .mt_2()
-                        .text_color(colors.muted)
-                        .child("Choose an open pull request or add another repository."),
-                )
-                .child(
-                    div()
-                        .id("empty-add")
-                        .mt(px(ui::GAP_PAGE))
-                        .mx_auto()
-                        .px(px(ui::PANEL_GUTTER))
-                        .py_0()
-                        .control()
-                        .bg(colors.elevated)
-                        .cursor_pointer()
-                        .child("Add repository")
-                        .on_click(cx.listener(|root, _, window, cx| {
-                            if let Root::Review(this) = root {
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .text_center()
+                    .flex()
+                    .flex_col()
+                    .gap(px(ui::GAP_PAGE))
+                    .child(
+                        layout::lines()
+                            .child(
+                                div()
+                                    .ui_text(TextRole::Display)
+                                    .font_weight(ui::WEIGHT_EMPHASIS)
+                                    .child("Repository-to-PR review"),
+                            )
+                            .child(
+                                div().text_color(colors.muted).child(
+                                    "Choose an open pull request or add another repository.",
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("empty-add")
+                            .mx_auto()
+                            .px(px(ui::PANEL_GUTTER))
+                            .py_0()
+                            .control()
+                            .bg(colors.elevated)
+                            .cursor_pointer()
+                            .child("Add repository")
+                            .on_click(cx.listener(|root, _, window, cx| {
+                                let this = &mut root.review;
                                 this.open_repository_picker(window, cx);
                                 cx.notify();
-                            }
-                        })),
-                ),
-        )
+                            })),
+                    ),
+            )
     }
 
     /// Everything this tab has to say about the freshness or completeness of
@@ -22824,87 +24344,35 @@ impl ReviewWorkspace {
                 None,
             ),
         ];
-        div()
-            // The gutter is spent on the row, the chip inset and the ring
-            // border, so the resting label still starts on the 20px gutter the
-            // title above it uses.
-            .px(px(ui::PANEL_GUTTER - ui::GAP_GROUP - 1.))
-            .h(px(PR_TAB_ROW_HEIGHT))
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(ui::GAP_ICON))
-            .bg(colors.surface)
+        layout::chip_row()
+            .px(px(ui::PANEL_GUTTER))
             .children(choices.into_iter().map(|(id, label, count, section)| {
                 let active = selected == section
                     || (section == Some(InspectorSection::Overview)
                         && selected == Some(InspectorSection::Activity));
-                let spoken = match count {
-                    Some(count) => format!("{label}  {count}"),
-                    None => label.to_owned(),
-                };
-                // The chip is painted small; the button still reserves the full
-                // row as its pointer target, the way sidebar icons do.
-                Button::new(id)
-                    .debug_selector(move || id.to_owned())
-                    .group(id)
-                    .h_full()
-                    .px_0()
-                    .py_0()
-                    .flex()
-                    .items_center()
-                    .rounded(px(ui::BADGE_RADIUS))
-                    .border_1()
-                    .border_color(rgba(0x00000000))
-                    .focus_ring(colors.accent, colors.selected)
-                    .cursor_pointer()
-                    .selected(active)
-                    .accessibility_label(format!(
-                        "{spoken} tab{}",
-                        if active { ", selected" } else { "" }
-                    ))
-                    .child(
-                        div()
-                            .h(px(ui::BUTTON_XS))
-                            .px(px(ui::GAP_GROUP))
-                            .flex()
-                            .items_center()
-                            .gap(px(ui::GAP_FIELD))
-                            .rounded(px(ui::BADGE_RADIUS))
-                            .ui_text(TextRole::Caption)
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(if active { colors.text } else { colors.muted })
-                            .when(active, |chip| chip.bg(colors.elevated))
-                            .when(!active, |chip| {
-                                chip.group_hover(id, |chip| chip.bg(colors.selected))
-                            })
-                            .child(label)
-                            .when_some(count, |chip, count| {
-                                chip.child(div().text_color(colors.faint).child(count.to_string()))
-                            }),
-                    )
-                    .on_click(cx.listener(move |root, _, window, cx| {
-                        if let Root::Review(this) = root {
-                            if let Some(section) = section {
-                                this.inspector_open = true;
-                                this.tabs[index].inspector_section = section;
-                                if section == InspectorSection::Commits {
-                                    this.tabs[index].comparison_picker.expanded = true;
-                                }
-                                if section == InspectorSection::Checks {
-                                    this.open_checks(window, cx);
-                                } else {
-                                    this.focus.focus(window, cx);
-                                }
+                layout::chip(id, label, count, active, colors).on_click(cx.listener(
+                    move |root, _, window, cx| {
+                        let this = &mut root.review;
+                        if let Some(section) = section {
+                            this.inspector_open = true;
+                            this.tabs[index].inspector_section = section;
+                            if section == InspectorSection::Commits {
+                                this.tabs[index].comparison_picker.expanded = true;
+                            }
+                            if section == InspectorSection::Checks {
+                                this.open_checks(window, cx);
                             } else {
-                                this.inspector_open = false;
                                 this.focus.focus(window, cx);
                             }
-                            this.inspector_scroll.set_offset(point(px(0.), px(0.)));
-                            this.refresh_auto_layout(window);
-                            cx.notify();
+                        } else {
+                            this.inspector_open = false;
+                            this.focus.focus(window, cx);
                         }
-                    }))
+                        this.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                        this.refresh_auto_layout(window);
+                        cx.notify();
+                    },
+                ))
             }))
             .when_some(self.render_tab_notices(index, colors), |row, notices| {
                 row.child(div().flex_1()).child(notices)
@@ -22930,13 +24398,13 @@ impl ReviewWorkspace {
             return div()
                 .flex_1()
                 .min_h_0()
+                .min_w_0()
                 .flex()
                 .flex_col()
-                .bg(colors.surface)
                 .child(
                     div()
                         .px(px(ui::PANEL_GUTTER))
-                        .py_2()
+                        .py(px(ui::GAP_GROUP))
                         .flex()
                         .items_center()
                         .gap(px(ui::GAP_ICON))
@@ -22949,10 +24417,9 @@ impl ReviewWorkspace {
                                 .text_color(colors.accent)
                                 .child("← Published review  ⌥⇧⌘E")
                                 .on_click(cx.listener(move |root, _, _, cx| {
-                                    if let Root::Review(this) = root {
-                                        this.tabs[index].local_visible = false;
-                                        cx.notify();
-                                    }
+                                    let this = &mut root.review;
+                                    this.tabs[index].local_visible = false;
+                                    cx.notify();
                                 })),
                         )
                         .child(format!("#{} · Local Changes", tab.pull_request.number)),
@@ -22977,177 +24444,168 @@ impl ReviewWorkspace {
         div()
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .flex()
             .flex_col()
-            .bg(colors.surface)
             .child(
-                div()
-                    .px(px(ui::PANEL_GUTTER))
-                    .py_2()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(ui::GAP_ICON))
-                            .child(
-                                div()
-                                    .badge()
-                                    .bg(colors.elevated)
-                                    .child(format!("#{}", tab.pull_request.number)),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .ui_text(TextRole::Title)
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .child(tab.pull_request.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .id("open-stack-view")
-                                    .control()
-                                    .border_1()
-                                    .border_color(colors.border)
-                                    .cursor_pointer()
-                                    .text_color(colors.accent)
-                                    .child("Stack  ⇧⌘S")
-                                    .on_click(cx.listener(|root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.open_stack(cx);
-                                        }
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("open-review-confirmation")
-                                    .control()
-                                    .border_1()
-                                    .border_color(colors.border)
-                                    .cursor_pointer()
-                                    .child("Review")
-                                    .on_click(cx.listener(|root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.open_submit_confirmation(cx);
-                                        }
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("open-merge-confirmation")
-                                    .control()
-                                    .border_1()
-                                    .border_color(colors.border)
-                                    .cursor_pointer()
-                                    .child("Merge…")
-                                    .on_click(cx.listener(|root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.prepare_merge_confirmation(cx);
-                                        }
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap(px(ui::GAP_ICON))
-                            .ui_text(TextRole::Body)
-                            .text_color(colors.muted)
-                            .child(branch_chip(&tab.pull_request.source_branch, colors))
-                            .child("→")
-                            .child(branch_chip(&tab.pull_request.target_branch, colors))
-                            .when(!compare_visible, |row| {
-                                row.child("·").child(format!(
-                                    "{} · {revision}",
-                                    tab.comparison_picker.request_label()
-                                ))
-                            })
-                            .when(newer, |row| {
-                                row.child(
-                                    div()
-                                        .id("advance-revision")
-                                        .ml_2()
-                                        .control()
-                                        .bg(colors.amber)
-                                        .text_color(colors.canvas)
-                                        .cursor_pointer()
-                                        .child("New head available · Advance manually")
-                                        .on_click(cx.listener(|root, _, _, cx| {
-                                            if let Root::Review(this) = root {
+                div().px(px(ui::PANEL_GUTTER)).py(px(ui::GAP_GROUP)).child(
+                    div()
+                        .id("pr-header-row")
+                        .debug_selector(|| "pr-header-row".to_owned())
+                        .flex()
+                        .items_center()
+                        .gap(px(ui::GAP_ICON))
+                        .child(
+                            div()
+                                .badge()
+                                .bg(colors.elevated)
+                                .child(format!("#{}", tab.pull_request.number)),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .ui_text(TextRole::Title)
+                                .font_weight(ui::WEIGHT_EMPHASIS)
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(tab.pull_request.title.clone()),
+                        )
+                        // Source → target rides beside the title rather
+                        // than on a row of its own; the diff wants the height.
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(ui::GAP_ICON))
+                                .ui_text(TextRole::Body)
+                                .text_color(colors.muted)
+                                .child(branch_chip(&tab.pull_request.source_branch, colors))
+                                .child("→")
+                                .child(branch_chip(&tab.pull_request.target_branch, colors))
+                                .when(!compare_visible, |row| {
+                                    row.child("·").child(format!(
+                                        "{} · {revision}",
+                                        tab.comparison_picker.request_label()
+                                    ))
+                                })
+                                .when(newer, |row| {
+                                    row.child(
+                                        div()
+                                            .id("advance-revision")
+                                            .control()
+                                            .bg(colors.amber)
+                                            .text_color(colors.canvas)
+                                            .cursor_pointer()
+                                            .child("New head available · Advance manually")
+                                            .on_click(cx.listener(|root, _, _, cx| {
+                                                let this = &mut root.review;
                                                 this.advance_revision(cx)
-                                            }
-                                        })),
-                                )
-                            })
-                            .child(div().flex_1())
-                            .child(
-                                div()
-                                    .id("edit-selected-file-locally")
-                                    .cursor_pointer()
-                                    .text_color(colors.accent)
-                                    .child("Edit locally  ⇧⌘E")
-                                    .on_click(cx.listener(|root, _, window, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.edit_locally(window, cx);
-                                        }
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("diff-mode")
-                                    .cursor_pointer()
-                                    .text_color(colors.accent)
-                                    .child(
-                                        session
-                                            .map(|session| match session.diff_mode() {
-                                                DiffMode::Auto => "Diff: Auto",
-                                                DiffMode::Unified => "Diff: Unified",
-                                                DiffMode::SideBySide => "Diff: Side by side",
-                                            })
-                                            .unwrap_or("Diff: Auto"),
+                                            })),
                                     )
-                                    .on_click(cx.listener(|root, _, window, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.cycle_diff(&CycleDiffMode, window, cx)
-                                        }
-                                    })),
-                            ),
-                    ),
+                                }),
+                        )
+                        .child(div().flex_1().min_w_0())
+                        // One row of five, left to right by weight: the view
+                        // control, then navigation in accent blue, the review
+                        // action in its green outline, the one irreversible
+                        // action as the single filled primary, and the editor
+                        // handoff as an icon past the end of the row.
+                        .child(
+                            div()
+                                .id("diff-mode")
+                                .control()
+                                .flex_none()
+                                .border_1()
+                                .border_color(colors.border)
+                                .cursor_pointer()
+                                .text_color(colors.accent)
+                                .hover(|button| button.bg(colors.selected))
+                                .child(
+                                    session
+                                        .map(|session| match session.diff_mode() {
+                                            DiffMode::Auto => "Diff: Auto",
+                                            DiffMode::Unified => "Diff: Unified",
+                                            DiffMode::SideBySide => "Diff: Side by side",
+                                        })
+                                        .unwrap_or("Diff: Auto"),
+                                )
+                                .on_click(cx.listener(|root, _, window, cx| {
+                                    let this = &mut root.review;
+                                    this.cycle_diff(&CycleDiffMode, window, cx)
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("open-stack-view")
+                                .control()
+                                .border_1()
+                                .border_color(colors.border)
+                                .cursor_pointer()
+                                .text_color(colors.accent)
+                                .hover(|button| button.bg(colors.accent_subtle))
+                                .child("Stack  ⇧⌘S")
+                                .on_click(cx.listener(|root, _, _, cx| {
+                                    let this = &mut root.review;
+                                    this.open_stack(cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("open-review-confirmation")
+                                .control()
+                                .border_1()
+                                .border_color(colors.green)
+                                .cursor_pointer()
+                                .text_color(colors.green)
+                                .hover(|button| button.bg(colors.add_line))
+                                .child("Review")
+                                .on_click(cx.listener(|root, _, _, cx| {
+                                    let this = &mut root.review;
+                                    this.open_submit_confirmation(cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("open-merge-confirmation")
+                                .control()
+                                .border_1()
+                                .border_color(colors.success_emphasis)
+                                .bg(colors.success_emphasis)
+                                .cursor_pointer()
+                                // White on Primer's green in both schemes;
+                                // the dark canvas would not read here.
+                                .text_color(rgba(0xffffffff))
+                                .hover(|button| button.bg(colors.green))
+                                .child("Merge…")
+                                .on_click(cx.listener(|root, _, _, cx| {
+                                    let this = &mut root.review;
+                                    this.prepare_merge_confirmation(cx);
+                                })),
+                        )
+                        .child(self.render_local_changes_control(index, colors, cx)),
+                ),
             )
             .child(self.render_pr_tabs(index, colors, cx))
-            .when(!self.inspector_open, |view| {
-                view.child(self.render_comparison_picker(index, colors, cx))
-            })
+            .when(
+                !self.inspector_open || tab.inspector_section == InspectorSection::Commits,
+                |view| {
+                    view.child(
+                        div()
+                            .px(px(ui::PANEL_GUTTER))
+                            .child(self.render_comparison_picker(index, colors, cx)),
+                    )
+                },
+            )
             .when_some(
                 match &tab.state {
                     LoadState::Error(error) => Some(error.clone()),
                     _ => None,
                 },
-                |view, notice| {
-                    view.child(
-                        div()
-                            .px(px(ui::PANEL_GUTTER))
-                            .py_2()
-                            .bg(colors.elevated)
-                            .text_color(colors.red)
-                            .child(notice),
-                    )
-                },
+                |view, notice| view.child(layout::notice(notice, colors.red)),
             )
             .when_some(tab.session_persistence_error.clone(), |view, notice| {
-                view.child(
-                    div()
-                        .px(px(ui::PANEL_GUTTER))
-                        .py_2()
-                        .bg(colors.elevated)
-                        .text_color(colors.red)
-                        .child(notice),
-                )
+                view.child(layout::notice(notice, colors.red))
             })
             .when(self.inspector_open, |view| {
                 view.child(self.render_inspector(index, colors, window, cx))
@@ -23156,6 +24614,7 @@ impl ReviewWorkspace {
                 view.child(
                     div()
                         .id("file-scroll")
+                        .debug_selector(|| "file-scroll".to_owned())
                         .flex_1()
                         .min_h_0()
                         .min_w_0()
@@ -23233,15 +24692,18 @@ impl ReviewWorkspace {
             .key_context("StackView")
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .flex()
             .flex_col()
-            .bg(colors.surface)
             .child(
                 div()
                     .px(px(ui::PANEL_GUTTER))
-                    .py_3()
+                    .py(px(ui::GAP_COLUMNS))
                     .border_b_1()
                     .border_color(colors.border)
+                    .flex()
+                    .flex_col()
+                    .gap(px(ui::GAP_GROUP))
                     .child(
                         div()
                             .flex()
@@ -23254,15 +24716,14 @@ impl ReviewWorkspace {
                                     .text_color(colors.accent)
                                     .child("← Pull request  Esc")
                                     .on_click(cx.listener(|root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.return_to_pull_request(cx);
-                                        }
+                                        let this = &mut root.review;
+                                        this.return_to_pull_request(cx);
                                     })),
                             )
                             .child(
                                 div()
                                     .ui_text(TextRole::Title)
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .font_weight(ui::WEIGHT_EMPHASIS)
                                     .child(format!(
                                         "#{} · Stack",
                                         self.tabs[index].pull_request.number
@@ -23279,17 +24740,20 @@ impl ReviewWorkspace {
                                     .text_color(colors.accent)
                                     .child("Refresh Stack  ⌥⌘R")
                                     .on_click(cx.listener(|root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.refresh_stack(cx);
-                                        }
+                                        let this = &mut root.review;
+                                        this.refresh_stack(cx);
                                     })),
                             )
                             .child(
                                 div()
                                     .id("stack-diff-mode")
-                                    .px(px(ui::CELL_INSET))
+                                    .control()
+                                    .flex_none()
+                                    .border_1()
+                                    .border_color(colors.border)
                                     .cursor_pointer()
                                     .text_color(colors.accent)
+                                    .hover(|button| button.bg(colors.selected))
                                     .child(
                                         stack
                                             .session
@@ -23302,16 +24766,14 @@ impl ReviewWorkspace {
                                             .unwrap_or("Diff: Auto"),
                                     )
                                     .on_click(cx.listener(move |root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.tabs[index].stack.cycle_diff(this.wide);
-                                            cx.notify();
-                                        }
+                                        let this = &mut root.review;
+                                        this.tabs[index].stack.cycle_diff(this.wide);
+                                        cx.notify();
                                     })),
                             ),
                     )
                     .child(
                         div()
-                            .mt_2()
                             .flex()
                             .items_center()
                             .gap(px(ui::GAP_GROUP))
@@ -23337,58 +24799,30 @@ impl ReviewWorkspace {
                                             "Layers  ⌥⌘L"
                                         })
                                         .on_click(cx.listener(|root, _, _, cx| {
-                                            if let Root::Review(this) = root {
-                                                this.toggle_stack_relationships(cx);
-                                            }
+                                            let this = &mut root.review;
+                                            this.toggle_stack_relationships(cx);
                                         })),
                                 )
                             }),
                     ),
             )
             .when_some(native, |view, notice| {
-                view.child(
-                    div()
-                        .px(px(ui::PANEL_GUTTER))
-                        .py_2()
-                        .bg(colors.elevated)
-                        .text_color(colors.muted)
-                        .child(notice),
-                )
+                view.child(layout::notice(notice, colors.muted))
             })
             .when_some(stack.state.notice().map(str::to_owned), |view, notice| {
-                view.child(
-                    div()
-                        .px(px(ui::PANEL_GUTTER))
-                        .py_2()
-                        .bg(colors.elevated)
-                        .text_color(match stack.state {
-                            StackLoadState::Unavailable(_) => colors.amber,
-                            _ => colors.muted,
-                        })
-                        .child(notice),
-                )
+                view.child(layout::notice(
+                    notice,
+                    match stack.state {
+                        StackLoadState::Unavailable(_) => colors.amber,
+                        _ => colors.muted,
+                    },
+                ))
             })
             .when_some(stack.tip_notice.clone(), |view, notice| {
-                view.child(
-                    div()
-                        .id("stack-tip-notice")
-                        .px(px(ui::PANEL_GUTTER))
-                        .py_2()
-                        .bg(colors.elevated)
-                        .ui_text(TextRole::Body)
-                        .text_color(colors.amber)
-                        .child(notice),
-                )
+                view.child(layout::notice(notice, colors.amber).id("stack-tip-notice"))
             })
             .when_some(stack.feedback.clone(), |view, feedback| {
-                view.child(
-                    div()
-                        .px(px(ui::PANEL_GUTTER))
-                        .py_2()
-                        .bg(colors.elevated)
-                        .text_color(colors.amber)
-                        .child(feedback),
-                )
+                view.child(layout::notice(feedback, colors.amber))
             })
             .child(
                 div()
@@ -23455,7 +24889,6 @@ impl ReviewWorkspace {
             .flex_col()
             .border_r_1()
             .border_color(colors.border)
-            .bg(colors.canvas)
             .child(self.render_stack_tips(index, colors, cx))
             .child(
                 div()
@@ -23488,9 +24921,12 @@ impl ReviewWorkspace {
                                         div()
                                             .h(px(52.))
                                             .px(px(ui::CONTROL_INSET))
-                                            .py_2()
+                                            .py(px(ui::GAP_GROUP))
                                             .border_b_1()
                                             .border_color(colors.border)
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(ui::GAP_ICON))
                                             .child(
                                                 div()
                                                     .flex()
@@ -23506,7 +24942,6 @@ impl ReviewWorkspace {
                                             )
                                             .child(
                                                 div()
-                                                    .mt_1()
                                                     .ui_text(TextRole::Caption)
                                                     .text_color(colors.muted)
                                                     .child(format!("→ {} · {:?}", layer.target.branch, layer.state)),
@@ -23542,7 +24977,8 @@ impl ReviewWorkspace {
                     .child("Edit personal relationship")
                     .child(if correction_editor_open { "▾" } else { "▸" })
                     .on_click(cx.listener(move |root, _, _, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             this.tabs[index].stack.correction_editor_open =
                                 !this.tabs[index].stack.correction_editor_open;
                             cx.notify();
@@ -23557,14 +24993,16 @@ impl ReviewWorkspace {
                         .flex_none()
                         .min_h_0()
                         .px(px(ui::CONTROL_INSET))
-                        .py_3()
+                        .py(px(ui::GAP_COLUMNS))
                         .border_t_1()
                         .border_color(colors.border)
                         .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .gap(px(ui::GAP_GROUP))
                         .child(section_label("PERSONAL RELATIONSHIP FOR THIS PR", colors))
                         .child(
                         div()
-                            .mt_2()
                             .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child("Local only. Choose a labelled parent, then Stack refreshes and validates the full relationship graph."),
@@ -23572,7 +25010,6 @@ impl ReviewWorkspace {
                         .child(
                             div()
                                 .id("stack-parent-choices")
-                                .mt_2()
                                 .h(px(120.))
                                 .min_h(px(72.))
                                 .relative()
@@ -23596,7 +25033,8 @@ impl ReviewWorkspace {
                                                         .child(format!("Use #{number} as parent"))
                                                         .on_click(move |_, _, cx| {
                                                             action_root.update(cx, |root, cx| {
-                                                                if let Root::Review(this) = root {
+                                                                {
+                                                                    let this = &mut root.review;
                                                                     this.set_stack_parent(index, parent.clone(), cx);
                                                                 }
                                                             });
@@ -23621,12 +25059,12 @@ impl ReviewWorkspace {
                             panel.child(
                                 div()
                                     .id("remove-stack-parent")
-                                    .mt_2()
                                     .cursor_pointer()
                                     .text_color(colors.amber)
                                     .child("Remove this personal parent")
                                     .on_click(cx.listener(move |root, _, _, cx| {
-                                        if let Root::Review(this) = root {
+                                        {
+                                            let this = &mut root.review;
                                             this.remove_stack_parent(index, cx);
                                         }
                                     })),
@@ -23636,12 +25074,12 @@ impl ReviewWorkspace {
                             panel.child(
                                 div()
                                     .id("reset-stack-relationships")
-                                    .mt_2()
                                     .cursor_pointer()
                                     .text_color(colors.red)
                                     .child("Reset all personal relationships")
                                     .on_click(cx.listener(move |root, _, _, cx| {
-                                        if let Root::Review(this) = root {
+                                        {
+                                            let this = &mut root.review;
                                             this.reset_stack_relationships(index, cx);
                                         }
                                     })),
@@ -23689,9 +25127,8 @@ impl ReviewWorkspace {
             colors,
             move |tip, cx| {
                 root.update(cx, |root, cx| {
-                    if let Root::Review(this) = root {
-                        this.select_stack_tip(index, tip.clone(), cx);
-                    }
+                    let this = &mut root.review;
+                    this.select_stack_tip(index, tip.clone(), cx);
                 });
             },
         )
@@ -23725,7 +25162,6 @@ impl ReviewWorkspace {
             .flex_col()
             .border_r_1()
             .border_color(colors.border)
-            .bg(colors.canvas)
             .child(
                 div()
                     .h(px(ui::DESKTOP_HIT))
@@ -23758,9 +25194,12 @@ impl ReviewWorkspace {
                                     .id(SharedString::from(format!("stack-file-{row}")))
                                     .h(px(64.))
                                     .px(px(ui::CONTROL_INSET))
-                                    .py_2()
+                                    .py(px(ui::GAP_GROUP))
                                     .border_b_1()
                                     .border_color(colors.border)
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(ui::GAP_ICON))
                                     .cursor_pointer()
                                     .when(selected.as_deref() == Some(key.as_str()), |row| {
                                         row.bg(colors.selected)
@@ -23773,7 +25212,6 @@ impl ReviewWorkspace {
                                     )
                                     .child(
                                         div()
-                                            .mt_1()
                                             .h(px(16.))
                                             .line_height(px(16.))
                                             .overflow_hidden()
@@ -23793,10 +25231,10 @@ impl ReviewWorkspace {
                                     )
                                     .on_click(move |_, _, cx| {
                                         click_root.update(cx, |root, cx| {
-                                            if let Root::Review(this) = root
-                                                && this.tabs[index]
-                                                    .stack
-                                                    .select_file(&click_key, this.wide)
+                                            let this = &mut root.review;
+                                            if this.tabs[index]
+                                                .stack
+                                                .select_file(&click_key, this.wide)
                                             {
                                                 this.load_selected_stack_local_file(index, cx);
                                                 cx.notify();
@@ -23844,7 +25282,6 @@ impl ReviewWorkspace {
             .h_full()
             .flex()
             .flex_col()
-            .bg(colors.surface)
             .child(
                 div()
                     .h(px(ui::DESKTOP_HIT))
@@ -23915,6 +25352,109 @@ impl ReviewWorkspace {
             })
     }
 
+    /// Records the application Local changes last launched. Saved rather than
+    /// held for the session: the control is icon-only, so a forgotten choice
+    /// would leave the user looking at a different brand each launch.
+    fn remember_editor(&mut self, preference: String) {
+        if self.workspace.preferences.preferred_editor.as_deref() == Some(preference.as_str()) {
+            return;
+        }
+        self.workspace.preferences.preferred_editor = Some(preference);
+        self.save_workspace();
+    }
+
+    /// Icon and accessible name for the Local changes control. Falls back to the
+    /// first installed application when nothing has been launched yet, and to a
+    /// neutral glyph when this build does not recognise the stored choice.
+    fn local_changes_editor(&self) -> (&'static str, String) {
+        let stored = self
+            .workspace
+            .preferences
+            .preferred_editor
+            .as_deref()
+            .and_then(|key| {
+                Some((
+                    open_with::icon_for_preference(key)?,
+                    open_with::label_for_preference(key)?,
+                ))
+            });
+        let (icon, label) = stored
+            .or_else(|| self.editors.first().map(|app| (app.icon, app.label)))
+            .unwrap_or(("folder", "an application"));
+        (icon, format!("Local changes in {label}  ⇧⌘E"))
+    }
+
+    /// The Local changes trigger: the mark of the application it will launch and
+    /// nothing else. The name the label used to carry moves to the accessible
+    /// name, so the control is still announced and still found by its selector.
+    fn local_changes_trigger(&self, colors: Palette) -> Button {
+        let (icon, label) = self.local_changes_editor();
+        Button::new("edit-selected-file-locally")
+            .debug_selector(|| "edit-selected-file-locally".to_owned())
+            // Square at the shared control height, so it sits on the same
+            // baseline and the same right edge as the labelled buttons beside it.
+            .size(px(ui::CONTROL_HEIGHT))
+            .p_0()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(ui::CONTROL_RADIUS))
+            .border_1()
+            .border_color(colors.border)
+            .cursor_pointer()
+            .hover(|button| button.bg(colors.selected))
+            .focus_ring(colors.accent, colors.selected)
+            .accessibility_label(label)
+            .child(app_icon(icon, colors))
+    }
+
+    /// The Local changes control and its popover. Detection is read-only, so
+    /// the controller is provisioned when the popover first opens rather than
+    /// for every tab that merely exists.
+    fn render_local_changes_control(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> AnyElement {
+        let tab = &self.tabs[index];
+        let key = tab.repository.cache_key();
+        let number = tab.pull_request.number;
+        let local = tab
+            .local_workspace
+            .clone()
+            .and_then(|view| view.downcast::<local_checkout::LocalCheckout>().ok());
+        let root = cx.entity();
+        Popover::new("local-changes-popover")
+            .anchor(Anchor::TopRight)
+            .open(tab.local_popover_open)
+            .trigger(self.local_changes_trigger(colors))
+            .on_open_change(move |open, window, cx| {
+                let opening = *open;
+                root.update(cx, |root, cx| {
+                    let this = &mut root.review;
+                    if opening {
+                        this.open_local_changes(window, cx);
+                        return;
+                    }
+                    if let Some(tab) = this.tabs.iter_mut().find(|tab| {
+                        tab.repository.cache_key() == key && tab.pull_request.number == number
+                    }) {
+                        tab.local_popover_open = false;
+                    }
+                    cx.notify();
+                });
+            })
+            .content(move |_, window, cx| match local.clone() {
+                Some(local) => local.update(cx, |local, cx| local.popover_body(colors, window, cx)),
+                // The first open provisions the controller; the notify that
+                // follows renders its content.
+                None => div().into_any_element(),
+            })
+            .into_any_element()
+    }
+
     fn render_comparison_picker(
         &self,
         index: usize,
@@ -23926,96 +25466,98 @@ impl ReviewWorkspace {
         let selected = tab.session.as_ref().map(|session| session.revision());
         let canonical = &tab.canonical_full_revision;
         let inventory_ready = picker.inventory_ready();
+        // A comparison that ends short of the published head can neither take a
+        // comment nor carry a review. The summary row already prints both
+        // heads, so it carries the warning in its tint rather than a paragraph
+        // under it restating what the row says.
+        let truncated = selected.is_some_and(|selected| selected.head_sha != canonical.head_sha);
         let mode = picker.mode();
-        // The Compare bar reads as a second row of chips under the tabs, so it
-        // uses their scale rather than the full control height.
-        let chip = |label: &'static str, selected: bool| {
-            div()
-                .h(px(ui::BUTTON_XS))
-                .px(px(ui::GAP_GROUP))
-                .flex_none()
-                .flex()
-                .items_center()
-                .rounded(px(ui::BADGE_RADIUS))
-                .ui_text(TextRole::Caption)
-                .font_weight(FontWeight::MEDIUM)
-                .cursor_pointer()
-                .when(selected, |chip| {
-                    chip.bg(colors.elevated).text_color(colors.text)
-                })
-                .when(!selected, |chip| {
-                    chip.text_color(colors.muted)
-                        .hover(|chip| chip.bg(colors.selected))
-                })
-                .child(label)
-        };
-        let full = chip("Full PR", mode == PickerMode::Full)
-            .id("comparison-full")
-            .on_click(cx.listener(move |root, _, _, cx| {
-                if let Root::Review(this) = root {
-                    this.restore_full_comparison(index, cx);
+        // The Compare bar is a second row of chips under the tabs; it is the
+        // same component, so the two rows share a gutter, a pitch and a height.
+        let full = layout::chip(
+            "comparison-full",
+            "Full PR",
+            None,
+            mode == PickerMode::Full,
+            colors,
+        )
+        .on_click(cx.listener(move |root, _, _, cx| {
+            let this = &mut root.review;
+            this.restore_full_comparison(index, cx);
+        }));
+        let commit = layout::chip(
+            "comparison-commit",
+            "Commit",
+            None,
+            mode == PickerMode::Commit,
+            colors,
+        )
+        .disabled(!inventory_ready)
+        .disabled_presentation()
+        .on_click(cx.listener(move |root, _, _, cx| {
+            let this = &mut root.review;
+            match this.tabs[index]
+                .comparison_picker
+                .begin_endpoint_selection(PickerMode::Commit)
+            {
+                Ok(()) => cx.notify(),
+                Err(error) => {
+                    this.status = error;
+                    cx.notify();
                 }
-            }));
-        let commit = chip("Commit", mode == PickerMode::Commit)
-            .id("comparison-commit")
-            .when(!inventory_ready, |button| button.opacity(0.55))
-            .on_click(cx.listener(move |root, _, _, cx| {
-                if let Root::Review(this) = root {
-                    match this.tabs[index]
-                        .comparison_picker
-                        .begin_endpoint_selection(PickerMode::Commit)
-                    {
-                        Ok(()) => cx.notify(),
-                        Err(error) => {
-                            this.status = error;
-                            cx.notify();
-                        }
-                    }
+            }
+        }));
+        let range = layout::chip(
+            "comparison-range",
+            "Range",
+            None,
+            mode == PickerMode::Range,
+            colors,
+        )
+        .disabled(!inventory_ready)
+        .disabled_presentation()
+        .on_click(cx.listener(move |root, _, _, cx| {
+            let this = &mut root.review;
+            match this.tabs[index]
+                .comparison_picker
+                .begin_endpoint_selection(PickerMode::Range)
+            {
+                Ok(()) => cx.notify(),
+                Err(error) => {
+                    this.status = error;
+                    cx.notify();
                 }
-            }));
-        let range = chip("Range", mode == PickerMode::Range)
-            .id("comparison-range")
-            .when(!inventory_ready, |button| button.opacity(0.55))
-            .on_click(cx.listener(move |root, _, _, cx| {
-                if let Root::Review(this) = root {
-                    match this.tabs[index]
-                        .comparison_picker
-                        .begin_endpoint_selection(PickerMode::Range)
-                    {
-                        Ok(()) => cx.notify(),
-                        Err(error) => {
-                            this.status = error;
-                            cx.notify();
-                        }
-                    }
-                }
-            }));
-        let since = chip("Since review", mode == PickerMode::SinceReview)
-            .id("comparison-since-review")
-            .on_click(cx.listener(move |root, _, _, cx| {
-                if let Root::Review(this) = root {
-                    this.select_since_last_review(index, cx);
-                }
-            }));
+            }
+        }));
+        let since = layout::chip(
+            "comparison-since-review",
+            "Since review",
+            None,
+            mode == PickerMode::SinceReview,
+            colors,
+        )
+        .on_click(cx.listener(move |root, _, _, cx| {
+            let this = &mut root.review;
+            this.select_since_last_review(index, cx);
+        }));
         // One row: the four scopes, the selected revisions beside the pinned
         // published pair, and the commit list's own toggle. The exact SHAs and
         // the commit count stay one click away instead of holding two lines.
-        let mut view = div()
-            .bg(colors.canvas)
-            .px(px(ui::PANEL_GUTTER))
-            .py_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(ui::GAP_ICON))
-                    .child(full)
-                    .child(commit)
-                    .child(range)
-                    .child(since)
-                    .when_some(selected, |row, selected| {
-                        row.child(
+        let mut view =
+            div()
+                .id("comparison-bar")
+                .debug_selector(|| "comparison-bar".to_owned())
+                .flex()
+                .flex_col()
+                .gap(px(ui::GAP_ICON))
+                .child(
+                    layout::chip_row()
+                        .child(full)
+                        .child(commit)
+                        .child(range)
+                        .child(since)
+                        .when_some(selected, |row, selected| {
+                            row.child(
                             div()
                                 .id("toggle-comparison-revision-details")
                                 .debug_selector(|| "toggle-comparison-revision-details".into())
@@ -24024,10 +25566,15 @@ impl ReviewWorkspace {
                                 .items_center()
                                 .gap(px(ui::GAP_ICON))
                                 .ui_text(TextRole::Caption)
-                                .text_color(colors.muted)
+                                .text_color(if truncated { colors.amber } else { colors.muted })
                                 .cursor_pointer()
                                 .hover(|summary| summary.text_color(colors.text))
-                                .aria_label(if picker.revision_details_expanded {
+                                .aria_label(if truncated {
+                                    "This comparison ends before the published PR revision, so it \
+                                     cannot take a comment or a review. Return to Full PR or \
+                                     choose a range ending at the published revision. Activate to \
+                                     show the exact selected and published revisions."
+                                } else if picker.revision_details_expanded {
                                     "Hide the exact selected and published revisions"
                                 } else {
                                     "Show the exact selected and published revisions"
@@ -24044,70 +25591,66 @@ impl ReviewWorkspace {
                                     "⌄"
                                 })
                                 .on_click(cx.listener(move |root, _, _, cx| {
-                                    if let Root::Review(this) = root {
-                                        let picker = &mut this.tabs[index].comparison_picker;
-                                        picker.revision_details_expanded =
-                                            !picker.revision_details_expanded;
-                                        cx.notify();
-                                    }
+                                    let this = &mut root.review;
+                                    let picker = &mut this.tabs[index].comparison_picker;
+                                    picker.revision_details_expanded =
+                                        !picker.revision_details_expanded;
+                                    cx.notify();
                                 })),
                         )
-                    })
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .id("toggle-comparison-commits")
-                            .ui_text(TextRole::Caption)
-                            .text_color(colors.accent)
-                            .cursor_pointer()
-                            .child(if picker.expanded {
-                                "Hide commits  ⌥⌘K"
-                            } else {
-                                "Choose commit  ⌥⌘K"
-                            })
-                            .on_click(cx.listener(move |root, _, _, cx| {
-                                if let Root::Review(this) = root {
+                        })
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .id("toggle-comparison-commits")
+                                .ui_text(TextRole::Caption)
+                                .text_color(colors.accent)
+                                .cursor_pointer()
+                                .child(if picker.expanded {
+                                    "Hide commits  ⌥⌘K"
+                                } else {
+                                    "Choose commit  ⌥⌘K"
+                                })
+                                .on_click(cx.listener(move |root, _, _, cx| {
+                                    let this = &mut root.review;
                                     this.tabs[index].comparison_picker.expanded =
                                         !this.tabs[index].comparison_picker.expanded;
                                     cx.notify();
-                                }
-                            })),
-                    ),
-            )
-            .when_some(
-                selected.filter(|_| picker.revision_details_expanded),
-                |view, selected| {
+                                })),
+                        ),
+                )
+                .when_some(
+                    selected.filter(|_| picker.revision_details_expanded),
+                    |view, selected| {
+                        view.child(
+                            div()
+                                .font_family(CODE_FONT)
+                                .ui_text(TextRole::Caption)
+                                .text_color(colors.muted)
+                                .child(format!(
+                                    "Selected: {} → {}. Published PR: {} → {}.",
+                                    selected.base_sha,
+                                    selected.head_sha,
+                                    canonical.base_sha,
+                                    canonical.head_sha,
+                                )),
+                        )
+                    },
+                )
+                // A settled inventory only ever said how many commits it holds,
+                // which the Commits tab and the list itself both carry.
+                .when(!inventory_ready || picker.expanded, |view| {
                     view.child(
                         div()
-                            .mt_1()
-                            .font_family(CODE_FONT)
                             .ui_text(TextRole::Caption)
-                            .text_color(colors.muted)
-                            .child(format!(
-                                "Selected: {} → {}. Published PR: {} → {}.",
-                                selected.base_sha,
-                                selected.head_sha,
-                                canonical.base_sha,
-                                canonical.head_sha,
-                            )),
+                            .text_color(if inventory_ready {
+                                colors.faint
+                            } else {
+                                colors.amber
+                            })
+                            .child(picker.inventory_reason()),
                     )
-                },
-            )
-            // A settled inventory only ever said how many commits it holds,
-            // which the Commits tab and the list itself both carry.
-            .when(!inventory_ready || picker.expanded, |view| {
-                view.child(
-                    div()
-                        .mt_1()
-                        .ui_text(TextRole::Caption)
-                        .text_color(if inventory_ready {
-                            colors.faint
-                        } else {
-                            colors.amber
-                        })
-                        .child(picker.inventory_reason()),
-                )
-            });
+                });
         if let Some(notice) = picker
             .notice
             .clone()
@@ -24115,7 +25658,6 @@ impl ReviewWorkspace {
         {
             view = view.child(
                 div()
-                    .mt_1()
                     .ui_text(TextRole::Caption)
                     .text_color(colors.amber)
                     .child(notice),
@@ -24143,21 +25685,9 @@ impl ReviewWorkspace {
             };
             view = view.child(
                 div()
-                    .mt_1()
                     .ui_text(TextRole::Caption)
                     .text_color(colors.amber)
                     .child(baseline),
-            );
-        }
-        if selected.is_some_and(|selected| selected.head_sha != canonical.head_sha) {
-            view = view.child(
-                div()
-                    .mt_1()
-                    .ui_text(TextRole::Caption)
-                    .text_color(colors.amber)
-                    .child(
-                        "This comparison ends before the published PR revision. To comment or submit a review, return to Full PR or choose a range ending at the published revision.",
-                    ),
             );
         }
         if picker.expanded {
@@ -24191,7 +25721,7 @@ impl ReviewWorkspace {
                         )))
                         .px(px(ui::CELL_INSET))
                         .h(px(ui::TWO_LINE_ROW))
-                        .py_1()
+                        .py(px(ui::GAP_ICON))
                         .flex()
                         .flex_col()
                         .justify_center()
@@ -24230,19 +25760,18 @@ impl ReviewWorkspace {
                                 .child(sha),
                         )
                         .on_click(cx.listener(move |root, _, window, cx| {
-                            if let Root::Review(this) = root {
-                                if editing_mode == PickerMode::Range {
-                                    this.select_picker_range_endpoint(index, commit_index, cx);
-                                } else {
-                                    this.select_picker_commit(index, commit_index, cx);
-                                }
-                                if editing_mode != PickerMode::Range
-                                    || this.tabs[index].comparison_picker.range_last.is_some()
-                                {
-                                    this.inspector_open = false;
-                                    this.refresh_auto_layout(window);
-                                    cx.notify();
-                                }
+                            let this = &mut root.review;
+                            if editing_mode == PickerMode::Range {
+                                this.select_picker_range_endpoint(index, commit_index, cx);
+                            } else {
+                                this.select_picker_commit(index, commit_index, cx);
+                            }
+                            if editing_mode != PickerMode::Range
+                                || this.tabs[index].comparison_picker.range_last.is_some()
+                            {
+                                this.inspector_open = false;
+                                this.refresh_auto_layout(window);
+                                cx.notify();
                             }
                         }))
                 })
@@ -24252,7 +25781,6 @@ impl ReviewWorkspace {
                     .id(SharedString::from(format!(
                         "comparison-commit-list-{index}"
                     )))
-                    .mt_2()
                     .h(px((picker.commits().len() as f32 * ui::TWO_LINE_ROW)
                         .clamp(ui::TWO_LINE_ROW, 520.)))
                     .overflow_y_scroll()
@@ -24294,21 +25822,19 @@ impl ReviewWorkspace {
                 .flex()
                 .flex_col()
                 .items_center()
-                .bg(colors.canvas)
                 .child(
                     div()
                         .id("restore-file-tree")
-                        .mt_3()
+                        .mt(px(ui::GAP_PAGE))
                         .control()
                         .cursor_pointer()
                         .text_color(colors.accent)
                         .child("›")
                         .on_click(cx.listener(|root, _, window, cx| {
-                            if let Root::Review(this) = root {
-                                this.panel_layout.file_tree_collapsed = false;
-                                this.refresh_auto_layout(window);
-                                cx.notify();
-                            }
+                            let this = &mut root.review;
+                            this.panel_layout.file_tree_collapsed = false;
+                            this.refresh_auto_layout(window);
+                            cx.notify();
                         })),
                 );
         }
@@ -24320,7 +25846,6 @@ impl ReviewWorkspace {
             .flex_col()
             .border_r_1()
             .border_color(colors.border)
-            .bg(colors.canvas)
             .child(
                 div()
                     .h(px(ui::DESKTOP_HIT))
@@ -24351,11 +25876,10 @@ impl ReviewWorkspace {
                                     .text_color(colors.accent)
                                     .child("‹")
                                     .on_click(cx.listener(|root, _, window, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.panel_layout.file_tree_collapsed = true;
-                                            this.refresh_auto_layout(window);
-                                            cx.notify();
-                                        }
+                                        let this = &mut root.review;
+                                        this.panel_layout.file_tree_collapsed = true;
+                                        this.refresh_auto_layout(window);
+                                        cx.notify();
                                     })),
                             ),
                     ),
@@ -24377,9 +25901,7 @@ impl ReviewWorkspace {
                             count,
                             move |range: Range<usize>, _, cx| {
                                 let viewed = root.read_with(cx, |root, _| {
-                                    let Root::Review(this) = root else {
-                                        return HashMap::new();
-                                    };
+                                    let this = &root.review;
                                     let session =
                                         this.tabs.get(index).and_then(|tab| tab.session.as_ref());
                                     range
@@ -24412,7 +25934,7 @@ impl ReviewWorkspace {
                                             .h(px(ui::ROW_HEIGHT))
                                             .ui_text(TextRole::Body)
                                             .pl(px(8. + row.depth as f32 * 14.))
-                                            .pr_2()
+                                            .pr(px(ui::GAP_GROUP))
                                             .flex()
                                             .items_center()
                                             .gap(px(ui::GAP_ICON))
@@ -24460,9 +25982,8 @@ impl ReviewWorkspace {
                                                     .on_click(move |_, window, cx| {
                                                         window.focus(&row_focus, cx);
                                                         click_root.update(cx, |root, cx| {
-                                                            if let Root::Review(this) = root
-                                                                && let Some(index) = this.active_tab
-                                                            {
+                                                            let this = &mut root.review;
+                                                            if let Some(index) = this.active_tab {
                                                                 this.tabs[index]
                                                                     .file_tree
                                                                     .set_cursor(
@@ -24535,14 +26056,10 @@ impl ReviewWorkspace {
                                                                 viewed_root.update(
                                                                     cx,
                                                                     |root, cx| {
-                                                                        if let Root::Review(this) =
-                                                                            root
-                                                                        {
-                                                                            this.toggle_viewed(
-                                                                                &viewed_key,
-                                                                                cx,
-                                                                            );
-                                                                        }
+                                                                        root.review.toggle_viewed(
+                                                                            &viewed_key,
+                                                                            cx,
+                                                                        );
                                                                     },
                                                                 );
                                                             }),
@@ -24565,7 +26082,6 @@ impl ReviewWorkspace {
                                                     })
                                                     .child(
                                                         div()
-                                                            .ml_1()
                                                             .flex()
                                                             .gap(px(ui::GAP_ICON))
                                                             .ui_text(TextRole::Caption)
@@ -24601,9 +26117,8 @@ impl ReviewWorkspace {
                                                     .on_click(move |_, window, cx| {
                                                         window.focus(&row_focus, cx);
                                                         row_root.update(cx, |root, cx| {
-                                                            if let Root::Review(this) = root
-                                                                && let Some(index) = this.active_tab
-                                                            {
+                                                            let this = &mut root.review;
+                                                            if let Some(index) = this.active_tab {
                                                                 this.tabs[index]
                                                                     .file_tree
                                                                     .set_cursor(
@@ -24707,7 +26222,6 @@ impl ReviewWorkspace {
             .h_full()
             .flex()
             .flex_col()
-            .bg(colors.surface)
             .child(
                 div()
                     .h(px(ui::DESKTOP_HIT))
@@ -24728,7 +26242,7 @@ impl ReviewWorkspace {
                             .mr(px(ui::GAP_GROUP))
                             .border_1()
                             .border_color(colors.border)
-                            .font_family(UI_FONT)
+                            .font_family(ui::TEXT_FONT)
                             .accessibility_label(if split_mode {
                                 "Switch to unified diff"
                             } else {
@@ -24740,18 +26254,16 @@ impl ReviewWorkspace {
                                 "Side by side"
                             })
                             .on_click(cx.listener(|root, _, _, cx| {
-                                if let Root::Review(this) = root {
-                                    this.toggle_diff_layout(cx);
-                                }
+                                let this = &mut root.review;
+                                this.toggle_diff_layout(cx);
                             })),
                     )
                     .child(
                         action_link_with_id("comment-on-file".into(), "Comment on file…", colors)
                             .on_click(move |_, window, cx| {
                                 file_action_root.update(cx, |root, cx| {
-                                    if let Root::Review(this) = root {
-                                        this.open_file_composer(window, cx);
-                                    }
+                                    let this = &mut root.review;
+                                    this.open_file_composer(window, cx);
                                 });
                             }),
                     ),
@@ -24860,29 +26372,20 @@ impl ReviewWorkspace {
             })
     }
 
-    fn render_lifecycle_overview(
+    /// The pull request's own actions. They sit in the conversation rail, so
+    /// the discussion column stays prose and every control the page offers is
+    /// in one column, in the order GitHub puts them.
+    fn render_lifecycle_actions(
         &self,
         index: usize,
         colors: Palette,
         cx: &mut Context<Root>,
-    ) -> AnyElement {
+    ) -> Option<AnyElement> {
         let tab = &self.tabs[index];
         let lifecycle = &tab.lifecycle;
-        let Some(snapshot) = lifecycle.snapshot.as_ref() else {
-            return div()
-                .mt_3()
-                .ui_text(TextRole::Caption)
-                .text_color(colors.muted)
-                .child(
-                    tab.lifecycle_state
-                        .notice()
-                        .unwrap_or_else(|| "Loading pull request details.".into()),
-                )
-                .into_any_element();
-        };
+        let snapshot = lifecycle.snapshot.as_ref()?;
         let capability = |label: &'static str, value: &cibergit::domain::ProviderCapability| {
             div()
-                .mt_1()
                 .ui_text(TextRole::Caption)
                 .text_color(if value.available {
                     colors.muted
@@ -24903,182 +26406,6 @@ impl ReviewWorkspace {
                         .unwrap_or_default()
                 ))
         };
-        let mut panel = div()
-            .p(px(ui::PANEL_GUTTER))
-            .rounded(px(ui::WINDOW_RADIUS))
-            .bg(colors.surface)
-            .border_1()
-            .border_color(colors.border)
-            .child(
-                div()
-                    .ui_text(TextRole::Subtitle)
-                    .child("Pull request"),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .ui_text(TextRole::Caption)
-                    .text_color(colors.muted)
-                    .child(format!(
-                        "Signed in as {}",
-                        snapshot.viewer_login
-                    )),
-            )
-            .when(!snapshot.values_complete || !snapshot.capabilities_complete, |panel| {
-                panel.child(
-                    div()
-                        .mt_1()
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.amber)
-                        .child(
-                            snapshot
-                                .notice
-                                .clone()
-                                .unwrap_or_else(|| "GitHub returned incomplete mutable values or capabilities; unavailable actions remain disabled.".into()),
-                        ),
-                )
-            });
-        if lifecycle.editing_metadata {
-            panel = panel
-                .child(
-                    div()
-                        .mt_3()
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.muted)
-                        .child("Title"),
-                )
-                .child(
-                    div()
-                        .mt_1()
-                        .h(px(ui::CONTROL_HEIGHT))
-                        .border_1()
-                        .border_color(colors.border)
-                        .rounded(px(ui::CONTROL_RADIUS))
-                        .child(Input::new(&self.metadata_title_input)),
-                )
-                .child(
-                    div()
-                        .mt_2()
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.muted)
-                        .child("Description · Markdown"),
-                )
-                .child(
-                    div()
-                        .mt_1()
-                        .h(px(112.))
-                        .border_1()
-                        .border_color(colors.border)
-                        .rounded(px(ui::CONTROL_RADIUS))
-                        .overflow_hidden()
-                        .child(Textarea::new(&self.metadata_body_input)),
-                )
-                .child(
-                    div()
-                        .mt_2()
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.muted)
-                        .child("Base branch"),
-                )
-                .child(
-                    div()
-                        .mt_1()
-                        .h(px(ui::CONTROL_HEIGHT))
-                        .border_1()
-                        .border_color(colors.border)
-                        .rounded(px(ui::CONTROL_RADIUS))
-                        .child(Input::new(&self.metadata_base_input)),
-                );
-            if let Some((branches, complete, notice)) = lifecycle.choices_for(ChoiceKind::Branch) {
-                panel = panel.child(
-                    div()
-                        .mt_2()
-                        .flex()
-                        .flex_wrap()
-                        .gap(px(ui::GAP_ICON))
-                        .children(branches.iter().take(10).map(|choice| {
-                            let value = choice.name.clone();
-                            action_link_with_id(
-                                format!("lifecycle-base-{value}"),
-                                "Use branch",
-                                colors,
-                            )
-                            .child(format!(" {value}"))
-                            .on_click(cx.listener(
-                                move |root, _, window, cx| {
-                                    if let Root::Review(this) = root {
-                                        this.metadata_base_input.update(cx, |input, cx| {
-                                            input.set_value(value.clone(), window, cx)
-                                        });
-                                    }
-                                },
-                            ))
-                        }))
-                        .when(!complete, |row| {
-                            row.child(
-                                div()
-                                    .ui_text(TextRole::Caption)
-                                    .text_color(colors.amber)
-                                    .child(notice.map(str::to_owned).unwrap_or_else(|| {
-                                        "Branch choices are incomplete.".into()
-                                    })),
-                            )
-                        }),
-                );
-            }
-            panel = panel.child(
-                div()
-                    .mt_3()
-                    .flex()
-                    .gap(px(ui::GAP_GROUP))
-                    .child(action_link("Review change…", colors).on_click(cx.listener(
-                        |root, _, _, cx| {
-                            if let Root::Review(this) = root {
-                                this.apply_metadata_edit(cx);
-                            }
-                        },
-                    )))
-                    .child(action_link("Cancel edit", colors).on_click(cx.listener(
-                        |root, _, _, cx| {
-                            if let Root::Review(this) = root
-                                && let Some(index) = this.active_tab
-                            {
-                                if this.tabs[index].write_in_flight
-                                    || this.tabs[index].lifecycle.active_operation.is_some()
-                                {
-                                    this.status = "Wait for the current action to finish; your edits are retained.".into();
-                                    cx.notify();
-                                    return;
-                                }
-                                this.tabs[index].lifecycle.cancel_metadata();
-                                this.status = "Metadata edits cancelled; zero writes sent.".into();
-                                cx.notify();
-                            }
-                        },
-                    ))),
-            );
-        } else {
-            panel = panel
-                .when(!snapshot.body.is_empty(), |panel| {
-                    panel.child(markdown_detail(
-                        format!("lifecycle-body-{}", tab.pull_request.number),
-                        "Description",
-                        &snapshot.body,
-                        colors,
-                    ))
-                })
-                .child(
-                    div()
-                        .mt_2()
-                        .child(action_link("Edit details…", colors).on_click(cx.listener(
-                            |root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.begin_metadata_edit(window, cx);
-                                }
-                            },
-                        ))),
-                );
-        }
         let state_action = if snapshot.state == "CLOSED" {
             PullRequestLifecycleAction::Reopen
         } else {
@@ -25099,49 +26426,53 @@ impl ReviewWorkspace {
         } else {
             "Convert to draft"
         };
-        panel = panel.child(
-            div()
-                .mt_3()
-                .flex()
-                .flex_wrap()
-                .gap(px(ui::GAP_GROUP))
-                .child(action_link(state_label, colors).on_click(cx.listener(
-                    move |root, _, _, cx| {
-                        if let Root::Review(this) = root {
-                            this.prepare_lifecycle_action(state_action.clone(), cx);
-                        }
+        // While the metadata editor is open, its own Review change / Cancel
+        // controls are the live pair; a second entry point into the same form
+        // would be a button that cannot do anything new.
+        let mut actions = div()
+            .flex()
+            .flex_col()
+            .gap(px(ui::GAP_FIELD))
+            .when(!lifecycle.editing_metadata, |column| {
+                column.child(rail_link("Edit details…", colors).on_click(cx.listener(
+                    |root, _, window, cx| {
+                        let this = &mut root.review;
+                        this.begin_metadata_edit(window, cx);
                     },
                 )))
-                .child(action_link(draft_label, colors).on_click(cx.listener(
-                    move |root, _, _, cx| {
-                        if let Root::Review(this) = root {
-                            this.prepare_lifecycle_action(draft_action.clone(), cx);
-                        }
-                    },
-                ))),
-        );
-        panel = panel.child(
-            action_link(
-                if tab.lifecycle_details_expanded {
-                    "Hide permissions"
-                } else {
-                    "Show permissions"
-                },
-                colors,
+            })
+            .child(
+                rail_link(state_label, colors).on_click(cx.listener(move |root, _, _, cx| {
+                    let this = &mut root.review;
+                    this.prepare_lifecycle_action(state_action.clone(), cx);
+                })),
             )
-            .mt_2()
-            .on_click(cx.listener(|root, _, _, cx| {
-                if let Root::Review(this) = root
-                    && let Some(index) = this.active_tab
-                {
-                    this.tabs[index].lifecycle_details_expanded =
-                        !this.tabs[index].lifecycle_details_expanded;
-                    cx.notify();
-                }
-            })),
-        );
+            .child(
+                rail_link(draft_label, colors).on_click(cx.listener(move |root, _, _, cx| {
+                    let this = &mut root.review;
+                    this.prepare_lifecycle_action(draft_action.clone(), cx);
+                })),
+            )
+            .child(
+                rail_link(
+                    if tab.lifecycle_details_expanded {
+                        "Hide permissions"
+                    } else {
+                        "Show permissions"
+                    },
+                    colors,
+                )
+                .on_click(cx.listener(|root, _, _, cx| {
+                    let this = &mut root.review;
+                    if let Some(index) = this.active_tab {
+                        this.tabs[index].lifecycle_details_expanded =
+                            !this.tabs[index].lifecycle_details_expanded;
+                        cx.notify();
+                    }
+                })),
+            );
         if tab.lifecycle_details_expanded {
-            panel = panel
+            actions = actions
                 .child(compact_detail("Last updated", &snapshot.updated_at, colors))
                 .child(capability("Metadata", &snapshot.can_update_metadata))
                 .child(capability("State", &snapshot.can_change_state))
@@ -25151,18 +26482,29 @@ impl ReviewWorkspace {
                 .child(capability("Assignees", &snapshot.can_change_assignees))
                 .child(capability("Comments", &snapshot.can_comment));
         }
+        Some(actions.into_any_element())
+    }
 
+    /// One add/remove button per exact observed choice, paged. The three groups
+    /// are returned separately so each hangs under the rail section that
+    /// already lists the metadata it changes.
+    fn render_lifecycle_deltas(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> Option<(AnyElement, AnyElement, AnyElement)> {
+        let tab = &self.tabs[index];
+        let lifecycle = &tab.lifecycle;
+        let snapshot = lifecycle.snapshot.as_ref()?;
         let delta_group = |title: &'static str,
                            selected: Vec<(String, PullRequestLifecycleAction)>,
                            available: Vec<(String, PullRequestLifecycleAction)>,
                            complete: bool,
                            notice: Option<String>| {
-            let mut group = div().mt_3().child(
-                div()
-                    .ui_text(TextRole::Caption)
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(title),
-            );
+            // The rail section already carries the group's name; a caption
+            // repeating it here would only push the buttons down.
+            let mut group = div().flex().flex_col().gap(px(ui::GAP_ICON));
             let group_index = match title {
                 "Reviewers" => 0,
                 "Labels" => 1,
@@ -25174,35 +26516,33 @@ impl ReviewWorkspace {
             let page = tab.lifecycle_choice_pages[group_index].min(page_count - 1);
             for (label, action) in choices.into_iter().skip(page * 18).take(18) {
                 group = group.child(
-                    action_link_with_id(format!("lifecycle-delta-{title}-{label}"), "", colors)
-                        .mt_1()
+                    rail_link_with_id(format!("lifecycle-delta-{title}-{label}"), "", colors)
+                        .overflow_hidden()
                         .child(label)
                         .on_click(cx.listener(move |root, _, _, cx| {
-                            if let Root::Review(this) = root {
-                                this.prepare_lifecycle_action(action.clone(), cx);
-                            }
+                            let this = &mut root.review;
+                            this.prepare_lifecycle_action(action.clone(), cx);
                         })),
                 );
             }
             if page_count > 1 {
                 group = group.child(
                     div()
-                        .mt_2()
                         .flex()
+                        .items_center()
                         .flex_wrap()
                         .gap(px(ui::GAP_GROUP))
                         .when(page > 0, |row| {
                             row.child(
-                                action_link_with_id(
+                                rail_link_with_id(
                                     format!("lifecycle-{title}-previous"),
                                     "Previous",
                                     colors,
                                 )
                                 .on_click(cx.listener(
                                     move |root, _, _, cx| {
-                                        if let Root::Review(this) = root
-                                            && let Some(index) = this.active_tab
-                                        {
+                                        let this = &mut root.review;
+                                        if let Some(index) = this.active_tab {
                                             this.tabs[index].lifecycle_choice_pages[group_index] =
                                                 page - 1;
                                             cx.notify();
@@ -25223,16 +26563,15 @@ impl ReviewWorkspace {
                         )
                         .when(page + 1 < page_count, |row| {
                             row.child(
-                                action_link_with_id(
+                                rail_link_with_id(
                                     format!("lifecycle-{title}-next"),
                                     "Next",
                                     colors,
                                 )
                                 .on_click(cx.listener(
                                     move |root, _, _, cx| {
-                                        if let Root::Review(this) = root
-                                            && let Some(index) = this.active_tab
-                                        {
+                                        let this = &mut root.review;
+                                        if let Some(index) = this.active_tab {
                                             this.tabs[index].lifecycle_choice_pages[group_index] =
                                                 page + 1;
                                             cx.notify();
@@ -25243,17 +26582,19 @@ impl ReviewWorkspace {
                         }),
                 )
             }
-            group.when(!complete, |group| {
-                group.child(
-                    div()
-                        .mt_1()
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.amber)
-                        .child(
-                            notice.unwrap_or_else(|| format!("{title} choices are incomplete.")),
-                        ),
-                )
-            })
+            group
+                .when(!complete, |group| {
+                    group.child(
+                        div()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.amber)
+                            .child(
+                                notice
+                                    .unwrap_or_else(|| format!("{title} choices are incomplete.")),
+                            ),
+                    )
+                })
+                .into_any_element()
         };
         let reviewer_selected = snapshot
             .reviewers
@@ -25295,13 +26636,13 @@ impl ReviewWorkspace {
                 );
             }
         }
-        panel = panel.child(delta_group(
+        let reviewers = delta_group(
             "Reviewers",
             reviewer_selected,
             reviewer_available,
             reviewer_complete,
             reviewer_notice,
-        ));
+        );
         let choice_delta =
             |kind: ChoiceKind,
              selected: &[String],
@@ -25340,24 +26681,158 @@ impl ReviewWorkspace {
             PullRequestLifecycleAction::AddLabel,
             PullRequestLifecycleAction::RemoveLabel,
         );
-        panel = panel.child(delta_group("Labels", selected, available, complete, notice));
+        let labels = delta_group("Labels", selected, available, complete, notice);
         let (selected, available, complete, notice) = choice_delta(
             ChoiceKind::Assignee,
             &snapshot.assignees,
             PullRequestLifecycleAction::AddAssignee,
             PullRequestLifecycleAction::RemoveAssignee,
         );
-        panel = panel.child(delta_group(
-            "Assignees",
-            selected,
-            available,
-            complete,
-            notice,
-        ));
+        let assignees = delta_group("Assignees", selected, available, complete, notice);
+        Some((reviewers, labels, assignees))
+    }
+
+    fn render_lifecycle_overview(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> AnyElement {
+        let tab = &self.tabs[index];
+        let lifecycle = &tab.lifecycle;
+        let Some(snapshot) = lifecycle.snapshot.as_ref() else {
+            return div()
+                .ui_text(TextRole::Caption)
+                .text_color(colors.muted)
+                .child(
+                    tab.lifecycle_state
+                        .notice()
+                        .unwrap_or_else(|| "Loading pull request details.".into()),
+                )
+                .into_any_element();
+        };
+        // No card and no inset: the page this sits on already owns the gutter,
+        // and a block that pads itself again starts its text off the line every
+        // other block on the page starts on.
+        let mut panel = layout::block()
+            .child(
+                div()
+                    .ui_text(TextRole::Subtitle)
+                    .child("Pull request"),
+            )
+            .child(
+                div()
+                    .ui_text(TextRole::Caption)
+                    .text_color(colors.muted)
+                    .child(format!(
+                        "Signed in as {}",
+                        snapshot.viewer_login
+                    )),
+            )
+            .when(!snapshot.values_complete || !snapshot.capabilities_complete, |panel| {
+                panel.child(
+                    div()
+                        .ui_text(TextRole::Caption)
+                        .text_color(colors.amber)
+                        .child(
+                            snapshot
+                                .notice
+                                .clone()
+                                .unwrap_or_else(|| "GitHub returned incomplete mutable values or capabilities; unavailable actions remain disabled.".into()),
+                        ),
+                )
+            });
+        if lifecycle.editing_metadata {
+            panel = panel
+                .child(layout::field("Title", colors).child(
+                    layout::text_field(colors).child(Input::new(&self.metadata_title_input)),
+                ))
+                .child(layout::field("Description · Markdown", colors).child(
+                    layout::text_area(5, colors).child(Textarea::new(&self.metadata_body_input)),
+                ))
+                .child(layout::field("Base branch", colors).child(
+                    layout::text_field(colors).child(Input::new(&self.metadata_base_input)),
+                ));
+            if let Some((branches, complete, notice)) = lifecycle.choices_for(ChoiceKind::Branch) {
+                panel = panel.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(ui::GAP_ICON))
+                        .children(branches.iter().take(10).map(|choice| {
+                            let value = choice.name.clone();
+                            action_link_with_id(
+                                format!("lifecycle-base-{value}"),
+                                "Use branch",
+                                colors,
+                            )
+                            .child(format!(" {value}"))
+                            .on_click(cx.listener(
+                                move |root, _, window, cx| {
+                                    let this = &mut root.review;
+                                    this.metadata_base_input.update(cx, |input, cx| {
+                                        input.set_value(value.clone(), window, cx)
+                                    });
+                                },
+                            ))
+                        }))
+                        .when(!complete, |row| {
+                            row.child(
+                                div()
+                                    .ui_text(TextRole::Caption)
+                                    .text_color(colors.amber)
+                                    .child(notice.map(str::to_owned).unwrap_or_else(|| {
+                                        "Branch choices are incomplete.".into()
+                                    })),
+                            )
+                        }),
+                );
+            }
+            panel = panel.child(
+                div()
+                    .flex()
+                    .gap(px(ui::GAP_GROUP))
+                    .child(action_link("Review change…", colors).on_click(cx.listener(
+                        |root, _, _, cx| {
+                            {
+                                let this = &mut root.review;
+                                this.apply_metadata_edit(cx);
+                            }
+                        },
+                    )))
+                    .child(action_link("Cancel edit", colors).on_click(cx.listener(
+                        |root, _, _, cx| {
+                            let this = &mut root.review;
+                            if let Some(index) = this.active_tab
+                            {
+                                if this.tabs[index].write_in_flight
+                                    || this.tabs[index].lifecycle.active_operation.is_some()
+                                {
+                                    this.status = "Wait for the current action to finish; your edits are retained.".into();
+                                    cx.notify();
+                                    return;
+                                }
+                                this.tabs[index].lifecycle.cancel_metadata();
+                                this.status = "Metadata edits cancelled; zero writes sent.".into();
+                                cx.notify();
+                            }
+                        },
+                    ))),
+            );
+        } else {
+            panel = panel.when(!snapshot.body.is_empty(), |panel| {
+                panel.child(markdown_detail(
+                    format!("lifecycle-body-{}", tab.pull_request.number),
+                    "Description",
+                    &snapshot.body,
+                    colors,
+                ))
+            });
+        }
+
         if let Some(notice) = &lifecycle.notice {
             panel = panel.child(
                 div()
-                    .mt_3()
                     .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .child(notice.clone()),
@@ -25379,17 +26854,10 @@ impl ReviewWorkspace {
             FrozenMutation::Discussion { request, .. } => &request.target,
         };
         Some(
-            div()
-                .mb(px(ui::GAP_PAGE))
-                .p_3()
-                .rounded(px(ui::CONTROL_RADIUS))
-                .border_1()
-                .border_color(colors.accent)
-                .child(div().ui_text(TextRole::Subtitle).child("Confirm change"))
+            layout::section("Confirm change", colors)
                 .child(render_lifecycle_change(frozen, colors))
                 .child(
                     div()
-                        .mt_1()
                         .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .child(format!(
@@ -25409,11 +26877,9 @@ impl ReviewWorkspace {
                         },
                         colors,
                     )
-                    .mt_2()
                     .on_click(cx.listener(|root, _, _, cx| {
-                        if let Root::Review(this) = root
-                            && let Some(index) = this.active_tab
-                        {
+                        let this = &mut root.review;
+                        if let Some(index) = this.active_tab {
                             this.tabs[index].lifecycle_confirmation_details =
                                 !this.tabs[index].lifecycle_confirmation_details;
                             cx.notify();
@@ -25423,7 +26889,6 @@ impl ReviewWorkspace {
                 .when(tab.lifecycle_confirmation_details, |card| {
                     card.child(
                         div()
-                            .mt_2()
                             .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child(frozen.summary().to_owned()),
@@ -25442,22 +26907,19 @@ impl ReviewWorkspace {
                 })
                 .child(
                     div()
-                        .mt_3()
                         .flex()
                         .flex_wrap()
                         .gap(px(ui::GAP_GROUP))
                         .child(action_link("Confirm", colors).on_click(cx.listener(
                             |root, _, _, cx| {
-                                if let Root::Review(this) = root {
-                                    this.confirm_lifecycle_mutation(cx);
-                                }
+                                let this = &mut root.review;
+                                this.confirm_lifecycle_mutation(cx);
                             },
                         )))
                         .child(action_link("Cancel", colors).on_click(cx.listener(
                             |root, _, _, cx| {
-                                if let Root::Review(this) = root
-                                    && let Some(index) = this.active_tab
-                                {
+                                let this = &mut root.review;
+                                if let Some(index) = this.active_tab {
                                     this.tabs[index].lifecycle.cancel_confirmation();
                                     this.status =
                                         "Lifecycle confirmation cancelled; zero writes sent."
@@ -25483,7 +26945,6 @@ impl ReviewWorkspace {
         let refresh_root = back_root.clone();
         content.push(
             div()
-                .mb_3()
                 .flex()
                 .items_center()
                 .gap(px(ui::GAP_GROUP))
@@ -25491,11 +26952,10 @@ impl ReviewWorkspace {
                     action_link_with_id("actions-jobs-back".into(), "Back to checks", colors)
                         .on_click(move |_, window, cx| {
                             back_root.update(cx, |root, cx| {
-                                if let Root::Review(this) = root {
-                                    this.tabs[index].ci_read.pane = CiPane::Checks;
-                                    this.focus_current_ci_pane(index, window, cx);
-                                    cx.notify();
-                                }
+                                let this = &mut root.review;
+                                this.tabs[index].ci_read.pane = CiPane::Checks;
+                                this.focus_current_ci_pane(index, window, cx);
+                                cx.notify();
                             });
                         }),
                 )
@@ -25503,9 +26963,8 @@ impl ReviewWorkspace {
                     action_link_with_id("actions-jobs-refresh".into(), "Refresh jobs", colors)
                         .on_click(move |_, _, cx| {
                             refresh_root.update(cx, |root, cx| {
-                                if let Root::Review(this) = root {
-                                    this.start_actions_jobs(index, cx);
-                                }
+                                let this = &mut root.review;
+                                this.start_actions_jobs(index, cx);
                             });
                         }),
                 )
@@ -25514,7 +26973,6 @@ impl ReviewWorkspace {
         if let Some(notice) = tab.ci_read.jobs.notice() {
             content.push(
                 div()
-                    .mb_2()
                     .ui_text(TextRole::Caption)
                     .text_color(colors.amber)
                     .child(notice.to_owned())
@@ -25538,12 +26996,7 @@ impl ReviewWorkspace {
             ActionsHeadRelation::Unknown => "PR association unknown",
         };
         content.push(
-            div()
-                .mb_3()
-                .p_2()
-                .rounded(px(ui::CONTROL_RADIUS))
-                .border_1()
-                .border_color(colors.border)
+            layout::block()
                 .child(detail(
                     "Exact attempt",
                     format!(
@@ -25590,11 +27043,11 @@ impl ReviewWorkspace {
                     .h_auto()
                     .min_h(px(ui::TWO_LINE_ROW))
                     .ui_text(TextRole::Body)
-                    .mb_2()
-                    .p_2()
+                    .p(px(ui::GAP_GROUP))
                     .w_full()
                     .flex_col()
                     .items_stretch()
+                    .gap(px(ui::GAP_ICON))
                     .rounded(px(ui::CONTROL_RADIUS))
                     .border_1()
                     .border_color(if selected {
@@ -25631,7 +27084,6 @@ impl ReviewWorkspace {
                     )
                     .child(
                         div()
-                            .mt_1()
                             .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child(format!(
@@ -25648,10 +27100,9 @@ impl ReviewWorkspace {
                     .on_click(move |_, window, cx| {
                         focus.focus(window, cx);
                         row_root.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
-                                this.tabs[index].ci_read.select_job(Some(id));
-                                cx.notify();
-                            }
+                            let this = &mut root.review;
+                            this.tabs[index].ci_read.select_job(Some(id));
+                            cx.notify();
                         });
                     })
                     .into_any_element(),
@@ -25659,7 +27110,6 @@ impl ReviewWorkspace {
         }
         content.push(
             div()
-                .mt_2()
                 .ui_text(TextRole::Caption)
                 .text_color(colors.muted)
                 .child(format!(
@@ -25677,7 +27127,6 @@ impl ReviewWorkspace {
         let log_root = previous_root.clone();
         content.push(
             div()
-                .mt_2()
                 .flex()
                 .flex_wrap()
                 .gap(px(ui::GAP_GROUP))
@@ -25691,9 +27140,8 @@ impl ReviewWorkspace {
                     )
                     .on_click(move |_, window, cx| {
                         previous_root.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
-                                this.move_jobs_page(-1, window, cx);
-                            }
+                            let this = &mut root.review;
+                            this.move_jobs_page(-1, window, cx);
                         });
                     }),
                 )
@@ -25707,9 +27155,8 @@ impl ReviewWorkspace {
                     )
                     .on_click(move |_, window, cx| {
                         next_root.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
-                                this.move_jobs_page(1, window, cx);
-                            }
+                            let this = &mut root.review;
+                            this.move_jobs_page(1, window, cx);
                         });
                     }),
                 )
@@ -25727,9 +27174,8 @@ impl ReviewWorkspace {
                         .child("Load log")
                         .on_click(move |_, window, cx| {
                             log_root.update(cx, |root, cx| {
-                                if let Root::Review(this) = root
-                                    && this.start_actions_log(index, cx)
-                                {
+                                let this = &mut root.review;
+                                if this.start_actions_log(index, cx) {
                                     this.focus_current_ci_pane(index, window, cx);
                                 }
                             });
@@ -25753,20 +27199,17 @@ impl ReviewWorkspace {
             action_link_with_id("actions-log-back".into(), "Back to jobs", colors)
                 .on_click(move |_, window, cx| {
                     back_root.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
-                            this.tabs[index].ci_read.pane = CiPane::Jobs;
-                            this.focus_current_ci_pane(index, window, cx);
-                            cx.notify();
-                        }
+                        let this = &mut root.review;
+                        this.tabs[index].ci_read.pane = CiPane::Jobs;
+                        this.focus_current_ci_pane(index, window, cx);
+                        cx.notify();
                     });
                 })
-                .mb_3()
                 .into_any_element(),
         );
         if let Some(notice) = tab.ci_read.log.notice() {
             content.push(
                 div()
-                    .mb_2()
                     .ui_text(TextRole::Caption)
                     .text_color(colors.amber)
                     .child(notice.to_owned())
@@ -25785,12 +27228,7 @@ impl ReviewWorkspace {
         };
         let locator = &log.key.locator;
         content.push(
-            div()
-                .mb_3()
-                .p_2()
-                .rounded(px(ui::CONTROL_RADIUS))
-                .border_1()
-                .border_color(colors.border)
+            layout::block()
                 .child(detail(
                     "Exact job",
                     format!("{} · REST job ID {}", log.job.name, log.job.id),
@@ -25926,7 +27364,6 @@ impl ReviewWorkspace {
         );
         content.push(
             div()
-                .mt_2()
                 .ui_text(TextRole::Caption)
                 .text_color(colors.muted)
                 .child(format!(
@@ -25935,6 +27372,41 @@ impl ReviewWorkspace {
                 .into_any_element(),
         );
         content
+    }
+
+    /// Start fetching any participant picture this snapshot named and we have
+    /// not asked for yet, and hand back the ones already on hand. Each login
+    /// is fetched once per run; until its bytes land — and forever, if they
+    /// never do — the drawn puck is what the conversation shows.
+    fn claim_avatars(
+        &self,
+        details: Option<&PullRequestDetails>,
+        cx: &mut Context<Root>,
+    ) -> HashMap<String, Arc<Image>> {
+        if let Some(details) = details {
+            for (login, url) in &details.participant_avatars {
+                let path = {
+                    let mut cache = self.avatars.borrow_mut();
+                    if !cache.claim(login) {
+                        continue;
+                    }
+                    cache.path_for(url)
+                };
+                let (login, url) = (login.clone(), url.clone());
+                let executor = cx.background_executor().clone();
+                cx.spawn(async move |root, cx| {
+                    let image = executor
+                        .spawn(async move { avatars::load(&path, &url) })
+                        .await;
+                    let _ = root.update(cx, |root, cx| {
+                        root.review.avatars.borrow_mut().finish(&login, image);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
+        self.avatars.borrow().ready()
     }
 
     fn render_pr_section_content(
@@ -25956,55 +27428,8 @@ impl ReviewWorkspace {
             .or_else(|| cached_observation.map(|observation| &observation.details));
         let root = cx.entity();
         match current {
-            InspectorSection::Commits => vec![self.render_comparison_picker(index, colors, cx)],
+            InspectorSection::Commits => Vec::new(),
             InspectorSection::Overview => {
-                let mut fields = vec![
-                    detail("Author", &tab.pull_request.author, colors),
-                    detail_element(
-                        "State",
-                        state_pill(&tab.pull_request.state, tab.pull_request.draft, colors)
-                            .into_any_element(),
-                        colors,
-                    ),
-                    detail(
-                        "Review",
-                        empty_unknown(&tab.pull_request.review_status),
-                        colors,
-                    ),
-                    detail(
-                        "Labels",
-                        if tab.pull_request.labels.is_empty() {
-                            "None".into()
-                        } else {
-                            tab.pull_request.labels.join(", ")
-                        },
-                        colors,
-                    ),
-                ];
-                if let Some(details) = displayed_details {
-                    fields.push(detail(
-                        "Requested reviewers",
-                        if details.requested_reviewers.is_empty() {
-                            "None".into()
-                        } else {
-                            details.requested_reviewers.join(", ")
-                        },
-                        colors,
-                    ));
-                    fields.push(detail(
-                        if cached_observation.is_some() {
-                            "Merge state (cached observation)"
-                        } else {
-                            "Merge state"
-                        },
-                        format!(
-                            "{} · {}",
-                            details.merge_eligibility.mergeable,
-                            details.merge_eligibility.merge_state_status
-                        ),
-                        colors,
-                    ));
-                }
                 let fallback_description = displayed_details.filter(|details| {
                     !details.body.trim().is_empty()
                         && (cached_observation.is_some() || tab.lifecycle.snapshot.is_none())
@@ -26025,42 +27450,29 @@ impl ReviewWorkspace {
                     div()
                         .w_full()
                         .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(ui::GAP_COLUMNS))
                         .when_some(fallback_description, |page, details| {
-                            page.child(
-                                div()
-                                    .p(px(ui::PANEL_GUTTER))
-                                    .rounded(px(ui::WINDOW_RADIUS))
-                                    .border_1()
-                                    .border_color(colors.border)
-                                    .bg(colors.surface)
-                                    .child(markdown_detail(
-                                        format!("pr-description-{}", tab.pull_request.number),
-                                        "Description",
-                                        &details.body,
-                                        colors,
-                                    )),
-                            )
+                            page.child(div().child(markdown_detail(
+                                format!("pr-description-{}", tab.pull_request.number),
+                                "Description",
+                                &details.body,
+                                colors,
+                            )))
                         })
                         .child(self.render_lifecycle_overview(index, colors, cx))
                         .child(pr_reactions)
-                        .child(
-                            div()
-                                .mt(px(ui::GAP_PAGE))
-                                .flex()
-                                .flex_wrap()
-                                .gap_6()
-                                .children(fields),
-                        )
                         .into_any_element(),
                 ]
             }
             InspectorSection::Activity => {
+                let avatars = self.claim_avatars(displayed_details, cx);
                 let mut activity = Vec::new();
                 if displayed_details.is_none() {
                     if let Some(error) = &tab.submitted_summary_editor.persistence_error {
                         activity.push(
                             div()
-                                .mb_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child(error.clone()),
@@ -26068,19 +27480,13 @@ impl ReviewWorkspace {
                     }
                     for draft in &tab.submitted_summary_editor.drafts {
                         activity.push(
-                            div()
-                                .mb_2()
-                                .p_3()
-                                .border_1()
-                                .border_color(colors.amber)
-                                .rounded(px(ui::CONTROL_RADIUS))
-                                .child(div().ui_text(TextRole::Body).child(format!(
+                            layout::section("Recovered review", colors)
+                                .child(div().ui_text(TextRole::Body).text_color(colors.amber).child(format!(
                                     "Recovered review {} while remote Activity is unavailable",
                                     draft.review.coordinates.remote_id
                                 )))
                                 .child(
                                     div()
-                                        .mt_2()
                                         .font_family(CODE_FONT)
                                         .ui_text(TextRole::Caption)
                                         .child(format!(
@@ -26089,54 +27495,41 @@ impl ReviewWorkspace {
                                             draft.body
                                         )),
                                 )
-                                .child(div().mt_2().ui_text(TextRole::Caption).text_color(colors.amber).child(
+                                .child(div().ui_text(TextRole::Caption).text_color(colors.amber).child(
                                     "Recoverable local history only; no confirmation or write authority was restored.",
                                 )),
                         );
                     }
                 }
                 if let Some(snapshot) = tab.lifecycle.snapshot.as_ref() {
-                    let mut composer = div()
-                        .mb(px(ui::GAP_PAGE))
-                        .p_3()
-                        .rounded(px(ui::CONTROL_RADIUS))
-                        .bg(colors.elevated)
-                        .child(div().ui_text(TextRole::Subtitle).child("Discussion"))
-                        .child(
-                            div()
-                                .mt_1()
-                                .ui_text(TextRole::Caption)
-                                .text_color(colors.muted)
-                                .child(format!("Comment as {}", snapshot.viewer_login)),
-                        );
+                    let mut composer = layout::section("Discussion", colors).child(
+                        div()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.muted)
+                            .child(format!("Comment as {}", snapshot.viewer_login)),
+                    );
                     if tab.lifecycle.discussion_form.is_some() {
                         composer = composer
                             .child(
-                                div()
-                                    .mt_2()
-                                    .h(px(110.))
-                                    .border_1()
-                                    .border_color(colors.border)
-                                    .rounded(px(ui::CONTROL_RADIUS))
-                                    .overflow_hidden()
+                                layout::text_area(5, colors)
                                     .child(Textarea::new(&self.discussion_input)),
                             )
                             .child(
                                 div()
-                                    .mt_2()
                                     .flex()
                                     .gap(px(ui::GAP_GROUP))
                                     .child(action_link("Review comment…", colors).on_click(
                                         cx.listener(|root, _, _, cx| {
-                                            if let Root::Review(this) = root {
+                                            {
+                                                let this = &mut root.review;
                                                 this.apply_discussion(cx);
                                             }
                                         }),
                                     ))
                                     .child(action_link("Cancel comment", colors).on_click(
                                         cx.listener(|root, _, _, cx| {
-                                            if let Root::Review(this) = root
-                                                && let Some(index) = this.active_tab
+                                            let this = &mut root.review;
+                                            if let Some(index) = this.active_tab
                                             {
                                                 if this.tabs[index].write_in_flight
                                                     || this.tabs[index].lifecycle.active_operation.is_some()
@@ -26155,12 +27548,11 @@ impl ReviewWorkspace {
                                     )),
                             );
                     } else {
-                        composer = composer.child(div().mt_2().child(
+                        composer = composer.child(div().child(
                             action_link("Write a comment…", colors).on_click(cx.listener(
                                 |root, _, window, cx| {
-                                    if let Root::Review(this) = root {
-                                        this.begin_comment_create(window, cx);
-                                    }
+                                    let this = &mut root.review;
+                                    this.begin_comment_create(window, cx);
                                 },
                             )),
                         ));
@@ -26199,15 +27591,9 @@ impl ReviewWorkspace {
                             || !controller.reconciliation_results.is_empty()
                             || !journal_unresolved.is_empty()
                             || pending_start_requires_attention;
-                        let mut pending_card = div()
-                                .mb(px(ui::GAP_PAGE))
-                                .p_3()
-                                .rounded(px(ui::CONTROL_RADIUS))
-                                .bg(colors.elevated)
-                                .child("Your pending review")
+                        let mut pending_card = layout::section("Your pending review", colors)
                                 .child(
                                     div()
-                                        .mt_1()
                                         .ui_text(TextRole::Caption)
                                         .text_color(colors.muted)
                                         .child(format!(
@@ -26218,7 +27604,6 @@ impl ReviewWorkspace {
                                 .when(recovery_details_expanded, |card| {
                                     card.child(
                                         div()
-                                            .mt_1()
                                             .ui_text(TextRole::Caption)
                                             .text_color(colors.faint)
                                             .child(
@@ -26240,7 +27625,6 @@ impl ReviewWorkspace {
                                 .when(!controller.pending_complete, |card| {
                                     card.child(
                                         div()
-                                            .mt_1()
                                             .ui_text(TextRole::Caption)
                                             .text_color(colors.amber)
                                             .child("Pending comment linkage is partial."),
@@ -26249,7 +27633,6 @@ impl ReviewWorkspace {
                                 .when(unresolved_reviews > 0, |card| {
                                     card.child(
                                         div()
-                                            .mt_1()
                                             .ui_text(TextRole::Caption)
                                             .text_color(colors.amber)
                                             .child(if unresolved_reviews == 1 {
@@ -26344,8 +27727,7 @@ impl ReviewWorkspace {
                             };
                             pending_card = pending_card.child(
                                 div()
-                                    .mt_2()
-                                    .p_2()
+                                    .p(px(ui::GAP_GROUP))
                                     .rounded(px(ui::CONTROL_RADIUS))
                                     .border_1()
                                     .border_color(if pending_start_requires_attention {
@@ -26365,7 +27747,6 @@ impl ReviewWorkspace {
                                 let stop_flow = continue_flow.clone();
                                 pending_card = pending_card.child(
                                     div()
-                                        .mt_2()
                                         .flex()
                                         .flex_wrap()
                                         .gap(px(ui::GAP_GROUP))
@@ -26381,13 +27762,12 @@ impl ReviewWorkspace {
                                                 )
                                                 .on_click(move |_, window, cx| {
                                                     continue_root.update(cx, |root, cx| {
-                                                        if let Root::Review(this) = root {
-                                                            this.continue_pending_review_start(
-                                                                &continue_flow,
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        }
+                                                        let this = &mut root.review;
+                                                        this.continue_pending_review_start(
+                                                            &continue_flow,
+                                                            window,
+                                                            cx,
+                                                        );
                                                     });
                                                 })
                                                 .child("Continue adding file comment"),
@@ -26404,11 +27784,10 @@ impl ReviewWorkspace {
                                                 )
                                                 .on_click(move |_, _, cx| {
                                                     stop_root.update(cx, |root, cx| {
-                                                        if let Root::Review(this) = root {
-                                                            this.stop_pending_review_start(
-                                                                &stop_flow, cx,
-                                                            );
-                                                        }
+                                                        let this = &mut root.review;
+                                                        this.stop_pending_review_start(
+                                                            &stop_flow, cx,
+                                                        );
                                                     });
                                                 })
                                                 .child("Stop and keep pending review"),
@@ -26421,7 +27800,7 @@ impl ReviewWorkspace {
                                 let cancel_root = cx.entity();
                                 let cancel_flow = record.intent.flow_id.clone();
                                 pending_card = pending_card.child(
-                                    div().mt_2().child(
+                                    div().child(
                                         Button::new("cancel-prepared-pending-file-start")
                                             .control()
                                             .border_1()
@@ -26433,12 +27812,11 @@ impl ReviewWorkspace {
                                             )
                                             .on_click(move |_, _, cx| {
                                                 cancel_root.update(cx, |root, cx| {
-                                                    if let Root::Review(this) = root {
-                                                        this.cancel_prepared_pending_review_start(
-                                                            &cancel_flow,
-                                                            cx,
-                                                        );
-                                                    }
+                                                    let this = &mut root.review;
+                                                    this.cancel_prepared_pending_review_start(
+                                                        &cancel_flow,
+                                                        cx,
+                                                    );
                                                 });
                                             })
                                             .child("Cancel recovered start"),
@@ -26451,8 +27829,9 @@ impl ReviewWorkspace {
                                 let finish_root = cx.entity();
                                 let finish_flow = record.intent.flow_id.clone();
                                 pending_card = pending_card.child(
-                                    div().mt_2().child(
-                                        Button::new("finish-acknowledged-pending-file-start").control()
+                                    div().child(
+                                        Button::new("finish-acknowledged-pending-file-start")
+                                            .control()
                                             .border_1()
                                             .border_color(colors.border)
                                             .text_color(colors.accent)
@@ -26462,12 +27841,11 @@ impl ReviewWorkspace {
                                             )
                                             .on_click(move |_, _, cx| {
                                                 finish_root.update(cx, |root, cx| {
-                                                    if let Root::Review(this) = root {
-                                                        this.finish_acknowledged_pending_review_start(
-                                                            &finish_flow,
-                                                            cx,
-                                                        );
-                                                    }
+                                                    let this = &mut root.review;
+                                                    this.finish_acknowledged_pending_review_start(
+                                                        &finish_flow,
+                                                        cx,
+                                                    );
                                                 });
                                             })
                                             .child("Finish local recovery"),
@@ -26477,13 +27855,12 @@ impl ReviewWorkspace {
                         }
                         if unresolved_reviews > 0 {
                             let reconcile_root = cx.entity();
-                            pending_card = pending_card.child(div().mt_2().child(
+                            pending_card = pending_card.child(div().child(
                                 action_link("Reconcile review outcomes", colors).on_click(
                                     move |_, _, cx| {
                                         reconcile_root.update(cx, |root, cx| {
-                                            if let Root::Review(this) = root {
-                                                this.reconcile_review_operations(cx);
-                                            }
+                                            let this = &mut root.review;
+                                            this.reconcile_review_operations(cx);
                                         });
                                     },
                                 ),
@@ -26496,12 +27873,11 @@ impl ReviewWorkspace {
                             } else {
                                 "Show recovery details"
                             };
-                            pending_card = pending_card.child(div().mt_2().child(
+                            pending_card = pending_card.child(div().child(
                                 action_link(disclosure_label, colors).on_click(move |_, _, cx| {
                                     disclosure_root.update(cx, |root, cx| {
-                                        if let Root::Review(this) = root
-                                            && let Some(index) = this.active_tab
-                                        {
+                                        let this = &mut root.review;
+                                        if let Some(index) = this.active_tab {
                                             this.tabs[index].recovery_details_expanded =
                                                 !recovery_details_expanded;
                                             cx.notify();
@@ -26527,7 +27903,6 @@ impl ReviewWorkspace {
                         {
                             pending_card = pending_card.child(
                                 div()
-                                    .mt_1()
                                     .ui_text(TextRole::Caption)
                                     .text_color(colors.amber)
                                     .child(description),
@@ -26539,14 +27914,12 @@ impl ReviewWorkspace {
                                 ReviewReconciliationOutcome::Unresolved(_) => colors.amber,
                             };
                             pending_card = pending_card.child(
-                                div()
-                                    .mt_1()
-                                    .ui_text(TextRole::Caption)
-                                    .text_color(color)
-                                    .child(review_reconciliation_description(
+                                div().ui_text(TextRole::Caption).text_color(color).child(
+                                    review_reconciliation_description(
                                         item,
                                         recovery_details_expanded,
-                                    )),
+                                    ),
+                                ),
                             );
                         }
                         for draft in controller.composition.file_drafts.iter().filter(|draft| {
@@ -26557,8 +27930,7 @@ impl ReviewWorkspace {
                             let draft_id = draft.id.clone();
                             pending_card = pending_card.child(
                                 div()
-                                    .mt_2()
-                                    .p_2()
+                                    .p(px(ui::GAP_GROUP))
                                     .rounded(px(ui::CONTROL_RADIUS))
                                     .border_1()
                                     .border_color(colors.border)
@@ -26567,13 +27939,14 @@ impl ReviewWorkspace {
                                         draft.target.path,
                                         short_sha(&draft.target.commit_sha)
                                     ))
-                                    .child(div().mt_1().ui_text(TextRole::Caption).text_color(colors.muted).child(
+                                    .child(div().ui_text(TextRole::Caption).text_color(colors.muted).child(
                                         "Saved locally; no provider write has been acknowledged.",
                                     ))
                                     .child(action_link("Open file draft", colors).on_click(
                                         move |_, window, cx| {
                                             reopen_root.update(cx, |root, cx| {
-                                                if let Root::Review(this) = root {
+                                                {
+                                                    let this = &mut root.review;
                                                     this.reopen_file_draft(&draft_id, window, cx);
                                                 }
                                             });
@@ -26588,7 +27961,6 @@ impl ReviewWorkspace {
                             let cancel_review = snapshot.review.coordinates.clone();
                             pending_card = pending_card.child(
                                 div()
-                                    .mt_2()
                                     .flex()
                                     .flex_wrap()
                                     .w_full()
@@ -26597,9 +27969,8 @@ impl ReviewWorkspace {
                                     .child(action_link("Edit pending summary", colors).on_click(
                                         move |_, window, cx| {
                                             edit_root.update(cx, |root, cx| {
-                                                if let Root::Review(this) = root
-                                                    && let Some(index) = this.active_tab
-                                                {
+                                                let this = &mut root.review;
+                                                if let Some(index) = this.active_tab {
                                                     this.tabs[index].editing_pending_summary = true;
                                                     this.review_summary_input.update(
                                                         cx,
@@ -26620,14 +27991,13 @@ impl ReviewWorkspace {
                                     .child(action_link("Cancel pending review", colors).on_click(
                                         move |_, _, cx| {
                                             cancel_root.update(cx, |root, cx| {
-                                                if let Root::Review(this) = root {
-                                                    this.dispatch_auxiliary_action(
-                                                        ReviewAuxiliaryAction::CancelPendingReview {
-                                                            review: cancel_review.clone(),
-                                                        },
-                                                        cx,
-                                                    );
-                                                }
+                                                let this = &mut root.review;
+                                                this.dispatch_auxiliary_action(
+                                                    ReviewAuxiliaryAction::CancelPendingReview {
+                                                        review: cancel_review.clone(),
+                                                    },
+                                                    cx,
+                                                );
                                             });
                                         },
                                     )),
@@ -26637,32 +28007,25 @@ impl ReviewWorkspace {
                                 let review = snapshot.review.coordinates.clone();
                                 pending_card = pending_card
                                     .child(
-                                        div()
-                                            .mt_2()
-                                            .h(px(72.))
-                                            .border_1()
-                                            .border_color(colors.border)
-                                            .rounded(px(ui::CONTROL_RADIUS))
-                                            .overflow_hidden()
+                                        layout::text_area(3, colors)
                                             .child(Textarea::new(&self.review_summary_input)),
                                     )
                                     .child(action_link("Save pending summary", colors).on_click(
                                         move |_, _, cx| {
                                             save_root.update(cx, |root, cx| {
-                                                if let Root::Review(this) = root {
-                                                    let body = this
-                                                        .review_summary_input
-                                                        .read(cx)
-                                                        .value()
-                                                        .to_string();
-                                                    this.dispatch_auxiliary_action(
-                                                        ReviewAuxiliaryAction::UpdatePendingSummary {
-                                                            review: review.clone(),
-                                                            body,
-                                                        },
-                                                        cx,
-                                                    );
-                                                }
+                                                let this = &mut root.review;
+                                                let body = this
+                                                    .review_summary_input
+                                                    .read(cx)
+                                                    .value()
+                                                    .to_string();
+                                                this.dispatch_auxiliary_action(
+                                                    ReviewAuxiliaryAction::UpdatePendingSummary {
+                                                        review: review.clone(),
+                                                        body,
+                                                    },
+                                                    cx,
+                                                );
                                             });
                                         },
                                     ));
@@ -26688,8 +28051,7 @@ impl ReviewWorkspace {
                                     review_subject_allows_actions(linked.comment.subject);
                                 pending_card = pending_card.child(
                                     div()
-                                        .mt_2()
-                                        .pl_2()
+                                        .pl(px(ui::GAP_GROUP))
                                         .border_l_2()
                                         .border_color(colors.accent)
                                         .child(match linked.comment.subject {
@@ -26713,7 +28075,6 @@ impl ReviewWorkspace {
                                             known_subject,
                                             |comment_card| comment_card.child(
                                             div()
-                                                .mt_1()
                                                 .flex()
                                                 .flex_wrap()
                                                 .w_full()
@@ -26727,7 +28088,8 @@ impl ReviewWorkspace {
                                                         )
                                                         .on_click(move |_, window, cx| {
                                                             edit_root.update(cx, |root, cx| {
-                                                                if let Root::Review(this) = root {
+                                                                {
+                                                                    let this = &mut root.review;
                                                                     this.reopen_pending_draft(
                                                                         &draft_id,
                                                                         window,
@@ -26746,7 +28108,8 @@ impl ReviewWorkspace {
                                                     )
                                                     .on_click(move |_, _, cx| {
                                                         delete_root.update(cx, |root, cx| {
-                                                            if let Root::Review(this) = root {
+                                                            {
+                                                                let this = &mut root.review;
                                                                 this.dispatch_auxiliary_action(
                                                                     ReviewAuxiliaryAction::DeletePendingComment {
                                                                         review: review.clone(),
@@ -26769,7 +28132,6 @@ impl ReviewWorkspace {
                                     |card| {
                                         card.child(
                                             div()
-                                                .mt_1()
                                                 .ui_text(TextRole::Caption)
                                                 .text_color(colors.muted)
                                                 .child(
@@ -26782,11 +28144,7 @@ impl ReviewWorkspace {
                         }
                         activity.push(pending_card);
                         if !journal_unresolved.is_empty() {
-                            let mut journal_card = div()
-                                .mb_2()
-                                .p_3()
-                                .rounded(px(ui::CONTROL_RADIUS))
-                                .bg(colors.elevated)
+                            let mut journal_card = layout::section("Reconciliation", colors)
                                 .child(format!(
                                     "{} auxiliary / merge action(s) require separate reconciliation",
                                     journal_unresolved.len()
@@ -26799,7 +28157,6 @@ impl ReviewWorkspace {
                                 };
                                 journal_card = journal_card.child(
                                     div()
-                                        .mt_1()
                                         .ui_text(TextRole::Caption)
                                         .text_color(colors.amber)
                                         .child(description),
@@ -26807,12 +28164,11 @@ impl ReviewWorkspace {
                             }
                             activity.push(journal_card);
                             activity.push(
-                                div().mb(px(ui::GAP_PAGE)).child(
+                                div().child(
                                     action_link("Reconcile auxiliary / merge actions", colors)
                                         .on_click(cx.listener(|root, _, _, cx| {
-                                            if let Root::Review(this) = root {
-                                                this.reconcile_action_journal(cx);
-                                            }
+                                            let this = &mut root.review;
+                                            this.reconcile_action_journal(cx);
                                         })),
                                 ),
                             );
@@ -26845,16 +28201,14 @@ impl ReviewWorkspace {
                     if comment_pages > 1 {
                         activity.push(
                             div()
-                                .mb_3()
                                 .flex()
                                 .flex_wrap()
                                 .gap(px(ui::GAP_GROUP))
                                 .when(comment_page > 0, |row| {
                                     row.child(action_link("Previous comments", colors).on_click(
                                         cx.listener(move |root, _, _, cx| {
-                                            if let Root::Review(this) = root
-                                                && let Some(index) = this.active_tab
-                                            {
+                                            let this = &mut root.review;
+                                            if let Some(index) = this.active_tab {
                                                 this.tabs[index].issue_comment_page =
                                                     comment_page - 1;
                                                 cx.notify();
@@ -26875,9 +28229,8 @@ impl ReviewWorkspace {
                                 .when(comment_page + 1 < comment_pages, |row| {
                                     row.child(action_link("Next comments", colors).on_click(
                                         cx.listener(move |root, _, _, cx| {
-                                            if let Root::Review(this) = root
-                                                && let Some(index) = this.active_tab
-                                            {
+                                            let this = &mut root.review;
+                                            if let Some(index) = this.active_tab {
                                                 this.tabs[index].issue_comment_page =
                                                     comment_page + 1;
                                                 cx.notify();
@@ -26897,82 +28250,95 @@ impl ReviewWorkspace {
                         let editable = issue_comment_is_editable(tab, comment);
                         let edit_comment = comment.clone();
                         let delete_comment = comment.clone();
-                        activity.push(
-                            activity_item(
-                                format!("issue-comment-{position}"),
-                                comment.author.as_deref().unwrap_or("Unknown author"),
-                                &comment.body,
-                                &comment.created_at,
-                                colors,
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .ui_text(TextRole::Caption)
-                                    .text_color(colors.faint)
-                                    .child(format!("Remote ID {}", comment.coordinates.remote_id)),
-                            )
-                            .child(render_reaction_row(
-                                reaction_subject(
-                                    details,
-                                    ReactableKind::IssueComment,
-                                    &comment.coordinates,
-                                ),
-                                cached_observation.is_some(),
-                                tab.write_in_flight,
-                                colors,
-                                &root,
-                            ))
-                            .when(editable, |card| {
-                                card.child(
+                        let footer =
+                            div()
+                                .child(
                                     div()
-                                        .mt_2()
-                                        .flex()
-                                        .gap(px(ui::GAP_GROUP))
-                                        .child(
-                                            action_link_with_id(
-                                                format!(
-                                                    "edit-issue-comment-{}",
-                                                    edit_comment.coordinates.remote_id
-                                                ),
-                                                "Edit comment…",
-                                                colors,
-                                            )
-                                            .on_click(
-                                                cx.listener(move |root, _, window, cx| {
-                                                    if let Root::Review(this) = root {
+                                        .ui_text(TextRole::Caption)
+                                        .text_color(colors.faint)
+                                        .child(format!(
+                                            "{} · Remote ID {}",
+                                            exact_timestamp_label(&comment.created_at),
+                                            comment.coordinates.remote_id
+                                        )),
+                                )
+                                .child(render_reaction_row(
+                                    reaction_subject(
+                                        details,
+                                        ReactableKind::IssueComment,
+                                        &comment.coordinates,
+                                    ),
+                                    cached_observation.is_some(),
+                                    tab.write_in_flight,
+                                    colors,
+                                    &root,
+                                ))
+                                .when(editable, |card| {
+                                    card.child(
+                                        div()
+                                            .flex()
+                                            .gap(px(ui::GAP_GROUP))
+                                            .child(
+                                                action_link_with_id(
+                                                    format!(
+                                                        "edit-issue-comment-{}",
+                                                        edit_comment.coordinates.remote_id
+                                                    ),
+                                                    "Edit comment…",
+                                                    colors,
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |root, _, window, cx| {
+                                                        let this = &mut root.review;
                                                         this.begin_comment_edit(
                                                             edit_comment.clone(),
                                                             window,
                                                             cx,
                                                         );
-                                                    }
-                                                }),
-                                            ),
-                                        )
-                                        .child(
-                                            action_link_with_id(
-                                                format!(
-                                                    "delete-issue-comment-{}",
-                                                    delete_comment.coordinates.remote_id
-                                                ),
-                                                "Delete exact comment",
-                                                colors,
+                                                    },
+                                                )),
                                             )
-                                            .on_click(
-                                                cx.listener(move |root, _, _, cx| {
-                                                    if let Root::Review(this) = root {
-                                                        this.prepare_comment_delete(
-                                                            delete_comment.clone(),
-                                                            cx,
-                                                        );
-                                                    }
-                                                }),
+                                            .child(
+                                                action_link_with_id(
+                                                    format!(
+                                                        "delete-issue-comment-{}",
+                                                        delete_comment.coordinates.remote_id
+                                                    ),
+                                                    "Delete exact comment",
+                                                    colors,
+                                                )
+                                                .on_click(cx.listener(move |root, _, _, cx| {
+                                                    let this = &mut root.review;
+                                                    this.prepare_comment_delete(
+                                                        delete_comment.clone(),
+                                                        cx,
+                                                    );
+                                                })),
                                             ),
-                                        ),
-                                )
-                            }),
-                        );
+                                    )
+                                });
+                        activity.push(activity_item(
+                            ActivityEntry {
+                                id: format!("issue-comment-{position}"),
+                                author: comment.author.as_deref(),
+                                avatar: comment
+                                    .author
+                                    .as_deref()
+                                    .and_then(|login| avatars.get(login)),
+                                role: comment
+                                    .author
+                                    .as_deref()
+                                    .filter(|author| {
+                                        author.eq_ignore_ascii_case(&tab.pull_request.author)
+                                    })
+                                    .map(|_| "Author"),
+                                action: "commented",
+                                timestamp: &comment.created_at,
+                                body: &comment.body,
+                                footer,
+                            },
+                            colors,
+                        ));
                     }
                     let review_count = details.reviews.len();
                     let (review_page, review_pages, review_range) =
@@ -26980,16 +28346,14 @@ impl ReviewWorkspace {
                     if review_pages > 1 {
                         activity.push(
                             div()
-                                .mb_3()
                                 .flex()
                                 .flex_wrap()
                                 .gap(px(ui::GAP_GROUP))
                                 .when(review_page > 0, |row| {
                                     row.child(action_link("Previous reviews", colors).on_click(
                                         cx.listener(move |root, _, _, cx| {
-                                            if let Root::Review(this) = root
-                                                && let Some(index) = this.active_tab
-                                            {
+                                            let this = &mut root.review;
+                                            if let Some(index) = this.active_tab {
                                                 this.tabs[index].review_page = review_page - 1;
                                                 cx.notify();
                                             }
@@ -27009,9 +28373,8 @@ impl ReviewWorkspace {
                                 .when(review_page + 1 < review_pages, |row| {
                                     row.child(action_link("Next reviews", colors).on_click(
                                         cx.listener(move |root, _, _, cx| {
-                                            if let Root::Review(this) = root
-                                                && let Some(index) = this.active_tab
-                                            {
+                                            let this = &mut root.review;
+                                            if let Some(index) = this.active_tab {
                                                 this.tabs[index].review_page = review_page + 1;
                                                 cx.notify();
                                             }
@@ -27027,7 +28390,6 @@ impl ReviewWorkspace {
                     {
                         activity.push(
                             div()
-                                .mb_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child(if tab.submitted_summary_editor.clear_in_flight
@@ -27042,18 +28404,12 @@ impl ReviewWorkspace {
                     if let Some(error) = &tab.submitted_summary_editor.persistence_error {
                         let root = cx.entity();
                         activity.push(
-                            div()
-                                .mb_2()
-                                .p_3()
-                                .border_1()
-                                .border_color(colors.amber)
-                                .rounded(px(ui::CONTROL_RADIUS))
+                            layout::block()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child(error.clone())
                                 .child(
                                     div()
-                                        .mt_2()
                                         .flex()
                                         .gap(px(ui::GAP_COLUMNS))
                                         .child(action_link("Retry safe recovery", colors).on_click(
@@ -27061,9 +28417,8 @@ impl ReviewWorkspace {
                                                 let root = root.clone();
                                                 move |_, _, cx| {
                                                     root.update(cx, |root, cx| {
-                                                        if let Root::Review(this) = root {
-                                                            this.retry_submitted_draft_load(cx);
-                                                        }
+                                                        let this = &mut root.review;
+                                                        this.retry_submitted_draft_load(cx);
                                                     });
                                                 }
                                             },
@@ -27071,9 +28426,8 @@ impl ReviewWorkspace {
                                         .child(action_link("Retry CAS save", colors).on_click(
                                             move |_, _, cx| {
                                                 root.update(cx, |root, cx| {
-                                                    if let Root::Review(this) = root {
-                                                        this.retry_submitted_draft_save(cx);
-                                                    }
+                                                    let this = &mut root.review;
+                                                    this.retry_submitted_draft_save(cx);
                                                 });
                                             },
                                         )),
@@ -27110,39 +28464,32 @@ impl ReviewWorkspace {
                             .join("\n\n");
                         let root = cx.entity();
                         activity.push(
-                            div()
-                                .mb_2()
-                                .p_3()
-                                .border_1()
-                                .border_color(colors.amber)
-                                .rounded(px(ui::CONTROL_RADIUS))
+                            layout::block()
                                 .child(div().ui_text(TextRole::Body).child(
                                     "Same-review draft conflict — both exact versions are preserved",
                                 ))
                                 .child(
                                     div()
-                                        .mt_2()
                                         .font_family(CODE_FONT)
                                         .ui_text(TextRole::Caption)
                                         .child(saved_text),
                                 )
                                 .child(
                                     div()
-                                        .mt_2()
                                         .font_family(CODE_FONT)
                                         .ui_text(TextRole::Caption)
                                         .child(current_text),
                                 )
                                 .child(
                                     div()
-                                        .mt_2()
                                         .flex()
                                         .gap(px(ui::GAP_COLUMNS))
                                         .child(action_link("Use saved text", colors).on_click({
                                             let root = root.clone();
                                             move |_, window, cx| {
                                                 root.update(cx, |root, cx| {
-                                                    if let Root::Review(this) = root {
+                                                    {
+                                                        let this = &mut root.review;
                                                         this.resolve_submitted_draft_conflict(
                                                             false, window, cx,
                                                         );
@@ -27153,7 +28500,8 @@ impl ReviewWorkspace {
                                         .child(action_link("Keep current text", colors).on_click(
                                             move |_, window, cx| {
                                                 root.update(cx, |root, cx| {
-                                                    if let Root::Review(this) = root {
+                                                    {
+                                                        let this = &mut root.review;
                                                         this.resolve_submitted_draft_conflict(
                                                             true, window, cx,
                                                         );
@@ -27170,17 +28518,12 @@ impl ReviewWorkspace {
                         })
                     }) {
                         activity.push(
-                            div()
-                                .mb_2()
-                                .p_3()
-                                .border_1()
-                                .border_color(colors.amber)
-                                .rounded(px(ui::CONTROL_RADIUS))
+                            layout::block()
                                 .child(div().ui_text(TextRole::Body).child(format!(
                                     "Recovered unavailable review {}",
                                     draft.review.coordinates.remote_id
                                 )))
-                                .child(div().mt_1().ui_text(TextRole::Caption).text_color(colors.muted).child(
+                                .child(div().ui_text(TextRole::Caption).text_color(colors.muted).child(
                                     format!(
                                         "Historical source: {} by {} at {} · commit {}",
                                         draft.review.state,
@@ -27191,7 +28534,6 @@ impl ReviewWorkspace {
                                 ))
                                 .child(
                                     div()
-                                        .mt_2()
                                         .font_family(CODE_FONT)
                                         .ui_text(TextRole::Caption)
                                         .child(format!(
@@ -27200,7 +28542,7 @@ impl ReviewWorkspace {
                                             draft.body
                                         )),
                                 )
-                                .child(div().mt_2().ui_text(TextRole::Caption).text_color(colors.amber).child(
+                                .child(div().ui_text(TextRole::Caption).text_color(colors.amber).child(
                                     "This text is recoverable local history only. No confirmation or write is available until the exact review returns in a fresh read.",
                                 )),
                         );
@@ -27218,7 +28560,6 @@ impl ReviewWorkspace {
                         {
                             Some(position) if position / 20 != review_page => activity.push(
                                 div()
-                                    .mb_2()
                                     .ui_text(TextRole::Caption)
                                     .text_color(colors.amber)
                                     .child(format!(
@@ -27228,7 +28569,6 @@ impl ReviewWorkspace {
                             ),
                             None => activity.push(
                                 div()
-                                    .mb_2()
                                     .ui_text(TextRole::Caption)
                                     .text_color(colors.amber)
                                     .child("The edited review is absent from the fresh activity read. Your typed draft is retained; no confirmation is available."),
@@ -27243,25 +28583,15 @@ impl ReviewWorkspace {
                         .skip(review_range.start)
                         .take(review_range.len())
                     {
-                        let mut card = activity_item(
-                            format!("review-{position}"),
-                            review.author.as_deref().unwrap_or("Unknown reviewer"),
-                            if review.body.is_empty() {
-                                &review.state
-                            } else {
-                                &review.body
-                            },
-                            review.submitted_at.as_deref().unwrap_or("Pending"),
-                            colors,
-                        )
-                        .child(
+                        let submitted_at = review.submitted_at.as_deref().unwrap_or("Pending");
+                        let mut card = layout::block().child(
                             div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.faint)
                                 .child(format!(
                                     "{} · Remote ID {}",
-                                    review.state, review.coordinates.remote_id
+                                    exact_timestamp_label(submitted_at),
+                                    review.coordinates.remote_id
                                 )),
                         );
                         card = card.child(render_reaction_row(
@@ -27293,7 +28623,6 @@ impl ReviewWorkspace {
                                     card = card
                                         .child(
                                             div()
-                                                .mt_2()
                                                 .ui_text(TextRole::Caption)
                                                 .text_color(if unknown {
                                                     colors.amber
@@ -27307,7 +28636,7 @@ impl ReviewWorkspace {
                                                 }),
                                         )
                                         .child(
-                                            div().mt_2().child(
+                                            div().child(
                                                 Button::new(format!(
                                                     "dismiss-review-{}",
                                                     review.coordinates.remote_id
@@ -27326,7 +28655,8 @@ impl ReviewWorkspace {
                                                 ))
                                                 .on_click(move |_, window, cx| {
                                                     root.update(cx, |root, cx| {
-                                                        if let Root::Review(this) = root {
+                                                        {
+                                                            let this = &mut root.review;
                                                             this.begin_review_dismissal(
                                                                 selected_review.clone(),
                                                                 window,
@@ -27342,7 +28672,6 @@ impl ReviewWorkspace {
                                 Some(capability) => {
                                     card = card.child(
                                         div()
-                                            .mt_1()
                                             .ui_text(TextRole::Caption)
                                             .text_color(colors.amber)
                                             .child(format!(
@@ -27357,7 +28686,6 @@ impl ReviewWorkspace {
                                 None => {
                                     card = card.child(
                                         div()
-                                            .mt_1()
                                             .ui_text(TextRole::Caption)
                                             .text_color(colors.amber)
                                             .child("Dismiss unavailable: cached, partial, or stale activity cannot authorize an attempt."),
@@ -27375,24 +28703,17 @@ impl ReviewWorkspace {
                                 let root = cx.entity();
                                 card = card
                                     .child(
-                                        div()
-                                            .mt_2()
-                                            .h(px(84.))
-                                            .border_1()
-                                            .border_color(colors.border)
-                                            .rounded(px(ui::CONTROL_RADIUS))
-                                            .overflow_hidden()
+                                        layout::text_area(3, colors)
                                             .child(Textarea::new(&self.dismissal_reason_input)),
                                     )
                                     .child(
                                         div()
-                                            .mt_1()
                                             .ui_text(TextRole::Caption)
                                             .text_color(colors.faint)
                                             .child("Reason is retained across cancellation and in-process tab/target switches, but is not persisted before dispatch; an abrupt restart can lose it."),
                                     )
                                     .child(
-                                        div().mt_2().child(
+                                        div().child(
                                             Button::new(format!(
                                                 "review-dismissal-{}",
                                                 review.coordinates.remote_id
@@ -27411,7 +28732,8 @@ impl ReviewWorkspace {
                                             ))
                                             .on_click(move |_, window, cx| {
                                                 root.update(cx, |root, cx| {
-                                                    if let Root::Review(this) = root {
+                                                    {
+                                                        let this = &mut root.review;
                                                         this.prepare_review_dismissal_confirmation(
                                                             window, cx,
                                                         );
@@ -27471,7 +28793,7 @@ impl ReviewWorkspace {
                                     let review = review.clone();
                                     card =
                                         card.child(
-                                            div().mt_2().child(
+                                            div().child(
                                                 action_link_with_id(
                                                     format!(
                                                         "edit-submitted-review-{}",
@@ -27482,13 +28804,12 @@ impl ReviewWorkspace {
                                                 )
                                                 .on_click(move |_, window, cx| {
                                                     root.update(cx, |root, cx| {
-                                                        if let Root::Review(this) = root {
-                                                            this.begin_submitted_summary_edit(
-                                                                review.clone(),
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        }
+                                                        let this = &mut root.review;
+                                                        this.begin_submitted_summary_edit(
+                                                            review.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
                                                     });
                                                 }),
                                             ),
@@ -27497,7 +28818,6 @@ impl ReviewWorkspace {
                                 Err(reason) => {
                                     card = card.child(
                                         div()
-                                            .mt_1()
                                             .ui_text(TextRole::Caption)
                                             .text_color(colors.amber)
                                             .child(format!("Edit unavailable: {reason}")),
@@ -27519,7 +28839,6 @@ impl ReviewWorkspace {
                             card = card.when(!active, |card| {
                                 card.child(
                                     div()
-                                        .mt_2()
                                         .ui_text(TextRole::Caption)
                                         .text_color(colors.amber)
                                         .child("A typed draft is retained for this review. Choose Edit to resume it."),
@@ -27530,26 +28849,20 @@ impl ReviewWorkspace {
                                 .when(source_changed, |card| {
                                     card.child(
                                         div()
-                                            .mt_2()
                                             .ui_text(TextRole::Caption)
                                             .text_color(colors.amber)
                                             .child("The fresh review changed after editing began. Your typed draft is retained; choose Edit again to adopt the new source before confirmation."),
                                     )
                                 })
                                 .child(
-                                    div()
-                                        .mt_2()
-                                        .h(px(84.))
-                                        .border_1()
-                                        .border_color(colors.border)
-                                        .rounded(px(ui::CONTROL_RADIUS))
-                                        .overflow_hidden()
+                                    layout::text_area(3, colors)
                                         .child(Textarea::new(&self.submitted_summary_input)),
                                 )
-                                .child(div().mt_2().child(
+                                .child(div().child(
                                     action_link("Review exact edit…", colors).on_click(
                                         cx.listener(|root, _, _, cx| {
-                                            if let Root::Review(this) = root {
+                                            {
+                                                let this = &mut root.review;
                                                 this.prepare_submitted_summary_confirmation(cx);
                                             }
                                         }),
@@ -27557,7 +28870,28 @@ impl ReviewWorkspace {
                                 ));
                             }
                         }
-                        activity.push(card);
+                        activity.push(activity_item(
+                            ActivityEntry {
+                                id: format!("review-{position}"),
+                                author: review.author.as_deref(),
+                                avatar: review
+                                    .author
+                                    .as_deref()
+                                    .and_then(|login| avatars.get(login)),
+                                role: review
+                                    .author
+                                    .as_deref()
+                                    .filter(|author| {
+                                        author.eq_ignore_ascii_case(&tab.pull_request.author)
+                                    })
+                                    .map(|_| "Author"),
+                                action: review_action_label(&review.state),
+                                timestamp: submitted_at,
+                                body: &review.body,
+                                footer: card,
+                            },
+                            colors,
+                        ));
                     }
                     let placed = tab
                         .session
@@ -27629,8 +28963,7 @@ impl ReviewWorkspace {
                                 )
                             }
                         };
-                        let mut thread_card = div()
-                                .mb_3()
+                        let mut thread_card = layout::block()
                                 .child(format!(
                                     "Thread {} · {}{}",
                                     thread.thread.coordinates.remote_id,
@@ -27643,7 +28976,6 @@ impl ReviewWorkspace {
                                 ))
                                 .child(
                                     div()
-                                        .mt_1()
                                         .ui_text(TextRole::Caption)
                                         .text_color(colors.faint)
                                         .child(format!(
@@ -27672,22 +29004,14 @@ impl ReviewWorkspace {
                         {
                             thread_card = thread_card.child(
                                 div()
-                                    .mt_2()
-                                    .pl_2()
+                                    .pl(px(ui::GAP_GROUP))
                                     .border_l_2()
                                     .border_color(colors.border)
-                                    .child(
-                                        div()
-                                            .ui_text(TextRole::Caption)
-                                            .text_color(colors.muted)
-                                            .child(
-                                                comment
-                                                    .author
-                                                    .as_deref()
-                                                    .unwrap_or("Unknown author")
-                                                    .to_owned(),
-                                            ),
-                                    )
+                                    .child(comment_byline(
+                                        comment.author.as_deref(),
+                                        &comment.created_at,
+                                        colors,
+                                    ))
                                     .child(
                                         markdown_text(
                                             format!(
@@ -27715,7 +29039,7 @@ impl ReviewWorkspace {
                         if !thread.thread.comments_complete {
                             thread_card =
                                 thread_card
-                                    .child(div().mt_1().ui_text(TextRole::Caption).text_color(colors.amber).child(
+                                    .child(div().ui_text(TextRole::Caption).text_color(colors.amber).child(
                                     "Thread comments are partial at the explicit provider bound.",
                                 ));
                         }
@@ -27743,20 +29067,104 @@ impl ReviewWorkspace {
                             .child("No activity returned for this pull request."),
                     );
                 }
-                vec![div().children(activity).into_any_element()]
+                vec![
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(ui::GAP_COLUMNS))
+                        .child(
+                            div()
+                                .ui_text(TextRole::Title)
+                                .font_weight(ui::WEIGHT_EMPHASIS)
+                                .debug_selector(|| "conversation-heading".to_owned())
+                                .child("Conversation"),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(ui::GAP_PAGE))
+                                .children(activity.into_iter().enumerate().map(
+                                    |(position, item)| {
+                                        item.debug_selector(move || {
+                                            format!("conversation-item-{position}")
+                                        })
+                                    },
+                                )),
+                        )
+                        .into_any_element(),
+                ]
             }
             InspectorSection::Checks => match tab.ci_read.pane {
                 CiPane::Jobs => self.render_actions_jobs(index, colors, cx),
                 CiPane::Log => self.render_actions_log(index, colors, cx),
                 CiPane::Checks => {
+                    // GitHub leads with one line that answers "can I merge
+                    // this": an icon, a verdict, and the counts behind it. The
+                    // rollup GitHub itself reported follows in muted text, so a
+                    // disagreement between the two is visible rather than
+                    // silently resolved here.
+                    let tally = displayed_details
+                        .map(|details| checks_tally(&details.checks))
+                        .unwrap_or_default();
+                    let complete = displayed_details.is_none_or(|details| details.checks_complete);
+                    let headline = tally.headline();
+                    let observed = if complete { "" } else { "observed " };
+                    let summary = if tally.total() == 0 {
+                        "No checks reported".to_owned()
+                    } else {
+                        match headline {
+                            CheckState::Success => {
+                                format!("All {observed}checks have passed")
+                            }
+                            CheckState::Failure => {
+                                format!("Some {observed}checks were not successful")
+                            }
+                            CheckState::Pending => {
+                                format!("Some {observed}checks have not completed")
+                            }
+                            CheckState::Skipped => format!("Every {observed}check was skipped"),
+                            CheckState::Unknown => {
+                                format!("Some {observed}checks reported no readable state")
+                            }
+                        }
+                    };
+                    let rollup = empty_unknown(&tab.pull_request.check_status);
+                    let mut counts = tally.parts();
+                    counts.push(format!("GitHub rollup: {rollup}"));
                     let mut checks: Vec<AnyElement> = vec![
-                        detail(
-                            "Status",
-                            empty_unknown(&tab.pull_request.check_status),
-                            colors,
-                        )
-                        .into_any_element(),
+                        div()
+                            .debug_selector(|| "checks-summary".to_owned())
+                            .mb(px(ui::GAP_PAGE))
+                            .flex()
+                            .items_start()
+                            .gap(px(ui::GAP_GROUP))
+                            .child(div().mt(px(2.)).child(check_state_icon(headline, colors)))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .child(
+                                        div()
+                                            .ui_text(TextRole::Subtitle)
+                                            .text_color(colors.text)
+                                            .child(summary),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt(px(2.))
+                                            .ui_text(TextRole::Caption)
+                                            .text_color(colors.muted)
+                                            .child(counts.join(" · ")),
+                                    ),
+                            )
+                            .into_any_element(),
                     ];
+
                     let source_identity = displayed_details
                         .map(|details| {
                             let repository =
@@ -27765,12 +29173,7 @@ impl ReviewWorkspace {
                                         .map(|repository| repository.name_with_owner.clone())
                                         .unwrap_or_else(|| "Unknown".into())
                                 };
-                            div()
-                                .mb_2()
-                                .p_2()
-                                .rounded(px(ui::CONTROL_RADIUS))
-                                .border_1()
-                                .border_color(colors.border)
+                            layout::block()
                                 .child(detail(
                                     "Observed PR head",
                                     details
@@ -27813,14 +29216,12 @@ impl ReviewWorkspace {
                         })
                         .unwrap_or_else(|| {
                             div()
-                                .mb_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child("Observed Checks source identity is unavailable.")
                         });
                     checks.push(
-                        div()
-                            .mb_3()
+                        layout::block()
                             .child(
                                 Button::new("checks-source-details")
                                     .control()
@@ -27841,11 +29242,10 @@ impl ReviewWorkspace {
                                     })
                                     .debug_selector(|| "checks-source-details".to_owned())
                                     .on_click(cx.listener(move |root, _, _, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.tabs[index].checks_source_expanded =
-                                                !this.tabs[index].checks_source_expanded;
-                                            cx.notify();
-                                        }
+                                        let this = &mut root.review;
+                                        this.tabs[index].checks_source_expanded =
+                                            !this.tabs[index].checks_source_expanded;
+                                        cx.notify();
                                     })),
                             )
                             .when(tab.checks_source_expanded, |section| {
@@ -27856,8 +29256,7 @@ impl ReviewWorkspace {
                     if self.selected_actions_locator(index).is_ok() {
                         let jobs_root = root.clone();
                         checks.push(
-                            div()
-                                .mb_3()
+                            layout::lines()
                                 .child(
                                     action_link_with_id(
                                         "checks-open-actions-jobs".into(),
@@ -27867,9 +29266,8 @@ impl ReviewWorkspace {
                                     .on_click(
                                         move |_, window, cx| {
                                             jobs_root.update(cx, |root, cx| {
-                                                if let Root::Review(this) = root
-                                                    && this.start_actions_jobs(index, cx)
-                                                {
+                                                let this = &mut root.review;
+                                                if this.start_actions_jobs(index, cx) {
                                                     this.focus_current_ci_pane(index, window, cx);
                                                 }
                                             });
@@ -27878,7 +29276,6 @@ impl ReviewWorkspace {
                                 )
                                 .child(
                                     div()
-                                        .mt_1()
                                         .ui_text(TextRole::Caption)
                                         .text_color(colors.muted)
                                         .child(
@@ -27887,7 +29284,7 @@ impl ReviewWorkspace {
                                 )
                                 .into_any_element(),
                         );
-                        let mut controls = div().mb_3().flex().flex_wrap().gap(px(ui::GAP_COLUMNS));
+                        let mut controls = div().flex().flex_wrap().gap(px(ui::GAP_COLUMNS));
                         for (position, action) in RUN_CONTROLS.into_iter().enumerate() {
                             let control_root = root.clone();
                             controls = controls.child(
@@ -27905,20 +29302,18 @@ impl ReviewWorkspace {
                                     .debug_selector(move || action.control_element_id().to_owned())
                                     .on_click(move |_, _, cx| {
                                         control_root.update(cx, |root, cx| {
-                                            if let Root::Review(this) = root {
-                                                this.prepare_actions_run_control(index, action, cx);
-                                            }
+                                            let this = &mut root.review;
+                                            this.prepare_actions_run_control(index, action, cx);
                                         });
                                     })
                                     .child(action.label()),
                             );
                         }
                         checks.push(
-                                div()
+                                layout::block()
                                     .child(controls)
                                     .child(
                                         div()
-                                            .mb_3()
                                             .ui_text(TextRole::Caption)
                                             .text_color(colors.muted)
                                             .child(
@@ -27938,9 +29333,26 @@ impl ReviewWorkspace {
                             let expanded = tab.checks_selection.expanded_id.as_deref()
                                 == Some(remote_id.as_str());
                             let row_root = root.clone();
+                            let state = check_state(check);
+                            // The row says what GitHub's row says: the state,
+                            // the name, and the provider's own words for it.
+                            // Identity evidence stays one click away in the
+                            // expansion, which already carries every field the
+                            // old stacked lines repeated.
+                            let outcome = check
+                                .description
+                                .clone()
+                                .filter(|description| !description.trim().is_empty())
+                                .unwrap_or_else(|| match &check.conclusion {
+                                    Some(conclusion) => {
+                                        format!("{} · {conclusion}", check.status)
+                                    }
+                                    None => check.status.clone(),
+                                });
                             let accessibility_label = format!(
-                                "{}; {}; {}; {}; {}; {}; {}",
+                                "{}; {}; {}; {}; {}; {}; {}; {}",
                                 check.name,
+                                state.label(),
                                 kind_label(check),
                                 required_label(check),
                                 sha_label(check),
@@ -27959,63 +29371,50 @@ impl ReviewWorkspace {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .justify_between()
                                     .gap(px(ui::GAP_GROUP))
+                                    .child(check_state_icon(state, colors))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_none()
+                                            .max_w(px(320.))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(check.name.clone()),
+                                    )
                                     .child(
                                         div()
                                             .min_w_0()
                                             .flex_1()
-                                            .whitespace_normal()
                                             .overflow_hidden()
-                                            .child(check.name.clone()),
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .ui_text(TextRole::Caption)
+                                            .text_color(colors.muted)
+                                            .child(format!("{} · {outcome}", kind_label(check))),
                                     )
                                     .child(
                                         div()
                                             .flex_none()
                                             .whitespace_nowrap()
                                             .ui_text(TextRole::Caption)
-                                            .text_color(colors.muted)
+                                            .text_color(colors.accent)
                                             .child(if expanded { "Hide" } else { "Details" }),
                                     ),
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .ui_text(TextRole::Caption)
-                                    .text_color(colors.muted)
-                                    .child(format!(
-                                        "{} · {}{}",
-                                        kind_label(check),
-                                        check.status,
-                                        check
-                                            .conclusion
-                                            .as_ref()
-                                            .map(|value| format!(" · {value}"))
-                                            .unwrap_or_default()
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .ui_text(TextRole::Caption)
-                                    .text_color(colors.faint)
-                                    .child(format!(
-                                        "{} · {} · {}",
-                                        required_label(check),
-                                        sha_label(check),
-                                        linkage_label(check)
-                                    )),
                             )
                             .when(expanded, |row| {
                                 row.child(
                                     div()
-                                        .mt_2()
-                                        .pt_2()
+                                        .pt(px(ui::GAP_GROUP))
                                         .border_t_1()
                                         .border_color(colors.border)
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(ui::GAP_ICON))
                                         .children(identity_fields(check).into_iter().map(
                                             |(label, value)| {
-                                                div()
-                                                    .mb_1()
+                                                layout::lines()
                                                     .child(
                                                         div()
                                                             .ui_text(TextRole::Caption)
@@ -28034,9 +29433,8 @@ impl ReviewWorkspace {
                             })
                             .on_click(move |_, _, cx| {
                                 row_root.update(cx, |root, cx| {
-                                    if let Root::Review(this) = root {
-                                        this.activate_check(&remote_id, cx);
-                                    }
+                                    let this = &mut root.review;
+                                    this.activate_check(&remote_id, cx);
                                 });
                             });
                             checks.push(row.into_any_element());
@@ -28044,7 +29442,6 @@ impl ReviewWorkspace {
                         if !details.checks.is_empty() {
                             checks.push(
                                 div()
-                                    .mt_2()
                                     .ui_text(TextRole::Caption)
                                     .text_color(colors.muted)
                                     .child(format!(
@@ -28065,7 +29462,6 @@ impl ReviewWorkspace {
                             let next_disabled = page + 1 == pages;
                             checks.push(
                                 div()
-                                    .mt_2()
                                     .flex()
                                     .gap(px(ui::GAP_GROUP))
                                     .child(
@@ -28083,9 +29479,8 @@ impl ReviewWorkspace {
                                         .on_click(
                                             move |_, window, cx| {
                                                 previous_root.update(cx, |root, cx| {
-                                                    if let Root::Review(this) = root {
-                                                        this.move_checks_page(-1, window, cx);
-                                                    }
+                                                    let this = &mut root.review;
+                                                    this.move_checks_page(-1, window, cx);
                                                 });
                                             },
                                         ),
@@ -28105,9 +29500,8 @@ impl ReviewWorkspace {
                                         .on_click(
                                             move |_, window, cx| {
                                                 next_root.update(cx, |root, cx| {
-                                                    if let Root::Review(this) = root {
-                                                        this.move_checks_page(1, window, cx);
-                                                    }
+                                                    let this = &mut root.review;
+                                                    this.move_checks_page(1, window, cx);
                                                 });
                                             },
                                         ),
@@ -28132,31 +29526,244 @@ impl ReviewWorkspace {
         }
     }
 
+    /// GitHub's conversation rail: the pull request's read-only metadata,
+    /// beside the discussion rather than wrapped into a field row beneath it.
+    /// Only sections backed by a real read appear. GitHub also prints Projects,
+    /// Milestone and Development headings with "None yet" under them; this app
+    /// never asks for those, and an empty heading would read as an answer.
+    fn render_conversation_rail(
+        &self,
+        index: usize,
+        docked: bool,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> impl IntoElement {
+        let actions = self.render_lifecycle_actions(index, colors, cx);
+        let (reviewer_delta, label_delta, assignee_delta) =
+            match self.render_lifecycle_deltas(index, colors, cx) {
+                Some((reviewers, labels, assignees)) => {
+                    (Some(reviewers), Some(labels), Some(assignees))
+                }
+                None => (None, None, None),
+            };
+        let tab = &self.tabs[index];
+        let cached = tab.details.is_none() && tab.cached_collaboration.is_some();
+        let details = tab.details.as_ref().or_else(|| {
+            tab.cached_collaboration
+                .as_ref()
+                .map(|observation| &observation.details)
+        });
+        let people = |names: &[String]| -> AnyElement {
+            if names.is_empty() {
+                return rail_empty("None yet", colors);
+            }
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(ui::GAP_FIELD))
+                .children(names.iter().map(|name| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(ui::GAP_FIELD))
+                        .child(sidebar_icon("person", colors.muted))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .font_weight(ui::WEIGHT_EMPHASIS)
+                                .child(name.to_owned()),
+                        )
+                }))
+                .into_any_element()
+        };
+        let reviewers = match details {
+            Some(details) => details.requested_reviewers.as_slice(),
+            None => tab.pull_request.reviewers.as_slice(),
+        };
+        let assignees = match details {
+            Some(details) => details.assignees.as_slice(),
+            None => tab.pull_request.assignees.as_slice(),
+        };
+        let labels = match details {
+            Some(details) => details.labels.as_slice(),
+            None => tab.pull_request.labels.as_slice(),
+        };
+        let participants = tab.pull_request.participants.as_slice();
+        let mut sections: Vec<(String, AnyElement)> = Vec::new();
+        let mut status = div()
+            .flex()
+            .flex_col()
+            .gap(px(ui::GAP_FIELD))
+            .child(rail_row("Author", &tab.pull_request.author, colors))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(ui::GAP_FIELD))
+                    .child(div().text_color(colors.muted).child("State"))
+                    .child(state_pill(
+                        &tab.pull_request.state,
+                        tab.pull_request.draft,
+                        colors,
+                    )),
+            )
+            .child(rail_row(
+                "Review",
+                &empty_unknown(&tab.pull_request.review_status),
+                colors,
+            ));
+        if let Some(details) = details {
+            status = status.child(rail_row(
+                "Mergeable",
+                &details.merge_eligibility.mergeable,
+                colors,
+            ));
+            status = status.child(rail_row(
+                "Merge state",
+                &details.merge_eligibility.merge_state_status,
+                colors,
+            ));
+        }
+        sections.push((
+            if cached {
+                "Pull request (cached observation)".into()
+            } else {
+                "Pull request".into()
+            },
+            rail_body(status.into_any_element(), actions),
+        ));
+        sections.push((
+            "Reviewers".into(),
+            rail_body(people(reviewers), reviewer_delta),
+        ));
+        sections.push((
+            "Assignees".into(),
+            rail_body(people(assignees), assignee_delta),
+        ));
+        sections.push((
+            "Labels".into(),
+            rail_body(
+                if labels.is_empty() {
+                    rail_empty("None yet", colors)
+                } else {
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(ui::GAP_ICON))
+                        .children(labels.iter().map(|name| label_chip(name, colors)))
+                        .into_any_element()
+                },
+                label_delta,
+            ),
+        ));
+        // The count is the count of identities this app actually observed, so
+        // it only claims to be the participant count when the read said so.
+        let participants_title = if tab.pull_request.participants_complete {
+            if participants.len() == 1 {
+                "1 participant".to_owned()
+            } else {
+                format!("{} participants", participants.len())
+            }
+        } else {
+            "Participants (partial)".to_owned()
+        };
+        sections.push((
+            participants_title,
+            div()
+                .child(if participants.is_empty() {
+                    rail_empty("None observed yet", colors)
+                } else {
+                    people(participants)
+                })
+                .when_some(
+                    tab.pull_request
+                        .participants_notice
+                        .clone()
+                        .filter(|_| !tab.pull_request.participants_complete),
+                    |section, notice| {
+                        section.child(
+                            div()
+                                .mt(px(ui::GAP_FIELD))
+                                .ui_text(TextRole::Caption)
+                                .text_color(colors.amber)
+                                .child(notice),
+                        )
+                    },
+                )
+                .into_any_element(),
+        ));
+        div()
+            .id("pr-conversation-rail")
+            .debug_selector(|| "pr-conversation-rail".to_owned())
+            // Docked under the discussion on a narrow page, the rail is the
+            // page: the actions it carries have no other entry point, so it
+            // widens rather than disappearing.
+            .map(|rail| {
+                if docked {
+                    rail.w_full()
+                } else {
+                    rail.w(px(CONVERSATION_RAIL_WIDTH))
+                }
+            })
+            .flex_none()
+            .flex()
+            .flex_col()
+            .children(
+                sections
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, (title, body))| {
+                        div()
+                            .py(px(ui::GAP_COLUMNS))
+                            .when(position == 0, |section| section.pt_0())
+                            .when(position > 0, |section| {
+                                section.border_t_1().border_color(colors.border)
+                            })
+                            .child(
+                                div()
+                                    .mb(px(ui::GAP_FIELD))
+                                    .ui_text(TextRole::Label)
+                                    .text_color(colors.muted)
+                                    .child(title),
+                            )
+                            .child(body)
+                    }),
+            )
+    }
+
     fn render_inspector(
         &self,
         index: usize,
         colors: Palette,
-        _window: &Window,
+        window: &Window,
         cx: &mut Context<Root>,
     ) -> impl IntoElement {
         let tab = &self.tabs[index];
         let confirmation_open = tab.confirmation.is_some();
         let current = tab.inspector_section;
-        let content = if matches!(
+        // Conversation runs denser than the other sections: it is a reading
+        // page, so the gutter it can afford to spend is the one between its two
+        // columns, not one around every card.
+        let conversation = matches!(
             current,
             InspectorSection::Overview | InspectorSection::Activity
-        ) {
+        );
+        let rail = conversation && self.available_diff_width(window) >= CONVERSATION_RAIL_MIN_PAGE;
+        let side_rail = rail.then(|| {
+            self.render_conversation_rail(index, false, colors, cx)
+                .into_any_element()
+        });
+        let docked_rail = (conversation && !rail).then(|| {
+            self.render_conversation_rail(index, true, colors, cx)
+                .into_any_element()
+        });
+        let content = if conversation {
             let mut content =
                 self.render_pr_section_content(index, InspectorSection::Overview, colors, cx);
-            content.push(
-                div()
-                    .mt(px(ui::GAP_PAGE))
-                    .mb(px(ui::GAP_PAGE))
-                    .ui_text(TextRole::Title)
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("Conversation")
-                    .into_any_element(),
-            );
             content.extend(self.render_pr_section_content(
                 index,
                 InspectorSection::Activity,
@@ -28176,7 +29783,6 @@ impl ReviewWorkspace {
             .h_full()
             .flex()
             .flex_col()
-            .bg(colors.canvas)
             // Freshness and completeness now ride in the tab row's notice
             // icon; see `render_tab_notices`.
             .child(
@@ -28186,8 +29792,14 @@ impl ReviewWorkspace {
                     .flex_1()
                     .min_h_0()
                     .w_full()
+                    // Every PR tab is the same page. Conversation used to pad
+                    // 12 while its three neighbours padded 20, so switching
+                    // tabs moved the content sideways.
                     .px(px(ui::PANEL_GUTTER))
-                    .py_5()
+                    .py(px(ui::PANEL_GUTTER))
+                    .flex()
+                    .flex_col()
+                    .gap(px(ui::GAP_GROUP))
                     .ui_text(TextRole::Body)
                     .overflow_y_scroll()
                     .when_some(
@@ -28199,11 +29811,29 @@ impl ReviewWorkspace {
                         |panel, confirmation| panel.child(confirmation),
                     )
                     .when(!confirmation_open, |panel| {
-                        if matches!(
-                            current,
-                            InspectorSection::Overview | InspectorSection::Activity
-                        ) {
-                            panel.child(div().w_full().max_w(px(960.)).mx_auto().children(content))
+                        if conversation {
+                            panel.child(
+                                div()
+                                    .w_full()
+                                    .max_w(px(1240.))
+                                    .mx_auto()
+                                    .flex()
+                                    .items_start()
+                                    .gap(px(ui::GAP_PAGE))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(ui::GAP_PAGE))
+                                            .children(content)
+                                            .when_some(docked_rail, |column, rail| {
+                                                column.child(rail)
+                                            }),
+                                    )
+                                    .when_some(side_rail, |row, rail| row.child(rail)),
+                            )
                         } else {
                             panel.children(content)
                         }
@@ -28250,9 +29880,8 @@ impl ReviewWorkspace {
                     side_control(label, selected == value, colors)
                         .id(SharedString::from(format!("submit-event-{label}")))
                         .on_click(cx.listener(move |root, _, _, cx| {
-                            if let Root::Review(this) = root
-                                && let Some(index) = this.active_tab
-                            {
+                            let this = &mut root.review;
+                            if let Some(index) = this.active_tab {
                                 this.tabs[index].confirmation = Some(NativeConfirmation::Submit {
                                     event: value.clone(),
                                 });
@@ -28275,20 +29904,9 @@ impl ReviewWorkspace {
                     .and_then(|session| session.available_revision())
                     .map(|revision| revision.head_sha.as_str());
                 Some(
-                    div()
-                        .mb(px(ui::GAP_PAGE))
-                        .p_3()
-                        .rounded(px(ui::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(colors.accent)
+                    layout::section("Submit review?", colors)
                         .child(
                             div()
-                                .ui_text(TextRole::Subtitle)
-                                .child("Submit review?"),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!(
@@ -28301,14 +29919,12 @@ impl ReviewWorkspace {
                         )
                         .child(
                             div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .child(format!("Actually reviewed head: {reviewed}")),
                         )
                         .when_some(newer, |card, newer| {
                             card.child(
                                 div()
-                                    .mt_2()
                                     .ui_text(TextRole::Caption)
                                     .text_color(colors.amber)
                                     .child(format!(
@@ -28318,7 +29934,6 @@ impl ReviewWorkspace {
                         })
                         .child(
                             div()
-                                .mt_3()
                                 .flex()
                                 .flex_wrap()
                                 .gap(px(ui::GAP_ICON))
@@ -28330,13 +29945,7 @@ impl ReviewWorkspace {
                                 )),
                         )
                         .child(
-                            div()
-                                .mt_2()
-                                .h(px(84.))
-                                .border_1()
-                                .border_color(colors.border)
-                                .rounded(px(ui::CONTROL_RADIUS))
-                                .overflow_hidden()
+                            layout::text_area(3, colors)
                                 .child(Textarea::new(&self.review_summary_input)),
                         )
                         .child(self.confirmation_controls(true, colors, cx))
@@ -28364,20 +29973,9 @@ impl ReviewWorkspace {
                     action: action.as_ref().clone(),
                 };
                 Some(
-                    div()
-                        .mb(px(ui::GAP_PAGE))
-                        .p_3()
-                        .rounded(px(ui::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(colors.accent)
+                    layout::section("Edit submitted review summary?", colors)
                         .child(
                             div()
-                                .ui_text(TextRole::Subtitle)
-                                .child("Edit submitted review summary?"),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!(
@@ -28389,7 +29987,6 @@ impl ReviewWorkspace {
                         )
                         .child(
                             div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .child(format!(
                                     "Author {selected_author} · state {submitted_state} · reviewed commit {submitted_commit_sha}"
@@ -28397,35 +29994,30 @@ impl ReviewWorkspace {
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.faint)
                                 .child("Frozen previous body (exact quoted text)"),
                         )
                         .child(
                             div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .font_family(CODE_FONT)
                                 .child(format!("{expected_body:?}")),
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.faint)
                                 .child("Requested new body (exact quoted text)"),
                         )
                         .child(
                             div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .font_family(CODE_FONT)
                                 .child(format!("{body:?}")),
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child("GitHub rechecks this exact review before saving, but another edit could happen between that check and the save. The review may refer to an older commit; this action does not change the displayed comparison."),
@@ -28457,20 +30049,9 @@ impl ReviewWorkspace {
                     DismissalAuthority::Unavailable { reason } => reason.as_str(),
                 };
                 Some(
-                    div()
-                        .mb(px(ui::GAP_PAGE))
-                        .p_3()
-                        .rounded(px(ui::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(colors.amber)
+                    layout::section("Dismiss submitted review?", colors)
                         .child(
                             div()
-                                .ui_text(TextRole::Subtitle)
-                                .child("Dismiss submitted review?"),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!(
@@ -28482,7 +30063,7 @@ impl ReviewWorkspace {
                                 )),
                         )
                         .child(
-                            div().mt_1().ui_text(TextRole::Caption).child(format!(
+                            div().ui_text(TextRole::Caption).child(format!(
                                 "Review {} · author {} · state {} · submitted {} · commit {}",
                                 request.target.review.remote_id,
                                 request.target.review_author.as_deref().unwrap_or("null"),
@@ -28497,49 +30078,42 @@ impl ReviewWorkspace {
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.faint)
                                 .child("Frozen previous body (exact quoted text)"),
                         )
                         .child(
                             div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .font_family(CODE_FONT)
                                 .child(format!("{:?}", request.target.review_body)),
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.faint)
                                 .child("Required dismissal reason (exact quoted text)"),
                         )
                         .child(
                             div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .font_family(CODE_FONT)
                                 .child(format!("{:?}", request.reason)),
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child(format!("Authority: {authority}")),
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child("Confirm durably records this exact request, repeats the exact preflight, then sends one GraphQL mutation. GitHub offers no atomic expected-state/body/commit condition, so the review can still race after that read. A later DISMISSED state alone cannot prove this exact reason."),
                         )
                         .child(
                             div()
-                                .mt_3()
                                 .flex()
                                 .flex_wrap()
                                 .gap(px(ui::GAP_COLUMNS))
@@ -28551,7 +30125,8 @@ impl ReviewWorkspace {
                                         .accessibility_label("Confirm exact submitted review dismissal")
                                         .on_click(move |_, window, cx| {
                                             confirm_root.update(cx, |root, cx| {
-                                                if let Root::Review(this) = root {
+                                                {
+                                                    let this = &mut root.review;
                                                     this.confirm_review_dismissal(
                                                         confirm_token.clone(),
                                                         window,
@@ -28573,7 +30148,8 @@ impl ReviewWorkspace {
                                         .on_click(move |_, _, cx| {
                                             let token = token.clone();
                                             cancel_root.update(cx, |root, cx| {
-                                                if let Root::Review(this) = root {
+                                                {
+                                                    let this = &mut root.review;
                                                     this.cancel_review_dismissal_confirmation(
                                                         &token, cx,
                                                     );
@@ -28616,20 +30192,14 @@ impl ReviewWorkspace {
                 let cancel_root = confirm_root.clone();
                 let confirm_token = token.clone();
                 let action = preparation.action;
-                let mut card = div()
-                    .mb(px(ui::GAP_PAGE))
-                    .p_3()
-                    .rounded(px(ui::CONTROL_RADIUS))
-                    .border_1()
-                    .border_color(colors.amber)
+                let mut card = layout::block()
                     .child(
                         div()
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(ui::WEIGHT_EMPHASIS)
                             .child(format!("{}?", action.label())),
                     )
                     .child(
                         div()
-                            .mt_1()
                             .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child(format!(
@@ -28640,7 +30210,7 @@ impl ReviewWorkspace {
                                 preparation.observation.viewer.node_id
                             )),
                     )
-                    .child(div().mt_1().ui_text(TextRole::Caption).child(format!(
+                    .child(div().ui_text(TextRole::Caption).child(format!(
                         "Workflow {} · run {} · run number {} · attempt {} · event {}",
                         target.workflow_name,
                         target.run_database_id,
@@ -28648,7 +30218,7 @@ impl ReviewWorkspace {
                         target.run_attempt,
                         target.run_event
                     )))
-                    .child(div().mt_1().ui_text(TextRole::Caption).child(format!(
+                    .child(div().ui_text(TextRole::Caption).child(format!(
                         "Run status {}{} · head {} · check {}",
                         preparation.observation.run_status,
                         preparation
@@ -28662,14 +30232,12 @@ impl ReviewWorkspace {
                     )))
                     .child(
                         div()
-                            .mt_2()
                             .ui_text(TextRole::Caption)
                             .text_color(colors.faint)
                             .child("Exact request sent on confirmation"),
                     )
                     .child(
                         div()
-                            .mt_1()
                             .ui_text(TextRole::Caption)
                             .font_family(CODE_FONT)
                             .child(format!(
@@ -28679,7 +30247,6 @@ impl ReviewWorkspace {
                     )
                     .child(
                         div()
-                            .mt_2()
                             .ui_text(TextRole::Caption)
                             .text_color(colors.amber)
                             .child(format!(
@@ -28690,7 +30257,6 @@ impl ReviewWorkspace {
                 for notice in &preparation.notices {
                     card = card.child(
                         div()
-                            .mt_1()
                             .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child(notice.clone()),
@@ -28699,14 +30265,12 @@ impl ReviewWorkspace {
                 Some(
                     card.child(
                         div()
-                            .mt_2()
                             .ui_text(TextRole::Caption)
                             .text_color(colors.amber)
                             .child("Confirm durably records this exact request, repeats the exact run and permission preflight, then sends one POST. A documented accepted status means GitHub accepted the request; it does not prove that a new attempt started or that the run is cancelled. Any other response leaves the attempt unresolved and frozen against replay."),
                     )
                     .child(
                         div()
-                            .mt_3()
                             .flex()
                             .flex_wrap()
                             .gap(px(ui::GAP_COLUMNS))
@@ -28725,7 +30289,8 @@ impl ReviewWorkspace {
                                     .debug_selector(|| "confirm-actions-run-control".to_owned())
                                     .on_click(move |_, _, cx| {
                                         confirm_root.update(cx, |root, cx| {
-                                            if let Root::Review(this) = root {
+                                            {
+                                                let this = &mut root.review;
                                                 this.confirm_actions_run_control(
                                                     confirm_token.clone(),
                                                     cx,
@@ -28748,7 +30313,8 @@ impl ReviewWorkspace {
                                     .on_click(move |_, _, cx| {
                                         let token = token.clone();
                                         cancel_root.update(cx, |root, cx| {
-                                            if let Root::Review(this) = root {
+                                            {
+                                                let this = &mut root.review;
                                                 this.cancel_actions_control_confirmation(
                                                     &token, cx,
                                                 );
@@ -28783,20 +30349,9 @@ impl ReviewWorkspace {
                 let cancel_root = confirm_root.clone();
                 let confirm_token = token.clone();
                 Some(
-                    div()
-                        .mb(px(ui::GAP_PAGE))
-                        .p_3()
-                        .rounded(px(ui::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(colors.green)
+                    layout::section("Add a file-level comment to your pending review?", colors)
                         .child(
                             div()
-                                .ui_text(TextRole::Subtitle)
-                                .child("Add a file-level comment to your pending review?"),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!(
@@ -28808,13 +30363,11 @@ impl ReviewWorkspace {
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .child(format!("Whole file: {}", target.path)),
                         )
                         .child(
                             div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .child(format!(
                                     "Pending review {} · reviewed commit {}",
@@ -28823,21 +30376,18 @@ impl ReviewWorkspace {
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .font_family(CODE_FONT)
                                 .child(format!("Exact comment: {body:?}")),
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child("This only adds to the existing pending review; it does not submit the review or post immediately. GitHub is checked again just before sending, but the head can still change in the small gap before the write."),
                         )
                         .child(
                             div()
-                                .mt_3()
                                 .flex()
                                 .gap(px(ui::GAP_COLUMNS))
                                 .ui_text(TextRole::Caption)
@@ -28845,7 +30395,8 @@ impl ReviewWorkspace {
                                     move |_, _, cx| {
                                         let token = confirm_token.clone();
                                         confirm_root.update(cx, |root, cx| {
-                                            if let Root::Review(this) = root {
+                                            {
+                                                let this = &mut root.review;
                                                 this.confirm_file_comment(token, cx);
                                             }
                                         });
@@ -28854,7 +30405,8 @@ impl ReviewWorkspace {
                                 .child(action_link("Cancel", colors).on_click(move |_, _, cx| {
                                     let token = token.clone();
                                     cancel_root.update(cx, |root, cx| {
-                                        if let Root::Review(this) = root {
+                                        {
+                                            let this = &mut root.review;
                                             this.cancel_file_comment_confirmation(&token, cx);
                                         }
                                     });
@@ -28890,12 +30442,7 @@ impl ReviewWorkspace {
                     return None;
                 };
                 Some(
-                    div()
-                        .mb(px(ui::GAP_PAGE))
-                        .p_3()
-                        .rounded(px(ui::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(colors.amber)
+                    layout::block()
                         .child(
                             div().ui_text(TextRole::Subtitle).child(if review_id.is_some() {
                                 "Continue adding this whole-file comment?"
@@ -28905,7 +30452,6 @@ impl ReviewWorkspace {
                         )
                         .child(
                             div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!(
@@ -28917,12 +30463,11 @@ impl ReviewWorkspace {
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .child(format!("Whole file: {}", target.path)),
                         )
                         .child(
-                            div().mt_1().ui_text(TextRole::Caption).child(format!(
+                            div().ui_text(TextRole::Caption).child(format!(
                                 "Reviewed commit: {}{}",
                                 intent.observed_head_sha,
                                 review_id
@@ -28932,14 +30477,12 @@ impl ReviewWorkspace {
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .font_family(CODE_FONT)
                                 .child(format!("Exact comment: {:?}", intent.body)),
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
                                 .child(if review_id.is_some() {
@@ -28950,7 +30493,6 @@ impl ReviewWorkspace {
                         )
                         .child(
                             div()
-                                .mt_3()
                                 .flex()
                                 .flex_wrap()
                                 .gap(px(ui::GAP_COLUMNS))
@@ -28971,7 +30513,8 @@ impl ReviewWorkspace {
                                         .on_click(move |_, _, cx| {
                                             let token = confirm_token.clone();
                                             confirm_root.update(cx, |root, cx| {
-                                                if let Root::Review(this) = root {
+                                                {
+                                                    let this = &mut root.review;
                                                     this.confirm_pending_review_start(token, cx);
                                                 }
                                             });
@@ -28997,7 +30540,8 @@ impl ReviewWorkspace {
                                         .on_click(move |_, _, cx| {
                                             let token = token.clone();
                                             cancel_root.update(cx, |root, cx| {
-                                                if let Root::Review(this) = root {
+                                                {
+                                                    let this = &mut root.review;
                                                     this.cancel_pending_review_start_confirmation(
                                                         &token, cx,
                                                     );
@@ -29026,8 +30570,8 @@ impl ReviewWorkspace {
                     side_control(label, selected_method == value, colors)
                         .id(SharedString::from(format!("merge-method-{label}")))
                         .on_click(cx.listener(move |root, _, _, cx| {
-                            if let Root::Review(this) = root
-                                && let Some(index) = this.active_tab
+                            let this = &mut root.review;
+                            if let Some(index) = this.active_tab
                                 && let Some(NativeConfirmation::Merge { method, .. }) =
                                     &mut this.tabs[index].confirmation
                             {
@@ -29040,8 +30584,8 @@ impl ReviewWorkspace {
                     side_control(label, selected_action == value, colors)
                         .id(SharedString::from(format!("merge-action-{label}")))
                         .on_click(cx.listener(move |root, _, _, cx| {
-                            if let Root::Review(this) = root
-                                && let Some(index) = this.active_tab
+                            let this = &mut root.review;
+                            if let Some(index) = this.active_tab
                                 && let Some(NativeConfirmation::Merge { action, .. }) =
                                     &mut this.tabs[index].confirmation
                             {
@@ -29063,20 +30607,9 @@ impl ReviewWorkspace {
                     .map(|(_, body)| body.as_str())
                     .unwrap_or("Provider default");
                 Some(
-                    div()
-                        .mb(px(ui::GAP_PAGE))
-                        .p_3()
-                        .rounded(px(ui::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(colors.green)
+                    layout::section("Confirm guarded merge action", colors)
                         .child(
                             div()
-                                .ui_text(TextRole::Subtitle)
-                                .child("Confirm guarded merge action"),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!(
@@ -29106,7 +30639,6 @@ impl ReviewWorkspace {
                         .when(!preparation.blockers.is_empty(), |card| {
                             card.child(
                                 div()
-                                    .mt_2()
                                     .ui_text(TextRole::Caption)
                                     .text_color(colors.amber)
                                     .child(format!(
@@ -29116,7 +30648,7 @@ impl ReviewWorkspace {
                             )
                         })
                         .child(
-                            div().mt_2().flex().flex_wrap().gap(px(ui::GAP_ICON)).children(
+                            div().flex().flex_wrap().gap(px(ui::GAP_ICON)).children(
                                 preparation
                                     .allowed_methods
                                     .iter()
@@ -29126,7 +30658,6 @@ impl ReviewWorkspace {
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .flex()
                                 .flex_wrap()
                                 .gap(px(ui::GAP_ICON))
@@ -29162,47 +30693,31 @@ impl ReviewWorkspace {
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!("Suggested headline: {suggested_title}")),
                         )
                         .child(
-                            div()
-                                .mt_1()
-                                .h(px(ui::CONTROL_HEIGHT))
-                                .border_1()
-                                .border_color(colors.border)
-                                .rounded(px(ui::CONTROL_RADIUS))
-                                .child(Input::new(&self.merge_title_input)),
+                            layout::text_field(colors).child(Input::new(&self.merge_title_input)),
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child(format!("Suggested body: {suggested_body}")),
                         )
                         .child(
-                            div()
-                                .mt_1()
-                                .h(px(72.))
-                                .border_1()
-                                .border_color(colors.border)
-                                .rounded(px(ui::CONTROL_RADIUS))
-                                .overflow_hidden()
+                            layout::text_area(3, colors)
                                 .child(Textarea::new(&self.merge_body_input)),
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.faint)
                                 .child("Delete branch unavailable: GitHub deleteRef has no expected-OID/CAS guard."),
                         )
                         .child(
                             div()
-                                .mt_2()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
                                 .child("Admin bypass is never selected automatically. Confirm dispatches exactly one guarded request."),
@@ -29222,19 +30737,16 @@ impl ReviewWorkspace {
     ) -> Div {
         let confirm = if submission {
             action_link("Confirm submission", colors).on_click(cx.listener(|root, _, _, cx| {
-                if let Root::Review(this) = root {
-                    this.confirm_submission(cx);
-                }
+                let this = &mut root.review;
+                this.confirm_submission(cx);
             }))
         } else {
             action_link("Confirm one action", colors).on_click(cx.listener(|root, _, _, cx| {
-                if let Root::Review(this) = root {
-                    this.confirm_merge(cx);
-                }
+                let this = &mut root.review;
+                this.confirm_merge(cx);
             }))
         };
         div()
-            .mt_3()
             .flex()
             .flex_wrap()
             .items_center()
@@ -29242,8 +30754,8 @@ impl ReviewWorkspace {
             .child(confirm)
             .child(
                 action_link("Cancel", colors).on_click(cx.listener(|root, _, _, cx| {
-                    if let Root::Review(this) = root
-                        && let Some(index) = this.active_tab
+                    let this = &mut root.review;
+                    if let Some(index) = this.active_tab
                         && !this.tabs[index].write_in_flight
                     {
                         this.tabs[index].confirmation = None;
@@ -29271,29 +30783,27 @@ impl ReviewWorkspace {
             .child(
                 action_link("Confirm exact edit", colors).on_click(cx.listener(
                     move |root, _, _, cx| {
-                        if let Root::Review(this) = root {
-                            this.confirm_submitted_summary(confirm_token.clone(), cx);
-                        }
+                        let this = &mut root.review;
+                        this.confirm_submitted_summary(confirm_token.clone(), cx);
                     },
                 )),
             )
             .child(
                 action_link("Cancel", colors).on_click(cx.listener(move |root, _, _, cx| {
-                    if let Root::Review(this) = root {
-                        this.cancel_submitted_summary_confirmation(&cancel_token, cx);
-                    }
+                    let this = &mut root.review;
+                    this.cancel_submitted_summary_confirmation(&cancel_token, cx);
                 })),
             )
     }
 
-    fn render_status(&self, colors: Palette) -> impl IntoElement {
+    fn render_status(&self, colors: Palette, glass: bool) -> impl IntoElement {
         div()
             .h(px(ui::CONTROL_HEIGHT))
             .px(px(ui::PANEL_GUTTER))
             .flex()
             .items_center()
             .gap(px(ui::GAP_COLUMNS))
-            .bg(colors.canvas)
+            .when(!glass, |line| line.bg(colors.canvas))
             .ui_text(TextRole::Caption)
             .text_color(colors.muted)
             .child(if self.focused {
@@ -29319,7 +30829,9 @@ impl ReviewWorkspace {
             .inset_0()
             .flex()
             .justify_center()
-            .pt_24()
+            // The palette hangs below the title bar rather than centring in the
+            // window, so it lands where the eye already is.
+            .pt(px(96.))
             .bg(rgba(0x00000055))
             .child(
                 div()
@@ -29333,7 +30845,7 @@ impl ReviewWorkspace {
                     .child(
                         div()
                             .px(px(ui::CONTROL_INSET))
-                            .py_2()
+                            .py(px(ui::GAP_GROUP))
                             .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child("COMMANDS"),
@@ -29344,11 +30856,10 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.refresh(&Refresh, window, cx);
-                                    this.command_palette = false;
-                                    cx.notify();
-                                }
+                                let this = &mut root.review;
+                                this.refresh(&Refresh, window, cx);
+                                this.command_palette = false;
+                                cx.notify();
                             })),
                     )
                     .child(
@@ -29357,11 +30868,10 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.next_file(&NextFile, window, cx);
-                                    this.command_palette = false;
-                                    cx.notify();
-                                }
+                                let this = &mut root.review;
+                                this.next_file(&NextFile, window, cx);
+                                this.command_palette = false;
+                                cx.notify();
                             })),
                     )
                     .child(
@@ -29370,11 +30880,10 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.previous_file(&PreviousFile, window, cx);
-                                    this.command_palette = false;
-                                    cx.notify();
-                                }
+                                let this = &mut root.review;
+                                this.previous_file(&PreviousFile, window, cx);
+                                this.command_palette = false;
+                                cx.notify();
                             })),
                     )
                     .child(
@@ -29383,9 +30892,8 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, _, cx| {
-                                if let Root::Review(this) = root
-                                    && let Some(index) = this.active_tab
-                                {
+                                let this = &mut root.review;
+                                if let Some(index) = this.active_tab {
                                     this.restore_full_comparison(index, cx);
                                     this.command_palette = false;
                                 }
@@ -29397,9 +30905,8 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, _, cx| {
-                                if let Root::Review(this) = root
-                                    && let Some(index) = this.active_tab
-                                {
+                                let this = &mut root.review;
+                                if let Some(index) = this.active_tab {
                                     this.inspector_open = true;
                                     this.tabs[index].inspector_section = InspectorSection::Commits;
                                     this.tabs[index].comparison_picker.expanded = true;
@@ -29414,9 +30921,8 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, _, cx| {
-                                if let Root::Review(this) = root
-                                    && let Some(index) = this.active_tab
-                                {
+                                let this = &mut root.review;
+                                if let Some(index) = this.active_tab {
                                     this.select_since_last_review(index, cx);
                                     this.command_palette = false;
                                 }
@@ -29428,11 +30934,10 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.cycle_diff(&CycleDiffMode, window, cx);
-                                    this.command_palette = false;
-                                    cx.notify();
-                                }
+                                let this = &mut root.review;
+                                this.cycle_diff(&CycleDiffMode, window, cx);
+                                this.command_palette = false;
+                                cx.notify();
                             })),
                     )
                     .child(
@@ -29441,12 +30946,11 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.inspector_open = !this.inspector_open;
-                                    this.refresh_auto_layout(window);
-                                    this.command_palette = false;
-                                    cx.notify();
-                                }
+                                let this = &mut root.review;
+                                this.inspector_open = !this.inspector_open;
+                                this.refresh_auto_layout(window);
+                                this.command_palette = false;
+                                cx.notify();
                             })),
                     )
                     .child(
@@ -29455,9 +30959,8 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.open_checks(window, cx);
-                                }
+                                let this = &mut root.review;
+                                this.open_checks(window, cx);
                             })),
                     )
                     .child(
@@ -29466,9 +30969,8 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root
-                                    && let Some(index) = this.active_tab
-                                {
+                                let this = &mut root.review;
+                                if let Some(index) = this.active_tab {
                                     this.command_palette = false;
                                     if this.start_actions_jobs(index, cx) {
                                         this.focus_current_ci_pane(index, window, cx);
@@ -29482,9 +30984,8 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root
-                                    && let Some(index) = this.active_tab
-                                {
+                                let this = &mut root.review;
+                                if let Some(index) = this.active_tab {
                                     this.command_palette = false;
                                     if this.start_actions_jobs(index, cx) {
                                         this.focus_current_ci_pane(index, window, cx);
@@ -29498,9 +30999,8 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root
-                                    && let Some(index) = this.active_tab
-                                {
+                                let this = &mut root.review;
+                                if let Some(index) = this.active_tab {
                                     this.command_palette = false;
                                     if this.start_actions_log(index, cx) {
                                         this.focus_current_ci_pane(index, window, cx);
@@ -29514,11 +31014,10 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.reset_layout(window, cx);
-                                    this.command_palette = false;
-                                    cx.notify();
-                                }
+                                let this = &mut root.review;
+                                this.reset_layout(window, cx);
+                                this.command_palette = false;
+                                cx.notify();
                             })),
                     )
                     .child(
@@ -29527,9 +31026,8 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.open_view_editor(window, cx);
-                                }
+                                let this = &mut root.review;
+                                this.open_view_editor(window, cx);
                             })),
                     )
                     .child(
@@ -29538,26 +31036,43 @@ impl ReviewWorkspace {
                             .cursor_pointer()
                             .hover(|row| row.bg(colors.selected))
                             .on_click(cx.listener(|root, _, window, cx| {
-                                if let Root::Review(this) = root {
-                                    this.open_repository_picker(window, cx);
-                                    cx.notify();
-                                }
+                                let this = &mut root.review;
+                                this.open_repository_picker(window, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        command_row("Commit history", "⇧⌘H", colors)
+                            .id("command-history")
+                            .cursor_pointer()
+                            .hover(|row| row.bg(colors.selected))
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                let this = &mut root.review;
+                                this.open_history(None, cx);
+                            })),
+                    )
+                    .child(
+                        command_row("Settings", "⌘,", colors)
+                            .id("command-settings")
+                            .cursor_pointer()
+                            .hover(|row| row.bg(colors.selected))
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                let this = &mut root.review;
+                                this.open_settings(cx);
                             })),
                     )
                     .child(
                         div()
                             .id("close-palette")
-                            .mt_2()
                             .px(px(ui::CONTROL_INSET))
-                            .py_2()
+                            .py(px(ui::GAP_GROUP))
                             .text_color(colors.accent)
                             .cursor_pointer()
                             .child("Close palette  ⇧⌘P")
                             .on_click(cx.listener(|root, _, _, cx| {
-                                if let Root::Review(this) = root {
-                                    this.command_palette = false;
-                                    cx.notify();
-                                }
+                                let this = &mut root.review;
+                                this.command_palette = false;
+                                cx.notify();
                             })),
                     ),
             )
@@ -29597,32 +31112,22 @@ fn field_label(label: &str, colors: Palette) -> Div {
 }
 
 fn input_box(editor: &Entity<InputState>, colors: Palette) -> Div {
-    div()
-        .mt(px(ui::GAP_FIELD))
-        .h(px(ui::CONTROL_HEIGHT))
-        .px(px(ui::CELL_INSET))
-        .rounded(px(ui::CONTROL_RADIUS))
-        .bg(colors.elevated)
-        .border_1()
-        .border_color(colors.border)
-        .font_family(UI_FONT)
-        .ui_text(TextRole::Body)
-        .child(Input::new(editor))
+    layout::text_field(colors).child(Input::new(editor))
 }
 
 fn editor_field(label: &str, editor: &Entity<InputState>, colors: Palette) -> Div {
-    div()
+    layout::field(label, colors)
         .flex_1()
         .min_w_0()
-        .mb(px(ui::GAP_GROUP))
-        .child(field_label(label, colors))
         .child(input_box(editor, colors))
 }
 
+/// A break between groups of fields. The leading belongs to the label rather
+/// than being a margin between two siblings, so the form's own `gap` stays the
+/// only thing spacing its rows.
 fn section_label(label: &str, colors: Palette) -> Div {
     ui::kicker(label)
-        .mt(px(ui::GAP_GROUP))
-        .mb(px(ui::GAP_GROUP))
+        .pt(px(ui::GAP_COLUMNS))
         .ui_text(TextRole::Kicker)
         .text_color(colors.faint)
 }
@@ -29700,23 +31205,18 @@ fn choice_row(
                     label.to_ascii_lowercase().replace(' ', "-")
                 )))
                 .on_click(cx.listener(move |root, _, _, cx| {
-                    if let Root::Review(this) = root {
-                        select(this, index);
-                        cx.notify();
-                    }
+                    let this = &mut root.review;
+                    select(this, index);
+                    cx.notify();
                 }))
         });
-    div()
-        .mb(px(ui::GAP_GROUP))
-        .child(field_label(label, colors))
-        .child(
-            div()
-                .mt_2()
-                .flex()
-                .flex_wrap()
-                .gap(px(ui::GAP_ICON))
-                .children(controls),
-        )
+    layout::field(label, colors).child(
+        div()
+            .flex()
+            .flex_wrap()
+            .gap(px(ui::GAP_ICON))
+            .children(controls),
+    )
 }
 
 fn view_summary(view: &cibergit::workspace::SavedView) -> String {
@@ -29748,7 +31248,314 @@ fn file_status_badge(status: &str) -> &'static str {
     }
 }
 
+/// Vendor artwork for the editors Local changes can launch, taken from the
+/// upstream logos.
+enum BrandArt {
+    /// A polychrome logo. GPUI tints an `svg()` as a single mask, so this one
+    /// has to be rasterised through `img()` to keep its own colours.
+    Colour(&'static Arc<Image>),
+    /// A logo that is one colour by design. It keeps the cheaper mask, painted
+    /// in the brand's own colour rather than in the chrome's.
+    Mono {
+        /// The fill rule the artwork was drawn for: the wrong one either fills
+        /// a logo's hole or punches one where the artwork has none.
+        rule: &'static str,
+        view_box: &'static str,
+        path: &'static str,
+        light: Rgba,
+        dark: Rgba,
+    },
+}
+
+/// Rasterising is per document, so each one is built once and shared.
+static VSCODE_ART: LazyLock<Arc<Image>> = LazyLock::new(|| {
+    Arc::new(Image::from_bytes(
+        ImageFormat::Svg,
+        include_bytes!("../assets/icons/editors/vscode.svg").to_vec(),
+    ))
+});
+static VSCODIUM_ART: LazyLock<Arc<Image>> = LazyLock::new(|| {
+    Arc::new(Image::from_bytes(
+        ImageFormat::Svg,
+        include_bytes!("../assets/icons/editors/vscodium.svg").to_vec(),
+    ))
+});
+
+fn brand_art(name: &str) -> Option<BrandArt> {
+    Some(match name {
+        // VS Code and VS Code Insiders share a silhouette upstream and differ
+        // only in fill, so Insiders points at this one too.
+        "vscode" => BrandArt::Colour(&VSCODE_ART),
+        "vscodium" => BrandArt::Colour(&VSCODIUM_ART),
+        "cursor" => BrandArt::Mono {
+            rule: "evenodd",
+            view_box: "0 0 466.73 532.09",
+            path: "M457.43,125.94L244.42,2.96c-6.84-3.95-15.28-3.95-22.12,0L9.3,125.94c-5.75,3.32-9.3,9.46-9.3,16.11v247.99c0,6.65,3.55,12.79,9.3,16.11l213.01,122.98c6.84,3.95,15.28,3.95,22.12,0l213.01-122.98c5.75-3.32,9.3-9.46,9.3-16.11v-247.99c0-6.65-3.55-12.79-9.3-16.11h-.01ZM444.05,151.99l-205.63,356.16c-1.39,2.4-5.06,1.42-5.06-1.36v-233.21c0-4.66-2.49-8.97-6.53-11.31L24.87,145.67c-2.4-1.39-1.42-5.06,1.36-5.06h411.26c5.84,0,9.49,6.33,6.57,11.39h-.01Z",
+            light: rgba(0x26251eff),
+            dark: rgba(0xedececff),
+        },
+        "zed" => BrandArt::Mono {
+            rule: "evenodd",
+            view_box: "0 0 96 96",
+            path: "M9 6a3 3 0 0 0-3 3v66H0V9a9 9 0 0 1 9-9h80.379c4.009 0 6.016 4.847 3.182 7.682L43.055 57.187H57V51h6v7.688a4.5 4.5 0 0 1-4.5 4.5H37.055L26.743 73.5H73.5V36h6v37.5a6 6 0 0 1-6 6H20.743L10.243 90H87a3 3 0 0 0 3-3V21h6v66a9 9 0 0 1-9 9H6.621c-4.009 0-6.016-4.847-3.182-7.682L52.757 39H39v6h-6v-7.5a4.5 4.5 0 0 1 4.5-4.5h21.257l10.5-10.5H22.5V60h-6V22.5a6 6 0 0 1 6-6h52.757L85.757 6H9Z",
+            light: rgba(0x000000ff),
+            dark: rgba(0xffffffff),
+        },
+        "trae" => BrandArt::Mono {
+            rule: "nonzero",
+            view_box: "0 0 24 24",
+            path: "M1 4h3v14H1V4Zm3 14h18v3H4v-3ZM4 4h18v3H4V4Zm15 3h3v11h-3V7Zm-8 3 2 2-2 2-2-2 2-2Zm5 0 2 2-2 2-2-2 2-2Z",
+            light: rgba(0x000000ff),
+            dark: rgba(0xffffffff),
+        },
+        _ => return None,
+    })
+}
+
+/// Icon for an application row or for the Local changes trigger: the brand's own
+/// artwork where there is one, and the drawn glyph otherwise.
+fn app_icon(name: &str, colors: Palette) -> AnyElement {
+    match brand_art(name) {
+        Some(BrandArt::Colour(art)) => img(art.clone())
+            .size(px(ui::ICON_SIZE))
+            .flex_none()
+            .into_any_element(),
+        Some(BrandArt::Mono {
+            rule,
+            view_box,
+            path,
+            light,
+            dark,
+        }) => svg()
+            .data(
+                format!(
+                    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='{view_box}' fill='black' fill-rule='{rule}'><path d='{path}'/></svg>"
+                )
+                .as_bytes(),
+            )
+            .size(px(ui::ICON_SIZE))
+            .flex_none()
+            .text_color(if colors.dark { dark } else { light })
+            .into_any_element(),
+        None => sidebar_icon(name, colors.muted).into_any_element(),
+    }
+}
+
 // SVG paint requires an explicit foreground; inherited text color is not enough.
+/// Horizontal distance between two lanes in the graph gutter.
+const HISTORY_LANE_PITCH: f32 = 14.;
+/// Radius of an ordinary commit's disc, and of a merge commit's ring. The ring
+/// is drawn larger because a 2px border eats most of a 4px disc.
+const HISTORY_NODE_RADIUS: f32 = 3.5;
+const HISTORY_MERGE_RADIUS: f32 = 5.;
+const HISTORY_COMMIT_COLUMN: f32 = 460.;
+
+/// A tab-strip chip for a page that is not a pull request.
+///
+/// Settings and History are the two of these, and they are identical but for
+/// their label and their two handlers — so they share one definition rather
+/// than a second seventy-line copy that could drift from the first. The ids it
+/// builds (`tab-<name>`, `close-tab-<name>`) are the ones the chips already
+/// carried.
+fn utility_tab(
+    name: &'static str,
+    label: &'static str,
+    active: bool,
+    colors: Palette,
+    cx: &mut Context<Root>,
+    open: impl Fn(&mut ReviewWorkspace, &mut Context<Root>) + 'static,
+    close: impl Fn(&mut ReviewWorkspace, &mut Context<Root>) + 'static,
+) -> impl IntoElement {
+    let tab_id = SharedString::from(format!("tab-{name}"));
+    let close_id = SharedString::from(format!("close-tab-{name}"));
+    div()
+        .id(tab_id.clone())
+        .group(tab_id.clone())
+        .h_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .cursor_pointer()
+        .child(
+            div()
+                .h(px(ui::CONTROL_HEIGHT))
+                .pl(px(ui::CONTROL_INSET))
+                // The close target carries its own inset, so the chip keeps an
+                // optical right edge without doubling it.
+                .pr(px(ui::GAP_ICON))
+                .flex()
+                .items_center()
+                .gap(px(ui::GAP_ICON))
+                .rounded(px(ui::CONTROL_RADIUS))
+                .text_color(if active { colors.text } else { colors.muted })
+                .when(active, |tab| tab.bg(colors.surface))
+                .when(!active, |tab| {
+                    tab.group_hover(tab_id, |tab| tab.bg(colors.selected))
+                })
+                .child(label)
+                .child(
+                    Button::new(close_id.clone())
+                        .debug_selector({
+                            let close_id = close_id.clone();
+                            move || close_id.to_string()
+                        })
+                        .group(close_id.clone())
+                        .size(px(ui::BADGE_HEIGHT))
+                        .flex_none()
+                        .p_0()
+                        .rounded(px(ui::BADGE_RADIUS))
+                        .border_1()
+                        .border_color(rgba(0x00000000))
+                        .focus_ring(colors.accent, colors.selected)
+                        .cursor_pointer()
+                        .hover(|close| close.bg(colors.elevated))
+                        .accessibility_label(format!("Close {label}"))
+                        .child(
+                            sidebar_icon("close", if active { colors.muted } else { colors.faint })
+                                .size(px(ui::ICON_SIZE - 2.))
+                                .group_hover(close_id, |icon| icon.text_color(colors.text)),
+                        )
+                        // The chip behind this target selects the page. Without
+                        // stopping the press, closing it would also select it on
+                        // the way out.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_click(cx.listener(move |root, _, _, cx| {
+                            close(&mut root.review, cx);
+                        })),
+                ),
+        )
+        .on_click(cx.listener(move |root, _, _, cx| {
+            open(&mut root.review, cx);
+        }))
+}
+
+/// The calendar day out of a Git ISO-8601 timestamp.
+///
+/// Git prints `2026-09-14T16:59:12-03:00`, whose first ten characters are the
+/// date in the author's own offset. That is what the commit says happened, so
+/// it is shown verbatim rather than converted into a relative phrase that
+/// would need a clock and would go stale while the page is open.
+fn history_day(timestamp: &str) -> String {
+    timestamp
+        .split('T')
+        .next()
+        .filter(|day| day.len() == 10)
+        .unwrap_or(timestamp)
+        .to_owned()
+}
+
+/// One row's slice of the commit graph.
+///
+/// GPUI paints an `svg()` as a single tinted mask, so one SVG cannot hold two
+/// lane colours. The row's edges are therefore grouped by colour and each
+/// group becomes its own overlaid SVG — typically one or two per row, since a
+/// row only ever draws the lanes that are live across it. The node is a plain
+/// element rather than part of the drawing, so the selected row can keep it
+/// crisp without re-rasterising a path.
+fn history_graph_cell(
+    row: &GraphRow,
+    lane_count: usize,
+    height: f32,
+    dark: bool,
+    colors: Palette,
+) -> Div {
+    let width = lane_count.max(1) as f32 * HISTORY_LANE_PITCH;
+    let center = |lane: usize| lane as f32 * HISTORY_LANE_PITCH + HISTORY_LANE_PITCH / 2.;
+    let node_x = center(row.node_lane);
+    let middle = height / 2.;
+
+    let mut by_color: BTreeMap<usize, String> = BTreeMap::new();
+    for edge in &row.edges {
+        let lane_x = center(edge.lane);
+        // Each edge is a cubic whose control points sit on the two verticals
+        // it joins, so a lane that does not move degenerates to a straight
+        // line and needs no special case.
+        let path = match edge.kind {
+            EdgeKind::Through => format!("M{lane_x},0 V{height} "),
+            EdgeKind::Into => format!(
+                "M{lane_x},0 C{lane_x},{bend} {node_x},{bend} {node_x},{middle} ",
+                bend = middle / 2.
+            ),
+            EdgeKind::OutOf => format!(
+                "M{node_x},{middle} C{node_x},{bend} {lane_x},{bend} {lane_x},{height} ",
+                bend = middle + middle / 2.
+            ),
+        };
+        by_color.entry(edge.color).or_default().push_str(&path);
+    }
+
+    let mut cell = div()
+        .relative()
+        .flex_none()
+        .w(px(width))
+        .h(px(height))
+        .overflow_hidden();
+    for (color, path) in by_color {
+        cell = cell.child(
+            svg()
+                .absolute()
+                .inset_0()
+                .size_full()
+                .text_color(lane_color(color, dark))
+                .data(
+                    format!(
+                        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {width} {height}' \
+                         fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round'>\
+                         <path d='{path}'/></svg>"
+                    )
+                    .as_bytes(),
+                ),
+        );
+    }
+    let tint = lane_color(row.node_color, dark);
+    let radius = if row.merge {
+        HISTORY_MERGE_RADIUS
+    } else {
+        HISTORY_NODE_RADIUS
+    };
+    cell.child(
+        div()
+            .absolute()
+            .left(px(node_x - radius))
+            .top(px(middle - radius))
+            .size(px(radius * 2.))
+            .rounded_full()
+            // A merge is a ring, so the lines converging on it stay readable
+            // underneath instead of disappearing into a filled dot.
+            .when(row.merge, |node| {
+                node.bg(colors.surface).border_2().border_color(tint)
+            })
+            .when(!row.merge, |node| node.bg(tint)),
+    )
+}
+
+/// A branch, remote branch or tag label on a commit.
+///
+/// These take the same tints the rest of the window already gives these ideas:
+/// branches are accent-tinted exactly as the PR header's branch chips are, a
+/// tag takes the merged purple, and the checked-out branch takes the success
+/// green that marks a current state elsewhere.
+fn history_ref_chip(label: &RefLabel, colors: Palette) -> Div {
+    let (fill, text) = match label.kind {
+        RefKind::Head => (colors.success_emphasis, rgba(0xffffffff)),
+        RefKind::LocalBranch => (colors.accent_subtle, colors.accent),
+        RefKind::RemoteBranch => (colors.selected, colors.muted),
+        RefKind::Tag => (colors.done_emphasis, rgba(0xffffffff)),
+    };
+    div()
+        .badge()
+        .flex_none()
+        .max_w(px(180.))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .bg(fill)
+        .text_color(text)
+        .child(label.name.clone())
+}
+
 fn sidebar_icon(name: &str, color: Rgba) -> Svg {
     let shape = match name {
         "search" => "<circle cx='10.5' cy='10.5' r='6.5'/><path d='m16 16 4 4'/>",
@@ -29758,6 +31565,16 @@ fn sidebar_icon(name: &str, color: Rgba) -> Svg {
             "<path d='M3 7V5a2 2 0 0 1 2-2h5l3 3h6a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7h18'/>"
         }
         "plus" => "<path d='M12 5v14M5 12h14'/>",
+        // GitHub's check states. Outlines rather than Octicons' filled marks:
+        // GPUI paints an SVG as a single tinted mask, so a white glyph punched
+        // into a filled disc would come back as a solid blob.
+        "check-circle" => "<circle cx='12' cy='12' r='9'/><path d='m8 12.3 2.6 2.6L16 9.4'/>",
+        "x-circle" => {
+            "<circle cx='12' cy='12' r='9'/><path d='m9.2 9.2 5.6 5.6M14.8 9.2l-5.6 5.6'/>"
+        }
+        "dot-circle" => "<circle cx='12' cy='12' r='9'/><circle cx='12' cy='12' r='3.4'/>",
+        "skip-circle" => "<circle cx='12' cy='12' r='9'/><path d='m8.6 15.4 6.8-6.8'/>",
+        "dash-circle" => "<circle cx='12' cy='12' r='9'/><path d='M8.5 12h7'/>",
         "close" => "<path d='m7 7 10 10M17 7 7 17'/>",
         "alert" => {
             "<path d='M10.3 3.9 1.8 18.5A2 2 0 0 0 3.5 21.5h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z'/><path d='M12 9v4.5M12 17.2h.01'/>"
@@ -29769,9 +31586,17 @@ fn sidebar_icon(name: &str, color: Rgba) -> Svg {
             "<path d='M13 4H6a3 3 0 0 0-3 3v11a3 3 0 0 0 3 3h11a3 3 0 0 0 3-3v-7M10 14l1-4L19 2l3 3-8 8-4 1Z'/>"
         }
         "review" => "<rect x='5' y='3' width='14' height='18' rx='3'/><path d='m8 12 3 3 5-6'/>",
+        "terminal" => {
+            "<rect x='3' y='4' width='18' height='16' rx='3'/><path d='m7.5 9.5 3 2.5-3 2.5M13 15h4'/>"
+        }
         "person" => "<circle cx='12' cy='7' r='4'/><path d='M4 21v-2a8 8 0 0 1 16 0v2'/>",
         "conversation" => {
             "<path d='M21 11a8 8 0 0 1-8 8H8l-5 3V6a3 3 0 0 1 3-3h7a8 8 0 0 1 8 8Z'/>"
+        }
+        // A branch leaving a trunk and rejoining it: the commit graph in one
+        // glyph, and the shape this icon already had as the fallback.
+        "graph" => {
+            "<circle cx='6' cy='5' r='2'/><circle cx='6' cy='19' r='2'/><circle cx='18' cy='19' r='2'/><path d='M6 7v10M18 17V9a4 4 0 0 0-4-4h-2m3-3-3 3 3 3'/>"
         }
         _ => {
             "<circle cx='6' cy='5' r='2'/><circle cx='6' cy='19' r='2'/><circle cx='18' cy='19' r='2'/><path d='M6 7v10M18 17V9a4 4 0 0 0-4-4h-2m3-3-3 3 3 3'/>"
@@ -29779,6 +31604,20 @@ fn sidebar_icon(name: &str, color: Rgba) -> Svg {
     };
     svg().data(format!("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'>{shape}</svg>").as_bytes())
         .size(px(ui::ICON_SIZE)).flex_none().text_color(color)
+}
+
+/// GitHub's colour for a check state: success green, failure red, unfinished
+/// amber, skipped muted. An unreadable state stays faint rather than borrowing
+/// a colour that would claim an outcome.
+fn check_state_icon(state: CheckState, colors: Palette) -> Svg {
+    let (icon, color) = match state {
+        CheckState::Success => ("check-circle", colors.green),
+        CheckState::Failure => ("x-circle", colors.red),
+        CheckState::Pending => ("dot-circle", colors.amber),
+        CheckState::Skipped => ("skip-circle", colors.muted),
+        CheckState::Unknown => ("dash-circle", colors.faint),
+    };
+    sidebar_icon(icon, color)
 }
 
 fn sidebar_icon_button(id: &'static str, label: &str, icon: &str, colors: Palette) -> Button {
@@ -29906,6 +31745,48 @@ fn action_link_with_id(id: String, label: &'static str, colors: Palette) -> Butt
         .child(label)
 }
 
+fn rail_link(label: &'static str, colors: Palette) -> Button {
+    rail_link_with_id(format!("action-{label}"), label, colors)
+}
+
+/// The same action as `action_link`, without the control box. GitHub's sidebar
+/// renders these as plain blue text, and it is right to: a bordered card per
+/// row turns one group of six choices into six stacked buttons and buries the
+/// group heading that is supposed to organize them. Dropping the box also puts
+/// the labels back on the rail's own left margin, in line with the headings.
+///
+/// The 1px border stays, transparent, because `focus_ring` recolors an existing
+/// border rather than adding one; without it a keyboard user would have nothing
+/// to follow. Hover underlines instead of filling, since a full-bleed fill on a
+/// zero-inset row reads as a selected band rather than a pointer target.
+fn rail_link_with_id(id: String, label: &'static str, colors: Palette) -> Button {
+    let selector = id.clone();
+    Button::new(SharedString::from(id))
+        .debug_selector(move || selector.clone())
+        .h(px(ui::BADGE_HEIGHT))
+        .px_0()
+        .py_0()
+        .flex()
+        .items_center()
+        .justify_start()
+        .flex_none()
+        .ui_text(TextRole::Label)
+        .border_1()
+        .border_color(rgba(0x00000000))
+        .cursor_pointer()
+        .text_color(colors.accent)
+        .hover(|button| button.underline())
+        .disabled_presentation()
+        .focus_ring(colors.accent, colors.selected)
+        .when(!label.is_empty(), |button| {
+            button.accessibility_label(label)
+        })
+        .child(label)
+}
+
+/// One row of the checks list. GitHub stacks these as a single bordered list
+/// with hairlines between rows rather than as separate cards, which is both
+/// denser and easier to scan down a column of icons.
 fn check_identity_button(
     id: String,
     accessibility_label: String,
@@ -29916,25 +31797,21 @@ fn check_identity_button(
     Button::new(id)
         .control()
         .h_auto()
-        .min_h(px(ui::TWO_LINE_ROW))
+        .min_h(px(ui::ROW_HEIGHT + ui::GAP_GROUP))
         .ui_text(TextRole::Body)
-        .mb_2()
-        .p(px(ui::CELL_INSET))
+        .px(px(ui::CELL_INSET))
+        .py(px(ui::GAP_FIELD))
         .w_full()
         .flex_col()
         .items_stretch()
-        .rounded(px(ui::CONTROL_RADIUS))
-        .border_1()
-        .border_color(if selected {
-            colors.accent
-        } else {
-            colors.border
-        })
+        .rounded(px(0.))
+        .border_b_1()
+        .border_color(colors.border)
         .selected(selected)
         .aria_selected(selected)
         .aria_expanded(expanded)
         .accessibility_label(accessibility_label)
-        .when(selected, |row| row.bg(colors.selected))
+        .when(selected, |row| row.bg(colors.elevated))
         .cursor_pointer()
         .hover(|row| row.bg(colors.selected))
 }
@@ -30014,7 +31891,7 @@ fn stack_tip_panel(
                 .child(
                     div()
                         .px(px(ui::CONTROL_INSET))
-                        .pb_2()
+                        .pb(px(ui::GAP_GROUP))
                         .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .child(
@@ -30071,7 +31948,7 @@ fn stack_tip_panel(
                 .children(excluded.into_iter().map(|excluded| {
                     div()
                         .px(px(ui::CELL_INSET))
-                        .py_1()
+                        .py(px(ui::GAP_ICON))
                         .ui_text(TextRole::Caption)
                         .text_color(colors.amber)
                         .child(format!(
@@ -30573,15 +32450,60 @@ fn command_row(label: &str, shortcut: &str, colors: Palette) -> Div {
 
 /// GitHub renders a branch as a monospace chip in the accent tint, which is the
 /// strongest colour cue on its pull request page.
-fn branch_chip(branch: &str, colors: Palette) -> Div {
-    div()
-        .px(px(ui::GAP_FIELD))
-        .rounded(px(ui::BADGE_RADIUS))
-        .bg(colors.accent_subtle)
-        .text_color(colors.accent)
-        .font_family(CODE_FONT)
-        .ui_text(TextRole::Caption)
-        .child(branch.to_owned())
+/// How much of a branch name a chip shows before it cuts. The chip is set in
+/// Menlo, so a character count is a width: 32 characters is the widest name
+/// that still leaves the title beside it room to read.
+const BRANCH_CHIP_MAX_CHARS: usize = 32;
+
+/// A branch name, cut to the chip's width with the full name one hover away.
+///
+/// The branch pair sits beside the PR title in a row that does not shrink, so
+/// before this a long branch name simply ate the title: the name is the part
+/// that is usually predictable, and the title is the part you are reading.
+/// Cutting it here rather than letting the layout do it is also what makes the
+/// hover card honest — the chip knows exactly when it dropped something.
+fn branch_chip(branch: &str, colors: Palette) -> AnyElement {
+    let chip = |text: String| {
+        div()
+            .px(px(ui::GAP_FIELD))
+            .rounded(px(ui::BADGE_RADIUS))
+            .bg(colors.accent_subtle)
+            .text_color(colors.accent)
+            .font_family(CODE_FONT)
+            .ui_text(TextRole::Caption)
+            .whitespace_nowrap()
+            .child(text)
+    };
+    if branch.chars().count() <= BRANCH_CHIP_MAX_CHARS {
+        return chip(branch.to_owned()).into_any_element();
+    }
+    let shown: String = branch.chars().take(BRANCH_CHIP_MAX_CHARS - 1).collect();
+    let full = branch.to_owned();
+    let spoken = branch.to_owned();
+    HoverCard::new(SharedString::from(format!("branch-chip-{branch}")))
+        .anchor(Anchor::BottomLeft)
+        .trigger(
+            chip(format!("{shown}…"))
+                .id(SharedString::from(format!("branch-chip-trigger-{branch}")))
+                .debug_selector(|| "branch-chip-trigger".to_owned())
+                .aria_label(spoken),
+        )
+        .content(move |_, _, _| {
+            div()
+                .id("branch-chip-card")
+                .debug_selector(|| "branch-chip-card".to_owned())
+                .max_w(px(420.))
+                .p(px(ui::CONTROL_INSET))
+                .rounded(px(ui::POPOVER_RADIUS))
+                .bg(colors.surface)
+                .border_1()
+                .border_color(colors.border)
+                .font_family(CODE_FONT)
+                .ui_text(TextRole::Caption)
+                .text_color(colors.text)
+                .child(full.clone())
+        })
+        .into_any_element()
 }
 
 /// GitHub's state colours: open is success, merged is done, closed is danger,
@@ -30600,8 +32522,61 @@ fn state_pill(state: &str, draft: bool, colors: Palette) -> Div {
         .w_auto()
         .bg(fill)
         .text_color(rgba(0xffffffff))
-        .font_weight(FontWeight::MEDIUM)
+        .font_weight(ui::WEIGHT_EMPHASIS)
         .child(label)
+}
+
+/// A rail line: muted name on the left, observed value on the right.
+fn rail_row(label: &str, value: &str, colors: Palette) -> Div {
+    div()
+        .flex()
+        .items_baseline()
+        .justify_between()
+        .gap(px(ui::GAP_FIELD))
+        .child(
+            div()
+                .flex_none()
+                .text_color(colors.muted)
+                .child(label.to_owned()),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_right()
+                .child(value.to_owned()),
+        )
+}
+
+/// A rail section: what the section reports, then the controls that change it.
+fn rail_body(list: AnyElement, controls: Option<AnyElement>) -> AnyElement {
+    div()
+        .child(list)
+        .when_some(controls, |body, controls| {
+            body.child(div().mt(px(ui::GAP_FIELD)).child(controls))
+        })
+        .into_any_element()
+}
+
+fn rail_empty(text: &str, colors: Palette) -> AnyElement {
+    div()
+        .text_color(colors.muted)
+        .child(text.to_owned())
+        .into_any_element()
+}
+
+fn label_chip(name: &str, colors: Palette) -> Div {
+    div()
+        .badge()
+        .flex_none()
+        .w_auto()
+        .rounded_full()
+        .bg(colors.elevated)
+        .border_1()
+        .border_color(colors.border)
+        .child(name.to_owned())
 }
 
 fn detail(label: &str, value: impl Into<String>, colors: Palette) -> Div {
@@ -30609,124 +32584,261 @@ fn detail(label: &str, value: impl Into<String>, colors: Palette) -> Div {
 }
 
 fn detail_element(label: &str, value: AnyElement, colors: Palette) -> Div {
-    div()
-        .mb(px(ui::GAP_PAGE))
-        .child(
-            div()
-                .ui_text(TextRole::Label)
-                .text_color(colors.muted)
-                .child(label.to_owned()),
-        )
-        .child(div().mt(px(ui::GAP_FIELD)).child(value))
+    layout::field(label, colors).child(value)
 }
 
 fn render_lifecycle_change(frozen: &FrozenMutation, colors: Palette) -> Div {
     let text = |label: &str, value: &str| {
-        div()
-            .mt_2()
+        layout::lines()
             .child(
                 div()
                     .ui_text(TextRole::Caption)
                     .text_color(colors.muted)
                     .child(label.to_owned()),
             )
-            .child(
-                div()
-                    .mt_1()
-                    .ui_text(TextRole::Caption)
-                    .child(if value.is_empty() {
-                        "(empty)".to_owned()
-                    } else {
-                        value.to_owned()
-                    }),
-            )
+            .child(div().ui_text(TextRole::Caption).child(if value.is_empty() {
+                "(empty)".to_owned()
+            } else {
+                value.to_owned()
+            }))
     };
     match frozen {
         FrozenMutation::Lifecycle { request, .. } => match &request.action {
             PullRequestLifecycleAction::UpdateTitle { observed, value }
             | PullRequestLifecycleAction::UpdateBody { observed, value }
-            | PullRequestLifecycleAction::UpdateBaseBranch { observed, value } => div()
-                .child(
-                    div()
-                        .mt_2()
-                        .ui_text(TextRole::Label)
-                        .child(match &request.action {
-                            PullRequestLifecycleAction::UpdateTitle { .. } => "Title",
-                            PullRequestLifecycleAction::UpdateBody { .. } => "Description",
-                            _ => "Base branch",
-                        }),
-                )
+            | PullRequestLifecycleAction::UpdateBaseBranch { observed, value } => layout::block()
+                .child(div().ui_text(TextRole::Label).child(match &request.action {
+                    PullRequestLifecycleAction::UpdateTitle { .. } => "Title",
+                    PullRequestLifecycleAction::UpdateBody { .. } => "Description",
+                    _ => "Base branch",
+                }))
                 .child(text("Current", observed))
                 .child(text("Replace with", value)),
             _ => div()
-                .mt_2()
                 .ui_text(TextRole::Caption)
                 .child(frozen.summary().to_owned()),
         },
         FrozenMutation::Discussion { request, .. } => match &request.action {
-            PullRequestDiscussionAction::Create { body } => div().child(text("Post comment", body)),
+            PullRequestDiscussionAction::Create { body } => {
+                layout::block().child(text("Post comment", body))
+            }
             PullRequestDiscussionAction::Edit {
                 observed_body,
                 body,
                 ..
-            } => div()
+            } => layout::block()
                 .child(text("Current comment", observed_body))
                 .child(text("Replace with", body)),
             PullRequestDiscussionAction::Delete { observed_body, .. } => {
-                div().child(text("Delete comment", observed_body))
+                layout::block().child(text("Delete comment", observed_body))
             }
         },
     }
 }
 
 fn compact_detail(label: &str, value: impl Into<String>, colors: Palette) -> Div {
-    div()
-        .mt_1()
-        .flex()
+    layout::row()
         .flex_wrap()
-        .gap(px(ui::GAP_ICON))
         .ui_text(TextRole::Caption)
         .child(div().text_color(colors.muted).child(format!("{label}:")))
         .child(value.into())
 }
 
 fn markdown_detail(id: String, label: &str, body: &str, colors: Palette) -> Div {
-    div()
-        .mb(px(ui::GAP_PAGE))
+    layout::field(label, colors).child(markdown_text(id, body, colors).ui_text(TextRole::Body))
+}
+
+const AVATAR_SIZE: f32 = 28.;
+
+/// The fills a participant puck can take when there is no picture to show:
+/// while one is being fetched, after a fetch fails, and for an author GitHub
+/// no longer names. The login picks its own colour, which keeps one
+/// participant one colour everywhere.
+const AVATAR_FILLS: [u32; 8] = [
+    0x0969daff, 0x1f883dff, 0x8250dfff, 0xbf3989ff, 0x9a6700ff, 0xcf222eff, 0x0f6b78ff, 0x59636eff,
+];
+
+/// FNV-1a over the login. Any stable hash would do; this one avoids pulling the
+/// cryptographic hasher into a presentation path.
+fn login_hash(login: &str) -> u64 {
+    login
+        .to_ascii_lowercase()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
+/// The participant puck GitHub paints beside every comment: the fetched
+/// picture where there is one, and the login's own letter until then. An
+/// absent author is the anonymous person glyph rather than a letter we would
+/// have to invent.
+///
+/// The letter is always drawn, with the picture laid over it, so the puck is
+/// never briefly empty while GPUI decodes the bytes.
+fn author_avatar(author: Option<&str>, avatar: Option<&Arc<Image>>, colors: Palette) -> Div {
+    let puck = div()
+        .size(px(AVATAR_SIZE))
+        .flex_none()
+        .flex()
+        .relative()
+        .items_center()
+        .justify_center()
+        .rounded_full();
+    match author.map(str::trim).filter(|login| !login.is_empty()) {
+        Some(login) => {
+            let initial = login
+                .chars()
+                .find(char::is_ascii_alphanumeric)
+                .unwrap_or('?')
+                .to_ascii_uppercase();
+            puck.bg(rgba(
+                AVATAR_FILLS[(login_hash(login) % AVATAR_FILLS.len() as u64) as usize],
+            ))
+            .text_color(rgba(0xffffffff))
+            .ui_text(TextRole::Label)
+            .child(initial.to_string())
+            .when_some(avatar, |puck, avatar| {
+                puck.child(
+                    img(avatar.clone())
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .rounded_full()
+                        .overflow_hidden(),
+                )
+            })
+        }
+        None => puck
+            .bg(colors.elevated)
+            .border_1()
+            .border_color(colors.border)
+            .child(sidebar_icon("person", colors.faint)),
+    }
+}
+
+/// One GitHub-style timeline entry.
+struct ActivityEntry<'a> {
+    id: String,
+    author: Option<&'a str>,
+    /// The author's picture, once it has been fetched.
+    avatar: Option<&'a Arc<Image>>,
+    /// The chip beside the login, the way GitHub marks the pull request's own
+    /// author.
+    role: Option<&'a str>,
+    /// GitHub's header verb: "commented", "approved these changes".
+    action: &'a str,
+    /// The provider instant, shown as an age with the instant kept for the
+    /// accessible label.
+    timestamp: &'a str,
+    body: &'a str,
+    /// Reactions and the entry's own actions, rendered under the prose inside
+    /// the card.
+    footer: Div,
+}
+
+/// A comment: the author's puck in the gutter, a byline saying who acted and
+/// when, then the rendered prose.
+///
+/// This used to be a bordered card with a tinted header strip. A conversation
+/// is a column of twenty of them, and twenty boxes stacked down a page is a
+/// list of containers rather than a thread — the reader parses an edge before
+/// every remark. The puck already marks where one comment starts, and the page
+/// gap already separates them, so the box was carrying no information the
+/// layout did not carry first.
+fn activity_item(entry: ActivityEntry<'_>, colors: Palette) -> Div {
+    let ActivityEntry {
+        id,
+        author,
+        avatar,
+        role,
+        action,
+        timestamp,
+        body,
+        footer,
+    } = entry;
+    // A review that was never submitted has no instant at all, so the byline
+    // carries the verb alone rather than the placeholder text.
+    let age = iso8601_unix_ms(timestamp).map(|_| comment_age_label(timestamp));
+    let spoken = format!(
+        "{} {action} {}",
+        author.unwrap_or("Unknown author"),
+        exact_timestamp_label(timestamp)
+    );
+    let byline = layout::row()
+        .id(SharedString::from(format!("{id}-header")))
+        .aria_label(spoken)
+        .h(px(ui::ROW_HEIGHT))
+        .ui_text(TextRole::Caption)
         .child(
             div()
-                .ui_text(TextRole::Label)
-                .text_color(colors.muted)
-                .child(label.to_owned()),
+                .font_weight(ui::WEIGHT_STRONG)
+                .text_color(colors.text)
+                .child(author.unwrap_or("Unknown author").to_owned()),
         )
+        .when_some(role, |row, role| {
+            row.child(
+                div()
+                    .badge()
+                    .border_1()
+                    .border_color(colors.border)
+                    .text_color(colors.muted)
+                    .child(role.to_owned()),
+            )
+        })
+        .child(div().text_color(colors.muted).child(match &age {
+            Some(age) => format!("{action} {age}"),
+            None => action.to_owned(),
+        }));
+    div()
+        .flex()
+        .items_start()
+        .gap(px(ui::GAP_GROUP))
+        .child(author_avatar(author, avatar, colors))
         .child(
-            div()
-                .mt(px(ui::GAP_FIELD))
-                .child(markdown_text(id, body, colors).ui_text(TextRole::Body)),
+            layout::block()
+                .flex_1()
+                .min_w_0()
+                .child(byline)
+                .when(!body.trim().is_empty(), |comment| {
+                    comment.child(markdown_text(id, body, colors).ui_text(TextRole::Body))
+                })
+                .child(footer),
         )
 }
 
-fn activity_item(id: String, author: &str, body: &str, timestamp: &str, colors: Palette) -> Div {
+/// The one-line form of a comment header, for a reply inside a thread where a
+/// full card would nest a box in a box.
+fn comment_byline(author: Option<&str>, timestamp: &str, colors: Palette) -> Div {
     div()
-        .mb(px(ui::GAP_PAGE))
+        .flex()
+        .items_center()
+        .gap(px(ui::GAP_ICON))
+        .ui_text(TextRole::Caption)
         .child(
             div()
-                .flex()
-                .justify_between()
-                .ui_text(TextRole::Caption)
-                .child(author.to_owned())
-                .child(
-                    div()
-                        .ml_2()
-                        .text_color(colors.faint)
-                        .child(timestamp.to_owned()),
-                ),
+                .font_weight(ui::WEIGHT_STRONG)
+                .text_color(colors.text)
+                .child(author.unwrap_or("Unknown author").to_owned()),
         )
         .child(
             div()
-                .mt_1()
-                .child(markdown_text(id, body, colors).ui_text(TextRole::Body)),
+                .text_color(colors.muted)
+                .child(format!("commented {}", comment_age_label(timestamp))),
         )
+}
+
+/// GitHub names a review by what it did, not by its enum. An unrecognised state
+/// is reported verbatim rather than flattened into "reviewed".
+fn review_action_label(state: &str) -> &str {
+    match state {
+        "APPROVED" => "approved these changes",
+        "CHANGES_REQUESTED" => "requested changes",
+        "COMMENTED" => "reviewed",
+        "DISMISSED" => "left a dismissed review",
+        "PENDING" => "has a pending review",
+        other => other,
+    }
 }
 
 fn reaction_subject<'a>(
@@ -30757,7 +32869,6 @@ fn render_reaction_row(
 ) -> Div {
     let Some(snapshot) = snapshot else {
         return div()
-            .mt_2()
             .ui_text(TextRole::Caption)
             .text_color(colors.faint)
             .child("Reactions unavailable in this snapshot.");
@@ -30768,7 +32879,6 @@ fn render_reaction_row(
         .as_ref()
         .is_some_and(|capability| capability.viewer_can_react);
     let mut row = div()
-        .mt_2()
         .flex()
         .flex_wrap()
         .gap(px(ui::GAP_ICON))
@@ -30828,12 +32938,11 @@ fn render_reaction_row(
             .disabled(!allowed)
             .accessibility_label(accessibility_label)
             .when(allowed, |chip| chip.cursor_pointer())
-            .child(format!("{} {count}", content.compact_label()))
+            .child(format!("{} {count}", content.emoji()))
             .on_click(move |_, _, cx| {
                 root.update(cx, |root, cx| {
-                    if let Root::Review(this) = root {
-                        this.dispatch_reaction(snapshot.clone(), content, intent, cx);
-                    }
+                    let this = &mut root.review;
+                    this.dispatch_reaction(snapshot.clone(), content, intent, cx);
                 });
             });
         row = row.child(chip);
@@ -30841,7 +32950,6 @@ fn render_reaction_row(
     row.child(
         div()
             .w_full()
-            .mt_1()
             .text_color(if fresh && snapshot.reactions.complete {
                 colors.faint
             } else {
@@ -30950,10 +33058,245 @@ fn sanitize_markdown_prose(line: &str, in_comment: &mut bool) -> String {
         remaining = &remaining[start + 4..];
         *in_comment = true;
     }
-    let without_images = remove_markdown_images(&without_comments);
-    escape_inline_code_delimiters(&without_images)
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    let (quote, prose) = split_block_quote_marker(&without_comments);
+    let prose = rewrite_alert_marker(quote, prose).unwrap_or_else(|| prose.to_owned());
+    let without_images = remove_markdown_images(&prose);
+    let mut sanitized = String::with_capacity(quote.len() + without_images.len());
+    sanitized.push_str(quote);
+    sanitized.push_str(&neutralize_html(&escape_inline_code_delimiters(
+        &without_images,
+    )));
+    sanitized
+}
+
+/// Split off a leading blockquote marker so it survives prose sanitizing.
+/// Escaping every `>` turned GitHub's quoted prose — and the alert callouts
+/// bots write with it — into one run-on paragraph of literal `&gt;`.
+fn split_block_quote_marker(line: &str) -> (&str, &str) {
+    let bytes = line.as_bytes();
+    let indent = bytes.iter().take_while(|byte| **byte == b' ').count();
+    if indent > 3 {
+        return ("", line);
+    }
+    let mut end = indent;
+    let mut depth = 0usize;
+    while end < bytes.len() {
+        match bytes[end] {
+            b'>' => {
+                depth += 1;
+                end += 1;
+            }
+            b' ' if depth > 0 => end += 1,
+            _ => break,
+        }
+    }
+    if depth == 0 {
+        ("", line)
+    } else {
+        line.split_at(end)
+    }
+}
+
+/// GitHub's alert callouts (`> [!WARNING]`). The pinned rich text has no alert
+/// node, so the marker becomes the bold label GitHub paints above the body
+/// instead of surfacing as bracket syntax.
+fn rewrite_alert_marker(quote: &str, prose: &str) -> Option<String> {
+    if quote.is_empty() {
+        return None;
+    }
+    let label = match prose.trim() {
+        "[!NOTE]" => "Note",
+        "[!TIP]" => "Tip",
+        "[!IMPORTANT]" => "Important",
+        "[!WARNING]" => "Warning",
+        "[!CAUTION]" => "Caution",
+        _ => return None,
+    };
+    Some(format!("**{label}**"))
+}
+
+/// Tags the pinned rich text renders as structure. GitHub prose uses these
+/// freely — a CodeRabbit review is almost entirely `<details>` — and escaping
+/// them printed the tag text where the section should have been.
+const RENDERED_HTML_TAGS: [&str; 52] = [
+    "a",
+    "abbr",
+    "article",
+    "aside",
+    "b",
+    "blockquote",
+    "br",
+    "caption",
+    "cite",
+    "code",
+    "dd",
+    "del",
+    "details",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "figcaption",
+    "figure",
+    "footer",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "i",
+    "ins",
+    "kbd",
+    "li",
+    "main",
+    "mark",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "q",
+    "s",
+    "samp",
+    "script",
+    "section",
+    "small",
+    "span",
+    "strong",
+    "style",
+    "sub",
+    "summary",
+    "sup",
+    "table",
+    "tbody",
+];
+
+/// The rest of the structure allowlist. Two arrays only because a single const
+/// of this length reads worse than two.
+const RENDERED_HTML_TAGS_CONTINUED: [&str; 8] =
+    ["td", "tfoot", "th", "thead", "tr", "u", "ul", "var"];
+
+/// Tags whose only purpose is to pull in media. Dropping them keeps the prose
+/// readable while no URI is ever resolved; an image still announces itself the
+/// way a Markdown image does.
+const MEDIA_HTML_TAGS: [&str; 13] = [
+    "audio", "base", "canvas", "embed", "iframe", "img", "link", "meta", "object", "picture",
+    "source", "svg", "video",
+];
+
+/// Keep the HTML GitHub prose actually uses while no tag can resolve media.
+/// Recognised structure passes through to the rich text renderer, media tags
+/// are replaced by the omission note images already get, and anything
+/// unrecognised stays escaped so it renders as the literal text it is.
+fn neutralize_html(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut remaining = source;
+    while let Some(start) = remaining.find('<') {
+        output.push_str(&remaining[..start].replace('>', "&gt;"));
+        remaining = &remaining[start..];
+        let Some((name, length)) = html_tag(remaining) else {
+            output.push_str("&lt;");
+            remaining = &remaining[1..];
+            continue;
+        };
+        let tag = &remaining[..length];
+        if MEDIA_HTML_TAGS.contains(&name.as_str()) {
+            if name == "img" {
+                output.push_str(&html_image_omission(tag));
+            }
+        } else if name == "summary" {
+            // A disclosure's summary is the line GitHub gives the reader to
+            // decide by. The pinned rich text draws no disclosure control, so
+            // the summary at least has to read as the section title it is.
+            if tag.starts_with("</") {
+                output.push_str("</strong>");
+                output.push_str(tag);
+            } else {
+                output.push_str(tag);
+                output.push_str("<strong>");
+            }
+        } else if RENDERED_HTML_TAGS.contains(&name.as_str())
+            || RENDERED_HTML_TAGS_CONTINUED.contains(&name.as_str())
+        {
+            output.push_str(tag);
+        } else {
+            output.push_str(&tag.replace('<', "&lt;").replace('>', "&gt;"));
+        }
+        remaining = &remaining[length..];
+    }
+    output.push_str(&remaining.replace('>', "&gt;"));
+    output
+}
+
+/// Measure one complete tag starting at `<`, returning its lowercased name and
+/// byte length. Quoted attribute values may hold `>`, so the scan tracks them.
+/// A tag split across lines is not matched, and stays escaped.
+fn html_tag(source: &str) -> Option<(String, usize)> {
+    let bytes = source.as_bytes();
+    let mut index = 1;
+    if bytes.get(index) == Some(&b'/') {
+        index += 1;
+    }
+    let name_start = index;
+    if !bytes.get(index)?.is_ascii_alphabetic() {
+        return None;
+    }
+    while bytes.get(index).is_some_and(u8::is_ascii_alphanumeric) {
+        index += 1;
+    }
+    let name = source.get(name_start..index)?.to_ascii_lowercase();
+    let mut quote: Option<u8> = None;
+    while let Some(byte) = bytes.get(index) {
+        index += 1;
+        match quote {
+            Some(open) if *byte == open => quote = None,
+            Some(_) => {}
+            None if *byte == b'"' || *byte == b'\'' => quote = Some(*byte),
+            None if *byte == b'>' => return Some((name, index)),
+            None => {}
+        }
+    }
+    None
+}
+
+fn html_image_omission(tag: &str) -> String {
+    match html_attribute(tag, "alt").filter(|alt| !alt.trim().is_empty()) {
+        Some(alt) => format!("[Image omitted: {}]", alt.trim()),
+        None => "[Image omitted]".to_owned(),
+    }
+}
+
+/// Read one attribute out of a tag, so an omitted image can still name itself.
+fn html_attribute(tag: &str, name: &str) -> Option<String> {
+    let lowered = tag.to_ascii_lowercase();
+    let mut cursor = 0;
+    loop {
+        let at = cursor + lowered.get(cursor..)?.find(name)?;
+        cursor = at + name.len();
+        let own_word = at
+            .checked_sub(1)
+            .and_then(|index| lowered.as_bytes().get(index))
+            .is_some_and(u8::is_ascii_whitespace);
+        let value = tag.get(cursor..)?.trim_start();
+        if own_word && let Some(value) = value.strip_prefix('=') {
+            let value = value.trim_start();
+            let quote = value.chars().next()?;
+            if quote == '"' || quote == '\'' {
+                return value[1..]
+                    .find(quote)
+                    .map(|end| value[1..1 + end].to_owned());
+            }
+            return Some(
+                value
+                    .split([' ', '\t', '>', '/'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+        }
+    }
 }
 
 fn remove_markdown_images(source: &str) -> String {
@@ -31036,6 +33379,150 @@ fn empty_unknown(value: &str) -> String {
     } else {
         value.into()
     }
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date, after Howard Hinnant's
+/// `days_from_civil`. The provider hands us calendar instants and this crate
+/// carries no date library.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year =
+        (153 * (i64::from(month) + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// The calendar date `days` after 1970-01-01, the inverse of `days_from_civil`.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let days = days + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u32;
+    let month = (shifted_month + if shifted_month < 10 { 3 } else { -9 }) as u32;
+    (year_of_era + era * 400 + i64::from(month <= 2), month, day)
+}
+
+/// Read a provider instant such as `2026-09-14T17:34:41Z` into Unix
+/// milliseconds. Fractional seconds and a numeric UTC offset are accepted; any
+/// other shape returns `None` so the caller can show the exact original text
+/// rather than invent a time.
+fn iso8601_unix_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() < 19 || (bytes[10] != b'T' && bytes[10] != b' ') {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| value.get(range)?.parse::<i64>().ok();
+    let year = number(0..4)?;
+    let month = number(5..7)?;
+    let day = number(8..10)?;
+    let hour = number(11..13)?;
+    let minute = number(14..16)?;
+    let second = number(17..19)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return None;
+    }
+    let mut rest = &value[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.chars().take_while(char::is_ascii_digit).count();
+        rest = &fraction[digits..];
+    }
+    let offset_minutes = match rest.as_bytes().first() {
+        None | Some(b'Z') | Some(b'z') => 0,
+        Some(sign @ (b'+' | b'-')) if rest.len() >= 3 => {
+            let hours: i64 = rest.get(1..3)?.parse().ok()?;
+            let minutes: i64 = match rest.len() {
+                5 => rest.get(3..5)?.parse().ok()?,
+                6 => rest.get(4..6)?.parse().ok()?,
+                _ => 0,
+            };
+            (hours * 60 + minutes) * if *sign == b'-' { -1 } else { 1 }
+        }
+        _ => return None,
+    };
+    let seconds = days_from_civil(year, month as u32, day as u32) * 86_400
+        + hour * 3_600
+        + minute * 60
+        + second
+        - offset_minutes * 60;
+    u64::try_from(seconds).ok()?.checked_mul(1_000)
+}
+
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// GitHub writes a comment's time as its age, and keeps the instant itself for
+/// the hover. Older entries switch to the date, because "412 days ago" is not
+/// something a reader can place.
+fn comment_age_label(timestamp: &str) -> String {
+    let Some(written_at) = iso8601_unix_ms(timestamp) else {
+        return timestamp.to_owned();
+    };
+    let Ok(now) = now_unix_ms() else {
+        return exact_timestamp_label(timestamp);
+    };
+    if written_at > now {
+        return exact_timestamp_label(timestamp);
+    }
+    let elapsed_seconds = (now - written_at) / 1_000;
+    match elapsed_seconds {
+        0..=59 => "just now".into(),
+        60..=3_599 => {
+            let minutes = elapsed_seconds / 60;
+            format!(
+                "{minutes} minute{} ago",
+                if minutes == 1 { "" } else { "s" }
+            )
+        }
+        3_600..=86_399 => {
+            let hours = elapsed_seconds / 3_600;
+            format!("{hours} hour{} ago", if hours == 1 { "" } else { "s" })
+        }
+        86_400..=2_591_999 => {
+            let days = elapsed_seconds / 86_400;
+            format!("{days} day{} ago", if days == 1 { "" } else { "s" })
+        }
+        _ => format!("on {}", exact_date_label(written_at)),
+    }
+}
+
+/// `Sep 14, 2026`, or `Sep 14` inside the current year, the way GitHub drops a
+/// year the reader already knows.
+fn exact_date_label(written_at_unix_ms: u64) -> String {
+    let (year, month, day) = civil_from_days((written_at_unix_ms / 1_000 / 86_400) as i64);
+    let name = MONTH_NAMES[(month as usize).clamp(1, 12) - 1];
+    let this_year = now_unix_ms()
+        .map(|now| civil_from_days((now / 1_000 / 86_400) as i64).0)
+        .is_ok_and(|current| current == year);
+    if this_year {
+        format!("{name} {day}")
+    } else {
+        format!("{name} {day}, {year}")
+    }
+}
+
+/// The instant itself, spelled the way a person reads a date rather than the
+/// way a provider transmits one. Unparseable input is returned verbatim: the
+/// exact provider text is better than a guess.
+fn exact_timestamp_label(timestamp: &str) -> String {
+    let Some(written_at) = iso8601_unix_ms(timestamp) else {
+        return timestamp.to_owned();
+    };
+    let seconds_of_day = written_at / 1_000 % 86_400;
+    let (year, month, day) = civil_from_days((written_at / 1_000 / 86_400) as i64);
+    format!(
+        "{} {day}, {year} at {:02}:{:02} UTC",
+        MONTH_NAMES[(month as usize).clamp(1, 12) - 1],
+        seconds_of_day / 3_600,
+        seconds_of_day / 60 % 60,
+    )
 }
 
 fn collaboration_age_label(observed_at_unix_ms: u64) -> String {
@@ -31506,9 +33993,8 @@ fn render_unified_scrolled(
             .hover(|row| row.border_l_2().border_color(colors.accent))
             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                 entity.update(cx, |root, cx| {
-                    if let Root::Review(this) = root {
-                        this.open_inline_composer(side, line, event.modifiers.shift, window, cx);
-                    }
+                    let this = &mut root.review;
+                    this.open_inline_composer(side, line, event.modifiers.shift, window, cx);
                 });
             });
     }
@@ -31593,7 +34079,10 @@ fn render_inline_thread(
         .w_full()
         .min_h(px(72.))
         .px(px(ui::PANEL_GUTTER))
-        .py_3()
+        .py(px(ui::GAP_COLUMNS))
+        .flex()
+        .flex_col()
+        .gap(px(ui::GAP_GROUP))
         .bg(if colors.dark {
             rgba(0x232934ff)
         } else {
@@ -31620,9 +34109,8 @@ fn render_inline_thread(
                             )
                             .on_click(move |_, window, cx| {
                                 reply_entity.update(cx, |root, cx| {
-                                    if let Root::Review(this) = root
-                                        && let Some(index) = this.active_tab
-                                    {
+                                    let this = &mut root.review;
+                                    if let Some(index) = this.active_tab {
                                         this.tabs[index].reply_thread =
                                             Some(reply_coordinate.clone());
                                         this.reply_input.update(cx, |input, cx| {
@@ -31643,15 +34131,14 @@ fn render_inline_thread(
                                 .child(if resolved { "Unresolve" } else { "Resolve" })
                                 .on_click(move |_, _, cx| {
                                     entity.update(cx, |root, cx| {
-                                        if let Root::Review(this) = root {
-                                            this.dispatch_auxiliary_action(
-                                                ReviewAuxiliaryAction::SetThreadResolved {
-                                                    thread: coordinate.clone(),
-                                                    resolved: !resolved,
-                                                },
-                                                cx,
-                                            );
-                                        }
+                                        let this = &mut root.review;
+                                        this.dispatch_auxiliary_action(
+                                            ReviewAuxiliaryAction::SetThreadResolved {
+                                                thread: coordinate.clone(),
+                                                resolved: !resolved,
+                                            },
+                                            cx,
+                                        );
                                     });
                                 }),
                         ),
@@ -31660,8 +34147,7 @@ fn render_inline_thread(
     for (position, comment) in thread.thread.comments.iter().enumerate() {
         card = card.child(
             div()
-                .mt_2()
-                .pl_3()
+                .pl(px(ui::GAP_COLUMNS))
                 .border_l_2()
                 .border_color(colors.accent)
                 .child(
@@ -31696,7 +34182,6 @@ fn render_inline_thread(
     if !thread.thread.comments_complete {
         card = card.child(
             div()
-                .mt_2()
                 .ui_text(TextRole::Body)
                 .text_color(colors.amber)
                 .child("Thread replies are partial; GitHub response limits were reached."),
@@ -31709,19 +34194,9 @@ fn render_inline_thread(
         let target = thread.thread.coordinates.clone();
         let pending_target = thread.thread.coordinates.clone();
         let pending_review = pending_review.cloned();
+        card = card.child(layout::text_area(3, colors).child(Textarea::new(reply_input)));
         card = card.child(
             div()
-                .mt_3()
-                .h(px(82.))
-                .border_1()
-                .border_color(colors.border)
-                .rounded(px(ui::CONTROL_RADIUS))
-                .overflow_hidden()
-                .child(Textarea::new(reply_input)),
-        );
-        card = card.child(
-            div()
-                .mt_2()
                 .flex()
                 .gap(px(ui::GAP_GROUP))
                 .ui_text(TextRole::Body)
@@ -31734,17 +34209,16 @@ fn render_inline_thread(
                         )
                         .on_click(move |_, _, cx| {
                             pending_root.update(cx, |root, cx| {
-                                if let Root::Review(this) = root {
-                                    let body = this.reply_input.read(cx).value().to_string();
-                                    this.dispatch_auxiliary_action(
-                                        ReviewAuxiliaryAction::Reply {
-                                            thread: pending_target.clone(),
-                                            pending_review: Some(pending_review.clone()),
-                                            body,
-                                        },
-                                        cx,
-                                    );
-                                }
+                                let this = &mut root.review;
+                                let body = this.reply_input.read(cx).value().to_string();
+                                this.dispatch_auxiliary_action(
+                                    ReviewAuxiliaryAction::Reply {
+                                        thread: pending_target.clone(),
+                                        pending_review: Some(pending_review.clone()),
+                                        body,
+                                    },
+                                    cx,
+                                );
                             });
                         }),
                     )
@@ -31757,17 +34231,16 @@ fn render_inline_thread(
                     )
                     .on_click(move |_, _, cx| {
                         immediate_root.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
-                                let body = this.reply_input.read(cx).value().to_string();
-                                this.dispatch_auxiliary_action(
-                                    ReviewAuxiliaryAction::Reply {
-                                        thread: target.clone(),
-                                        pending_review: None,
-                                        body,
-                                    },
-                                    cx,
-                                );
-                            }
+                            let this = &mut root.review;
+                            let body = this.reply_input.read(cx).value().to_string();
+                            this.dispatch_auxiliary_action(
+                                ReviewAuxiliaryAction::Reply {
+                                    thread: target.clone(),
+                                    pending_review: None,
+                                    body,
+                                },
+                                cx,
+                            );
                         });
                     }),
                 )
@@ -31779,9 +34252,8 @@ fn render_inline_thread(
                     )
                     .on_click(move |_, _, cx| {
                         cancel_root.update(cx, |root, cx| {
-                            if let Root::Review(this) = root
-                                && let Some(index) = this.active_tab
-                            {
+                            let this = &mut root.review;
+                            if let Some(index) = this.active_tab {
                                 this.tabs[index].reply_thread = None;
                                 this.rebuild_diff(index, this.wide);
                                 cx.notify();
@@ -31821,7 +34293,10 @@ fn render_inline_composer(
         .w_full()
         .min_h(px(172.))
         .px(px(ui::PANEL_GUTTER))
-        .py_3()
+        .py(px(ui::GAP_COLUMNS))
+        .flex()
+        .flex_col()
+        .gap(px(ui::GAP_GROUP))
         .bg(if colors.dark {
             rgba(0x202a24ff)
         } else {
@@ -31845,7 +34320,6 @@ fn render_inline_composer(
         .when(canonical_reanchored, |composer| {
             composer.child(
                 div()
-                    .mt_1()
                     .ui_text(TextRole::Body)
                     .text_color(colors.muted)
                     .child(
@@ -31854,18 +34328,11 @@ fn render_inline_composer(
             )
         })
         .child(
-            div()
-                .mt_2()
-                .h(px(88.))
-                .border_1()
-                .border_color(colors.border)
-                .rounded(px(ui::CONTROL_RADIUS))
-                .overflow_hidden()
+            layout::text_area(4, colors)
                 .child(Textarea::new(input)),
         )
         .child(
             div()
-                .mt_2()
                 .flex()
                 .items_center()
                 .gap(px(ui::GAP_COLUMNS))
@@ -31873,7 +34340,8 @@ fn render_inline_composer(
                 .child(
                     action_link("Save locally", colors).on_click(move |_, _, cx| {
                         save_root.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
+                            {
+                                let this = &mut root.review;
                                 this.persist_composer(cx);
                             }
                         });
@@ -31882,7 +34350,8 @@ fn render_inline_composer(
                 .child(
                     action_link("Add to pending review", colors).on_click(move |_, _, cx| {
                         pending_root.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
+                            {
+                                let this = &mut root.review;
                                 this.start_comment_write(false, cx);
                             }
                         });
@@ -31891,7 +34360,8 @@ fn render_inline_composer(
                 .child(
                     action_link("Post immediately", colors).on_click(move |_, _, cx| {
                         immediate_root.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
+                            {
+                                let this = &mut root.review;
                                 this.start_comment_write(true, cx);
                             }
                         });
@@ -31900,7 +34370,8 @@ fn render_inline_composer(
                 .child(div().flex_1())
                 .child(action_link("Close", colors).on_click(move |_, _, cx| {
                     cancel_root.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
+                        {
+                            let this = &mut root.review;
                             this.close_inline_composer(cx);
                         }
                     });
@@ -31922,7 +34393,7 @@ fn render_file_composer(
         .w_full()
         .min_h(px(174.))
         .px(px(ui::PANEL_GUTTER))
-        .py_3()
+        .py(px(ui::GAP_COLUMNS))
         .bg(if colors.dark {
             rgba(0x202a24ff)
         } else {
@@ -31930,6 +34401,9 @@ fn render_file_composer(
         })
         .border_b_1()
         .border_color(colors.green)
+        .flex()
+        .flex_col()
+        .gap(px(ui::GAP_GROUP))
         .child(
             div()
                 .flex()
@@ -31941,24 +34415,13 @@ fn render_file_composer(
         )
         .child(
             div()
-                .mt_1()
                 .ui_text(TextRole::Body)
                 .text_color(colors.muted)
                 .child("Targets the whole file; no line or diff side will be sent."),
         )
+        .child(layout::text_area(4, colors).child(Textarea::new(input)))
         .child(
             div()
-                .mt_2()
-                .h(px(88.))
-                .border_1()
-                .border_color(colors.border)
-                .rounded(px(ui::CONTROL_RADIUS))
-                .overflow_hidden()
-                .child(Textarea::new(input)),
-        )
-        .child(
-            div()
-                .mt_2()
                 .flex()
                 .items_center()
                 .gap(px(ui::GAP_COLUMNS))
@@ -31966,27 +34429,24 @@ fn render_file_composer(
                 .child(
                     action_link("Save locally", colors).on_click(move |_, _, cx| {
                         save_root.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
-                                this.persist_composer(cx);
-                            }
+                            let this = &mut root.review;
+                            this.persist_composer(cx);
                         });
                     }),
                 )
                 .child(action_link("Review pending-only write…", colors).on_click(
                     move |_, _, cx| {
                         review_root.update(cx, |root, cx| {
-                            if let Root::Review(this) = root {
-                                this.prepare_file_comment_confirmation(cx);
-                            }
+                            let this = &mut root.review;
+                            this.prepare_file_comment_confirmation(cx);
                         });
                     },
                 ))
                 .child(div().flex_1())
                 .child(action_link("Close", colors).on_click(move |_, _, cx| {
                     close_root.update(cx, |root, cx| {
-                        if let Root::Review(this) = root {
-                            this.close_inline_composer(cx);
-                        }
+                        let this = &mut root.review;
+                        this.close_inline_composer(cx);
                     });
                 })),
         )
@@ -32171,40 +34631,12 @@ fn split_cell_scrolled_interactive(
             .hover(|cell| cell.border_b_1().border_color(colors.accent))
             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                 entity.update(cx, |root, cx| {
-                    if let Root::Review(this) = root {
-                        this.open_inline_composer(side, number, event.modifiers.shift, window, cx);
-                    }
+                    let this = &mut root.review;
+                    this.open_inline_composer(side, number, event.modifiers.shift, window, cx);
                 });
             });
     }
     cell
-}
-
-// Compatibility landing screen for the retired M0 --edit prototype. All
-// actual file editing now goes through the PR LocalWorkspace/DocumentStore.
-pub struct EditorWorkspace {
-    path: PathBuf,
-}
-
-impl EditorWorkspace {
-    fn new(_window: &mut Window, _cx: &mut Context<Root>, path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Root>) -> impl IntoElement {
-        let colors = palette(is_dark(window));
-        div().size_full().flex().flex_col().p(px(ui::PANEL_GUTTER)).gap(px(ui::GAP_PAGE))
-            .bg(colors.canvas).font_family(UI_FONT).text_color(colors.text)
-            .child(div().ui_text(TextRole::Title).child("Open a pull request to edit locally"))
-            .child(self.path.display().to_string())
-            .child("Choose Edit locally in a pull-request tab, then create a dedicated checkout or attach an existing one.")
-            .child(div().id("open-review-from-legacy-editor").control()
-                .bg(colors.selected).cursor_pointer().child("Open review workspace")
-                .on_click(cx.listener(|root, _, window, cx| {
-                    *root = Root::review(window, cx, Startup::default());
-                    cx.notify();
-                })))
-    }
 }
 
 #[cfg(test)]
@@ -32228,9 +34660,10 @@ mod layout_tests {
         SubmittedDraftCloseDisposition, SubmittedDraftLoadState, SubmittedSummaryEditor,
         active_review_composer_body, active_review_composer_needs_save, activity_thread_visible,
         apply_submitted_draft_save_if_current, available_diff_width_for, bounded_log_render_range,
-        bounded_page, collaboration_completion_matches, diff_content_width, display_columns,
-        file_confirmation_matches_visible_body, journal_operation_description,
-        journal_operation_summary, line_text_chunks, media_free_markdown, observe_auxiliary,
+        bounded_page, collaboration_completion_matches, comment_age_label, diff_content_width,
+        display_columns, exact_timestamp_label, file_confirmation_matches_visible_body,
+        iso8601_unix_ms, journal_operation_description, journal_operation_summary,
+        line_text_chunks, media_free_markdown, observe_auxiliary,
         pending_review_start_confirmation_matches_visible_body, resolved_panel_widths_for,
         review_subject_allows_actions, submitted_review_edit_action,
     };
@@ -32253,8 +34686,9 @@ mod layout_tests {
         ActionsAttemptKey, ActionsAttemptLocator, ActionsHeadRelation, ActionsJob, ActionsJobLog,
         ActionsJobsSnapshot, ActionsLinkage, ActionsLogProvenance, ActionsRunAttemptObservation,
         CheckKind, CheckRepositoryIdentity, CheckShaClass, CheckSuiteIdentity, DismissalAuthority,
-        FreshReviewDismissalCapability, PendingReviewCreationAcknowledgement,
-        ProviderMutationOutcome, PullRequest, PullRequestCheck, SelectedViewer,
+        FreshReviewDismissalCapability, PendingReviewCreationAcknowledgement, ProviderCapability,
+        ProviderChoice, ProviderChoiceSet, ProviderMutationOutcome, PullRequest, PullRequestCheck,
+        PullRequestLifecycleChoices, PullRequestLifecycleSnapshot, SelectedViewer,
         SubmittedReviewDismissalAcknowledgement, SubmittedReviewDismissalRequest,
         SubmittedReviewDismissalTarget, WorkflowRunIdentity,
     };
@@ -32297,12 +34731,17 @@ mod layout_tests {
                     .p(px(ui::PANEL_GUTTER))
                     .ui_text(TextRole::Body)
                     .child(
-                        super::field_label("Repository", colors)
-                            .debug_selector(|| "density-label".into()),
-                    )
-                    .child(
-                        super::input_box(&self.input, colors)
-                            .debug_selector(|| "density-input".into()),
+                        super::layout::field("Repository", colors)
+                            .debug_selector(|| "density-field".into())
+                            .child(
+                                super::layout::text_field(colors)
+                                    .debug_selector(|| "density-input".into())
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "density-input-text".into())
+                                            .child(gpui_base::input::Input::new(&self.input)),
+                                    ),
+                            ),
                     )
                     .child(
                         super::modal_button("density-button", "Add repository", true, colors)
@@ -32338,7 +34777,10 @@ mod layout_tests {
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         for (id, height) in [
-            ("density-label", 16.),
+            // Label 16 + GAP_FIELD 6 + control 28: the field's whole geometry
+            // comes from the component, so this is the real relationship and
+            // not two elements arranged to look like one.
+            ("density-field", 50.),
             ("density-input", 28.),
             ("density-button", 28.),
             ("density-badge", 20.),
@@ -32349,10 +34791,29 @@ mod layout_tests {
         ] {
             assert_eq!(cx.debug_bounds(id).unwrap().size.height, px(height), "{id}");
         }
-        let label = cx.debug_bounds("density-label").unwrap();
+        let field = cx.debug_bounds("density-field").unwrap();
         let input = cx.debug_bounds("density-input").unwrap();
-        assert_eq!(input.top() - label.bottom(), px(6.));
+        assert_eq!(input.top() - field.top(), px(16. + 6.));
         assert_eq!(input.left(), px(20.));
+        assert_eq!(field.left(), input.left());
+        // A text field is a control, so its text sits on the control's centre
+        // line. Six hand-built copies of this box fixed a 28px height and then
+        // centred nothing, leaving every caret hanging off the top edge.
+        let text = cx.debug_bounds("density-input-text").unwrap();
+        assert!(
+            text.size.height > px(0.) && text.size.height < input.size.height,
+            "the field must be taller than the line it holds"
+        );
+        assert_eq!(
+            text.top() - input.top(),
+            input.bottom() - text.bottom(),
+            "text in a single-line field must be vertically centred"
+        );
+        assert_eq!(
+            text.left() - input.left(),
+            px(ui::CONTROL_INSET + 1.),
+            "text in a field must clear its hairline by the control inset"
+        );
         let target = cx.debug_bounds("density-icon").unwrap();
         let visual = cx.debug_bounds("density-icon-visual").unwrap();
         let edge = target.origin + point(px(2.), px(2.));
@@ -32392,9 +34853,7 @@ mod layout_tests {
         cx.update(|window, cx| {
             window.resize(size(px(1440.), px(900.)));
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.install_pr_layout_fixture(window, cx);
             });
             window.draw(cx).clear(cx);
@@ -32497,9 +34956,7 @@ mod layout_tests {
         // the real handler sets.
         let status_of = |cx: &mut gpui::VisualTestContext| {
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 this.status.clone()
             })
         };
@@ -32516,9 +34973,7 @@ mod layout_tests {
             assert!(focused, "Tab must reach the control again before {key}");
 
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.status = format!("before-{key}");
                 cx.notify();
             });
@@ -32574,9 +35029,7 @@ mod layout_tests {
         cx.update(|window, cx| {
             window.resize(size(px(1440.), px(900.)));
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.install_pr_layout_fixture(window, cx);
             });
             window.draw(cx).clear(cx);
@@ -32618,9 +35071,7 @@ mod layout_tests {
 
         let is_focused = |cx: &mut gpui::VisualTestContext| {
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 this.checks_details_focus.clone()
             })
         };
@@ -32646,9 +35097,7 @@ mod layout_tests {
         );
 
         let expanded_before = root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             this.tabs[0].checks_source_expanded
         });
         let enter = Keystroke::parse("enter").unwrap();
@@ -32661,9 +35110,7 @@ mod layout_tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert_ne!(
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 this.tabs[0].checks_source_expanded
             }),
             expanded_before,
@@ -32671,9 +35118,7 @@ mod layout_tests {
         );
 
         let before_space = root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             this.tabs[0].checks_source_expanded
         });
         let space = Keystroke::parse("space").unwrap();
@@ -32686,9 +35131,7 @@ mod layout_tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert_ne!(
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 this.tabs[0].checks_source_expanded
             }),
             before_space,
@@ -32699,16 +35142,12 @@ mod layout_tests {
         // itself rather than a control, Enter still toggles the selected check
         // identity. Guarding the shortcut must not delete it.
         let identity_before = root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             this.tabs[0].checks_selection.expanded_id.clone()
         });
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.checks_focus.focus(window, cx);
             });
             window.draw(cx).clear(cx);
@@ -32725,9 +35164,7 @@ mod layout_tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert_ne!(
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 this.tabs[0].checks_selection.expanded_id.clone()
             }),
             identity_before,
@@ -32760,9 +35197,7 @@ mod layout_tests {
         cx.update(|window, cx| {
             window.resize(size(px(1440.), px(900.)));
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.install_pr_layout_fixture(window, cx);
             });
             window.draw(cx).clear(cx);
@@ -32775,9 +35210,7 @@ mod layout_tests {
         let notice = "Cached · saved 50 minutes ago · read-only.".to_owned();
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.tabs[0].collaboration_cache_notice = Some(notice.clone());
                 cx.notify();
             });
@@ -32804,15 +35237,421 @@ mod layout_tests {
 
         // The text itself is what has to survive, not only the icon.
         root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert_eq!(
                 this.tab_notices(0),
                 vec![(notice.clone(), true)],
                 "the card is built from the tab's own notices"
             );
         });
+    }
+
+    /// Every control the conversation offers lives in its rail. A button that
+    /// drifted back into the discussion column would still be clickable, so
+    /// this measures where each one is painted rather than that it exists.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn conversation_rail_carries_the_pull_request_controls(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.install_pr_layout_fixture(window, cx);
+                let repository = this.tabs[0].repository.clone();
+                let pull = this.tabs[0].pull_request.clone();
+                let capability = ProviderCapability {
+                    available: true,
+                    reason: None,
+                };
+                this.tabs[0]
+                    .lifecycle
+                    .install_snapshot(PullRequestLifecycleSnapshot {
+                        repository: repository.clone(),
+                        pull_request: ProviderCoordinates {
+                            provider: "github".into(),
+                            host: repository.host.clone(),
+                            owner: repository.owner.clone(),
+                            repository: repository.name.clone(),
+                            pull_request: pull.number,
+                            remote_id: "PR_203".into(),
+                        },
+                        updated_at: "2026-09-14T00:00:00Z".into(),
+                        state: pull.state.clone(),
+                        head_sha: pull.head_sha.clone(),
+                        title: pull.title.clone(),
+                        body: "An observed body.".into(),
+                        base_branch: pull.target_branch.clone(),
+                        draft: false,
+                        reviewers: Vec::new(),
+                        assignees: Vec::new(),
+                        labels: Vec::new(),
+                        viewer_login: repository.account.login.clone(),
+                        viewer_permission: Some("WRITE".into()),
+                        can_update_metadata: capability.clone(),
+                        can_change_state: capability.clone(),
+                        can_change_draft: capability.clone(),
+                        can_request_reviewers: capability.clone(),
+                        can_change_labels: capability.clone(),
+                        can_change_assignees: capability.clone(),
+                        can_comment: capability,
+                        values_complete: true,
+                        capabilities_complete: true,
+                        notice: None,
+                    })
+                    .expect("the fixture snapshot targets the fixture pull request");
+                let choices = |name: &str| ProviderChoiceSet {
+                    values: vec![ProviderChoice {
+                        remote_id: Some(format!("{name}-id")),
+                        name: name.to_owned(),
+                    }],
+                    complete: true,
+                    notice: None,
+                };
+                this.tabs[0]
+                    .lifecycle
+                    .install_choices(PullRequestLifecycleChoices {
+                        repository,
+                        branches: choices("main"),
+                        labels: choices("bug"),
+                        assignees: choices("maya"),
+                        reviewer_users: choices("rae"),
+                        reviewer_teams: ProviderChoiceSet {
+                            values: Vec::new(),
+                            complete: true,
+                            notice: None,
+                        },
+                    })
+                    .expect("the fixture choices target the fixture repository");
+            });
+            window.draw(cx).clear(cx);
+        });
+        let conversation = cx.debug_bounds("pr-tab-conversation").unwrap();
+        cx.simulate_click(conversation.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let rail = cx
+            .debug_bounds("pr-conversation-rail")
+            .expect("the conversation must paint its rail");
+        for selector in [
+            "action-Edit details…",
+            "action-Close PR",
+            "action-Convert to draft",
+            "action-Show permissions",
+            "lifecycle-delta-Reviewers-Add USER rae",
+            "lifecycle-delta-Labels-Add bug",
+            "lifecycle-delta-Assignees-Add maya",
+        ] {
+            let control = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must be painted in the conversation"));
+            assert!(
+                control.size.width > px(0.) && control.size.height > px(0.),
+                "{selector} must have real painted area"
+            );
+            assert!(
+                control.origin.x >= rail.origin.x
+                    && control.origin.x + control.size.width
+                        <= rail.origin.x + rail.size.width + px(1.),
+                "{selector} is painted outside the rail column"
+            );
+        }
+        // A narrow page has no room for a column beside the discussion. The
+        // rail docks under it instead of disappearing, because these controls
+        // have no other entry point on this screen. `resize` only moves the
+        // platform window's bounds; without `bounds_changed` the layout keeps
+        // drawing at the old viewport and the narrow case is never exercised.
+        cx.update(|window, cx| {
+            window.resize(size(px(1040.), px(620.)));
+            window.bounds_changed(cx);
+            window.draw(cx).clear(cx);
+        });
+        let docked = cx
+            .debug_bounds("pr-conversation-rail")
+            .expect("the rail must dock under the discussion rather than vanish");
+        assert!(
+            docked.size.width > px(super::CONVERSATION_RAIL_WIDTH),
+            "this window must be narrow enough to actually exercise the docked \
+             rail; at the side-column width the rest of this proves nothing"
+        );
+        let control = cx
+            .debug_bounds("action-Close PR")
+            .expect("the docked rail must still carry the pull request's actions");
+        assert!(
+            control.origin.y > docked.origin.y - px(1.)
+                && control.origin.x >= docked.origin.x
+                && control.origin.x + control.size.width
+                    <= docked.origin.x + docked.size.width + px(1.),
+            "the docked rail must contain the controls it carries"
+        );
+    }
+
+    /// Narrowing the window has to narrow what is in it. This measures where
+    /// each screen is actually laid out, because a column that overflows still
+    /// paints and still reports bounds -- it just reports them off the edge.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn narrowing_the_window_keeps_every_review_screen_inside_it(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.install_pr_layout_fixture(window, cx);
+                let repository = this.tabs[0].repository.clone();
+                let pull = this.tabs[0].pull_request.clone();
+                let capability = ProviderCapability {
+                    available: true,
+                    reason: None,
+                };
+                this.tabs[0]
+                    .lifecycle
+                    .install_snapshot(PullRequestLifecycleSnapshot {
+                        repository: repository.clone(),
+                        pull_request: ProviderCoordinates {
+                            provider: "github".into(),
+                            host: repository.host.clone(),
+                            owner: repository.owner.clone(),
+                            repository: repository.name.clone(),
+                            pull_request: pull.number,
+                            remote_id: "PR_203".into(),
+                        },
+                        updated_at: "2026-09-14T00:00:00Z".into(),
+                        state: pull.state.clone(),
+                        head_sha: pull.head_sha.clone(),
+                        title: pull.title.clone(),
+                        body: "An observed body.".into(),
+                        base_branch: pull.target_branch.clone(),
+                        draft: false,
+                        reviewers: Vec::new(),
+                        assignees: Vec::new(),
+                        labels: Vec::new(),
+                        viewer_login: repository.account.login.clone(),
+                        viewer_permission: Some("WRITE".into()),
+                        can_update_metadata: capability.clone(),
+                        can_change_state: capability.clone(),
+                        can_change_draft: capability.clone(),
+                        can_request_reviewers: capability.clone(),
+                        can_change_labels: capability.clone(),
+                        can_change_assignees: capability.clone(),
+                        can_comment: capability,
+                        values_complete: true,
+                        capabilities_complete: true,
+                        notice: None,
+                    })
+                    .expect("the fixture snapshot targets the fixture pull request");
+                let choices = |name: &str| ProviderChoiceSet {
+                    values: vec![ProviderChoice {
+                        remote_id: Some(format!("{name}-id")),
+                        name: name.to_owned(),
+                    }],
+                    complete: true,
+                    notice: None,
+                };
+                this.tabs[0]
+                    .lifecycle
+                    .install_choices(PullRequestLifecycleChoices {
+                        repository,
+                        branches: choices("main"),
+                        labels: choices("bug"),
+                        assignees: choices("maya"),
+                        reviewer_users: choices("rae"),
+                        reviewer_teams: ProviderChoiceSet {
+                            values: Vec::new(),
+                            complete: true,
+                            notice: None,
+                        },
+                    })
+                    .expect("the fixture choices target the fixture repository");
+            });
+            window.draw(cx).clear(cx);
+        });
+        let conversation = cx.debug_bounds("pr-tab-conversation").unwrap();
+        cx.simulate_click(conversation.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // Every screen the review can show has to fit the window it is given.
+        // A column that keeps its content's width instead of taking the
+        // window's still paints its right-hand side, just past the edge, where
+        // the frame clips it and the pointer cannot reach it.
+        for width in [1440., 1200., 1040., 960., 900., 820., 760., 700., 640.] {
+            cx.update(|window, cx| {
+                window.resize(size(px(width), px(900.)));
+                window.bounds_changed(cx);
+                window.draw(cx).clear(cx);
+            });
+            for tab in [
+                "pr-tab-conversation",
+                "pr-tab-commits",
+                "pr-tab-checks",
+                "pr-tab-files",
+            ] {
+                let chip = cx
+                    .debug_bounds(tab)
+                    .unwrap_or_else(|| panic!("{tab} must be painted at {width:.0}pt"));
+                cx.simulate_click(chip.center(), Modifiers::default());
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                // The rail and the lifecycle controls belong to the
+                // conversation alone; each selector is measured wherever it
+                // actually appears.
+                for selector in [
+                    "pr-header-row",
+                    "pr-section-page",
+                    "pr-content-scroll",
+                    "pr-conversation-rail",
+                    "action-Close PR",
+                    "lifecycle-delta-Reviewers-Add USER rae",
+                    "file-scroll",
+                ] {
+                    let Some(bounds) = cx.debug_bounds(selector) else {
+                        continue;
+                    };
+                    let right = bounds.origin.x + bounds.size.width;
+                    assert!(
+                        bounds.origin.x >= px(0.) && right <= px(width) + px(1.),
+                        "at {width:.0}pt on {tab}, {selector} is laid out at \
+                         {:.0}..{:.0}, outside the window",
+                        bounds.origin.x.as_f32(),
+                        right.as_f32()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Open tabs outrun the strip long before the window is narrow: eleven of
+    /// them need about 1650pt, and the strip never gets more than the window.
+    /// Tabs keep their width rather than shrinking to nothing, so the strip has
+    /// to scroll and has to bring whatever was activated back into view. A tab
+    /// laid out past the edge is masked, which makes it unclickable and
+    /// invisible at once.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn the_tab_strip_scrolls_and_reveals_the_activated_tab(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            window.bounds_changed(cx);
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.install_pr_layout_fixture(window, cx);
+                let repository = this.tabs[0].repository.clone();
+                for number in 300..310u64 {
+                    this.install_tab_with_restore(
+                        repository.clone(),
+                        PullRequest {
+                            number,
+                            title: format!("A synthetic pull request numbered {number}"),
+                            author: "maya".into(),
+                            state: "OPEN".into(),
+                            source_branch: format!("feature/{number}"),
+                            target_branch: "main".into(),
+                            ..Default::default()
+                        },
+                        None,
+                        InstallTabOptions {
+                            activate: true,
+                            window: Some(window),
+                            start_background_work: false,
+                        },
+                        cx,
+                    );
+                }
+            });
+            window.draw(cx).clear(cx);
+        });
+        // 1040pt is the window's own minimum, so this is the narrowest the
+        // strip is ever asked to hold eleven tabs.
+        for width in [1440., 1200., 1040.] {
+            cx.update(|window, cx| {
+                window.resize(size(px(width), px(900.)));
+                window.bounds_changed(cx);
+                window.draw(cx).clear(cx);
+            });
+            let strip = cx
+                .debug_bounds("tab-strip")
+                .expect("the tab strip must be painted");
+            assert!(
+                strip.origin.x >= px(0.) && strip.origin.x + strip.size.width <= px(width) + px(1.),
+                "at {width:.0}pt the strip itself is laid out at {:.0}..{:.0}, \
+                 outside the window",
+                strip.origin.x.as_f32(),
+                (strip.origin.x + strip.size.width).as_f32()
+            );
+            assert!(
+                root.read_with(cx, |root, _| {
+                    let this = &root.review;
+                    this.tab_strip_scroll.max_offset().x
+                }) > px(0.),
+                "eleven tabs must overflow {width:.0}pt; without that the rest \
+                 of this proves nothing"
+            );
+            // The last tab and the first one sit at opposite ends of the
+            // content, so revealing each in turn exercises both directions.
+            for index in [10usize, 0] {
+                cx.update(|window, cx| {
+                    root.update(cx, |root, cx| {
+                        let this = &mut root.review;
+                        this.activate_tab(index, window, cx);
+                    });
+                    // The reveal is applied from the previous frame's child
+                    // bounds, so the frame that requests it is not the frame
+                    // that shows it.
+                    window.draw(cx).clear(cx);
+                    window.draw(cx).clear(cx);
+                });
+                let selector: &'static str = Box::leak(format!("tab-{index}").into_boxed_str());
+                let tab = cx
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("tab-{index} must be painted"));
+                assert!(
+                    tab.origin.x >= strip.origin.x - px(1.)
+                        && tab.origin.x + tab.size.width
+                            <= strip.origin.x + strip.size.width + px(1.),
+                    "at {width:.0}pt, activating tab {index} left it at \
+                     {:.0}..{:.0}, outside the strip's {:.0}..{:.0}",
+                    tab.origin.x.as_f32(),
+                    (tab.origin.x + tab.size.width).as_f32(),
+                    strip.origin.x.as_f32(),
+                    (strip.origin.x + strip.size.width).as_f32()
+                );
+            }
+        }
     }
 
     #[cfg(feature = "ui-smoke")]
@@ -32834,9 +35673,7 @@ mod layout_tests {
         cx.update(|window, cx| {
             window.resize(size(px(1440.), px(900.)));
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.install_pr_layout_fixture(window, cx);
             });
             window.draw(cx).clear(cx);
@@ -32860,9 +35697,7 @@ mod layout_tests {
                     cx.simulate_click(summary.center(), Modifiers::default());
                     cx.update(|window, cx| window.draw(cx).clear(cx));
                     root.read_with(cx, |root, _| {
-                        let Root::Review(this) = root else {
-                            unreachable!()
-                        };
+                        let this = &root.review;
                         assert_eq!(
                             this.tabs[0].comparison_picker.revision_details_expanded,
                             expected
@@ -32870,13 +35705,30 @@ mod layout_tests {
                     });
                 }
             }
+            if id == "pr-tab-conversation" {
+                // The rail is the conversation's metadata column. It has to be
+                // painted beside the discussion and inside the scrolled page;
+                // a rail that wrapped under the discussion or ran off the right
+                // edge would still have bounds, so check where they are.
+                let rail = cx
+                    .debug_bounds("pr-conversation-rail")
+                    .expect("the conversation must paint its metadata rail");
+                assert!(
+                    rail.size.width >= px(super::CONVERSATION_RAIL_WIDTH)
+                        && rail.size.height > px(0.),
+                    "the rail must have real painted area, not a collapsed box"
+                );
+                assert!(
+                    rail.origin.x + rail.size.width <= page.origin.x + page.size.width
+                        && rail.origin.x > page.origin.x + page.size.width / 2.,
+                    "the rail belongs beside the discussion, on the right of the page"
+                );
+            }
             if id == "pr-tab-checks" {
                 let disclosure = cx.debug_bounds("checks-source-details").unwrap();
                 cx.simulate_click(disclosure.center(), Modifiers::default());
                 root.read_with(cx, |root, _| {
-                    let Root::Review(this) = root else {
-                        unreachable!()
-                    };
+                    let this = &root.review;
                     assert!(this.tabs[0].checks_source_expanded);
                 });
                 cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -32890,18 +35742,14 @@ mod layout_tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         for _ in 0..2 {
             let was_split = root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 this.tabs[0].diff_split
             });
             let toggle = cx.debug_bounds("toggle-diff-layout").unwrap();
             cx.simulate_click(toggle.center(), Modifiers::default());
             cx.update(|window, cx| window.draw(cx).clear(cx));
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 assert_eq!(this.tabs[0].diff_split, !was_split);
                 assert_eq!(
                     this.tabs[0].session.as_ref().unwrap().diff_mode(),
@@ -32920,9 +35768,7 @@ mod layout_tests {
             let bounds = cx.debug_bounds(selector).unwrap();
             let start = bounds.center();
             let before = root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 this.panel_layout.width(panel, false)
             });
             cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::default());
@@ -32939,9 +35785,7 @@ mod layout_tests {
             );
             cx.update(|window, cx| window.draw(cx).clear(cx));
             let enlarged = root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 this.panel_layout.width(panel, false)
             });
             assert!(
@@ -32956,9 +35800,7 @@ mod layout_tests {
             );
             cx.update(|window, cx| window.draw(cx).clear(cx));
             let reversed = root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 this.panel_layout.width(panel, false)
             });
             assert!((reversed - before - 20.).abs() < 2.);
@@ -32970,9 +35812,7 @@ mod layout_tests {
             cx.simulate_mouse_move(start + point(px(90.), px(0.)), None, Modifiers::default());
             cx.update(|window, cx| window.draw(cx).clear(cx));
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 assert_eq!(this.panel_layout.width(panel, false), reversed);
                 let session = this.tabs[0].session.as_ref().unwrap();
                 assert_eq!(session.revision().head_sha, "2".repeat(40));
@@ -32980,6 +35820,317 @@ mod layout_tests {
                 assert!(!this.tabs[0].write_in_flight);
             });
         }
+    }
+
+    /// A branch name longer than the chip can show is cut by the chip, not by
+    /// the layout, and the full name is one hover away. The branch pair sits in
+    /// a row that does not shrink, so before this a long name simply ate the PR
+    /// title beside it.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn a_long_branch_name_is_cut_to_its_chip_and_hovers_the_full_name(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        let long = "bb/remove-view-button-separators-thr_qjtyfdj5jy";
+        assert!(long.chars().count() > super::BRANCH_CHIP_MAX_CHARS);
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.install_pr_layout_fixture(window, cx);
+                this.tabs[0].pull_request.source_branch = long.into();
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        let title = cx.debug_bounds("pr-header-row").unwrap();
+        let trigger = cx.debug_bounds("branch-chip-trigger").unwrap();
+        assert!(
+            trigger.size.width < title.size.width / 2.,
+            "a cut branch chip must not take the title's half of the header row"
+        );
+        assert!(
+            cx.debug_bounds("branch-chip-card").is_none(),
+            "the full name stays behind the hover"
+        );
+        // Hovering is the whole affordance. Drive it the way a pointer does,
+        // then let the component's own open delay elapse.
+        cx.simulate_mouse_move(trigger.center(), None, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            cx.debug_bounds("branch-chip-card").is_some(),
+            "hovering a cut branch chip must show the whole name"
+        );
+
+        // A name that fits is not a trigger at all, so it carries no hover and
+        // no card: the affordance appears only where something was dropped.
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.tabs[0].pull_request.source_branch = "feature/short".into();
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("branch-chip-trigger").is_none());
+    }
+
+    /// The four PR tabs are one page reached four ways. Before the spacing was
+    /// standardized Conversation padded its content 12px while its three
+    /// neighbours padded 20, so every tab switch nudged the text sideways and
+    /// changed the rhythm under it. This pins the gutter and the first line's
+    /// position across all four.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn every_pr_tab_starts_its_content_on_the_same_gutter(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.install_pr_layout_fixture(window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let mut gutters = Vec::new();
+        for tab in ["pr-tab-conversation", "pr-tab-commits", "pr-tab-checks"] {
+            let chip = cx.debug_bounds(tab).unwrap();
+            cx.simulate_click(chip.center(), Modifiers::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let page = cx.debug_bounds("pr-content-scroll").unwrap();
+            gutters.push((tab, page.left(), page.top()));
+        }
+        let (_, left, top) = gutters[0];
+        for (tab, tab_left, _) in &gutters {
+            assert_eq!(
+                *tab_left, left,
+                "{tab} starts its content on a different gutter than the others"
+            );
+        }
+        // Conversation and Checks carry no chrome between the tabs and their
+        // page, so they open on the same line. Commits does not belong in this
+        // check: its Compare bar is chrome, so its page legitimately begins
+        // below one — the same way Files changed does.
+        assert_eq!(
+            gutters[2].2, top,
+            "Checks and Conversation must open their page on the same line"
+        );
+        // The page gutter is the title block's gutter, so the chrome above the
+        // tabs and the content below them line up on one edge.
+        // The page tabs and the Compare bar are two rows of the same chip
+        // component, so they share a gutter, a pitch and a height. They used to
+        // be built separately: the Compare bar's chips were plain divs at a
+        // different inset, landing 8px right of the tab labels above them.
+        let commits_chip = cx.debug_bounds("pr-tab-commits").unwrap();
+        cx.simulate_click(commits_chip.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let conversation_chip = cx.debug_bounds("pr-tab-conversation").unwrap();
+        let full_pr_chip = cx.debug_bounds("comparison-full").unwrap();
+        assert_eq!(
+            full_pr_chip.left(),
+            conversation_chip.left(),
+            "the Compare bar and the tab row above it must start on one gutter"
+        );
+        assert_eq!(
+            cx.debug_bounds("comparison-bar").unwrap().left(),
+            left + px(cibergit::ui::PANEL_GUTTER),
+            "the Compare bar must sit on the page gutter, not inside a second one"
+        );
+        assert_eq!(
+            full_pr_chip.size.height, conversation_chip.size.height,
+            "both chip rows must give their chips the same pointer target"
+        );
+        let checks_chip = cx.debug_bounds("pr-tab-checks").unwrap();
+        let commit_chip = cx.debug_bounds("comparison-commit").unwrap();
+        assert_eq!(
+            commit_chip.left() - full_pr_chip.right(),
+            checks_chip.left() - cx.debug_bounds("pr-tab-commits").unwrap().right(),
+            "both chip rows must use one pitch between chips"
+        );
+        // Pinning this step against a constant is what let the defect through
+        // the first time: measured on Commits alone it looked deliberate, when
+        // in fact Files changed put the identical bar 20px higher. The property
+        // is that the two tabs agree, so measure both and compare them.
+        let commits_step = full_pr_chip.top() - conversation_chip.bottom();
+        let files_chip = cx.debug_bounds("pr-tab-files").unwrap();
+        cx.simulate_click(files_chip.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let files_step = cx.debug_bounds("comparison-full").unwrap().top()
+            - cx.debug_bounds("pr-tab-conversation").unwrap().bottom();
+        assert_eq!(
+            commits_step, files_step,
+            "the Compare bar must sit the same distance under the tab row on \
+             every tab that shows it"
+        );
+
+        // `pr-content-scroll` is measured outside its own padding, so the
+        // first character on the page sits one gutter in from its left edge —
+        // which is exactly where the title above the tabs starts. Files changed
+        // is the selected tab here, and it is the diff itself rather than a
+        // fourth inspector page, so it closes the inspector rather than laying
+        // out another one.
+        assert!(cx.debug_bounds("pr-content-scroll").is_none());
+        assert_eq!(
+            cx.debug_bounds("pr-header-row").unwrap().left(),
+            left + px(cibergit::ui::PANEL_GUTTER),
+            "the PR title and the page under the tabs must share one gutter"
+        );
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn conversation_separates_comments_and_keeps_its_heading_close(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        for width in [900., 1440.] {
+            cx.update(|window, cx| {
+                window.resize(size(px(width), px(1800.)));
+                root.update(cx, |root, cx| {
+                    let this = &mut root.review;
+                    if this.tabs.is_empty() {
+                        this.install_pr_layout_fixture(window, cx);
+                        let details = this.tabs[0].details.as_mut().unwrap();
+                        details.body.clear();
+                        let mut comment = details.issue_comments[0].clone();
+                        comment.coordinates.remote_id = "COMMENT_spacing".into();
+                        comment.body = "A separate comment should be easy to spot.".into();
+                        details.issue_comments.push(comment);
+                    }
+                    this.tabs[0].inspector_section = InspectorSection::Overview;
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            let heading = cx.debug_bounds("conversation-heading").unwrap();
+            let mut items = Vec::new();
+            let mut position = 0;
+            while let Some(bounds) = cx.debug_bounds(Box::leak(
+                format!("conversation-item-{position}").into_boxed_str(),
+            )) {
+                items.push(bounds);
+                position += 1;
+            }
+            assert!(
+                items.len() >= 3,
+                "review controls and both comments must render"
+            );
+            assert_eq!(
+                items[0].top() - heading.bottom(),
+                px(cibergit::ui::GAP_COLUMNS)
+            );
+            for pair in items.windows(2) {
+                assert_eq!(pair[1].top() - pair[0].bottom(), px(cibergit::ui::GAP_PAGE));
+            }
+        }
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn a_tab_strip_close_control_closes_the_tab_it_names(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.install_pr_layout_fixture(window, cx);
+                let repository = this.tabs[0].repository.clone();
+                this.install_tab_with_restore(
+                    repository,
+                    PullRequest {
+                        number: 204,
+                        title: "Keep the conversation beside the diff".into(),
+                        author: "maya".into(),
+                        state: "OPEN".into(),
+                        source_branch: "feature/conversation".into(),
+                        target_branch: "main".into(),
+                        base_sha: "1".repeat(40),
+                        head_sha: "3".repeat(40),
+                        ..Default::default()
+                    },
+                    None,
+                    InstallTabOptions {
+                        activate: false,
+                        window: None,
+                        start_background_work: false,
+                    },
+                    cx,
+                );
+                assert_eq!(this.active_tab, Some(0));
+            });
+            window.draw(cx).clear(cx);
+        });
+        // The control on a background tab has to close that tab. If the press
+        // reached the chip underneath instead, the strip would merely select it.
+        let close_background = cx
+            .debug_bounds("close-tab-1")
+            .expect("every tab in the strip carries its own close control");
+        cx.simulate_click(close_background.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        root.read_with(cx, |root, _| {
+            let this = &root.review;
+            assert_eq!(this.tabs.len(), 1);
+            assert_eq!(this.tabs[0].pull_request.number, 203);
+            assert_eq!(this.active_tab, Some(0));
+        });
+        let close_last = cx.debug_bounds("close-tab-0").unwrap();
+        cx.simulate_click(close_last.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        root.read_with(cx, |root, _| {
+            let this = &root.review;
+            assert!(this.tabs.is_empty());
+            assert_eq!(this.active_tab, None);
+        });
     }
 
     #[cfg(feature = "ui-smoke")]
@@ -33010,9 +36161,7 @@ mod layout_tests {
         cx.run_until_parked();
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 assert!(this.setup_open);
                 assert!(!this.repository_picker_open);
                 assert_eq!(
@@ -33027,9 +36176,7 @@ mod layout_tests {
         cx.run_until_parked();
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 assert_eq!(
                     this.repository_input.read(cx).value().as_str(),
                     selected.to_str().unwrap()
@@ -33043,7 +36190,7 @@ mod layout_tests {
         cx.run_until_parked();
         cx.update(|_, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else { unreachable!() };
+                let this = &mut root.review;
                 assert!(matches!(&this.repository_setup_state, LoadState::Error(message) if message.contains("gh auth login")));
                 assert!(this.setup_open && this.repositories.is_empty());
                 this.accounts.push(Account { host: "github.com".into(), login: "fixture".into() });
@@ -33055,7 +36202,7 @@ mod layout_tests {
         cx.run_until_parked();
         cx.update(|_, cx| {
             root.update(cx, |root, _| {
-                let Root::Review(this) = root else { unreachable!() };
+                let this = &mut root.review;
                 assert!(matches!(&this.repository_setup_state, LoadState::Error(message) if message.contains("Cannot add repository")));
                 assert!(this.setup_open && this.repositories.is_empty());
             });
@@ -33086,9 +36233,7 @@ mod layout_tests {
         });
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.setup_open = false;
                 cx.notify();
             });
@@ -33103,9 +36248,7 @@ mod layout_tests {
         cx.run_until_parked();
         cx.update(|window, cx| {
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 assert_eq!(this.workspace.view().filter.search, "sidebar");
             });
             window.draw(cx).clear(cx);
@@ -33114,9 +36257,7 @@ mod layout_tests {
         cx.simulate_click(button.center(), Modifiers::default());
         cx.update(|_, cx| {
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 let filter = this.workspace.view().filter;
                 assert_eq!(filter.search, "sidebar");
                 assert_eq!(filter.personal, cibergit::workspace::PersonalFilter::Own);
@@ -33146,9 +36287,7 @@ mod layout_tests {
         });
         let (tree_rows, diff_rows) = cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.install_pr_layout_fixture(window, cx);
                 let mut pulls = (204..5204)
                     .map(|number| PullRequest {
@@ -33207,9 +36346,7 @@ mod layout_tests {
         });
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 let first = this.sidebar_materializations.replace(0);
                 assert!(first > 0 && first < 80, "rendered {first} of 5002 rows");
                 this.sidebar_scroll
@@ -33227,9 +36364,7 @@ mod layout_tests {
             .expect("last PR is reachable");
         cx.update(|_, cx| {
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 let rendered = this.sidebar_materializations.get();
                 assert!(
                     rendered > 0 && rendered < 80,
@@ -33249,9 +36384,7 @@ mod layout_tests {
         cx.simulate_click(last_file.center(), Modifiers::default());
         cx.update(|_, cx| {
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 assert_eq!(
                     this.tabs[0]
                         .session
@@ -33267,9 +36400,7 @@ mod layout_tests {
         cx.simulate_click(last.center(), Modifiers::default());
         cx.update(|_, cx| {
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 assert_eq!(this.tabs[this.active_tab.unwrap()].pull_request.number, 203);
                 assert!(!this.tabs[0].write_in_flight);
             })
@@ -33551,6 +36682,7 @@ mod layout_tests {
             review_threads: Vec::new(),
             reactions: Vec::new(),
             checks: Vec::new(),
+            participant_avatars: Default::default(),
             activity_complete: true,
             checks_complete: true,
             notice: None,
@@ -34066,9 +37198,7 @@ mod layout_tests {
         let pull = transition_pull_request(7);
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.repositories.push(RepoRuntime {
                     repository: repository.clone(),
                     pull_requests: Arc::new(vec![pull.clone()]),
@@ -34098,9 +37228,7 @@ mod layout_tests {
         cx.dispatch_action(OpenChecks);
         cx.update(|window, cx| window.draw(cx).clear(cx));
         root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert!(matches!(
                 this.tabs[0].inspector_section,
                 InspectorSection::Checks
@@ -34116,9 +37244,7 @@ mod layout_tests {
         }
         cx.update(|window, cx| window.draw(cx).clear(cx));
         root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert_eq!(
                 this.tabs[0].checks_selection.selected_id.as_deref(),
                 Some("CHECK-39")
@@ -34131,9 +37257,7 @@ mod layout_tests {
         cx.dispatch_action(NextCheck);
         cx.update(|window, cx| window.draw(cx).clear(cx));
         root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert_eq!(
                 this.tabs[0].checks_selection.selected_id.as_deref(),
                 Some("CHECK-40")
@@ -34146,9 +37270,7 @@ mod layout_tests {
         cx.dispatch_action(ToggleCheckIdentity);
         cx.update(|window, cx| window.draw(cx).clear(cx));
         root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert_eq!(
                 this.tabs[0].checks_selection.expanded_id.as_deref(),
                 Some("CHECK-40")
@@ -34159,9 +37281,7 @@ mod layout_tests {
 
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 let tab = &mut this.tabs[0];
                 let details = tab.details.as_mut().unwrap();
                 details.checks.rotate_left(17);
@@ -34172,9 +37292,7 @@ mod layout_tests {
             window.draw(cx).clear(cx);
         });
         root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert_eq!(
                 this.tabs[0].checks_selection.selected_id.as_deref(),
                 Some("CHECK-40")
@@ -34189,9 +37307,7 @@ mod layout_tests {
         cx.dispatch_action(NextCheckPage);
         cx.update(|window, cx| window.draw(cx).clear(cx));
         root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert_eq!(this.tabs[0].checks_selection.page, 2);
             assert!(this.inspector_scroll.top_item() <= 2);
             assert!(this.inspector_scroll.bottom_item() >= 2);
@@ -34201,9 +37317,7 @@ mod layout_tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
 
         root.update(cx, |root, cx| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &mut root.review;
             let selected = this.tabs[0].checks_selection.selected_id.clone().unwrap();
             let tab = &mut this.tabs[0];
             let details = tab.details.as_mut().unwrap();
@@ -34221,6 +37335,82 @@ mod layout_tests {
                 expected.as_deref()
             );
             cx.notify();
+        });
+    }
+
+    /// A picture last run already fetched paints without touching the network:
+    /// the saved bytes are what the cache reports ready, and the login is
+    /// never claimed a second time.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn saved_participant_avatar_loads_once_and_is_offered_to_the_next_render(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        /// A 1x1 RGBA PNG: the smallest thing GPUI would actually paint.
+        const ONE_PIXEL_PNG: [u8; 70] = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99,
+            0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        const AVATAR_URL: &str = "https://avatars.githubusercontent.com/in/347564?s=64";
+
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    ..Default::default()
+                },
+            )
+        });
+        let (repository, _) = submitted_review_fixture();
+        let pull = transition_pull_request(7);
+        root.update(cx, |root, cx| {
+            let this = &mut root.review;
+            this.install_tab_with_restore(
+                repository.clone(),
+                pull,
+                None,
+                InstallTabOptions {
+                    activate: true,
+                    window: None,
+                    start_background_work: false,
+                },
+                cx,
+            );
+            let mut details = details_with_reviews(Vec::new());
+            details
+                .participant_avatars
+                .insert("coderabbitai".into(), AVATAR_URL.into());
+            this.tabs[0].details = Some(details);
+            this.tabs[0].details_state = LoadState::Ready;
+            let path = this.avatars.borrow().path_for(AVATAR_URL);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, ONE_PIXEL_PNG).unwrap();
+            // The pass that discovers the picture has nothing to show yet; it
+            // only claims the work, and the puck keeps its letter.
+            let details = this.tabs[0].details.clone();
+            assert!(this.claim_avatars(details.as_ref(), cx).is_empty());
+        });
+        cx.run_until_parked();
+        root.update(cx, |root, cx| {
+            let this = &root.review;
+            let details = this.tabs[0].details.clone();
+            let ready = this.claim_avatars(details.as_ref(), cx);
+            let image = ready
+                .get("coderabbitai")
+                .expect("the saved picture must be offered to the next render");
+            assert_eq!(image.bytes, ONE_PIXEL_PNG.to_vec());
+            assert!(
+                !this.avatars.borrow_mut().claim("coderabbitai"),
+                "a participant whose picture is in hand is never fetched again"
+            );
         });
     }
 
@@ -34245,9 +37435,7 @@ mod layout_tests {
         let (repository, _) = submitted_review_fixture();
         let pull = transition_pull_request(7);
         root.update(cx, |root, cx| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &mut root.review;
             this.install_tab_with_restore(
                 repository.clone(),
                 pull,
@@ -34402,9 +37590,7 @@ mod layout_tests {
         let pull = transition_pull_request(7);
         let busy_token = cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.install_tab_with_restore(
                     repository.clone(),
                     pull,
@@ -34433,9 +37619,7 @@ mod layout_tests {
         cx.dispatch_action(OpenSelectedCheckJobs);
         cx.update(|window, cx| {
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 assert_eq!(this.tabs[0].ci_read.pane, CiPane::Checks);
                 assert!(this.checks_focus.is_focused(window));
                 assert!(!this.jobs_focus.is_focused(window));
@@ -34444,9 +37628,7 @@ mod layout_tests {
 
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 let disposition = this.general_reads.complete(
                     &busy_token,
                     &GeneralReadDirective::default(),
@@ -34472,9 +37654,7 @@ mod layout_tests {
         cx.dispatch_action(OpenChecks);
         cx.update(|window, cx| {
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 assert!(matches!(
                     this.tabs[0].inspector_section,
                     InspectorSection::Checks
@@ -34487,9 +37667,7 @@ mod layout_tests {
 
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 let snapshot = this.tabs[0].ci_read.jobs.visible().unwrap().clone();
                 let (operation, _, selected_job_id) = this.tabs[0].ci_read.begin_log().unwrap();
                 assert!(
@@ -34507,9 +37685,7 @@ mod layout_tests {
         cx.simulate_click(checks_section.center(), Modifiers::default());
         cx.update(|window, cx| {
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 assert!(matches!(
                     this.tabs[0].inspector_section,
                     InspectorSection::Checks
@@ -34522,9 +37698,7 @@ mod layout_tests {
 
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 let now = Instant::now();
                 let (token, _) = this
                     .general_reads
@@ -34553,9 +37727,7 @@ mod layout_tests {
         cx.simulate_click(load_log.center(), Modifiers::default());
         cx.update(|window, cx| {
             root.read_with(cx, |root, app| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 assert_eq!(this.tabs[0].ci_read.pane, CiPane::Jobs);
                 assert!(this.jobs_focus.contains_focused(window, app));
                 assert!(!this.log_focus.contains_focused(window, app));
@@ -34591,9 +37763,7 @@ mod layout_tests {
         let final_log_row_materializations = Arc::new(AtomicU64::new(0));
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.install_tab_with_restore(
                     repository.clone(),
                     pull,
@@ -34649,9 +37819,7 @@ mod layout_tests {
         cx.run_until_parked();
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 assert!(matches!(this.tabs[0].ci_read.jobs, MemoryRead::Fresh(_)));
                 assert_eq!(jobs_dispatches.load(Ordering::Relaxed), 1);
                 assert!(
@@ -34668,9 +37836,7 @@ mod layout_tests {
 
         cx.update(|_, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 assert!(this.start_actions_log(0, cx));
                 assert!(matches!(
                     this.tabs[0].ci_read.log,
@@ -34681,9 +37847,7 @@ mod layout_tests {
         cx.run_until_parked();
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 assert!(matches!(this.tabs[0].ci_read.log, MemoryRead::Fresh(_)));
                 assert_eq!(log_dispatches.load(Ordering::Relaxed), 1);
                 assert!(
@@ -34705,9 +37869,7 @@ mod layout_tests {
             "the native list must materialize the final displayed row"
         );
         root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             let log = this.tabs[0].ci_read.log.visible().unwrap();
             assert_eq!(log.line_count, 200_000);
             assert!(
@@ -34722,9 +37884,7 @@ mod layout_tests {
 
         let horizontal_maximum = cx.update(|_, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 let maximum = this.tabs[0].log_horizontal.max_offset().x.as_f32();
                 assert!(maximum > 1_000.);
                 this.tabs[0]
@@ -34791,9 +37951,7 @@ mod layout_tests {
         let (repository, submitted_review) = submitted_review_fixture();
         let (checkpoint, before) = cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 let mut pull = transition_pull_request(7);
                 pull.base_sha = "1".repeat(40);
                 pull.head_sha = "2".repeat(40);
@@ -35018,9 +38176,7 @@ mod layout_tests {
         cx.run_until_parked();
         cx.update(|_, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 assert_eq!(preserved(this, cx), before);
                 assert!(matches!(this.tabs[0].ci_read.jobs, MemoryRead::Fresh(_)));
                 assert!(
@@ -35050,9 +38206,7 @@ mod layout_tests {
         });
         cx.run_until_parked();
         root.read_with(cx, |root, cx| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert_eq!(preserved(this, cx), before);
             assert!(matches!(this.tabs[0].ci_read.log, MemoryRead::Fresh(_)));
             assert!(!this.tabs[0].write_in_flight);
@@ -35239,9 +38393,7 @@ mod layout_tests {
         let pull_c = transition_pull_request(9);
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.repositories.push(RepoRuntime {
                     repository: repository.clone(),
                     pull_requests: Arc::new(vec![pull_a.clone(), pull_b.clone(), pull_c.clone()]),
@@ -35483,9 +38635,7 @@ mod layout_tests {
         });
         cx.update(|_, _| {});
         let (value, disabled, active_pull, active_review, stored_body) = cx.read(|cx| {
-            let Root::Review(this) = root.read(cx) else {
-                unreachable!()
-            };
+            let this = &root.read(cx).review;
             assert_eq!(this.composer_input.read(cx).value(), "line B");
             assert!(!this.composer_input.read(cx).presentation().is_disabled());
             let active = this.active_tab.unwrap();
@@ -35535,9 +38685,7 @@ mod layout_tests {
         cx.update(|window, cx| {
             window.resize(size(px(1440.), px(900.)));
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.install_actions_control_fixture(window, cx);
             });
             window.draw(cx).clear(cx);
@@ -35566,9 +38714,7 @@ mod layout_tests {
         for action in RUN_CONTROLS {
             cx.update(|_, cx| {
                 root.update(cx, |root, _| {
-                    let Root::Review(this) = root else {
-                        unreachable!()
-                    };
+                    let this = &mut root.review;
                     this.status = "sentinel".into();
                 });
             });
@@ -35576,9 +38722,7 @@ mod layout_tests {
             cx.simulate_click(bounds.center(), Modifiers::default());
             cx.run_until_parked();
             root.read_with(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &root.review;
                 assert!(
                     this.status.contains(action.label()) && this.status.contains("zero writes"),
                     "the pointer press did not reach {}: {}",
@@ -35599,16 +38743,12 @@ mod layout_tests {
         for (position, action) in RUN_CONTROLS.into_iter().enumerate() {
             cx.update(|window, cx| {
                 root.update(cx, |root, cx| {
-                    let Root::Review(this) = root else {
-                        unreachable!()
-                    };
+                    let this = &mut root.review;
                     this.actions_control_focus.controls[position].focus(window, cx);
                 });
                 window.draw(cx).clear(cx);
                 root.update(cx, |root, _| {
-                    let Root::Review(this) = root else {
-                        unreachable!()
-                    };
+                    let this = &mut root.review;
                     assert!(
                         this.actions_control_focus.controls[position].is_focused(window),
                         "{} does not accept focus",
@@ -35619,9 +38759,7 @@ mod layout_tests {
         }
 
         root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert!(this.tabs[0].confirmation.is_none());
             assert!(!this.tabs[0].write_in_flight);
         });
@@ -35657,9 +38795,7 @@ mod layout_tests {
         cx.update(|window, cx| {
             window.resize(size(px(1440.), px(900.)));
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.install_tab_with_restore(
                     repository.clone(),
                     transition_pull_request(7),
@@ -35709,9 +38845,7 @@ mod layout_tests {
         );
 
         let row_handle = root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             this.jobs_first_row_focus.clone()
         });
         let mut reached = cx.update(|window, _| row_handle.is_focused(window));
@@ -35730,9 +38864,7 @@ mod layout_tests {
         // shortcut would leave the selection alone and start a log read.
         press(cx, "enter");
         root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert_eq!(
                 this.tabs[0].ci_read.selected_job_id,
                 Some(11),
@@ -35749,9 +38881,7 @@ mod layout_tests {
         // itself, Enter still reaches the pane-level log action.
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.status = "sentinel".into();
                 this.jobs_focus.focus(window, cx);
             });
@@ -35759,9 +38889,7 @@ mod layout_tests {
         });
         press(cx, "enter");
         root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert_ne!(
                 this.status, "sentinel",
                 "the pane-level Enter shortcut must still act when the pane itself holds focus"
@@ -35802,9 +38930,7 @@ mod layout_tests {
         cx.update(|window, cx| {
             window.resize(size(px(1440.), px(900.)));
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.install_actions_control_fixture(window, cx);
             });
             window.draw(cx).clear(cx);
@@ -35844,9 +38970,7 @@ mod layout_tests {
 
             let focused_now = |cx: &mut gpui::VisualTestContext| {
                 let handle = root.read_with(cx, |root, _| {
-                    let Root::Review(this) = root else {
-                        unreachable!()
-                    };
+                    let this = &root.review;
                     this.actions_control_focus.controls[position].clone()
                 });
                 cx.update(|window, _| handle.is_focused(window))
@@ -35870,9 +38994,7 @@ mod layout_tests {
             for key in ["enter", "space"] {
                 cx.update(|_, cx| {
                     root.update(cx, |root, _| {
-                        let Root::Review(this) = root else {
-                            unreachable!()
-                        };
+                        let this = &mut root.review;
                         this.status = "sentinel".into();
                     });
                 });
@@ -35884,9 +39006,7 @@ mod layout_tests {
                 );
                 press(cx, key);
                 root.read_with(cx, |root, _| {
-                    let Root::Review(this) = root else {
-                        unreachable!()
-                    };
+                    let this = &root.review;
                     // The status names the exact control, so a key answered by
                     // some other element cannot satisfy this.
                     assert!(
@@ -35911,9 +39031,7 @@ mod layout_tests {
             for key in ["enter", "space"] {
                 cx.update(|window, cx| {
                     root.update(cx, |root, _| {
-                        let Root::Review(this) = root else {
-                            unreachable!()
-                        };
+                        let this = &mut root.review;
                         this.install_synthetic_actions_confirmation(
                             ActionsRunControlAction::RerunFailedJobs,
                         );
@@ -35927,9 +39045,7 @@ mod layout_tests {
                 );
 
                 let handle = root.read_with(cx, |root, _| {
-                    let Root::Review(this) = root else {
-                        unreachable!()
-                    };
+                    let this = &root.review;
                     if confirm {
                         this.actions_control_focus.confirm.clone()
                     } else {
@@ -35957,9 +39073,7 @@ mod layout_tests {
 
                 press(cx, key);
                 root.read_with(cx, |root, _| {
-                    let Root::Review(this) = root else {
-                        unreachable!()
-                    };
+                    let this = &root.review;
                     if confirm {
                         // Confirm reaches the dispatch path and stops at the
                         // synthetic scene's zero-capability guard.
@@ -35987,18 +39101,14 @@ mod layout_tests {
         // Leave no prepared request behind.
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.invalidate_actions_control_confirmation(0, "test teardown");
                 let _ = cx;
             });
             window.draw(cx).clear(cx);
         });
         root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert!(!this.tabs[0].write_in_flight);
             assert!(this.tabs[0].ci_actions.in_flight.is_none());
         });
@@ -36025,9 +39135,7 @@ mod layout_tests {
         cx.update(|window, cx| {
             window.resize(size(px(1440.), px(900.)));
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 let locator = this.install_actions_control_fixture(window, cx);
                 let request = ReviewWorkspace::synthetic_actions_control_request(
                     &locator,
@@ -36042,9 +39150,7 @@ mod layout_tests {
             window.draw(cx).clear(cx);
         });
         let composer_before = root.read_with(cx, |root, cx| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             this.composer_input.read(cx).value().to_string()
         });
 
@@ -36054,9 +39160,7 @@ mod layout_tests {
         cx.simulate_click(confirm.center(), Modifiers::default());
         cx.run_until_parked();
         root.read_with(cx, |root, _| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert!(
                 this.status.contains("zero writes were sent"),
                 "{}",
@@ -36071,24 +39175,18 @@ mod layout_tests {
         // pointer/focus test above.
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.actions_control_focus.confirm.focus(window, cx);
             });
             window.draw(cx).clear(cx);
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 assert!(this.actions_control_focus.confirm.is_focused(window));
                 this.actions_control_focus.cancel.focus(window, cx);
             });
             window.draw(cx).clear(cx);
             root.update(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 assert!(this.actions_control_focus.cancel.is_focused(window));
             });
         });
@@ -36098,9 +39196,7 @@ mod layout_tests {
         cx.simulate_click(cancel.center(), Modifiers::default());
         cx.run_until_parked();
         root.read_with(cx, |root, cx| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             assert!(this.tabs[0].confirmation.is_none());
             assert!(this.status.contains("zero writes sent"), "{}", this.status);
             assert!(!this.tabs[0].write_in_flight);
@@ -36121,9 +39217,7 @@ mod layout_tests {
         // than letting it confirm against a different exact run.
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 // A token captured before Cancel must never dispatch after it.
                 let cancelled =
                     this.install_synthetic_actions_confirmation(ActionsRunControlAction::CancelRun);
@@ -36152,9 +39246,7 @@ mod layout_tests {
         });
         cx.run_until_parked();
         root.read_with(cx, |root, cx| {
-            let Root::Review(this) = root else {
-                unreachable!()
-            };
+            let this = &root.review;
             // Discarding a prepared control preserves every shared input, the
             // private recovery controller, and both comparison identities.
             assert_eq!(
@@ -36179,9 +39271,7 @@ mod layout_tests {
         // post-dispatch uncertain case below.
         cx.update(|_, cx| {
             root.update(cx, |root, _| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.tabs[0].checks_selection.selected_id =
                     Some("SYNTHETIC_ACTIONS_CHECK_NODE".into());
                 let (token, request) =
@@ -36215,9 +39305,7 @@ mod layout_tests {
         // outcome even when the display moved while it was in flight.
         cx.update(|_, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.tabs[0].checks_selection.selected_id =
                     Some("SYNTHETIC_ACTIONS_CHECK_NODE".into());
                 let token = this
@@ -36283,9 +39371,7 @@ mod layout_tests {
         let (_, review_b) = dismissal_review_fixture(8, "REVIEW_B");
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 for (pull, review, reason) in [
                     (transition_pull_request(7), review_a.clone(), "reason A"),
                     (transition_pull_request(8), review_b.clone(), "reason B"),
@@ -36332,9 +39418,7 @@ mod layout_tests {
         });
         cx.update(|_, _| {});
         cx.read(|cx| {
-            let Root::Review(this) = root.read(cx) else {
-                unreachable!()
-            };
+            let this = &root.read(cx).review;
             assert_eq!(
                 this.tabs[0].dismissal_editor.active_reason(),
                 "late queued A text"
@@ -36350,9 +39434,7 @@ mod layout_tests {
         });
         cx.update(|window, cx| {
             let input = {
-                let Root::Review(this) = root.read(cx) else {
-                    unreachable!()
-                };
+                let this = &root.read(cx).review;
                 this.dismissal_reason_input.clone()
             };
             input.update(cx, |input, cx| {
@@ -36362,9 +39444,7 @@ mod layout_tests {
         });
         cx.update(|_, _| {});
         cx.read(|cx| {
-            let Root::Review(this) = root.read(cx) else {
-                unreachable!()
-            };
+            let this = &root.read(cx).review;
             assert_eq!(
                 this.tabs[1].dismissal_editor.active_reason(),
                 "late queued A text",
@@ -36411,9 +39491,7 @@ mod layout_tests {
         };
         let old_entity = cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 for (pull, review, reason) in [
                     (transition_pull_request(7), review_a.clone(), "old A reason"),
                     (
@@ -36452,7 +39530,7 @@ mod layout_tests {
         let _notification_subscription = cx.update(|_, cx| {
             cx.observe(&root, move |root, cx| {
                 if root.read_with(cx, |root, _| {
-                    matches!(root, Root::Review(this)
+                    matches!(&root.review, this
                     if this.active_tab == Some(1)
                         && this.active_tab_input_restore.is_none()
                         && this.dismissal_reason_input_owner.as_ref().is_some_and(
@@ -36466,9 +39544,7 @@ mod layout_tests {
         });
         cx.update(|_, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.activate_tab_context(1, false, cx);
                 assert!(this.active_tab_input_restore.is_some());
             });
@@ -36481,9 +39557,7 @@ mod layout_tests {
         );
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 let index = this.active_tab.unwrap();
                 assert_eq!(this.tabs[index].pull_request.number, 8);
                 assert!(this.active_tab_input_restore.is_none());
@@ -36560,9 +39634,7 @@ mod layout_tests {
         review_b.body = "Second exact frozen body".into();
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.install_tab_with_restore(
                     repository.clone(),
                     transition_pull_request(7),
@@ -36668,9 +39740,7 @@ mod layout_tests {
         let (repository, review) = dismissal_review_fixture(7, "REVIEW_A");
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.install_tab_with_restore(
                     repository.clone(),
                     transition_pull_request(7),
@@ -37474,9 +40544,7 @@ mod layout_tests {
         });
         let active_token = cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 let mut pull = transition_pull_request(7);
                 pull.base_sha = "1".repeat(40);
                 pull.head_sha = "2".repeat(40);
@@ -37515,9 +40583,7 @@ mod layout_tests {
         notifications.set(0);
         cx.update(|_, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.start_pending_review_thread(active_token.clone(), cx);
                 assert!(!this.tabs[0].write_in_flight);
                 assert!(this.tabs[0].pending_review_start_live.is_none());
@@ -37532,9 +40598,7 @@ mod layout_tests {
 
         let inactive_token = cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 let mut pull = transition_pull_request(8);
                 pull.base_sha = "1".repeat(40);
                 pull.head_sha = "2".repeat(40);
@@ -37562,9 +40626,7 @@ mod layout_tests {
         notifications.set(0);
         cx.update(|_, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.start_pending_review_thread(inactive_token.clone(), cx);
                 assert!(!this.tabs[0].write_in_flight);
                 assert!(this.tabs[0].pending_review_start_live.is_none());
@@ -37625,9 +40687,7 @@ mod layout_tests {
         });
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 let mut pull = transition_pull_request(7);
                 pull.base_sha = "1".repeat(40);
                 pull.head_sha = "2".repeat(40);
@@ -37694,9 +40754,7 @@ mod layout_tests {
         });
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 this.composer_input.update(cx, |input, cx| {
                     input.set_value("Whole-file rationale", window, cx)
                 });
@@ -37769,9 +40827,7 @@ mod layout_tests {
         });
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                let Root::Review(this) = root else {
-                    unreachable!()
-                };
+                let this = &mut root.review;
                 let mut pull = transition_pull_request(7);
                 pull.base_sha = "1".repeat(40);
                 pull.head_sha = "2".repeat(40);
@@ -38835,12 +41891,13 @@ mod layout_tests {
     fn auto_uses_remaining_diff_pane_instead_of_whole_window() {
         let layout = PanelLayout::default();
         let wide_diff = available_diff_width_for(&layout, true, 1440.);
-        // 1440 minus the default 292/250/274 panels and three 8px dividers.
-        assert_eq!(wide_diff, 600.);
+        // 1440 minus the default 292/250/274 panels. The splitters overlay the
+        // seams rather than holding a column open, so they take nothing here.
+        assert_eq!(wide_diff, 624.);
         assert!(wide_diff >= MIN_SPLIT_DIFF_WIDTH);
 
         let narrow_diff = available_diff_width_for(&layout, true, 1180.);
-        assert_eq!(narrow_diff, 360.);
+        assert_eq!(narrow_diff, 364.);
         assert!(narrow_diff < MIN_SPLIT_DIFF_WIDTH);
         let (sidebar, tree, details) = resolved_panel_widths_for(&layout, true, 1040.);
         assert!(sidebar >= MIN_SIDEBAR_WIDTH);
@@ -38907,12 +41964,57 @@ mod layout_tests {
         let fenced = "```text\n`literal` <!-- keep --> <tag> ![code](asset.png)\n```";
         let indented = "    `literal` <!-- keep --> <tag> ![code](asset.png)";
         let source = format!(
-            "Before `bounded` words <!-- remove --> <video> ![prose](asset.png)\n\n{fenced}\n\n{indented}"
+            "Before `bounded` words <!-- remove --> <tag> ![prose](asset.png)\n\n{fenced}\n\n{indented}"
         );
         let safe = media_free_markdown(&source);
-        assert!(safe.contains("Before \\`bounded\\` words  &lt;video&gt; [Image omitted: prose]"));
+        assert!(safe.contains("Before \\`bounded\\` words  &lt;tag&gt; [Image omitted: prose]"));
         assert!(safe.contains(fenced));
         assert!(safe.contains(indented));
+    }
+
+    #[test]
+    fn blockquotes_and_alerts_survive_prose_sanitizing() {
+        let source = "> [!WARNING]\n> Review limit reached.\n>\n> Retry in 59 minutes.";
+        let safe = media_free_markdown(source);
+        assert_eq!(
+            safe,
+            "> **Warning**\n> Review limit reached.\n>\n> Retry in 59 minutes."
+        );
+        // A comparison in prose is not a quote and stays escaped.
+        assert_eq!(media_free_markdown("if a > b then"), "if a &gt; b then");
+    }
+
+    #[test]
+    fn rendered_html_passes_through_while_media_tags_never_reach_the_renderer() {
+        let source = "<details>\n<summary>Files selected</summary>\n\n<img alt=\"chart\" src=\"https://example.test/a.png\"> <video src=\"b.mp4\"></video> <unknown attr=\"x\">\n</details>";
+        let safe = media_free_markdown(source);
+        assert!(safe.contains("<details>"));
+        assert!(safe.contains("<summary><strong>Files selected</strong></summary>"));
+        assert!(safe.contains("</details>"));
+        assert!(safe.contains("[Image omitted: chart]"));
+        assert!(!safe.contains("example.test"));
+        assert!(!safe.contains("b.mp4"));
+        assert!(safe.contains("&lt;unknown attr=\"x\"&gt;"));
+    }
+
+    #[test]
+    fn comment_times_read_as_an_age_over_the_exact_instant() {
+        assert_eq!(
+            iso8601_unix_ms("2026-09-14T17:34:41Z"),
+            Some(1_789_407_281_000)
+        );
+        assert_eq!(
+            iso8601_unix_ms("2026-09-14T19:34:41.250+02:00"),
+            iso8601_unix_ms("2026-09-14T17:34:41Z")
+        );
+        assert_eq!(iso8601_unix_ms("Pending"), None);
+        assert_eq!(
+            exact_timestamp_label("2026-09-14T17:34:41Z"),
+            "Sep 14, 2026 at 17:34 UTC"
+        );
+        // An unreadable instant is reported exactly as the provider sent it.
+        assert_eq!(exact_timestamp_label("Pending"), "Pending");
+        assert_eq!(comment_age_label("Pending"), "Pending");
     }
 
     #[test]
@@ -38966,5 +42068,243 @@ mod layout_tests {
         assert!(!summary.contains("reply-attempt"));
         assert!(!summary.contains("thread-7"));
         assert!(!summary.contains("frozen reply body"));
+    }
+
+    /// Opens a window with the synthetic History page already installed.
+    #[cfg(feature = "ui-smoke")]
+    fn history_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::Entity<Root>,
+        &mut gpui::VisualTestContext,
+        tempfile::TempDir,
+    ) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                root.review.install_history_fixture(cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        (root, cx, data)
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn the_history_page_renders_one_row_per_commit_with_its_graph(cx: &mut gpui::TestAppContext) {
+        let (root, cx, _data) = history_window(cx);
+        for index in 0..4 {
+            assert!(
+                cx.debug_bounds(Box::leak(
+                    format!("history-commit-{index}").into_boxed_str()
+                ))
+                .is_some(),
+                "commit row {index} must render"
+            );
+        }
+        assert!(
+            cx.debug_bounds("history-commit-4").is_none(),
+            "the list must not invent a fifth commit"
+        );
+        cx.update(|_, cx| {
+            root.read_with(cx, |root, _| {
+                let history = root.review.history.as_ref().unwrap();
+                // The fixture's merge forks a second lane, so the gutter is two
+                // columns wide and the merge is drawn as a ring.
+                assert_eq!(history.lane_count, 2);
+                assert!(history.rows()[0].merge);
+                assert!(!history.overflowed);
+            });
+        });
+    }
+
+    /// Every row's gutter is the graph's full width, so the subjects beside
+    /// them start on one line instead of stepping in and out with each row's
+    /// own lane count.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn commit_rows_share_one_gutter_width_and_one_subject_edge(cx: &mut gpui::TestAppContext) {
+        let (_root, cx, _data) = history_window(cx);
+        let rows: Vec<_> = (0..4)
+            .map(|index| {
+                cx.debug_bounds(Box::leak(
+                    format!("history-commit-{index}").into_boxed_str(),
+                ))
+                .unwrap()
+            })
+            .collect();
+        for pair in rows.windows(2) {
+            assert_eq!(
+                pair[1].left(),
+                pair[0].left(),
+                "rows must not step sideways"
+            );
+            assert_eq!(
+                pair[1].top() - pair[0].top(),
+                px(cibergit::ui::TWO_LINE_ROW),
+                "rows are one two-line row apart"
+            );
+        }
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn choosing_a_commit_selects_it_and_asks_for_its_changes(cx: &mut gpui::TestAppContext) {
+        let (root, cx, _data) = history_window(cx);
+        let row = cx.debug_bounds("history-commit-1").unwrap();
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            root.read_with(cx, |root, _| {
+                let history = root.review.history.as_ref().unwrap();
+                assert_eq!(
+                    history.selected.as_deref(),
+                    Some("b".repeat(40).as_str()),
+                    "the clicked commit becomes the selection"
+                );
+            });
+            window.draw(cx).clear(cx);
+        });
+    }
+
+    /// The selection is an exact commit, not a row. Narrowing the scope keeps
+    /// it when that commit is still present and clears it when it is not —
+    /// never silently moving it onto whatever now occupies the same row.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn a_selection_survives_a_history_that_still_contains_it(cx: &mut gpui::TestAppContext) {
+        let (root, cx, _data) = history_window(cx);
+        cx.update(|_, cx| {
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.select_history_commit(&"s".repeat(40), cx);
+            });
+        });
+        cx.update(|_, cx| {
+            root.update(cx, |root, _| {
+                let history = root.review.history.as_mut().unwrap();
+                let kept = history.history.clone().unwrap();
+                history.install(kept);
+                assert_eq!(
+                    history.selected.as_deref(),
+                    Some("s".repeat(40).as_str()),
+                    "a commit still in the history keeps its selection"
+                );
+
+                // Now a history the selected commit is absent from.
+                let mut narrowed = history.history.clone().unwrap();
+                narrowed
+                    .commits
+                    .retain(|commit| commit.sha != "s".repeat(40));
+                history.install(narrowed);
+                assert_eq!(
+                    history.selected, None,
+                    "a commit that is gone must not leave the selection on another row"
+                );
+                assert!(history.session.is_none(), "and its changes must go with it");
+            });
+        });
+    }
+
+    /// A reply for a superseded read must not be installed. Both the history
+    /// read and the per-commit diff read carry a token for exactly this.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn a_reply_for_a_superseded_history_read_is_refused(cx: &mut gpui::TestAppContext) {
+        let (root, cx, _data) = history_window(cx);
+        cx.update(|_, cx| {
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                let history = this.history.as_mut().unwrap();
+                let stale = history.begin_read(7);
+                assert!(history.accepts(&stale), "its own token is accepted");
+
+                // A later read supersedes it.
+                let current = history.begin_read(8);
+                assert!(!history.accepts(&stale), "the earlier read is superseded");
+                assert!(history.accepts(&current));
+
+                // So does narrowing the scope, even at the same generation.
+                history.set_scope(super::HistoryScope::Ref("main".into()));
+                assert!(
+                    !history.accepts(&current),
+                    "a reply for the previous scope belongs to a different question"
+                );
+
+                // And a diff reply is refused once the selection moves.
+                let history = this.history.as_mut().unwrap();
+                history.select(&"b".repeat(40));
+                let diff = history.begin_diff(9).unwrap();
+                assert!(history.accepts_diff(&diff));
+                history.select(&"s".repeat(40));
+                assert!(
+                    !history.accepts_diff(&diff),
+                    "another commit's changes must not land on this one"
+                );
+                let _ = cx;
+            });
+        });
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn closing_history_releases_what_it_loaded(cx: &mut gpui::TestAppContext) {
+        let (root, cx, _data) = history_window(cx);
+        assert!(cx.debug_bounds("close-tab-history").is_some());
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.close_history(cx);
+                assert!(!this.history_open && !this.history_active);
+                assert!(
+                    this.history.is_none(),
+                    "reopening must read afresh rather than show a stale graph"
+                );
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("history-commit-0").is_none());
+    }
+
+    /// The lane palette is addressed by index from the layout, so every index
+    /// the layout can produce has to resolve to a colour in both appearances.
+    #[test]
+    fn every_lane_index_resolves_to_a_colour_in_both_appearances() {
+        for index in 0..cibergit::history::GRAPH_LANE_COLORS * 3 {
+            for dark in [true, false] {
+                let color = super::lane_color(index, dark);
+                assert_eq!(color.a, 1., "lane {index} must be fully opaque");
+            }
+        }
+        assert_eq!(
+            super::lane_color(0, false),
+            super::lane_color(cibergit::history::GRAPH_LANE_COLORS, false),
+            "the palette cycles rather than running off its end"
+        );
+    }
+
+    #[test]
+    fn a_git_timestamp_shows_its_own_calendar_day() {
+        assert_eq!(
+            super::history_day("2026-09-14T16:59:12-03:00"),
+            "2026-09-14"
+        );
+        // Anything that is not a Git ISO-8601 stamp is shown as it came,
+        // rather than cut to ten characters of something else.
+        assert_eq!(super::history_day("unknown"), "unknown");
+        assert_eq!(super::history_day(""), "");
     }
 }

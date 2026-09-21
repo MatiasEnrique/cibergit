@@ -4,8 +4,9 @@
 compile_error!("cibergit V1 supports macOS on Apple Silicon only");
 
 mod app;
+mod glass;
 
-use app::{LaunchMode, Startup};
+use app::Startup;
 use gpui::{
     AppContext as _, Bounds, KeyBinding, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
     WindowOptions, actions, px, size,
@@ -33,6 +34,8 @@ actions!(
         ToggleInspector,
         CycleDiffMode,
         OpenRepositorySetup,
+        OpenSettings,
+        OpenHistory,
         ComposeInlineComment,
         SaveReviewDraft,
         AddPendingComment,
@@ -121,13 +124,10 @@ fn parse_startup() -> Result<Startup, String> {
             "--data-dir" => {
                 startup.data_dir = Some(PathBuf::from(next_value(&mut args, "--data-dir")?))
             }
-            "--edit" => {
-                startup.mode = LaunchMode::Edit(PathBuf::from(next_value(&mut args, "--edit")?))
-            }
             "--help" | "-h" => {
                 println!(
                     "cibergit [--repo OWNER/NAME|URL|FOLDER --account LOGIN --pr NUMBER] \
-                     [--data-dir PATH] [--edit PATH]\n\n\
+                     [--data-dir PATH]\n\n\
                      CIBERGIT_DATA_DIR also overrides the personal workspace directory."
                 );
                 std::process::exit(0);
@@ -143,6 +143,7 @@ fn parse_startup() -> Result<Startup, String> {
         && (std::env::var_os("CIBERGIT_SMOKE_ACTIONS_JOBS_LOGS").is_some()
             || std::env::var_os("CIBERGIT_SMOKE_SIDEBAR").is_some()
             || std::env::var_os("CIBERGIT_SMOKE_PR_LAYOUT").is_some()
+            || std::env::var_os("CIBERGIT_SMOKE_HISTORY").is_some()
             || std::env::var_os("CIBERGIT_SMOKE_STACK_TIPS").is_some())
     {
         startup.provider_reads_disabled = true;
@@ -163,9 +164,15 @@ fn load_interface_fonts(cx: &gpui::App) {
         Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf").as_slice()),
         Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Medium.ttf").as_slice()),
         Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Bold.ttf").as_slice()),
+        // The reading face. Cut from the upstream variable font by
+        // scripts/build-text-font.py; see assets/fonts/manifest.json.
+        Cow::Borrowed(include_bytes!("../assets/fonts/DMSans-Regular.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/DMSans-Medium.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/DMSans-Bold.ttf").as_slice()),
     ];
     if let Err(error) = cx.text_system().add_fonts(fonts) {
-        eprintln!("Cannot load bundled IBM Plex Sans: {error:#}");
+        eprintln!("Cannot load bundled interface fonts: {error:#}");
     }
 }
 
@@ -197,6 +204,8 @@ fn main() {
             KeyBinding::new("cmd-shift-i", ToggleInspector, None),
             KeyBinding::new("cmd-shift-d", CycleDiffMode, None),
             KeyBinding::new("cmd-o", OpenRepositorySetup, None),
+            KeyBinding::new("cmd-,", OpenSettings, None),
+            KeyBinding::new("cmd-shift-h", OpenHistory, None),
             KeyBinding::new("cmd-shift-n", OpenPullRequestCreation, None),
             KeyBinding::new("cmd-enter", PreparePullRequestCreation, Some("PrCreation")),
             KeyBinding::new(
@@ -269,18 +278,13 @@ fn main() {
                     cx,
                 ))),
                 window_min_size: Some(size(px(1040.), px(620.))),
-                window_background: WindowBackgroundAppearance::Blurred,
+                // The sidebar carries its own AppKit material (src/glass.rs), so
+                // the window only has to stop painting behind it.
+                window_background: WindowBackgroundAppearance::Transparent,
                 ..Default::default()
             },
             move |window, cx| {
-                let root = match &startup.mode {
-                    LaunchMode::Review => {
-                        cx.new(|cx| app::Root::review(window, cx, startup.clone()))
-                    }
-                    LaunchMode::Edit(path) => {
-                        cx.new(|cx| app::Root::editor(window, cx, path.clone()))
-                    }
-                };
+                let root = cx.new(|cx| app::Root::review(window, cx, startup.clone()));
                 *root_for_window.borrow_mut() = Some(root.downgrade());
                 root
             },

@@ -8,7 +8,6 @@
 mod local_workspace;
 
 use cibergit::{
-    document::DocumentStatus,
     domain::{Account, PullRequestCheckoutSource, Repository, Revision},
     local_git::{GitPath, HeadState, LocalGit, OperationState},
     rebase::{OperationState as RebaseState, PlanAction},
@@ -17,12 +16,12 @@ use cibergit::{
     },
 };
 use gpui::{
-    AppContext as _, Bounds, Focusable, KeyBinding, TitlebarOptions, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, px, size,
+    AppContext as _, Bounds, KeyBinding, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
+    WindowOptions, px, size,
 };
 use local_workspace::{
-    LocalAction, LocalFind, LocalRefresh, LocalReplace, LocalSave, LocalWorkspace,
-    LocalWorkspaceAppearance, LocalWorkspaceContext, PrPublishContext,
+    LocalAction, LocalRefresh, LocalWorkspace, LocalWorkspaceAppearance, LocalWorkspaceContext,
+    PrPublishContext,
 };
 use std::{
     borrow::Cow,
@@ -117,7 +116,7 @@ fn fixture(
     fs::create_dir_all(&data).expect("explicit data directory");
     fs::write(
         checkout.join("src/lib.rs"),
-        "// unchanged file visible in quick-open\n\npub struct LocalDemo {\n    pub ready: bool,\n}\n",
+        "// unchanged tracked file\n\npub struct LocalDemo {\n    pub ready: bool,\n}\n",
     )
     .expect("fixture source");
     fs::write(checkout.join("README.md"), "# Local workspace demo\n").expect("fixture readme");
@@ -144,7 +143,7 @@ fn fixture(
     run_git(&checkout, &["commit", "-m", "second replay"]);
     fs::write(
         checkout.join("src/lib.rs"),
-        "// unchanged file visible in quick-open\n\npub struct LocalDemo {\n    pub ready: bool,\n    pub lifecycle: bool,\n}\n",
+        "// unchanged tracked file\n\npub struct LocalDemo {\n    pub ready: bool,\n    pub lifecycle: bool,\n}\n",
     )
     .expect("tail source");
     run_git(&checkout, &["add", "."]);
@@ -244,6 +243,12 @@ fn load_fonts(cx: &gpui::App) {
         Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf").as_slice()),
         Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Medium.ttf").as_slice()),
         Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Bold.ttf").as_slice()),
+        // The reading face. Cut from the upstream variable font by
+        // scripts/build-text-font.py; see assets/fonts/manifest.json.
+        Cow::Borrowed(include_bytes!("../assets/fonts/DMSans-Regular.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/DMSans-Medium.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/DMSans-Bold.ttf").as_slice()),
     ];
     cx.text_system().add_fonts(fonts).expect("load UI fonts");
 }
@@ -271,12 +276,11 @@ fn main() {
     gpui_platform::application().run(move |cx| {
         gpui_base::init(cx);
         load_fonts(cx);
-        cx.bind_keys([
-            KeyBinding::new("cmd-s", LocalSave, Some("LocalWorkspace")),
-            KeyBinding::new("cmd-r", LocalRefresh, Some("LocalWorkspace")),
-            KeyBinding::new("cmd-f", LocalFind, Some("LocalWorkspace")),
-            KeyBinding::new("cmd-alt-f", LocalReplace, Some("LocalWorkspace")),
-        ]);
+        cx.bind_keys([KeyBinding::new(
+            "cmd-r",
+            LocalRefresh,
+            Some("LocalWorkspace"),
+        )]);
         let dark = std::env::var("CIBERGIT_LOCAL_WORKSPACE_APPEARANCE")
             .map(|value| value != "light")
             .unwrap_or(true);
@@ -793,16 +797,15 @@ fn start_smoke(
                 window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-conflict-dark-narrow.png" } else { "rebase-conflict-light-narrow.png" })).map_err(Into::into)).is_ok()
             }).unwrap_or(false);
 
-            let conflict_opened = window.update(|window, cx| workspace.update(cx, |workspace, cx| {
-                workspace.open_rebase_conflict_sources(0, window, cx);
+            let conflict_opened = window.update(|_, cx| workspace.update(cx, |workspace, cx| {
+                workspace.open_rebase_conflict_sources(0, cx);
                 true
             }).unwrap_or(false)).unwrap_or(false);
             let conflict_open_at = std::time::Instant::now();
             let conflict_sources_ready = loop {
                 window.background_executor().timer(std::time::Duration::from_millis(50)).await;
                 let ready = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
-                    workspace.active_path() == Some(Path::new("workflow.txt"))
-                        && workspace.rebase_conflict_source_proof().is_some()
+                    workspace.rebase_conflict_source_proof().is_some()
                 }).unwrap_or(false)).unwrap_or(false);
                 if ready || conflict_open_at.elapsed() > std::time::Duration::from_secs(20) { break ready; }
             };
@@ -842,43 +845,20 @@ fn start_smoke(
                 window.render_to_image().and_then(|image| image.save(output.join(if dark { "rebase-conflict-sources-dark-narrow.png" } else { "rebase-conflict-sources-light-narrow.png" })).map_err(Into::into)).is_ok()
             }).unwrap_or(false);
 
-            let result_edit_undo_redo = window.update(|window, cx| workspace.update(cx, |workspace, cx| {
-                let Some(editor) = workspace.active_editor() else { return false; };
-                editor.update(cx, |editor, cx| {
-                    editor.focus(window, cx);
-                    editor.select_all(window, cx);
-                    editor.replace("resolved-result-token\nresult-long-line-END\n", window, cx);
-                });
-                let edited = editor.read(cx).value().to_string();
-                let focus = editor.read(cx).focus_handle(cx).clone();
-                focus.dispatch_action(&gpui_base::input::Undo, window, cx);
-                let undone = editor.read(cx).value().to_string();
-                focus.dispatch_action(&gpui_base::input::Redo, window, cx);
-                let redone = editor.read(cx).value().to_string();
-                edited.contains("resolved-result-token") && undone != edited && redone == edited
-            }).unwrap_or(false)).unwrap_or(false);
-            let result_persist_at = std::time::Instant::now();
-            let result_persisted_dirty = loop {
-                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
-                let dirty = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
-                    workspace.active_document_status() == Some(DocumentStatus::Dirty)
-                }).unwrap_or(false)).unwrap_or(false);
-                if dirty || result_persist_at.elapsed() > std::time::Duration::from_secs(20) { break dirty; }
-            };
-            let _ = window.update(|_, cx| { let _ = workspace.update(cx, |workspace, cx| workspace.save_active(cx)); });
-            let result_save_at = std::time::Instant::now();
-            let result_saved = loop {
-                window.background_executor().timer(std::time::Duration::from_millis(50)).await;
-                let clean = window.update(|_, cx| workspace.read_with(cx, |workspace, _| {
-                    workspace.active_document_status() == Some(DocumentStatus::Clean)
-                }).unwrap_or(false)).unwrap_or(false);
-                if clean || result_save_at.elapsed() > std::time::Duration::from_secs(20) { break clean; }
-            };
+            // The conflicted result is resolved outside cibergit: the app shows
+            // the immutable stages and stages the result, but never writes it.
+            window.background_executor().spawn({
+                let path = checkout.join("workflow.txt");
+                async move {
+                    fs::write(path, "resolved-result-token\nresult-long-line-END\n")
+                        .expect("external conflict resolution")
+                }
+            }).await;
             let result_readback = window.background_executor().spawn({
                 let path = checkout.join("workflow.txt");
                 async move { fs::read_to_string(path).unwrap_or_default() }
             }).await;
-            let result_save_readback = result_readback == "resolved-result-token\nresult-long-line-END\n";
+            let result_external_resolution = result_readback == "resolved-result-token\nresult-long-line-END\n";
             let _ = window.update(|_, cx| { let _ = workspace.update(cx, |workspace, cx| workspace.refresh_all(cx)); });
             let saved_context_at = std::time::Instant::now();
             loop {
@@ -954,94 +934,22 @@ fn start_smoke(
             }
             let _ = window.update(|_, cx| { let _ = workspace.update(cx, |workspace, cx| workspace.toggle_rebase(cx)); });
             let _ = window.update(|window, _| window.resize(size(px(1440.), px(900.))));
-            let opened = window
-                .update(|window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.open_relative_path("src/lib.rs", window, cx);
-                        })
-                        .is_ok()
-                })
-                .unwrap_or(false);
-            let opened_at = std::time::Instant::now();
-            loop {
-                window
-                    .background_executor()
-                    .timer(std::time::Duration::from_millis(100))
-                    .await;
-                let has_editor = window
-                    .update(|_, cx| {
-                        workspace
-                            .read_with(cx, |workspace, _| workspace.active_editor().is_some())
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if has_editor || opened_at.elapsed() > std::time::Duration::from_secs(20) {
-                    break;
-                }
-            }
-            let edited = window
-                .update(|window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            let Some(editor) = workspace.active_editor() else {
-                                return false;
-                            };
-                            editor.update(cx, |editor, cx| {
-                                editor.focus(window, cx);
-                                editor.insert("// highlighted local edit\n", window, cx);
-                                editor.open_search(true, cx);
-                                editor.set_search_query("ready", true, cx);
-                                assert_eq!(
-                                    editor.replace_all_search_matches("verified", window, cx),
-                                    1
-                                );
-                            });
-                            true
-                        })
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            for action in [
-                &gpui_base::input::Undo as &dyn gpui::Action,
-                &gpui_base::input::Redo as &dyn gpui::Action,
-            ] {
-                let _ = window.update(|window, cx| {
-                    let focus = workspace
-                        .read_with(cx, |workspace, cx| {
-                            workspace
-                                .active_editor()
-                                .map(|editor| editor.read(cx).focus_handle(cx).clone())
-                        })
-                        .ok()
-                        .flatten();
-                    if let Some(focus) = focus {
-                        focus.dispatch_action(action, window, cx);
+            // An external tool edits a tracked file; cibergit only observes it.
+            window
+                .background_executor()
+                .spawn({
+                    let checkout = checkout.clone();
+                    async move {
+                        let path = checkout.join("src/lib.rs");
+                        let mut text = fs::read_to_string(&path).expect("read smoke source");
+                        text.insert_str(0, "// highlighted local edit\n");
+                        let text = text.replace("ready", "verified");
+                        fs::write(&path, text).expect("external smoke edit");
+                        run_git(&checkout, &["add", "--", "src/lib.rs"]);
+                        run_git(&checkout, &["commit", "-m", "record external smoke fixture"]);
                     }
-                });
-            }
-            let _ = window.update(|_, cx| {
-                let _ = workspace.update(cx, |workspace, cx| workspace.save_active(cx));
-            });
-            let save_started = std::time::Instant::now();
-            loop {
-                window
-                    .background_executor()
-                    .timer(std::time::Duration::from_millis(100))
-                    .await;
-                let clean = window
-                    .update(|_, cx| {
-                        workspace
-                            .read_with(cx, |workspace, _| {
-                                workspace.active_document_status() == Some(DocumentStatus::Clean)
-                            })
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if clean || save_started.elapsed() > std::time::Duration::from_secs(20) {
-                    break;
-                }
-            }
+                })
+                .await;
             let readback = window
                 .background_executor()
                 .spawn({
@@ -1049,18 +957,12 @@ fn start_smoke(
                     async move { fs::read_to_string(path).unwrap_or_default() }
                 })
                 .await;
+            let _ = window.update(|_, cx| {
+                let _ = workspace.update(cx, |workspace, cx| workspace.refresh_all(cx));
+            });
             window
                 .background_executor()
-                .spawn({
-                    let checkout = checkout.clone();
-                    async move {
-                        run_git(&checkout, &["add", "--", "src/lib.rs"]);
-                        run_git(
-                            &checkout,
-                            &["commit", "-m", "record editor smoke fixture"],
-                        );
-                    }
-                })
+                .timer(std::time::Duration::from_millis(250))
                 .await;
             let highlighted_capture = window
                 .update(|window, _| {
@@ -1419,125 +1321,6 @@ fn start_smoke(
                 let _ = window.update(|_, cx| cx.quit());
                 return;
             }
-            let save_in_flight_confirmation_paused = window
-                .update(|window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            let Some(request_id) = workspace.request_action(
-                                LocalAction::SwitchBranch {
-                                    branch: "feature/local-ui".into(),
-                                },
-                                cx,
-                            ) else {
-                                return false;
-                            };
-                            let Some(editor) = workspace.active_editor() else {
-                                return false;
-                            };
-                            editor.update(cx, |editor, cx| {
-                                editor.insert("// save-in-flight guard\n", window, cx)
-                            });
-                            workspace.save_active(cx);
-                            workspace.confirm_action(request_id, cx);
-                            let paused = workspace.in_flight_action_id().is_none()
-                                && workspace
-                                    .status_message()
-                                    .contains("Confirmation paused");
-                            workspace.cancel_action(request_id, cx);
-                            paused && workspace.status_message().contains("cancelled")
-                        })
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            let save_guard_at = std::time::Instant::now();
-            loop {
-                window
-                    .background_executor()
-                    .timer(std::time::Duration::from_millis(50))
-                    .await;
-                let clean = window
-                    .update(|_, cx| {
-                        workspace
-                            .read_with(cx, |workspace, _| {
-                                workspace.active_document_status() == Some(DocumentStatus::Clean)
-                            })
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if clean || save_guard_at.elapsed() > std::time::Duration::from_secs(20) {
-                    break;
-                }
-            }
-            let checkout_action_edit_race_paused = window
-                .update(|window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            let request = workspace.request_action(
-                                LocalAction::SwitchBranch {
-                                    branch: "feature".into(),
-                                },
-                                cx,
-                            );
-                            let Some(editor) = workspace.active_editor() else {
-                                return false;
-                            };
-                            editor.update(cx, |editor, cx| {
-                                editor.insert("// unsaved ours\n", window, cx)
-                            });
-                            let Some(request_id) = request else {
-                                return false;
-                            };
-                            workspace.confirm_action(request_id, cx);
-                            let paused_and_retained = workspace.in_flight_action_id().is_none()
-                                && workspace
-                                    .status_message()
-                                    .contains("Confirmation paused");
-                            workspace.cancel_action(request_id, cx);
-                            paused_and_retained
-                                && workspace.status_message().contains("cancelled")
-                        })
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            window
-                .background_executor()
-                .spawn({
-                    let path = checkout.join("src/lib.rs");
-                    async move {
-                        let mut disk = fs::read_to_string(&path).expect("smoke disk read");
-                        disk.push_str("// external disk edit\n");
-                        fs::write(path, disk).expect("smoke external edit");
-                    }
-                })
-                .await;
-            let document_conflict_requested = window
-                .update(|_, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.refresh_all(cx);
-                        })
-                        .is_ok()
-                })
-                .unwrap_or(false);
-            let conflict_at = std::time::Instant::now();
-            loop {
-                window
-                    .background_executor()
-                    .timer(std::time::Duration::from_millis(100))
-                    .await;
-                let conflict = window
-                    .update(|_, cx| {
-                        workspace
-                            .read_with(cx, |workspace, _| {
-                                workspace.active_document_status() == Some(DocumentStatus::Conflict)
-                            })
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if conflict || conflict_at.elapsed() > std::time::Duration::from_secs(20) {
-                    break;
-                }
-            }
             window.background_executor().spawn({
                 let readme = checkout.join("README.md");
                 async move {
@@ -1672,7 +1455,7 @@ fn start_smoke(
                 }
             };
             let report = format!(
-                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nPR source prepare requested: {}\nfresh fake-provider target prepared: {}\npublish target wide capture: {}\nimmutable publish confirmation requested: {:?}\npublish confirmation wide capture: {}\npublish confirmation narrow capture: {}\nnon-force publish dispatched: {}\nnon-force publish completed: {}\nlocal-bare exact target readback: {}\nrebase prepare requested: {}\npopulated three-commit plan ready: {}\nplan normal capture: {}\npending plan/message inputs disabled: {}\npending Drop handler preserved exact frozen Edit: {}\nfrozen plan/confirmation capture: {}\nCancel restored editing and explicit edit/reprepare: {}\nedit plan Start requested through confirmation: {}\nPausedForEdit observed: {}\nedit wide capture: {}\nexpanded operation details capture: {}\nexplicit Continue requested through confirmation: {}\nCompleted observed: {}\nresult normal capture: {}\nsafe archive requested and second prepare enabled: {}\nreordered single-conflict plan prepared: {}\nconflicting Start requested through confirmation: {}\nConflicted observed from real Git with one exact path: {}\nconflict list narrow capture: {}\nsource/result presentation opened: {}\nDocumentStore result and immutable source proof ready: {}\nlabels, distinct source content, and exact OIDs pinned: {}\nthree source panes wide capture: {}\nexplicit source-selection narrow capture: {}\nactual result edit plus undo/redo: {}\nresult recovery persist reached Dirty before save: {}\nexplicit result save completed: {}\nsaved result exact readback: {}\nsaved result identity explicitly refreshed without replacing buffer: {}\nexact stage command requested through confirmation: {}\nGit proved the presented conflict resolved: {}\nresolved/stale-evidence capture: {}\nexplicit Continue after resolution requested: {}\nconflict rebase completed: {}\ncompleted checkout retained exact result: {}\nunchanged-file open: {}\nsyntax edit/find-replace/undo-redo/save dispatched: {}\nsave readback contains highlighted edit: {}\nhighlighted editor capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nCreateBranch request outcome: {:?}\nCreateBranch dispatched while no-op refresh pending: {}\nCreateBranch completed authoritatively: {}\nCreateBranch terminal status/error: {}\nSwitchBranch request outcome: {:?}\nSwitchBranch dispatched: {}\nSwitchBranch completed authoritatively: {}\nSwitchBranch terminal status/error: {}\nsame-current SwitchBranch request outcome: {:?}\nsame-current SwitchBranch dispatched: {}\nsame-current SwitchBranch completed authoritatively: {}\nsame-current SwitchBranch terminal status/error: {}\nsave-in-flight checkout confirmation paused and retained until cancel: {}\nimmediate edit/persist versus checkout confirmation paused and retained until cancel: {}\nexternal dirty conflict requested: {}\nconflict visible: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
+                "Local workspace native smoke\nappearance: {}\nfocus option: false; cx.activate: not called\nPR source prepare requested: {}\nfresh fake-provider target prepared: {}\npublish target wide capture: {}\nimmutable publish confirmation requested: {:?}\npublish confirmation wide capture: {}\npublish confirmation narrow capture: {}\nnon-force publish dispatched: {}\nnon-force publish completed: {}\nlocal-bare exact target readback: {}\nrebase prepare requested: {}\npopulated three-commit plan ready: {}\nplan normal capture: {}\npending plan/message inputs disabled: {}\npending Drop handler preserved exact frozen Edit: {}\nfrozen plan/confirmation capture: {}\nCancel restored editing and explicit edit/reprepare: {}\nedit plan Start requested through confirmation: {}\nPausedForEdit observed: {}\nedit wide capture: {}\nexpanded operation details capture: {}\nexplicit Continue requested through confirmation: {}\nCompleted observed: {}\nresult normal capture: {}\nsafe archive requested and second prepare enabled: {}\nreordered single-conflict plan prepared: {}\nconflicting Start requested through confirmation: {}\nConflicted observed from real Git with one exact path: {}\nconflict list narrow capture: {}\nconflict source presentation opened: {}\nimmutable source proof ready: {}\nlabels, distinct source content, and exact OIDs pinned: {}\nthree source panes wide capture: {}\nexplicit source-selection narrow capture: {}\nconflicted result resolved in an external editor with exact readback: {}\nsaved result identity explicitly refreshed without replacing buffer: {}\nexact stage command requested through confirmation: {}\nGit proved the presented conflict resolved: {}\nresolved/stale-evidence capture: {}\nexplicit Continue after resolution requested: {}\nconflict rebase completed: {}\ncompleted checkout retained exact result: {}\nexternal edit observed in readback: {}\nexternal-edit capture: {}\nempty-message prestart refused with zero in-flight Git: {}\nCreateBranch request outcome: {:?}\nCreateBranch dispatched while no-op refresh pending: {}\nCreateBranch completed authoritatively: {}\nCreateBranch terminal status/error: {}\nSwitchBranch request outcome: {:?}\nSwitchBranch dispatched: {}\nSwitchBranch completed authoritatively: {}\nSwitchBranch terminal status/error: {}\nsame-current SwitchBranch request outcome: {:?}\nsame-current SwitchBranch dispatched: {}\nsame-current SwitchBranch completed authoritatively: {}\nsame-current SwitchBranch terminal status/error: {}\nmaterial action confirmation visible: {}\nin-flight acknowledgement and second action refused: {}\nconfirmed temporary-repository stage completed and refreshed: {}\nLocal Changes refreshed independently; ReviewSession imported/mutated: false\nconflict/confirmation scene capture: {}\nphysical input and desktop acrylic: not established by own-scene capture\n",
                 if dark { "dark" } else { "light" },
                 publish_prepare_requested,
                 publish_prepared,
@@ -1707,10 +1490,7 @@ fn start_smoke(
                 source_identity_proof,
                 conflict_sources_wide_capture,
                 conflict_sources_narrow_capture,
-                result_edit_undo_redo,
-                result_persisted_dirty,
-                result_saved,
-                result_save_readback,
+                result_external_resolution,
                 result_identity_refreshed,
                 stage_requested,
                 staged_and_proven_resolved,
@@ -1718,8 +1498,6 @@ fn start_smoke(
                 continue_after_resolution,
                 conflict_rebase_completed,
                 completed_result_persisted,
-                opened,
-                edited,
                 readback.contains("highlighted local edit") && readback.contains("verified"),
                 highlighted_capture,
                 invalid_prestart_refused,
@@ -1735,12 +1513,6 @@ fn start_smoke(
                 same_branch_dispatched,
                 same_branch_finished,
                 same_branch_status,
-                save_in_flight_confirmation_paused,
-                checkout_action_edit_race_paused,
-                checkout_action_edit_race_paused && document_conflict_requested,
-                window
-                    .update(|_, cx| workspace.read_with(cx, |workspace, _| workspace.active_document_status() == Some(DocumentStatus::Conflict)).unwrap_or(false))
-                    .unwrap_or(false),
                 confirmation.is_some(),
                 controller_running_gate,
                 action_finished,

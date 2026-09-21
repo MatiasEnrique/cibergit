@@ -1,6 +1,6 @@
 //! Shared provider-independent models. No credentials belong in these values.
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Account {
@@ -158,6 +158,19 @@ impl ReactionContent {
             Self::Hooray => "HOORAY",
             Self::Rocket => "ROCKET",
             Self::Eyes => "EYES",
+        }
+    }
+
+    pub fn emoji(self) -> &'static str {
+        match self {
+            Self::ThumbsUp => "👍",
+            Self::ThumbsDown => "👎",
+            Self::Laugh => "😄",
+            Self::Confused => "😕",
+            Self::Heart => "❤️",
+            Self::Hooray => "🎉",
+            Self::Rocket => "🚀",
+            Self::Eyes => "👀",
         }
     }
 
@@ -1390,6 +1403,14 @@ pub struct PullRequestDetails {
     #[serde(default)]
     pub reactions: Vec<ReactionSubjectSnapshot>,
     pub checks: Vec<PullRequestCheck>,
+    /// Avatar for each participant this snapshot observed, keyed by the login
+    /// its activity entries carry. The URL is kept as the provider returned it
+    /// rather than built from the login, because GitHub spells a bot two ways
+    /// — `coderabbitai` in GraphQL, `coderabbitai[bot]` in REST — and neither
+    /// spelling addresses the picture. Absent for every cached record written
+    /// before avatars, which simply keeps the drawn puck.
+    #[serde(default)]
+    pub participant_avatars: BTreeMap<String, String>,
     /// False when any activity connection was partial or hit an explicit cap.
     pub activity_complete: bool,
     /// False when the status/check context connection was partial or capped.

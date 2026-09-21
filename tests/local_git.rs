@@ -1354,3 +1354,127 @@ fn explicit_commit_reference_resolution_pins_objects_without_moving_refs() {
     let tree = git(repo.path(), &["rev-parse", "HEAD^{tree}"]);
     assert!(backend.resolve_commit_reference(&tree).is_err());
 }
+
+#[test]
+fn worktrees_resolve_each_branch_to_exactly_one_path_and_report_detached_heads() {
+    let repo = init();
+    let root = repo.path().canonicalize().unwrap();
+    fs::write(root.join("file.txt"), "first\n").unwrap();
+    let first = commit_all(&root, "first");
+    let backend = LocalGit::open(&root).unwrap();
+
+    // Only the main worktree exists yet.
+    let only = backend.worktrees().unwrap();
+    assert_eq!(only.len(), 1);
+    assert_eq!(only[0].path, root);
+    assert_eq!(only[0].branch.as_deref(), Some("main"));
+    assert_eq!(only[0].head.as_deref(), Some(first.as_str()));
+    assert!(!only[0].detached && !only[0].bare);
+
+    // A linked worktree on its own branch, and a second detached at a commit.
+    let linked = repo.path().join("linked");
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/one",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let detached = repo.path().join("detached");
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            detached.to_str().unwrap(),
+            &first,
+        ],
+    );
+
+    let entries = backend.worktrees().unwrap();
+    assert_eq!(entries.len(), 3);
+
+    let feature = entries
+        .iter()
+        .find(|entry| entry.branch.as_deref() == Some("feature/one"))
+        .expect("linked worktree is resolvable by its branch");
+    assert_eq!(feature.path, linked.canonicalize().unwrap());
+    assert!(!feature.detached);
+
+    // Git refuses a second checkout of a branch by default...
+    let duplicate = repo.path().join("duplicate");
+    assert!(
+        !git_output(
+            &root,
+            &[
+                "worktree",
+                "add",
+                duplicate.to_str().unwrap(),
+                "feature/one"
+            ],
+        )
+        .status
+        .success(),
+        "Git refuses the same branch in a second worktree without --force"
+    );
+
+    let loose = entries
+        .iter()
+        .find(|entry| entry.path == detached.canonicalize().unwrap())
+        .expect("detached worktree is listed");
+    assert!(loose.detached);
+    assert_eq!(loose.branch, None, "a detached worktree carries no branch");
+    assert_eq!(loose.head.as_deref(), Some(first.as_str()));
+
+    // A branch the PR does not use must not resolve to anything.
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.branch.as_deref() == Some("absent/branch"))
+    );
+
+    // ...but --force overrides that, so a branch is NOT unique across
+    // worktrees. Callers must resolve more than one match explicitly rather
+    // than assume the first one is correct.
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-f",
+            duplicate.to_str().unwrap(),
+            "feature/one",
+        ],
+    );
+    let forced = backend.worktrees().unwrap();
+    assert_eq!(
+        forced
+            .iter()
+            .filter(|entry| entry.branch.as_deref() == Some("feature/one"))
+            .count(),
+        2,
+        "a forced duplicate checkout is reported as two entries on one branch"
+    );
+}
+
+#[test]
+fn on_branch_matches_exactly_and_never_matches_a_detached_worktree() {
+    let entry = |branch: Option<&str>| WorktreeEntry {
+        path: Path::new("/wt").to_owned(),
+        head: Some("a".repeat(40)),
+        branch: branch.map(str::to_owned),
+        detached: branch.is_none(),
+        bare: false,
+    };
+    assert!(entry(Some("bb/feature")).on_branch("bb/feature"));
+    assert!(!entry(Some("bb/feature")).on_branch("bb/feature-2"));
+    // Git refs are case-sensitive, so a near miss is still a miss.
+    assert!(!entry(Some("Main")).on_branch("main"));
+    // A detached or bare worktree carries no branch to match.
+    assert!(!entry(None).on_branch("main"));
+    assert!(!entry(None).on_branch(""));
+}

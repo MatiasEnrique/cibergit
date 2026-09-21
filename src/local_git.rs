@@ -234,6 +234,29 @@ pub enum HeadState {
     Detached { oid: String },
 }
 
+/// One record from `git worktree list`. `branch` is the short name; it is
+/// `None` for a detached or bare worktree, and for a branch name Git reports
+/// that is not UTF-8.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: PathBuf,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub detached: bool,
+    pub bare: bool,
+}
+
+impl WorktreeEntry {
+    /// Whether this worktree has `branch` checked out.
+    ///
+    /// A detached or bare worktree carries no branch and never matches, and the
+    /// comparison is exact: Git refs are case-sensitive, so `Feature` is not
+    /// `feature`.
+    pub fn on_branch(&self, branch: &str) -> bool {
+        self.branch.as_deref() == Some(branch)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RebaseState {
     Apply,
@@ -1169,6 +1192,22 @@ impl LocalGit {
         Ok(oid)
     }
 
+    /// Every worktree Git records for this repository, including the main one.
+    ///
+    /// Git refuses to check one branch out in two worktrees, so at most one
+    /// entry can carry any given branch name. Callers rely on that uniqueness
+    /// to resolve a branch to exactly one path.
+    pub fn worktrees(&self) -> Result<Vec<WorktreeEntry>> {
+        let output = self.run(
+            "list Git worktrees",
+            os_args(&["worktree", "list", "--porcelain", "-z"]),
+            None,
+            false,
+            &[0],
+        )?;
+        parse_worktree_records(&output)
+    }
+
     pub fn stage(&self, paths: &[GitPath], guard: &SnapshotGuard) -> Result<MutationReceipt> {
         let input = pathspec_input(paths, self.limits.max_input_bytes)?;
         self.guarded(guard, MutationAction::Stage, None, |_| {
@@ -2071,6 +2110,56 @@ fn parse_status(raw: &[u8]) -> Result<LocalSnapshot> {
             blocker: None,
         },
     })
+}
+
+/// `worktree list --porcelain -z` emits NUL-terminated attribute records and
+/// separates worktrees with an empty record. Paths keep their raw bytes; a
+/// branch name Git reports that is not UTF-8 is dropped to `None` rather than
+/// lossily rendered, because callers compare it against an exact branch name.
+fn parse_worktree_records(raw: &[u8]) -> Result<Vec<WorktreeEntry>> {
+    let mut entries = Vec::new();
+    let mut current: Option<WorktreeEntry> = None;
+    for record in raw.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        if let Some(path) = record.strip_prefix(b"worktree ") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some(WorktreeEntry {
+                path: PathBuf::from(OsStr::from_bytes(path)),
+                head: None,
+                branch: None,
+                detached: false,
+                bare: false,
+            });
+            continue;
+        }
+        let Some(entry) = current.as_mut() else {
+            return Err(LocalGitError::MalformedOutput(
+                "worktree attribute before its worktree record",
+            ));
+        };
+        if let Some(oid) = record.strip_prefix(b"HEAD ") {
+            let oid = text(oid, "non-UTF-8 worktree object ID")?;
+            validate_oid(oid)?;
+            entry.head = Some(oid.to_owned());
+        } else if let Some(refname) = record.strip_prefix(b"branch ") {
+            entry.branch = refname
+                .strip_prefix(b"refs/heads/")
+                .and_then(|branch| std::str::from_utf8(branch).ok())
+                .map(str::to_owned);
+        } else if record == b"detached" {
+            entry.detached = true;
+        } else if record == b"bare" {
+            entry.bare = true;
+        }
+    }
+    if let Some(entry) = current.take() {
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 fn parse_local_branch_oids(raw: &[u8]) -> Result<BTreeMap<String, String>> {

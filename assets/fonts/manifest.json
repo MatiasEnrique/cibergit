@@ -21,10 +21,52 @@
       "sha256": "a20caf8286023a6a7a85e40b1d2a4ae9fc3e3b1f9eda8f4c542dd4986af67bb1"
     },
     {
+      "path": "IBMPlexSans-Bold.ttf",
+      "source": "https://raw.githubusercontent.com/IBM/plex/bf260093582f04622aacc1e9f9ca604d7ccd0c42/packages/plex-sans/fonts/complete/ttf/IBMPlexSans-Bold.ttf",
+      "size": 200872,
+      "sha256": "9e6c74a889a700d707613d24548fe4ffa6bc59559a0689d2cf9e133bdcdafb2f"
+    },
+    {
       "path": "IBM-Plex-LICENSE.txt",
       "source": "https://raw.githubusercontent.com/IBM/plex/bf260093582f04622aacc1e9f9ca604d7ccd0c42/LICENSE.txt",
       "size": 4456,
       "sha256": "7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da"
     }
-  ]
+  ],
+  "derived": {
+    "note": "DM Sans is published upstream only as a variable font; the static text faces below are cut from it by scripts/build-text-font.py. Rerun that script to reproduce them.",
+    "repository": "https://github.com/google/fonts",
+    "revision": "db50662ac42c361aa77afeef89ae2e6e2298e2ab",
+    "source": "https://raw.githubusercontent.com/google/fonts/db50662ac42c361aa77afeef89ae2e6e2298e2ab/ofl/dmsans/DMSans%5Bopsz,wght%5D.ttf",
+    "source_sha256": "8cd08d97e89c24d0aa92edd2f0f4c8ee6195eee9b7c9f154865a58b02f0c1c0d",
+    "instance": {
+      "opsz": 12
+    },
+    "files": [
+      {
+        "path": "DMSans-Regular.ttf",
+        "wght": 400,
+        "size": 56716,
+        "sha256": "c4e349f3a4fbedaccfb36cbd8ac47f1ddfb4da6d15486ee4ccf29e15257d81eb"
+      },
+      {
+        "path": "DMSans-Medium.ttf",
+        "wght": 500,
+        "size": 56748,
+        "sha256": "f95392378b2f2a22845976f8dd465c1870c025ffbe8c580e7b9b51013ffe8dab"
+      },
+      {
+        "path": "DMSans-Bold.ttf",
+        "wght": 700,
+        "size": 56748,
+        "sha256": "480f616180e26f78eb58595595ce5cdf09bd65d351607d8cf6648f50c3889d65"
+      },
+      {
+        "path": "DM-Sans-LICENSE.txt",
+        "source": "https://raw.githubusercontent.com/google/fonts/db50662ac42c361aa77afeef89ae2e6e2298e2ab/ofl/dmsans/OFL.txt",
+        "size": 4482,
+        "sha256": "9af36190332437f5ecd09974de43c1f7c77a310a996cdd8ceb25628b458840e1"
+      }
+    ]
+  }
 }

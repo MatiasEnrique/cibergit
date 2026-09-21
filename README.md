@@ -12,6 +12,8 @@ The review workspace has full-width Conversation, Commits, Checks, and Files cha
 
 This implementation also includes explicit selection among stack tips and confirmed Actions run controls for re-running all jobs, re-running failed jobs, or cancelling a run. See [stack navigation](docs/stack-ui.md), [Actions jobs and logs](docs/actions-jobs-logs.md), and [run controls](docs/actions-run-controls.md) for their behavior and limits.
 
+A read-only History page shows the repository's own commit graph over every branch, with the selected commit's full diff beside it. See [commit history](docs/commit-history.md) for its scope chips, bounds, and what a repository with no local clone cannot show.
+
 Full V1 remains unfinished. Stack-wide review and merge operations, automatic descendant rewriting, broader GitHub Actions management, and signed/notarized distribution are not complete.
 
 ## Documentation

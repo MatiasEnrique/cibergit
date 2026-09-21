@@ -1,7 +1,7 @@
 //! LocalWorkspace-owned interactive-rebase controller and native panel.
 //!
 //! The controller never invents Git state. Every mutation is confirmed against
-//! an immutable backend snapshot plus the exact state of every open document.
+//! an immutable backend snapshot.
 
 use super::conflict_view::{
     ConflictContextState, ConflictPresentation, ConflictSource, WIDE_CONFLICT_PANE_MIN,
@@ -9,26 +9,11 @@ use super::conflict_view::{
 };
 use super::*;
 use cibergit::rebase::{
-    ActiveOperationIdentity, BlobContent, ConflictFile, DirtyPreparation,
-    OperationState as RebaseState, PlanAction, PlanStep, PrepareOutcome, RebasePlan,
-    RebasePreparation, SplitState, StashRestoreState,
+    ActiveOperationIdentity, ConflictFile, DirtyPreparation, OperationState as RebaseState,
+    PlanAction, PlanStep, PrepareOutcome, RebasePlan, RebasePreparation, SplitState,
+    StashRestoreState,
 };
 use cibergit::ui::{self, Density, TextRole};
-use std::{ffi::OsString, os::unix::ffi::OsStringExt};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DocumentFenceEntry {
-    path: PathBuf,
-    edit_generation: u64,
-    editor_value: String,
-    accepted_base: String,
-    status: DocumentStatus,
-    pending_checkout_operations: usize,
-    pending_programmatic_reload: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct DocumentFence(Vec<DocumentFenceEntry>);
 
 #[derive(Clone)]
 enum RebaseCommand {
@@ -148,7 +133,6 @@ struct PendingRebaseCommand {
     id: u64,
     command: RebaseCommand,
     editable_inputs: RebaseEditableInputIdentity,
-    documents: DocumentFence,
     checkout_generation: u64,
 }
 
@@ -401,13 +385,8 @@ impl LocalWorkspace {
         }
     }
 
-    pub fn open_rebase_conflict_sources(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_rebase_conflict(index, window, cx);
+    pub fn open_rebase_conflict_sources(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.open_rebase_conflict(index, cx);
     }
 
     pub fn request_stage_open_rebase_conflict(&mut self, cx: &mut Context<Self>) {
@@ -481,30 +460,7 @@ impl LocalWorkspace {
         }
     }
 
-    fn capture_document_fence(&self, cx: &App) -> DocumentFence {
-        DocumentFence(
-            self.documents
-                .values()
-                .map(|tab| DocumentFenceEntry {
-                    path: tab.path.clone(),
-                    edit_generation: tab.edit_generation,
-                    editor_value: tab.editor.read(cx).value().to_string(),
-                    accepted_base: tab.view.base.clone(),
-                    status: tab.view.status,
-                    pending_checkout_operations: tab.pending_checkout_operations,
-                    pending_programmatic_reload: tab.pending_programmatic_reload.is_some(),
-                })
-                .collect(),
-        )
-    }
-
-    fn rebase_document_blocker(&self, cx: &App) -> Option<String> {
-        self.checkout_action_blocker(cx).map(|reason| {
-            format!("Rebase paused: {reason}. Save and reconcile in-memory text first; Git stash cannot preserve editor buffers")
-        })
-    }
-
-    fn rebase_lane_blocker(&self, cx: &App) -> Option<String> {
+    fn rebase_lane_blocker(&self) -> Option<String> {
         if self.rebase.in_flight.is_some() {
             return Some("A rebase effect is already running".into());
         }
@@ -515,18 +471,10 @@ impl LocalWorkspace {
         {
             return Some("A local Git action or its durable reconciliation is pending".into());
         }
-        self.rebase_document_blocker(cx)
-    }
-
-    fn document_fence_matches(&self, expected: &DocumentFence, cx: &App) -> bool {
-        self.capture_document_fence(cx) == *expected
+        None
     }
 
     fn set_rebase_editors_disabled(&self, disabled: bool, cx: &mut Context<Self>) {
-        for tab in self.documents.values() {
-            tab.editor
-                .update(cx, |editor, cx| editor.set_disabled(disabled, cx));
-        }
         self.rebase
             .message
             .update(cx, |editor, cx| editor.set_disabled(disabled, cx));
@@ -571,7 +519,7 @@ impl LocalWorkspace {
     }
 
     pub fn prepare_rebase(&mut self, cx: &mut Context<Self>) {
-        if let Some(error) = self.rebase_lane_blocker(cx) {
+        if let Some(error) = self.rebase_lane_blocker() {
             self.report_error(error, cx);
             return;
         }
@@ -803,7 +751,7 @@ impl LocalWorkspace {
             return;
         }
         self.rebase.open = false;
-        self.status = "Rebase preparation is dirty. Use the existing staged Commit control, then reopen Rebase; unsaved editor text must be saved first.".into();
+        self.status = "Rebase preparation is dirty. Use the existing staged Commit control, then reopen Rebase.".into();
         cx.notify();
     }
 
@@ -832,7 +780,7 @@ impl LocalWorkspace {
             self.report_error("A rebase confirmation is already pending".into(), cx);
             return;
         }
-        if let Some(error) = self.rebase_lane_blocker(cx) {
+        if let Some(error) = self.rebase_lane_blocker() {
             self.report_error(error, cx);
             return;
         }
@@ -865,7 +813,6 @@ impl LocalWorkspace {
             id,
             command,
             editable_inputs,
-            documents: self.capture_document_fence(cx),
             checkout_generation: backend.checkout_generation,
         });
         self.set_rebase_editors_disabled(true, cx);
@@ -896,10 +843,6 @@ impl LocalWorkspace {
             );
             return;
         }
-        if !self.document_fence_matches(&pending.documents, cx) {
-            self.report_error("Rebase confirmation paused: editor text or document generation changed. The confirmation remains pending; save/reconcile and request again or cancel.".into(), cx);
-            return;
-        }
         let current_inputs = match self.capture_rebase_editable_inputs(&pending.command, cx) {
             Ok(identity) => identity,
             Err(reason) => {
@@ -911,7 +854,7 @@ impl LocalWorkspace {
             self.pause_rebase_confirmation("Rebase confirmation paused: the displayed plan, base, or message input drifted from the frozen request. Nothing was dispatched; the exact pending request was retained. Cancel, edit/reprepare, and request a new confirmation.".into(), cx);
             return;
         }
-        if let Some(error) = self.rebase_lane_blocker(cx) {
+        if let Some(error) = self.rebase_lane_blocker() {
             self.report_error(format!("Rebase confirmation paused: {error}"), cx);
             return;
         }
@@ -925,23 +868,17 @@ impl LocalWorkspace {
         }
         let store = backend.rebase.clone();
         let git = backend.git.clone();
-        let checkout_root = self.context.checkout.association.path.clone();
         let command = pending.command;
         self.rebase.pending = None;
         self.rebase.in_flight = Some(request_id);
-        // Invalidate preparation/observation replies and document opens that
-        // began against the pre-effect checkout before dispatching Git.
+        // Invalidate preparation/observation replies that began against the
+        // pre-effect checkout before dispatching Git.
         self.rebase.invalidate_reads();
-        self.open_generation = self.open_generation.wrapping_add(1);
         self.set_rebase_editors_disabled(true, cx);
         self.rebase.status = "Dispatching the exact confirmed local rebase transition…".into();
         let task = cx.background_spawn(async move {
             let effect = run_rebase_command(&store, command);
-            let refresh = (|| {
-                let snapshot = git.snapshot().map_err(|error| error.to_string())?;
-                let browser = enumerate_worktree(&checkout_root, BrowserLimits::default())?;
-                Ok::<_, String>((snapshot, browser))
-            })();
+            let refresh = git.snapshot().map_err(|error| error.to_string());
             (effect, refresh)
         });
         cx.spawn(async move |this, cx| {
@@ -956,20 +893,13 @@ impl LocalWorkspace {
                 this.rebase.in_flight = None;
                 this.set_rebase_editors_disabled(false, cx);
                 let refresh_error = match refresh {
-                    Ok((snapshot, browser)) => {
+                    Ok(snapshot) => {
                         this.git_generation = this.git_generation.wrapping_add(1);
                         this.snapshot = Some(snapshot);
-                        if let BackendState::Ready(backend) = &mut this.backend {
-                            backend.browser = browser;
-                        }
                         None
                     }
                     Err(error) => Some(error),
                 };
-                let paths = this.documents.keys().cloned().collect::<Vec<_>>();
-                for path in paths {
-                    this.refresh_document(&path, cx);
-                }
                 match effect {
                     Ok(effect) => {
                         if effect.retired {
@@ -1234,7 +1164,7 @@ impl LocalWorkspace {
         );
     }
 
-    fn open_rebase_conflict(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_rebase_conflict(&mut self, index: usize, cx: &mut Context<Self>) {
         if self.refuse_conflict_control(cx) {
             return;
         }
@@ -1252,16 +1182,11 @@ impl LocalWorkspace {
             return;
         };
         self.rebase.conflict_view = Some(presentation);
-        if !conflict_is_editor_candidate(&conflict) {
-            self.rebase.status = format!(
-                "Showing immutable sources for {}. Its result cannot be opened in the safe text editor; resolve it externally, refresh, then stage explicitly",
-                conflict.path.display
-            );
-            cx.notify();
-            return;
-        }
-        let path = PathBuf::from(OsString::from_vec(conflict.path.raw.clone()));
-        self.open_relative_path(path, window, cx);
+        self.rebase.status = format!(
+            "Showing immutable sources for {}. Resolve the result in your own editor, refresh, then stage explicitly",
+            conflict.path.display
+        );
+        cx.notify();
     }
 
     fn refuse_conflict_control(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1284,8 +1209,7 @@ impl LocalWorkspace {
         }
         self.rebase.conflict_view = None;
         self.rebase.status =
-            "Closed the source presentation; the result document and unsaved buffer were preserved"
-                .into();
+            "Closed the source presentation; the file on disk was not changed".into();
         cx.notify();
     }
 
@@ -1352,7 +1276,7 @@ impl LocalWorkspace {
             .as_mut()
             .is_some_and(|view| view.refresh_from(operation, conflict));
         self.rebase.status = if refreshed {
-            "Refreshed immutable source stages; the editable result buffer was not changed"
+            "Refreshed immutable source stages; the file on disk was not changed"
         } else {
             "The operation identity changed; this presentation cannot attach to the new operation"
         }
@@ -1389,33 +1313,6 @@ impl LocalWorkspace {
             return;
         };
         self.request_stage_rebase_conflict(index, cx);
-    }
-
-    fn save_presented_conflict(&mut self, cx: &mut Context<Self>) {
-        if self.refuse_conflict_control(cx) {
-            return;
-        }
-        let Some(view) = self.rebase.conflict_view.as_ref() else {
-            return;
-        };
-        let path = PathBuf::from(OsString::from_vec(view.path_raw().to_vec()));
-        if self.active_document.as_ref() != Some(&path) {
-            self.rebase.status =
-                "The presented result is not the active document; reopen it before saving".into();
-            cx.notify();
-            return;
-        }
-        if self.documents.get(&path).is_none_or(|tab| {
-            !matches!(
-                tab.view.status,
-                DocumentStatus::Clean | DocumentStatus::Dirty
-            )
-        }) {
-            self.rebase.status = "Save is blocked by the separate disk/base/buffer conflict; reconcile or reload it in Local Changes first".into();
-            cx.notify();
-            return;
-        }
-        self.save_active(cx);
     }
 
     fn request_stage_rebase_conflict(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1568,14 +1465,13 @@ impl LocalWorkspace {
         } else if let Some(operation) = operation {
             content = content.child(self.render_operation(operation, colors, cx));
         } else if let Some(preparation) = preparation {
-            content = content.child(render_preparation_summary(&preparation, colors));
+            content = content.child(render_preparation_summary(&preparation));
             match preparation {
                 PrepareOutcome::ExternalWorkflow(workflow) => {
                     content = content.child(notice_box(
                         "External workflow required",
                         workflow.explanation,
                         colors.red,
-                        colors,
                     ));
                 }
                 PrepareOutcome::Dirty(dirty) => {
@@ -1587,9 +1483,7 @@ impl LocalWorkspace {
                     ).child(notice_box(
                         "Dirty checkout",
                         format!("{} staged · {} unstaged · {} untracked · {} conflicts. Stash includes untracked; ignored files remain outside it. The exact retained stash receipt appears after creation.", dirty.staged, dirty.unstaged, dirty.untracked, dirty.conflicts),
-                        colors.amber,
-                        colors,
-                    ));
+                        colors.amber));
                 }
                 PrepareOutcome::Ready(_) => {
                     content = content
@@ -1598,7 +1492,7 @@ impl LocalWorkspace {
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .child(div().font_weight(FontWeight::MEDIUM).child("LINEAR PLAN"))
+                                .child(div().font_weight(ui::WEIGHT_EMPHASIS).child("LINEAR PLAN"))
                                 .child(
                                     div()
                                         .ui_text(TextRole::Caption)
@@ -1622,9 +1516,12 @@ impl LocalWorkspace {
             }
         } else {
             content = content
-                .child(div().font_weight(FontWeight::MEDIUM).child("CHOOSE A LOCAL BASE"))
+                .child(div().font_weight(ui::WEIGHT_EMPHASIS).child("CHOOSE A LOCAL BASE"))
                 .child(div().ui_text(TextRole::Caption).text_color(colors.muted).child("Candidates below are already resolved to immutable full commit OIDs. Manual input accepts HEAD, a full OID, or a fully-qualified refs/* name; ambiguous expressions are refused."))
-                .child(Input::new(&self.rebase.base));
+                .child(
+                    ui::text_field(colors.elevated, colors.border)
+                        .child(Input::new(&self.rebase.base)),
+                );
             if let Some(snapshot) = self.snapshot.clone() {
                 if let Some(oid) = snapshot.upstream_oid {
                     content = content.child(action_button(
@@ -1658,16 +1555,9 @@ impl LocalWorkspace {
                 notice_box(
                     "Explicit confirmation",
                     pending.command.summary(),
-                    colors.amber,
-                    colors,
-                )
+                    colors.amber)
                 .children(pending.editable_inputs.frozen_description().map(|description| {
                     div()
-                        .mt_2()
-                        .p_2()
-                        .rounded(px(ui::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(colors.amber)
                         .font_family(CODE_FONT)
                         .ui_text(TextRole::Caption)
                         .whitespace_normal()
@@ -1675,14 +1565,12 @@ impl LocalWorkspace {
                 }))
                 .child(
                     div()
-                        .mt_2()
                         .ui_text(TextRole::Caption)
                         .text_color(colors.muted)
                         .child("Plan, base, and message inputs are disabled until Cancel. Confirmation rechecks their exact frozen identity before dispatch."),
                 )
                 .child(
                     div()
-                        .mt_2()
                         .flex()
                         .gap(px(ui::GAP_GROUP))
                         .child(action_button(
@@ -1717,7 +1605,7 @@ impl LocalWorkspace {
                     .border_color(colors.border)
                     .child(
                         div()
-                            .child(div().font_weight(FontWeight::MEDIUM).child("REBASE"))
+                            .child(div().font_weight(ui::WEIGHT_EMPHASIS).child("REBASE"))
                             .child(
                                 div()
                                     .ui_text(TextRole::Caption)
@@ -1736,7 +1624,7 @@ impl LocalWorkspace {
                 div()
                     .min_h(px(36.))
                     .px(px(ui::PANEL_GUTTER))
-                    .py_2()
+                    .py(px(ui::GAP_GROUP))
                     .border_t_1()
                     .border_color(colors.border)
                     .ui_text(TextRole::Caption)
@@ -1828,11 +1716,6 @@ impl LocalWorkspace {
         let pane_width = (window.bounds().size.width.as_f32() - 300.).max(0.);
         let wide = pane_width >= WIDE_CONFLICT_PANE_MIN;
         let controls_frozen = self.rebase.has_pending_or_running();
-        let path = PathBuf::from(OsString::from_vec(view.path_raw().to_vec()));
-        let editor_candidate = conflict_is_editor_candidate(view.conflict());
-        let tab = self.documents.get(&path);
-        let tab_state = tab.map(|tab| (tab.editor.clone(), tab.view.status, tab.message.clone()));
-
         let mut selectors = div().flex().flex_wrap().gap(px(ui::GAP_GROUP));
         for source in ConflictSource::ALL {
             let label = view.source(source).0;
@@ -1881,7 +1764,7 @@ impl LocalWorkspace {
                             .min_w_0()
                             .child(
                                 div()
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .font_weight(ui::WEIGHT_EMPHASIS)
                                     .child("THREE-WAY CONFLICT"),
                             )
                             .child(
@@ -1914,9 +1797,7 @@ impl LocalWorkspace {
                 notice_box(
                     "Frozen source context",
                     explanation,
-                    colors.red,
-                    colors,
-                )
+                    colors.red)
             }))
             .child(
                 div()
@@ -1971,7 +1852,7 @@ impl LocalWorkspace {
                     .child(if wide {
                         "Immutable sources are side by side. Select with the mouse or ⌘← / ⌘→; each pane scrolls to the actual end of long lines."
                     } else {
-                        "Narrow layout shows one immutable source at a time. Select with the mouse or ⌘← / ⌘→; the editable result remains labelled below."
+                        "Narrow layout shows one immutable source at a time. Select with the mouse or ⌘← / ⌘→; the result panel remains labelled below."
                     }),
             )
             .child(sources);
@@ -1986,154 +1867,44 @@ impl LocalWorkspace {
             .border_color(colors.border)
             .child(
                 div()
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("EDITABLE RESULT"),
-                    )
+                    .child(div().font_weight(ui::WEIGHT_EMPHASIS).child("RESULT"))
                     .child(
                         div()
                             .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
-                            .child("Same Local Changes document · save is explicit"),
+                            .child("Resolved in your own editor · staging is explicit"),
                     ),
             );
-        if !editor_candidate {
-            body = body.child(
-                div()
-                    .rounded(px(ui::CONTROL_RADIUS))
-                    .border_1()
-                    .border_color(colors.red)
-                    .bg(colors.surface)
-                    .child(result_header)
-                    .child(
-                        div()
-                            .p_3()
-                            .text_color(colors.red)
-                            .child("This result cannot be represented safely by the accepted text editor. Use an external Git tool, then return and refresh. cibergit will not launch an application, create, remove, rename, or stage the path implicitly."),
-                    ),
-            );
-        } else if let Some((editor, status, message)) = tab_state {
-            let disk_conflict = matches!(
-                status,
-                DocumentStatus::Conflict
-                    | DocumentStatus::Missing
-                    | DocumentStatus::Unsafe
-                    | DocumentStatus::RecoveryCorrupt
-            );
-            let result_actions = div()
+        let result_actions =
+            div()
                 .flex()
                 .gap(px(ui::GAP_GROUP))
-                .child(
-                    action_button(
-                        "Save result ⌘S",
-                        colors,
-                        cx.listener(|this, _, _, cx| this.save_presented_conflict(cx)),
-                    )
-                    .when(controls_frozen || disk_conflict, |button| {
-                        button.opacity(0.52).cursor_default()
-                    }),
-                )
                 .when(view.can_stage(), |actions| {
                     actions.child(
                         action_button(
-                            "Stage saved result",
+                            "Stage resolved result",
                             colors,
                             cx.listener(|this, _, _, cx| this.request_stage_presented_conflict(cx)),
                         )
-                        .when(controls_frozen || disk_conflict, |button| {
+                        .when(controls_frozen, |button| {
                             button.opacity(0.52).cursor_default()
                         }),
                     )
                 });
-            let result_header = result_header.child(result_actions);
-            let mut result = div()
-                .h(px(300.))
-                .min_h(px(220.))
-                .flex()
-                .flex_col()
+        body = body.child(
+            div()
                 .rounded(px(ui::CONTROL_RADIUS))
                 .border_1()
-                .border_color(if disk_conflict {
-                    colors.red
-                } else {
-                    colors.border
-                })
+                .border_color(colors.border)
                 .bg(colors.surface)
-                .child(result_header);
-            if disk_conflict {
-                result = result.child(
+                .child(result_header.child(result_actions))
+                .child(
                     div()
-                        .flex_1()
-                        .p_3()
-                        .bg(if colors.dark {
-                            rgba(0xf851491a)
-                        } else {
-                            rgba(0xffebe9ff)
-                        })
-                        .text_color(colors.red)
-                        .child("This file also changed on disk. Reconcile that change in Local Changes before editing or staging the result. Your unsaved text is preserved.")
-                        .child(
-                            action_button(
-                                "Open disk reconciliation in Local Changes",
-                                colors,
-                                cx.listener(|this, _, _, cx| {
-                                    this.route_rebase_to_local_changes(
-                                        "Reconcile the external disk change without discarding the preserved result buffer, then reopen Rebase",
-                                        cx,
-                                    )
-                                }),
-                            )
-                            .when(controls_frozen, |button| {
-                                button.opacity(0.52).cursor_default()
-                            }),
-                        ),
-                );
-            } else {
-                result = result.child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .font_family(CODE_FONT)
-                        .child(Editor::new(&editor)),
-                );
-            }
-            body = body.child(
-                result.child(
-                    div()
-                        .min_h(px(30.))
-                        .px(px(ui::CONTROL_INSET))
-                        .py_1()
-                        .border_t_1()
-                        .border_color(colors.border)
-                        .ui_text(TextRole::Caption)
-                        .text_color(if status == DocumentStatus::Clean {
-                            colors.green
-                        } else if status == DocumentStatus::Dirty {
-                            colors.amber
-                        } else {
-                            colors.red
-                        })
-                        .child(format!("{message} · {status:?}")),
+                        .p(px(ui::GAP_COLUMNS))
+                        .text_color(colors.muted)
+                        .child("Resolve the conflicted file in your own editor, then refresh and stage it here. Local changes can open the checkout in an editor you pick; nothing is launched, created, removed, renamed, or staged implicitly."),
                 ),
-            );
-        } else {
-            body = body.child(
-                div()
-                    .h(px(220.))
-                    .rounded(px(ui::CONTROL_RADIUS))
-                    .border_1()
-                    .border_color(colors.border)
-                    .bg(colors.surface)
-                    .child(result_header)
-                    .child(
-                        div()
-                            .p_3()
-                            .text_color(colors.muted)
-                            .child("Opening the editable result…"),
-                    ),
-            );
-        }
+        );
         body.into_any_element()
     }
 
@@ -2170,7 +1941,7 @@ impl LocalWorkspace {
                     .justify_between()
                     .child(
                         div()
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(ui::WEIGHT_EMPHASIS)
                             .child(format!("{} · attempt {}", state, operation.attempt)),
                     )
                     .child(
@@ -2211,22 +1982,22 @@ impl LocalWorkspace {
         }
         if !self.rebase.conflicts.is_empty() {
             let conflict_controls_frozen = self.rebase.has_pending_or_running();
-            body = body.child(div().font_weight(FontWeight::MEDIUM).child("CONFLICTS"));
+            body = body.child(div().font_weight(ui::WEIGHT_EMPHASIS).child("CONFLICTS"));
             for (index, conflict) in self.rebase.conflicts.clone().into_iter().enumerate() {
                 let detail = conflict_reason(&conflict, self.rebase.show_operation_details);
-                body = body.child(div().p_2().border_1().border_color(colors.border).rounded(px(ui::CONTROL_RADIUS))
+                body = body.child(div().flex().flex_col().gap(px(ui::GAP_ICON))
                     .child(div().font_family(CODE_FONT).child(conflict.path.display.clone()))
-                    .child(div().mt_1().ui_text(TextRole::Caption).text_color(colors.muted).child(detail))
-                    .child(div().mt_1().ui_text(TextRole::Caption).child("Rebase orientation: ours = already rebased series; theirs = replayed original commit."))
-                    .child(div().mt_2().flex().gap(px(ui::GAP_GROUP))
-                        .child(action_button("Open sources and result", colors, cx.listener(move |this, _, window, cx| this.open_rebase_conflict(index, window, cx)))
+                    .child(div().ui_text(TextRole::Caption).text_color(colors.muted).child(detail))
+                    .child(div().ui_text(TextRole::Caption).child("Rebase orientation: ours = already rebased series; theirs = replayed original commit."))
+                    .child(div().flex().gap(px(ui::GAP_GROUP))
+                        .child(action_button("Open sources and result", colors, cx.listener(move |this, _, _, cx| this.open_rebase_conflict(index, cx)))
                             .when(conflict_controls_frozen, |button| button.opacity(0.52).cursor_default()))
-                        .child(action_button("Stage saved result", colors, cx.listener(move |this, _, _, cx| this.request_stage_rebase_conflict(index, cx)))
+                        .child(action_button("Stage resolved result", colors, cx.listener(move |this, _, _, cx| this.request_stage_rebase_conflict(index, cx)))
                             .when(conflict_controls_frozen, |button| button.opacity(0.52).cursor_default()))));
             }
         }
         if let Some(stash) = &operation.stash {
-            body = body.child(notice_box("Retained stash receipt", format!("OID {} · includes untracked: {} · ignored excluded: {} · retained after restore: {} · restore {:?}", stash.oid, stash.includes_untracked, stash.ignored_files_excluded, stash.retained_after_restore, operation.stash_restore), colors.amber, colors));
+            body = body.child(notice_box("Retained stash receipt", format!("OID {} · includes untracked: {} · ignored excluded: {} · retained after restore: {} · restore {:?}", stash.oid, stash.includes_untracked, stash.ignored_files_excluded, stash.retained_after_restore, operation.stash_restore), colors.amber));
         }
         match operation.state {
             RebaseState::PausedForEdit if operation.split.is_some() => {
@@ -2240,7 +2011,7 @@ impl LocalWorkspace {
             RebaseState::PausedForEdit => {
                 body = body.child(self.render_edit_message("Optional amend message", colors))
                     .child(div().flex().flex_wrap().gap(px(ui::GAP_GROUP))
-                        .child(action_button("Open/stage in Local Changes", colors, cx.listener(|this, _, _, cx| this.route_rebase_to_local_changes("Edit safely, save, and stage selected paths in Local Changes; then reopen Rebase", cx))))
+                        .child(action_button("Open/stage in Local Changes", colors, cx.listener(|this, _, _, cx| this.route_rebase_to_local_changes("Edit the files in your own editor, stage the selected paths in Local Changes, then reopen Rebase", cx))))
                         .child(action_button("Amend", colors, cx.listener(|this, _, _, cx| this.request_amend_rebase(cx))))
                         .child(action_button("Begin split", colors, cx.listener(|this, _, _, cx| this.request_begin_split(cx))))
                         .child(action_button("Continue", colors, cx.listener(|this, _, _, cx| this.request_continue_rebase(cx))))
@@ -2297,7 +2068,7 @@ impl LocalWorkspace {
                 if !operation.resulting_commits.is_empty() {
                     body = body.child(
                         div()
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(ui::WEIGHT_EMPHASIS)
                             .child("RESULTING COMMITS"),
                     );
                     for commit in &operation.resulting_commits {
@@ -2310,7 +2081,7 @@ impl LocalWorkspace {
                     }
                 }
                 if operation.publish_handoff.is_some() {
-                    body = body.child(notice_box("Publish handoff only", "Rewritten local history is ready for the existing explicit remote-branch/OID lease observation and confirmation flow. This component has no verified PR-source target, does not infer one from a local branch, and never defaults to force push.", colors.amber, colors));
+                    body = body.child(notice_box("Publish handoff only", "Rewritten local history is ready for the existing explicit remote-branch/OID lease observation and confirmation flow. This component has no verified PR-source target, does not infer one from a local branch, and never defaults to force push.", colors.amber));
                 }
                 let unrestored = operation.stash.is_some()
                     && operation.stash_restore == StashRestoreState::NotStarted;
@@ -2333,10 +2104,10 @@ impl LocalWorkspace {
                 );
             }
             RebaseState::FailedUncertain => {
-                body = body.child(notice_box("Uncertain — evidence retained", "This operation cannot be acknowledged away or archived. Controls are read-only; inspect actual Git state and durable evidence. No retry is automatic.", colors.red, colors));
+                body = body.child(notice_box("Uncertain — evidence retained", "This operation cannot be acknowledged away or archived. Controls are read-only; inspect actual Git state and durable evidence. No retry is automatic.", colors.red));
             }
             RebaseState::Prepared => {
-                body = body.child(notice_box("Prepared intent observed", "The durable intent exists. Observe and inspect it; cibergit will not automatically replay Start.", colors.amber, colors));
+                body = body.child(notice_box("Prepared intent observed", "The durable intent exists. Observe and inspect it; cibergit will not automatically replay Start.", colors.amber));
             }
         }
         body.into_any_element()
@@ -2582,33 +2353,29 @@ fn run_rebase_command(
     })
 }
 
-fn render_preparation_summary(outcome: &PrepareOutcome, colors: LocalPalette) -> AnyElement {
+fn render_preparation_summary(outcome: &PrepareOutcome) -> AnyElement {
     let inventory = match outcome {
         PrepareOutcome::Ready(preparation) => &preparation.inventory,
         PrepareOutcome::Dirty(preparation) => &preparation.inventory,
         PrepareOutcome::ExternalWorkflow(_) => return div().into_any_element(),
     };
     div()
-        .p_3()
-        .rounded(px(ui::CONTROL_RADIUS))
-        .border_1()
-        .border_color(colors.border)
-        .bg(colors.surface)
-        .child(div().font_weight(FontWeight::MEDIUM).child(format!(
+        .flex()
+        .flex_col()
+        .gap(px(ui::GAP_ICON))
+        .child(div().font_weight(ui::WEIGHT_EMPHASIS).child(format!(
             "{} commits · {}",
             inventory.commits.len(),
             inventory.branch
         )))
         .child(
             div()
-                .mt_1()
                 .font_family(CODE_FONT)
                 .ui_text(TextRole::Body)
                 .child(format!("base {}", inventory.base_oid)),
         )
         .child(
             div()
-                .mt_1()
                 .font_family(CODE_FONT)
                 .ui_text(TextRole::Body)
                 .child(format!("head {}", inventory.head_oid)),
@@ -2634,27 +2401,23 @@ fn render_split(split: &SplitState, colors: LocalPalette) -> AnyElement {
                 .unwrap_or_else(|| "unknown".into())
         ),
         colors.amber,
-        colors,
     )
     .into_any_element()
 }
 
-fn notice_box(
-    title: impl Into<SharedString>,
-    body: impl Into<SharedString>,
-    accent: Rgba,
-    colors: LocalPalette,
-) -> Div {
+fn notice_box(title: impl Into<SharedString>, body: impl Into<SharedString>, accent: Rgba) -> Div {
     div()
-        .p_3()
-        .rounded(px(ui::CONTROL_RADIUS))
-        .border_1()
-        .border_color(accent)
-        .bg(colors.surface)
-        .child(div().font_weight(FontWeight::MEDIUM).child(title.into()))
+        .flex()
+        .flex_col()
+        .gap(px(ui::GAP_ICON))
         .child(
             div()
-                .mt_1()
+                .font_weight(ui::WEIGHT_EMPHASIS)
+                .text_color(accent)
+                .child(title.into()),
+        )
+        .child(
+            div()
                 .ui_text(TextRole::Caption)
                 .whitespace_normal()
                 .child(body.into()),
@@ -2664,19 +2427,17 @@ fn notice_box(
 fn operation_details_box(operation: &RebaseOperationView, colors: LocalPalette) -> Div {
     let active = operation.active.as_ref();
     div()
-        .p_3()
-        .rounded(px(ui::CONTROL_RADIUS))
-        .border_1()
-        .border_color(colors.accent)
-        .bg(colors.surface)
+        .flex()
+        .flex_col()
+        .gap(px(ui::GAP_ICON))
         .child(
             div()
-                .font_weight(FontWeight::MEDIUM)
+                .font_weight(ui::WEIGHT_EMPHASIS)
+                .text_color(colors.accent)
                 .child("Operation details"),
         )
         .child(
             div()
-                .mt_1()
                 .ui_text(TextRole::Caption)
                 .flex()
                 .flex_col()
@@ -2718,25 +2479,8 @@ fn plan_action_label(action: &PlanAction) -> &'static str {
     }
 }
 
-fn conflict_is_editor_candidate(conflict: &ConflictFile) -> bool {
-    matches!(
-        conflict.disk,
-        cibergit::rebase::DiskGeneration::Regular { .. }
-    ) && [
-        &conflict.base.content,
-        &conflict.ours.content,
-        &conflict.theirs.content,
-    ]
-    .iter()
-    .all(|content| matches!(content, BlobContent::Utf8(_) | BlobContent::Deleted))
-}
-
 fn conflict_reason(conflict: &ConflictFile, show_details: bool) -> String {
-    let support = if conflict_is_editor_candidate(conflict) {
-        "regular UTF-8 result can be opened safely"
-    } else {
-        "binary/media/non-UTF8/missing/type result requires an external workflow; cibergit will not create or delete it"
-    };
+    let support = "resolve the result in an external editor; cibergit will not create, delete, or stage it implicitly";
     let kind = match &conflict.kind {
         cibergit::rebase::ConflictKind::BothModified => "Both sides modified this file".into(),
         cibergit::rebase::ConflictKind::AddedByBoth => "Both sides added this file".into(),
@@ -3253,29 +2997,6 @@ mod tests {
         assert!(rebase_input_is_frozen(true, false));
         assert!(rebase_input_is_frozen(false, true));
         assert!(!rebase_input_is_frozen(false, false));
-    }
-
-    #[test]
-    fn editor_fence_detects_typing_pending_fifo_and_accepted_baseline_changes() {
-        let initial = DocumentFence(vec![DocumentFenceEntry {
-            path: "file.txt".into(),
-            edit_generation: 4,
-            editor_value: "ours".into(),
-            accepted_base: "ours".into(),
-            status: DocumentStatus::Clean,
-            pending_checkout_operations: 0,
-            pending_programmatic_reload: false,
-        }]);
-        let mut changed = initial.clone();
-        changed.0[0].edit_generation += 1;
-        changed.0[0].editor_value.push('!');
-        assert_ne!(initial, changed);
-        let mut fifo = initial.clone();
-        fifo.0[0].pending_checkout_operations = 1;
-        assert_ne!(initial, fifo);
-        let mut baseline = initial.clone();
-        baseline.0[0].accepted_base.push('!');
-        assert_ne!(initial, baseline);
     }
 
     #[test]

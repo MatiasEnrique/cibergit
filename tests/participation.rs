@@ -184,6 +184,7 @@ fn details(
         review_threads,
         reactions: vec![],
         checks: vec![],
+        participant_avatars: Default::default(),
         activity_complete: true,
         checks_complete: true,
         notice: None,

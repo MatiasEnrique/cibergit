@@ -1,9 +1,9 @@
-//! Embeddable, checkout-scoped local editor and Local Changes surface.
+//! Embeddable, checkout-scoped Local Changes surface.
 //!
 //! This component deliberately has no `ReviewSession` or provider dependency. The
-//! parent keeps the published review pinned and routes an explicit "Edit locally"
-//! gesture here. All checkout and Git I/O is started on GPUI's background executor;
-//! editor changes are serialized by one FIFO worker per open document.
+//! parent keeps the published review pinned and routes an explicit "Local changes"
+//! gesture here. All checkout and Git I/O is started on GPUI's background executor.
+//! Worktree files are never opened for editing here; use an external editor.
 
 use cibergit::ui::{self, Density, TextRole};
 #[path = "local_workspace/conflict_view.rs"]
@@ -17,10 +17,6 @@ use pr_publish::PrPublishAttempt;
 pub use pr_publish::{PrPublishContext, PrPublishMode, PrPublishPreparation};
 
 use cibergit::{
-    document::{
-        ConflictKind, DiskState, DiskVersion, Document, DocumentLimits, DocumentStatus,
-        DocumentStore, RecoveryScope, RecoveryStatus, RefreshOutcome, SaveOutcome,
-    },
     domain::Repository,
     local_git::{
         DiffContent, DiffTarget, GitPath, HeadState, LocalGit, LocalGitError, LocalSnapshot,
@@ -31,46 +27,33 @@ use cibergit::{
     worktrees::{CheckoutView, FilesystemIdentity},
 };
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, EventEmitter, FontWeight,
-    HighlightStyle, KeyDownEvent, Render, Rgba, SharedString, Subscription, Window,
-    WindowAppearance, actions, div, prelude::*, px, rgba,
+    AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, EventEmitter, KeyDownEvent,
+    Render, Rgba, SharedString, Subscription, Window, WindowAppearance, actions, div, prelude::*,
+    px, rgba,
 };
 use gpui_base::Button;
-use gpui_base::input::{
-    Editor, EditorState, FoldRange, HighlightStyleResolver, Input, InputEditorStyle, InputEvent,
-    InputHighlighter, InputHighlighterFactory, InputState, Rope,
-};
+use gpui_base::input::{Editor, EditorState, Input, InputEditorStyle, InputState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
-    ffi::{CString, OsStr, OsString, c_char, c_int, c_void},
+    ffi::{CString, c_char, c_int},
     fs::{self, File},
     io::Write,
     ops::Range,
     os::fd::{AsRawFd, FromRawFd},
     os::unix::{
-        ffi::{OsStrExt, OsStringExt},
+        ffi::OsStrExt,
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     rc::Rc,
-    sync::mpsc,
-    thread,
     time::Duration,
 };
 
-const UI_FONT: &str = "IBM Plex Sans";
 const CODE_FONT: &str = "Menlo";
-/// Width of the file browser's entry-kind glyph column. Fixed so names align
-/// whether or not an entry carries a marker.
-const BROWSER_ICON_COLUMN: f32 = 12.;
 /// Width of the Local Changes status column. Fixed so every path in the list
 /// starts on the same x position; sized for the longest status word.
 const CHANGE_STATUS_COLUMN: f32 = 70.;
-const DEFAULT_FILE_LIMIT: usize = 20_000;
-const DEFAULT_DEPTH_LIMIT: usize = 64;
-const DEFAULT_PATH_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 const ACTION_JOURNAL: &str = "started-local-action.json";
 
 // Darwin values from <sys/fcntl.h> and <sys/file.h>. cibergit's native V1
@@ -87,43 +70,15 @@ const O_NOFOLLOW_ANY: c_int = 0x2000_0000;
 const LOCK_EX: c_int = 0x02;
 const LOCK_NB: c_int = 0x04;
 const LOCK_UN: c_int = 0x08;
-const DT_DIR: u8 = 4;
-const DT_REG: u8 = 8;
-const DT_LNK: u8 = 10;
-
-#[repr(C)]
-struct DarwinDirent {
-    d_ino: u64,
-    d_seekoff: u64,
-    d_reclen: u16,
-    d_namlen: u16,
-    d_type: u8,
-    d_name: [c_char; 1024],
-}
 
 unsafe extern "C" {
     fn openat(fd: c_int, path: *const c_char, oflag: c_int, ...) -> c_int;
     fn flock(fd: c_int, operation: c_int) -> c_int;
     fn dup(fd: c_int) -> c_int;
-    fn fdopendir(fd: c_int) -> *mut c_void;
-    fn readdir(directory: *mut c_void) -> *mut DarwinDirent;
-    fn closedir(directory: *mut c_void) -> c_int;
     fn __error() -> *mut c_int;
 }
 
-actions!(
-    local_workspace,
-    [
-        LocalSave,
-        LocalRefresh,
-        LocalQuickOpen,
-        LocalConfirm,
-        LocalCancel,
-        LocalReloadDisk,
-        LocalFind,
-        LocalReplace
-    ]
-);
+actions!(local_workspace, [LocalRefresh, LocalConfirm, LocalCancel]);
 
 /// Colors are supplied rather than inherited from the parent application, so
 /// the component can render in a small standalone native evidence harness.
@@ -146,65 +101,12 @@ pub struct LocalWorkspaceContext {
     pub appearance: LocalWorkspaceAppearance,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BrowserLimits {
-    pub max_entries: usize,
-    pub max_depth: usize,
-    pub max_path_bytes: usize,
-}
-
-impl Default for BrowserLimits {
-    fn default() -> Self {
-        Self {
-            max_entries: DEFAULT_FILE_LIMIT,
-            max_depth: DEFAULT_DEPTH_LIMIT,
-            max_path_bytes: DEFAULT_PATH_BYTES_LIMIT,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BrowserEntryKind {
-    Directory,
-    EditableCandidate,
-    Symlink,
-    UnsupportedMedia,
-    Other,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BrowserEntry {
-    /// Exact platform path identity. `display` is never used for I/O.
-    pub relative_path: PathBuf,
-    pub display: String,
-    pub kind: BrowserEntryKind,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BrowserSnapshot {
-    pub entries: Vec<BrowserEntry>,
-    pub truncated: bool,
-    pub truncation_reason: Option<String>,
-}
-
 #[derive(Clone, Debug)]
 pub enum LocalWorkspaceEvent {
-    DocumentOpened(PathBuf),
-    DocumentSaved {
-        path: PathBuf,
-        newer_edits_remain: bool,
-    },
     LocalSnapshotChanged,
     RemoteBranchObserved(RemoteBranchObservation),
-    MaterialActionConfirmationRequested {
-        request_id: u64,
-        summary: String,
-    },
-    LocalActionFinished {
-        request_id: u64,
-        result: String,
-    },
-    RetainedPathNotice(PathBuf),
+    MaterialActionConfirmationRequested { request_id: u64, summary: String },
+    LocalActionFinished { request_id: u64, result: String },
     Error(String),
 }
 
@@ -339,220 +241,9 @@ struct StartedAction {
     pr_publish: Option<PrPublishAttempt>,
 }
 
-#[derive(Clone, Debug)]
-struct DocumentView {
-    buffer: String,
-    base: String,
-    disk: DiskState,
-    status: DocumentStatus,
-    recovery: RecoveryStatus,
-    conflict_kind: Option<ConflictKind>,
-    retained_paths: Vec<PathBuf>,
-}
-
-impl DocumentView {
-    fn from_document(document: &Document, retained_paths: Vec<PathBuf>) -> Self {
-        Self {
-            buffer: document.buffer().to_owned(),
-            base: document.base().text.clone(),
-            disk: document.disk().clone(),
-            status: document.status(),
-            recovery: document.recovery_status().clone(),
-            conflict_kind: document.conflict().map(|conflict| conflict.kind),
-            retained_paths,
-        }
-    }
-
-    fn displayed_disk_version(&self) -> Option<DiskVersion> {
-        match &self.disk {
-            DiskState::Present(snapshot) => Some(snapshot.version.clone()),
-            DiskState::Missing | DiskState::Unsafe(_) => None,
-        }
-    }
-}
-
-enum DocumentCommand {
-    Persist {
-        generation: u64,
-        text: String,
-        reply: mpsc::Sender<DocumentReply>,
-    },
-    Save {
-        generation: u64,
-        text: String,
-        reply: mpsc::Sender<DocumentReply>,
-    },
-    Refresh {
-        generation: u64,
-        reply: mpsc::Sender<DocumentReply>,
-    },
-    Reload {
-        generation: u64,
-        reply: mpsc::Sender<DocumentReply>,
-    },
-    Reconcile {
-        generation: u64,
-        expected_disk: DiskVersion,
-        proposed: String,
-        reply: mpsc::Sender<DocumentReply>,
-    },
-}
-
-#[derive(Clone, Debug)]
-enum DocumentReplyKind {
-    Persisted,
-    Saved {
-        saved_buffer: String,
-        outcome: SaveOutcome,
-    },
-    Refreshed(RefreshOutcome),
-    Reloaded,
-    Reconciled(cibergit::document::ReconcileOutcome),
-}
-
-#[derive(Clone, Debug)]
-struct DocumentReply {
-    generation: u64,
-    result: Result<(DocumentReplyKind, DocumentView), String>,
-}
-
-#[derive(Clone)]
-struct DocumentWorker {
-    sender: mpsc::Sender<DocumentCommand>,
-}
-
-impl DocumentWorker {
-    fn start(mut document: Document) -> Self {
-        let (sender, receiver) = mpsc::channel();
-        thread::Builder::new()
-            .name("cibergit-document".into())
-            .spawn(move || {
-                let mut retained_paths = Vec::new();
-                while let Ok(command) = receiver.recv() {
-                    let (generation, reply, result) = match command {
-                        DocumentCommand::Persist {
-                            generation,
-                            text,
-                            reply,
-                        } => {
-                            let result = document
-                                .set_buffer(text)
-                                .map(|()| DocumentReplyKind::Persisted)
-                                .map_err(|error| error.to_string());
-                            (generation, reply, result)
-                        }
-                        DocumentCommand::Save {
-                            generation,
-                            text,
-                            reply,
-                        } => {
-                            let saved_buffer = text.clone();
-                            let result = document
-                                .set_buffer(text)
-                                .and_then(|()| document.save())
-                                .map(|outcome| {
-                                    match &outcome {
-                                        SaveOutcome::Saved {
-                                            retained_previous, ..
-                                        } => retained_paths.push(retained_previous.clone()),
-                                        SaveOutcome::ConflictRetained {
-                                            retained_external, ..
-                                        } => retained_paths.push(retained_external.clone()),
-                                        SaveOutcome::CommittedButUncertain {
-                                            retained_path: Some(path),
-                                            ..
-                                        } => retained_paths.push(path.clone()),
-                                        _ => {}
-                                    }
-                                    DocumentReplyKind::Saved {
-                                        saved_buffer,
-                                        outcome,
-                                    }
-                                })
-                                .map_err(|error| error.to_string());
-                            (generation, reply, result)
-                        }
-                        DocumentCommand::Refresh { generation, reply } => {
-                            let result = document
-                                .refresh()
-                                .map(DocumentReplyKind::Refreshed)
-                                .map_err(|error| error.to_string());
-                            (generation, reply, result)
-                        }
-                        DocumentCommand::Reload { generation, reply } => {
-                            let result = document
-                                .reload_from_disk()
-                                .map(|()| DocumentReplyKind::Reloaded)
-                                .map_err(|error| error.to_string());
-                            (generation, reply, result)
-                        }
-                        DocumentCommand::Reconcile {
-                            generation,
-                            expected_disk,
-                            proposed,
-                            reply,
-                        } => {
-                            let result = document
-                                .reconcile(&expected_disk, proposed)
-                                .map(DocumentReplyKind::Reconciled)
-                                .map_err(|error| error.to_string());
-                            (generation, reply, result)
-                        }
-                    };
-                    let result = result.map(|kind| {
-                        (
-                            kind,
-                            DocumentView::from_document(&document, retained_paths.clone()),
-                        )
-                    });
-                    let _ = reply.send(DocumentReply { generation, result });
-                }
-            })
-            .expect("spawn serialized document worker");
-        Self { sender }
-    }
-
-    fn dispatch(&self, command: DocumentCommand) -> Result<(), String> {
-        self.sender
-            .send(command)
-            .map_err(|_| "document worker stopped".to_owned())
-    }
-}
-
-struct DocumentTab {
-    path: PathBuf,
-    editor: Entity<EditorState>,
-    worker: DocumentWorker,
-    view: DocumentView,
-    generation: u64,
-    /// Advances only for user-originated editor changes. Background refreshes
-    /// may advance `generation` without invalidating a material confirmation.
-    edit_generation: u64,
-    persisted_generation: u64,
-    pending_checkout_operations: usize,
-    message: String,
-    pending_programmatic_reload: Option<PendingProgrammaticReload>,
-    _subscription: Subscription,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingProgrammaticReload {
-    generation: u64,
-    expected_editor_value: String,
-    replacement: String,
-}
-
-impl PendingProgrammaticReload {
-    fn still_applies(&self, generation: u64, editor_value: &str) -> bool {
-        self.generation == generation && self.expected_editor_value == editor_value
-    }
-}
-
 struct Backend {
-    documents: DocumentStore,
     git: LocalGit,
     rebase: RebaseStore,
-    browser: BrowserSnapshot,
     journal_path: PathBuf,
     checkout_generation: u64,
 }
@@ -566,11 +257,6 @@ enum BackendState {
 pub struct LocalWorkspace {
     context: LocalWorkspaceContext,
     backend: BackendState,
-    documents: BTreeMap<PathBuf, DocumentTab>,
-    active_document: Option<PathBuf>,
-    revealed_path: Option<PathBuf>,
-    open_generation: u64,
-    open_in_flight: usize,
     git_generation: u64,
     snapshot: Option<LocalSnapshot>,
     selected_diff: Option<SelectedDiff>,
@@ -590,11 +276,8 @@ pub struct LocalWorkspace {
     pr_publish_notice: String,
     pr_publish_details_expanded: bool,
     local_actions_scroll: gpui::ScrollHandle,
-    quick_open: Entity<InputState>,
     commit_message: Entity<InputState>,
     branch_name: Entity<InputState>,
-    proposed_merge: Entity<EditorState>,
-    proposed_seed: Option<(PathBuf, String)>,
     rebase: rebase_panel::RebasePanel,
     status: String,
     focused: bool,
@@ -602,31 +285,20 @@ pub struct LocalWorkspace {
 }
 
 impl LocalWorkspace {
-    /// Cheap construction only. Filesystem enumeration, `DocumentStore::new`,
-    /// `LocalGit::open`, and the first snapshot all run after Loading is visible.
+    /// Cheap construction only. `LocalGit::open` and the first snapshot both
+    /// run after Loading is visible.
     pub fn new(
         context: LocalWorkspaceContext,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let colors = palette(context.appearance.dark);
-        let quick_open = new_input("Quick-open any worktree file", colors, window, cx);
         let commit_message = new_input("Commit message", colors, window, cx);
         let branch_name = new_input("Branch name", colors, window, cx);
-        let proposed_merge = cx.new(|cx| {
-            let mut state = EditorState::new(window, cx).language("text");
-            state.set_editor_style(editor_style(colors));
-            state
-        });
         let rebase = rebase_panel::RebasePanel::new(colors, window, cx);
         let mut this = Self {
             context,
             backend: BackendState::Loading,
-            documents: BTreeMap::new(),
-            active_document: None,
-            revealed_path: None,
-            open_generation: 0,
-            open_in_flight: 0,
             git_generation: 0,
             snapshot: None,
             selected_diff: None,
@@ -646,11 +318,8 @@ impl LocalWorkspace {
             pr_publish_notice: String::new(),
             pr_publish_details_expanded: false,
             local_actions_scroll: gpui::ScrollHandle::new(),
-            quick_open,
             commit_message,
             branch_name,
-            proposed_merge,
-            proposed_seed: None,
             rebase,
             status: "Preparing safe local workspace…".into(),
             focused: window.is_window_active(),
@@ -664,13 +333,6 @@ impl LocalWorkspace {
         });
         let appearance = cx.observe_window_appearance(window, |this, window, cx| {
             this.context.appearance.dark = is_dark(window);
-            let style = editor_style(palette(this.context.appearance.dark));
-            for tab in this.documents.values() {
-                tab.editor
-                    .update(cx, |editor, _| editor.set_editor_style(style.clone()));
-            }
-            this.proposed_merge
-                .update(cx, |editor, _| editor.set_editor_style(style));
             this.rebase
                 .update_appearance(palette(this.context.appearance.dark), cx);
             cx.notify();
@@ -679,13 +341,6 @@ impl LocalWorkspace {
         this.start_initialization(window, cx);
         this.start_polling(cx);
         this
-    }
-
-    pub fn browser(&self) -> Option<&BrowserSnapshot> {
-        match &self.backend {
-            BackendState::Ready(backend) => Some(&backend.browser),
-            BackendState::Loading | BackendState::Failed(_) => None,
-        }
     }
 
     pub fn local_snapshot(&self) -> Option<&LocalSnapshot> {
@@ -783,10 +438,6 @@ impl LocalWorkspace {
                     .into(),
                 cx,
             );
-            return;
-        }
-        if let Some(reason) = self.checkout_action_blocker(cx) {
-            self.report_error(reason, cx);
             return;
         }
         self.pr_publish_generation = self.pr_publish_generation.wrapping_add(1);
@@ -974,6 +625,24 @@ impl LocalWorkspace {
         .detach();
     }
 
+    /// Selects the local diff for a worktree-relative path, when that path is
+    /// one of the files Git currently reports as changed. A path with no local
+    /// change has no diff to show, so the selection is left untouched.
+    pub fn select_relative_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let raw = path.as_os_str().as_bytes();
+        let Some((_, git_path, target)) = self
+            .snapshot
+            .as_ref()
+            .map(local_change_rows)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(_, candidate, _)| candidate.raw == raw)
+        else {
+            return;
+        };
+        self.select_local_diff(git_path, target, cx);
+    }
+
     pub fn select_local_diff(&mut self, path: GitPath, target: DiffTarget, cx: &mut Context<Self>) {
         let BackendState::Ready(backend) = &self.backend else {
             return;
@@ -1005,100 +674,8 @@ impl LocalWorkspace {
         .detach();
     }
 
-    pub fn active_path(&self) -> Option<&Path> {
-        self.active_document.as_deref()
-    }
-
     pub fn is_ready(&self) -> bool {
         matches!(self.backend, BackendState::Ready(_))
-    }
-
-    pub fn active_editor(&self) -> Option<Entity<EditorState>> {
-        self.active_document
-            .as_ref()
-            .and_then(|path| self.documents.get(path))
-            .map(|tab| tab.editor.clone())
-    }
-
-    pub fn active_document_status(&self) -> Option<DocumentStatus> {
-        self.active_document
-            .as_ref()
-            .and_then(|path| self.documents.get(path))
-            .map(|tab| tab.view.status)
-    }
-
-    pub fn reveal_relative_path(&mut self, path: impl AsRef<Path>, cx: &mut Context<Self>) {
-        match validate_relative_path(path.as_ref()) {
-            Ok(path) => {
-                self.revealed_path = Some(path);
-                cx.notify();
-            }
-            Err(error) => self.report_error(error, cx),
-        }
-    }
-
-    pub fn open_relative_path(
-        &mut self,
-        path: impl AsRef<Path>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !document_open_allowed(self.rebase.is_running()) {
-            self.report_error(
-                "Document open paused while a rebase transition is running; retry after the exact effect is observed"
-                    .into(),
-                cx,
-            );
-            return;
-        }
-        let path = match validate_relative_path(path.as_ref()) {
-            Ok(path) => path,
-            Err(error) => {
-                self.report_error(error, cx);
-                return;
-            }
-        };
-        self.revealed_path = Some(path.clone());
-        if self.documents.contains_key(&path) {
-            self.active_document = Some(path);
-            cx.notify();
-            return;
-        }
-        let BackendState::Ready(backend) = &self.backend else {
-            self.status = "Local workspace is still loading".into();
-            cx.notify();
-            return;
-        };
-        self.open_generation = self.open_generation.wrapping_add(1);
-        self.open_in_flight = self.open_in_flight.saturating_add(1);
-        let generation = self.open_generation;
-        let store = backend.documents.clone();
-        self.status = format!("Opening {}…", display_path(&path));
-        let task = cx.background_spawn({
-            let path = path.clone();
-            async move { store.open(&path).map_err(|error| error.to_string()) }
-        });
-        let weak = cx.weak_entity();
-        window
-            .spawn(cx, async move |window| {
-                let result = task.await;
-                let _ = window.update(|window, cx| {
-                    let _ = weak.update(cx, |this, cx| {
-                        this.open_in_flight = this.open_in_flight.saturating_sub(1);
-                        if generation != this.open_generation {
-                            return;
-                        }
-                        match result {
-                            Ok(document) => this.install_document(path, document, window, cx),
-                            Err(error) => this.report_error(
-                                format!("Cannot open {}: {error}", display_path(&path)),
-                                cx,
-                            ),
-                        }
-                    });
-                });
-            })
-            .detach();
     }
 
     pub fn request_action(&mut self, action: LocalAction, cx: &mut Context<Self>) -> Option<u64> {
@@ -1136,12 +713,6 @@ impl LocalWorkspace {
                 "Reconcile or cancel the current local action before starting another".into(),
                 cx,
             );
-            return None;
-        }
-        if action.requires_exclusive_checkout_lane()
-            && let Some(reason) = self.checkout_action_blocker(cx)
-        {
-            self.report_error(reason, cx);
             return None;
         }
         if let LocalAction::ForcePushWithLease {
@@ -1239,12 +810,6 @@ impl LocalWorkspace {
                 "Checkout identity changed; refresh before retrying".into(),
                 cx,
             );
-            return;
-        }
-        if pending.action.requires_exclusive_checkout_lane()
-            && let Some(reason) = self.checkout_action_blocker(cx)
-        {
-            self.report_error(format!("Confirmation paused: {reason}"), cx);
             return;
         }
         if pending.action.requires_exclusive_checkout_lane()
@@ -1531,106 +1096,6 @@ impl LocalWorkspace {
     pub fn refresh_all(&mut self, cx: &mut Context<Self>) {
         self.refresh_git(cx);
         self.observe_rebase(cx);
-        let paths = self.documents.keys().cloned().collect::<Vec<_>>();
-        for path in paths {
-            self.refresh_document(&path, cx);
-        }
-    }
-
-    pub fn save_active(&mut self, cx: &mut Context<Self>) {
-        if self.rebase.is_running() {
-            self.report_error(
-                "Document save paused while a rebase transition is running".into(),
-                cx,
-            );
-            return;
-        }
-        let Some(path) = self.active_document.clone() else {
-            self.report_error("No local document is open".into(), cx);
-            return;
-        };
-        let Some(tab) = self.documents.get_mut(&path) else {
-            return;
-        };
-        tab.generation = tab.generation.wrapping_add(1);
-        let generation = tab.generation;
-        let text = tab.editor.read(cx).value().to_string();
-        let (reply, receiver) = mpsc::channel();
-        if let Err(error) = tab.worker.dispatch(DocumentCommand::Save {
-            generation,
-            text,
-            reply,
-        }) {
-            self.report_error(error, cx);
-            return;
-        }
-        tab.pending_checkout_operations = tab.pending_checkout_operations.saturating_add(1);
-        tab.message = "Saving checked buffer…".into();
-        self.await_document_reply(path, receiver, true, cx);
-    }
-
-    pub fn reload_active_from_disk(&mut self, cx: &mut Context<Self>) {
-        if self.rebase.is_running() {
-            self.report_error(
-                "Document reload paused while a rebase transition is running".into(),
-                cx,
-            );
-            return;
-        }
-        let Some(path) = self.active_document.clone() else {
-            return;
-        };
-        let Some(tab) = self.documents.get_mut(&path) else {
-            return;
-        };
-        tab.generation = tab.generation.wrapping_add(1);
-        let generation = tab.generation;
-        let (reply, receiver) = mpsc::channel();
-        if tab
-            .worker
-            .dispatch(DocumentCommand::Reload { generation, reply })
-            .is_ok()
-        {
-            tab.pending_checkout_operations = tab.pending_checkout_operations.saturating_add(1);
-            self.await_document_reply(path, receiver, true, cx);
-        }
-    }
-
-    pub fn reconcile_active(
-        &mut self,
-        expected_disk: DiskVersion,
-        proposed: String,
-        cx: &mut Context<Self>,
-    ) {
-        if self.rebase.is_running() {
-            self.report_error(
-                "Document reconciliation paused while a rebase transition is running".into(),
-                cx,
-            );
-            return;
-        }
-        let Some(path) = self.active_document.clone() else {
-            return;
-        };
-        let Some(tab) = self.documents.get_mut(&path) else {
-            return;
-        };
-        tab.generation = tab.generation.wrapping_add(1);
-        let generation = tab.generation;
-        let (reply, receiver) = mpsc::channel();
-        if tab
-            .worker
-            .dispatch(DocumentCommand::Reconcile {
-                generation,
-                expected_disk,
-                proposed,
-                reply,
-            })
-            .is_ok()
-        {
-            tab.pending_checkout_operations = tab.pending_checkout_operations.saturating_add(1);
-            self.await_document_reply(path, receiver, true, cx);
-        }
     }
 
     fn start_initialization(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1693,233 +1158,6 @@ impl LocalWorkspace {
         .detach();
     }
 
-    fn install_document(
-        &mut self,
-        path: PathBuf,
-        document: Document,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let view = DocumentView::from_document(&document, Vec::new());
-        let colors = palette(self.context.appearance.dark);
-        let language = language_for_path(&path);
-        let editor = cx.new(|cx| {
-            let mut state = EditorState::new(window, cx)
-                .language(language)
-                .replaceable(true);
-            state.set_disabled(self.rebase.has_pending_or_running(), cx);
-            state.set_editor_style(editor_style(colors));
-            state.set_highlighter_factory(highlighter_factory(), cx);
-            // Initial/recovery load is the one intentional programmatic reload.
-            state.set_value(view.buffer.clone(), window, cx);
-            state
-        });
-        let subscription = cx.subscribe_in(&editor, window, |this, editor, event, _, cx| {
-            if !matches!(event, InputEvent::Change) {
-                return;
-            }
-            let Some((path, tab)) = this
-                .documents
-                .iter_mut()
-                .find(|(_, tab)| tab.editor.entity_id() == editor.entity_id())
-            else {
-                return;
-            };
-            // A user edit always wins over a reload reply waiting for a Window.
-            tab.pending_programmatic_reload = None;
-            tab.generation = tab.generation.wrapping_add(1);
-            tab.edit_generation = tab.edit_generation.wrapping_add(1);
-            let generation = tab.generation;
-            let text = editor.read(cx).value().to_string();
-            let (reply, receiver) = mpsc::channel();
-            if tab
-                .worker
-                .dispatch(DocumentCommand::Persist {
-                    generation,
-                    text,
-                    reply,
-                })
-                .is_ok()
-            {
-                tab.pending_checkout_operations = tab.pending_checkout_operations.saturating_add(1);
-                tab.message = "Persisting recovery…".into();
-                let path = path.clone();
-                this.await_document_reply(path, receiver, true, cx);
-            }
-        });
-        let worker = DocumentWorker::start(document);
-        self.documents.insert(
-            path.clone(),
-            DocumentTab {
-                path: path.clone(),
-                editor,
-                worker,
-                view,
-                generation: 0,
-                edit_generation: 0,
-                persisted_generation: 0,
-                pending_checkout_operations: 0,
-                message: "File opened; any recovered edits are preserved".into(),
-                pending_programmatic_reload: None,
-                _subscription: subscription,
-            },
-        );
-        self.active_document = Some(path.clone());
-        self.status = format!("Opened {}", display_path(&path));
-        cx.emit(LocalWorkspaceEvent::DocumentOpened(path));
-        cx.notify();
-    }
-
-    fn refresh_document(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(tab) = self.documents.get_mut(path) else {
-            return;
-        };
-        tab.generation = tab.generation.wrapping_add(1);
-        let generation = tab.generation;
-        let (reply, receiver) = mpsc::channel();
-        if tab
-            .worker
-            .dispatch(DocumentCommand::Refresh { generation, reply })
-            .is_ok()
-        {
-            self.await_document_reply(path.to_owned(), receiver, false, cx);
-        }
-    }
-
-    fn await_document_reply(
-        &mut self,
-        path: PathBuf,
-        receiver: mpsc::Receiver<DocumentReply>,
-        blocks_checkout: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let task = cx.background_spawn(async move {
-            receiver
-                .recv()
-                .map_err(|_| "document worker reply was lost".to_owned())
-        });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(reply) => {
-                    if blocks_checkout && let Some(tab) = this.documents.get_mut(&path) {
-                        tab.pending_checkout_operations =
-                            tab.pending_checkout_operations.saturating_sub(1);
-                    }
-                    this.apply_document_reply(&path, reply, cx);
-                }
-                Err(error) => this.report_error(error, cx),
-            });
-        })
-        .detach();
-    }
-
-    fn apply_document_reply(&mut self, path: &Path, reply: DocumentReply, cx: &mut Context<Self>) {
-        let Some(tab) = self.documents.get_mut(path) else {
-            return;
-        };
-        if reply.generation != tab.generation {
-            if let Ok((DocumentReplyKind::Saved { .. }, view)) = reply.result {
-                // Receiver tasks may reach the UI out of order even though the
-                // owning worker is FIFO. Preserve every retained inode path,
-                // but never let this stale save replace newer status/message.
-                for retained in
-                    merge_retained_paths(&mut tab.view.retained_paths, &view.retained_paths)
-                {
-                    cx.emit(LocalWorkspaceEvent::RetainedPathNotice(retained.clone()));
-                }
-                cx.emit(LocalWorkspaceEvent::DocumentSaved {
-                    path: path.to_owned(),
-                    newer_edits_remain: true,
-                });
-                cx.notify();
-            }
-            return;
-        }
-        match reply.result {
-            Ok((kind, mut view)) => {
-                tab.persisted_generation = tab.persisted_generation.max(reply.generation);
-                match &kind {
-                    DocumentReplyKind::Persisted => {
-                        tab.message = if reply.generation == tab.generation {
-                            "Unsaved buffer recovered durably".into()
-                        } else {
-                            "Older recovery write completed; newer edit is queued".into()
-                        };
-                    }
-                    DocumentReplyKind::Saved {
-                        saved_buffer,
-                        outcome,
-                    } => {
-                        let current = tab.editor.read(cx).value();
-                        let newer_edits_remain = current.as_ref() != saved_buffer;
-                        tab.message = format!(
-                            "{}{}",
-                            save_outcome_message(outcome),
-                            if newer_edits_remain {
-                                " · newer edits remain dirty"
-                            } else {
-                                ""
-                            }
-                        );
-                        cx.emit(LocalWorkspaceEvent::DocumentSaved {
-                            path: path.to_owned(),
-                            newer_edits_remain,
-                        });
-                    }
-                    DocumentReplyKind::Refreshed(outcome) => {
-                        tab.message = refresh_outcome_message(*outcome).into();
-                        if matches!(outcome, RefreshOutcome::Reloaded)
-                            && reply.generation == tab.generation
-                        {
-                            // Applied on the next render, where GPUI supplies the Window.
-                            tab.pending_programmatic_reload = Some(PendingProgrammaticReload {
-                                generation: reply.generation,
-                                expected_editor_value: tab.editor.read(cx).value().to_string(),
-                                replacement: view.buffer.clone(),
-                            });
-                        }
-                    }
-                    DocumentReplyKind::Reloaded => {
-                        tab.message = "Explicitly reloaded from disk".into();
-                        tab.pending_programmatic_reload = Some(PendingProgrammaticReload {
-                            generation: reply.generation,
-                            expected_editor_value: tab.editor.read(cx).value().to_string(),
-                            replacement: view.buffer.clone(),
-                        });
-                    }
-                    DocumentReplyKind::Reconciled(outcome) => {
-                        tab.message = match outcome {
-                            cibergit::document::ReconcileOutcome::Applied =>
-                                "Merged changes are ready to save",
-                            cibergit::document::ReconcileOutcome::Stale =>
-                                "The file changed again. Your proposed merge is preserved; review the latest disk version",
-                        }.into();
-                        tab.pending_programmatic_reload = Some(PendingProgrammaticReload {
-                            generation: reply.generation,
-                            expected_editor_value: tab.editor.read(cx).value().to_string(),
-                            replacement: view.buffer.clone(),
-                        });
-                    }
-                }
-                for retained in
-                    merge_retained_paths(&mut tab.view.retained_paths, &view.retained_paths)
-                {
-                    cx.emit(LocalWorkspaceEvent::RetainedPathNotice(retained.clone()));
-                }
-                view.retained_paths = tab.view.retained_paths.clone();
-                tab.view = view;
-                cx.notify();
-            }
-            Err(error) => {
-                tab.message = format!("Persistence/operation failed: {error}");
-                self.status = tab.message.clone();
-                cx.emit(LocalWorkspaceEvent::Error(self.status.clone()));
-                cx.notify();
-            }
-        }
-    }
-
     fn refresh_git(&mut self, cx: &mut Context<Self>) {
         let BackendState::Ready(backend) = &self.backend else {
             return;
@@ -1944,7 +1182,6 @@ impl LocalWorkspace {
                             .snapshot
                             .as_ref()
                             .is_some_and(|previous| previous.head != snapshot.head);
-                        let dirty_buffers = this.checkout_action_blocker(cx).is_some();
                         let publish_stale = this.pending_action.is_none()
                             && this.pr_publish_preparation.as_ref().is_some_and(|preparation| {
                                 preparation.snapshot_guard() != &snapshot.guard
@@ -1958,8 +1195,10 @@ impl LocalWorkspace {
                         if this.in_flight_action.is_none() {
                             this.unresolved_refresh_required = false;
                         }
-                        if head_changed && dirty_buffers {
-                            this.status = "External branch/HEAD change observed; dirty buffers were preserved and incompatible actions are paused".into();
+                        if head_changed {
+                            this.status =
+                                "External branch/HEAD change observed; Local Changes refreshed"
+                                    .into();
                         }
                         cx.emit(LocalWorkspaceEvent::LocalSnapshotChanged);
                         cx.notify();
@@ -1978,27 +1217,6 @@ impl LocalWorkspace {
         cx.emit(LocalWorkspaceEvent::Error(error));
         cx.notify();
     }
-
-    fn checkout_action_blocker(&self, cx: &App) -> Option<String> {
-        if self.open_in_flight != 0 {
-            return Some(
-                "Branch/publish action paused while an exact document open is still running".into(),
-            );
-        }
-        self.documents.values().find_map(|tab| {
-            let editor_value = tab.editor.read(cx).value();
-            let buffer_differs_from_accepted_base = editor_value.as_ref() != tab.view.base;
-            let operation_pending = tab.pending_checkout_operations != 0;
-            let unresolved = tab.view.status != DocumentStatus::Clean
-                || tab.pending_programmatic_reload.is_some();
-            (buffer_differs_from_accepted_base || operation_pending || unresolved).then(|| {
-                format!(
-                    "Branch/pull action paused: {} has unsaved, unreconciled, or queued document work",
-                    display_path(&tab.path)
-                )
-            })
-        })
-    }
 }
 
 fn selected_paths_summary(action: &str, paths: &[GitPath]) -> String {
@@ -2007,44 +1225,6 @@ fn selected_paths_summary(action: &str, paths: &[GitPath]) -> String {
     } else {
         format!("{action} {} selected files", paths.len())
     }
-}
-
-fn save_outcome_message(outcome: &SaveOutcome) -> &'static str {
-    match outcome {
-        SaveOutcome::Unchanged => "No changes to save",
-        SaveOutcome::Saved { .. } => "Saved · Previous version kept",
-        SaveOutcome::Blocked {
-            status: DocumentStatus::Conflict,
-        } => "Save paused · Resolve the disk conflict first",
-        SaveOutcome::Blocked { .. } => "Save paused · Your unsaved text is preserved",
-        SaveOutcome::ConflictRetained { .. } => {
-            "The file changed during save · Both versions are preserved"
-        }
-        SaveOutcome::CommittedButUncertain { .. } => {
-            "Save needs verification · Refresh and inspect the file before continuing"
-        }
-    }
-}
-
-fn refresh_outcome_message(outcome: RefreshOutcome) -> &'static str {
-    match outcome {
-        RefreshOutcome::Unchanged => "File checked · No disk changes",
-        RefreshOutcome::Reloaded => "Reloaded changes from disk",
-        RefreshOutcome::Conflict => "Disk conflict · Your unsaved text is preserved",
-        RefreshOutcome::Missing => "File missing · Your buffer is preserved",
-        RefreshOutcome::Unsafe => "File cannot be safely updated · Your buffer is preserved",
-    }
-}
-
-fn merge_retained_paths(target: &mut Vec<PathBuf>, incoming: &[PathBuf]) -> Vec<PathBuf> {
-    let mut added = Vec::new();
-    for path in incoming {
-        if !target.iter().any(|existing| existing == path) {
-            target.push(path.clone());
-            added.push(path.clone());
-        }
-    }
-    added
 }
 
 fn initialize_backend(
@@ -2064,40 +1244,11 @@ fn initialize_backend(
     let git =
         LocalGit::open(&context.checkout.association.path).map_err(|error| error.to_string())?;
     validate_checkout(&context.checkout, &git)?;
-    let partition = recovery_partition(context)?;
-    let recovery_root = context
-        .data_root
-        .join("local-workspace")
-        .join("recovery")
-        .join(partition);
-    fs::create_dir_all(&recovery_root)
-        .map_err(|error| format!("prepare recovery partition: {error}"))?;
-    let documents = DocumentStore::new(
-        &context.checkout.association.path,
-        &recovery_root,
-        RecoveryScope::new(
-            format!(
-                "{}:{}",
-                context.repository.account.host, context.repository.account.login
-            ),
-            format!(
-                "{}:{}:{}/{}:pr:{}",
-                context.repository.host,
-                context.checkout.association.key.provider,
-                context.repository.owner,
-                context.repository.name,
-                context.checkout.association.key.pull_request
-            ),
-        ),
-        DocumentLimits::default(),
-    )
-    .map_err(|error| error.to_string())?;
-    let browser = enumerate_worktree(&context.checkout.association.path, BrowserLimits::default())?;
     let action_root = context
         .data_root
         .join("local-workspace")
         .join("actions")
-        .join(recovery_partition(context)?);
+        .join(checkout_partition(context)?);
     prepare_private_directory(&action_root)?;
     let journal_path = action_root.join(ACTION_JOURNAL);
     let started = read_started_action(&journal_path)?;
@@ -2120,10 +1271,8 @@ fn initialize_backend(
         .map_err(|error| format!("observe rebase lifecycle: {error}"))?;
     Ok((
         Backend {
-            documents,
             git,
             rebase,
-            browser,
             journal_path,
             checkout_generation: 1,
         },
@@ -2133,14 +1282,15 @@ fn initialize_backend(
     ))
 }
 
-fn recovery_partition(context: &LocalWorkspaceContext) -> Result<String, String> {
+fn checkout_partition(context: &LocalWorkspaceContext) -> Result<String, String> {
     let association = &context.checkout.association;
     let checkout = fs::canonicalize(&association.path)
-        .map_err(|error| format!("canonicalize checkout for recovery: {error}"))?;
+        .map_err(|error| format!("canonicalize checkout for its partition key: {error}"))?;
     let git_dir = fs::canonicalize(&association.git_dir)
-        .map_err(|error| format!("canonicalize Git directory for recovery: {error}"))?;
-    let common = fs::canonicalize(&association.common_git_dir)
-        .map_err(|error| format!("canonicalize common Git directory for recovery: {error}"))?;
+        .map_err(|error| format!("canonicalize Git directory for its partition key: {error}"))?;
+    let common = fs::canonicalize(&association.common_git_dir).map_err(|error| {
+        format!("canonicalize common Git directory for its partition key: {error}")
+    })?;
     let mut hash = Sha256::new();
     for value in [
         context.repository.host.as_bytes(),
@@ -2220,270 +1370,6 @@ fn filesystem_identity(path: &Path) -> Result<FilesystemIdentity, String> {
         device: metadata.dev(),
         inode: metadata.ino(),
     })
-}
-
-fn enumerate_worktree(root: &Path, limits: BrowserLimits) -> Result<BrowserSnapshot, String> {
-    enumerate_worktree_with_hook(root, limits, |_| {})
-}
-
-fn enumerate_worktree_with_hook(
-    root: &Path,
-    limits: BrowserLimits,
-    mut before_descend: impl FnMut(&Path),
-) -> Result<BrowserSnapshot, String> {
-    if limits.max_entries == 0 || limits.max_depth == 0 || limits.max_path_bytes == 0 {
-        return Err("browser limits must be non-zero".into());
-    }
-    let root = fs::canonicalize(root).map_err(|error| format!("canonicalize worktree: {error}"))?;
-    let expected_root = filesystem_identity(&root)?;
-    let root_fd = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY)
-        .open(&root)
-        .map_err(|error| format!("open worktree root without following links: {error}"))?;
-    let opened_root = root_fd
-        .metadata()
-        .map_err(|error| format!("inspect opened worktree root: {error}"))?;
-    if !opened_root.is_dir()
-        || opened_root.dev() != expected_root.device
-        || opened_root.ino() != expected_root.inode
-    {
-        return Err("opened worktree root identity does not match the accepted path".into());
-    }
-    let mut snapshot = BrowserSnapshot {
-        entries: Vec::new(),
-        truncated: false,
-        truncation_reason: None,
-    };
-    let mut pending = vec![(PathBuf::new(), 0usize)];
-    let mut path_bytes = 0usize;
-    while let Some((relative_dir, depth)) = pending.pop() {
-        if depth > limits.max_depth {
-            truncate(&mut snapshot, "maximum directory depth reached");
-            continue;
-        }
-        let opened_directory;
-        let directory_fd = if relative_dir.as_os_str().is_empty() {
-            &root_fd
-        } else {
-            before_descend(&relative_dir);
-            let Ok(directory) = open_directory_at(&root_fd, relative_dir.as_os_str()) else {
-                continue;
-            };
-            opened_directory = directory;
-            &opened_directory
-        };
-        let mut bounded_children: Vec<(OsString, PathBuf, BrowserEntryKind)> = Vec::new();
-        let mut reached_bound = false;
-        read_directory_names(directory_fd, |name, entry_type| {
-            if name.as_bytes() == b".git" {
-                return true;
-            }
-            let relative = relative_dir.join(&name);
-            let relative_bytes = relative.as_os_str().as_bytes().len();
-            if snapshot
-                .entries
-                .len()
-                .saturating_add(bounded_children.len())
-                >= limits.max_entries
-                || path_bytes.saturating_add(relative_bytes) > limits.max_path_bytes
-            {
-                reached_bound = true;
-                return false;
-            }
-            path_bytes = path_bytes.saturating_add(relative_bytes);
-            let kind = if entry_type == DT_LNK {
-                BrowserEntryKind::Symlink
-            } else if entry_type == DT_DIR {
-                BrowserEntryKind::Directory
-            } else if entry_type == DT_REG && is_media_path(&relative) {
-                BrowserEntryKind::UnsupportedMedia
-            } else if entry_type == DT_REG {
-                BrowserEntryKind::EditableCandidate
-            } else {
-                BrowserEntryKind::Other
-            };
-            bounded_children.push((name, relative, kind));
-            true
-        })
-        .map_err(|error| {
-            format!(
-                "enumerate descriptor for {}: {error}",
-                display_path(&relative_dir)
-            )
-        })?;
-        if reached_bound {
-            truncate(&mut snapshot, "file or path-byte enumeration bound reached");
-            snapshot.entries.extend(bounded_children.into_iter().map(
-                |(_, relative_path, kind)| BrowserEntry {
-                    display: display_path(&relative_path),
-                    relative_path,
-                    kind,
-                },
-            ));
-            sort_browser_entries(&mut snapshot.entries);
-            return Ok(snapshot);
-        }
-        bounded_children.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
-        for (_, relative, kind) in bounded_children {
-            snapshot.entries.push(BrowserEntry {
-                display: display_path(&relative),
-                relative_path: relative.clone(),
-                kind: kind.clone(),
-            });
-            if kind == BrowserEntryKind::Directory {
-                if depth == limits.max_depth {
-                    truncate(&mut snapshot, "maximum directory depth reached");
-                } else {
-                    pending.push((relative, depth + 1));
-                }
-            }
-        }
-    }
-    sort_browser_entries(&mut snapshot.entries);
-    Ok(snapshot)
-}
-
-struct DirectoryStream(*mut c_void);
-
-impl Drop for DirectoryStream {
-    fn drop(&mut self) {
-        unsafe {
-            closedir(self.0);
-        }
-    }
-}
-
-fn read_directory_names(
-    directory: &File,
-    mut visit: impl FnMut(OsString, u8) -> bool,
-) -> Result<(), String> {
-    let duplicate = unsafe { dup(directory.as_raw_fd()) };
-    if duplicate < 0 {
-        return Err(format!(
-            "duplicate directory descriptor: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let stream = unsafe { fdopendir(duplicate) };
-    if stream.is_null() {
-        unsafe {
-            File::from_raw_fd(duplicate);
-        }
-        return Err(format!(
-            "open directory stream: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let stream = DirectoryStream(stream);
-    loop {
-        unsafe {
-            *__error() = 0;
-        }
-        let entry = unsafe { readdir(stream.0) };
-        if entry.is_null() {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error().unwrap_or(0) == 0 {
-                return Ok(());
-            }
-            return Err(format!("read directory stream: {error}"));
-        }
-        let entry = unsafe { &*entry };
-        let name_len = usize::from(entry.d_namlen).min(entry.d_name.len());
-        let name =
-            unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr().cast::<u8>(), name_len) };
-        if name == b"." || name == b".." {
-            continue;
-        }
-        if !visit(OsString::from_vec(name.to_vec()), entry.d_type) {
-            return Ok(());
-        }
-    }
-}
-
-fn open_directory_at(parent: &File, name: &OsStr) -> Result<File, String> {
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| "directory entry unexpectedly contains NUL".to_owned())?;
-    let fd = unsafe {
-        openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            O_RDONLY | O_NONBLOCK | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY | O_RESOLVE_BENEATH,
-        )
-    };
-    if fd < 0 {
-        Err(format!(
-            "open directory entry without following links: {}",
-            std::io::Error::last_os_error()
-        ))
-    } else {
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-}
-
-fn sort_browser_entries(entries: &mut [BrowserEntry]) {
-    entries.sort_by(|left, right| {
-        left.relative_path
-            .as_os_str()
-            .as_bytes()
-            .cmp(right.relative_path.as_os_str().as_bytes())
-    });
-}
-
-fn truncate(snapshot: &mut BrowserSnapshot, reason: &str) {
-    snapshot.truncated = true;
-    if snapshot.truncation_reason.is_none() {
-        snapshot.truncation_reason = Some(reason.into());
-    }
-}
-
-fn validate_relative_path(path: &Path) -> Result<PathBuf, String> {
-    if path.as_os_str().is_empty() || path.is_absolute() {
-        return Err("path must be a non-empty worktree-relative path".into());
-    }
-    for component in path.components() {
-        match component {
-            Component::Normal(_) => {}
-            Component::CurDir
-            | Component::ParentDir
-            | Component::RootDir
-            | Component::Prefix(_) => return Err("path contains traversal or a root".into()),
-        }
-    }
-    if path
-        .components()
-        .any(|component| matches!(component, Component::Normal(name) if name.as_bytes() == b".git"))
-    {
-        return Err("Git internals are not part of the workspace browser".into());
-    }
-    Ok(path.to_owned())
-}
-
-fn is_media_path(path: &Path) -> bool {
-    let extension = path
-        .extension()
-        .and_then(OsStr::to_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(
-        extension.as_str(),
-        "png"
-            | "jpg"
-            | "jpeg"
-            | "gif"
-            | "webp"
-            | "avif"
-            | "heic"
-            | "mp4"
-            | "mov"
-            | "avi"
-            | "mkv"
-            | "webm"
-            | "mp3"
-            | "wav"
-            | "flac"
-            | "pdf"
-    )
 }
 
 fn display_path(path: &Path) -> String {
@@ -2907,16 +1793,10 @@ fn checkout_identity_label(checkout: &CheckoutView) -> String {
     )
 }
 
-fn language_for_path(path: &Path) -> &'static str {
-    match path.extension().and_then(OsStr::to_str) {
-        Some("rs") => "rust",
-        Some("json") => "json",
-        Some("md" | "markdown") => "markdown",
-        Some("toml") => "toml",
-        _ => "text",
-    }
-}
-
+/// The local workspace's own view of the review palette. The neutral steps
+/// here track `crate::app::palette` exactly; they are duplicated rather than
+/// shared only because this view is separately owned, so a change to one ramp
+/// belongs in both.
 #[derive(Clone, Copy)]
 struct LocalPalette {
     canvas: Rgba,
@@ -2937,14 +1817,14 @@ struct LocalPalette {
 fn palette(dark: bool) -> LocalPalette {
     if dark {
         LocalPalette {
-            canvas: rgba(0x18191bff),
-            surface: rgba(0x202124ff),
-            sidebar: rgba(0x17181af0),
-            elevated: rgba(0x292b2fff),
-            text: rgba(0xf1f2f3ff),
-            muted: rgba(0xb8bbc1ff),
-            border: rgba(0x36383dff),
-            selected: rgba(0xffffff13),
+            canvas: rgba(0x111417ff),
+            surface: rgba(0x1b1f24ff),
+            sidebar: rgba(0x131619f0),
+            elevated: rgba(0x22272dff),
+            text: rgba(0xf0f6fcff),
+            muted: rgba(0xb7bfc8ff),
+            border: rgba(0x373e47ff),
+            selected: rgba(0xffffff14),
             accent: rgba(0x4493f8ff),
             green: rgba(0x3fb950ff),
             red: rgba(0xf85149ff),
@@ -2953,14 +1833,14 @@ fn palette(dark: bool) -> LocalPalette {
         }
     } else {
         LocalPalette {
-            canvas: rgba(0xfafaf9ff),
+            canvas: rgba(0xf2f4f7ff),
             surface: rgba(0xffffffff),
-            sidebar: rgba(0xf8f8f7f0),
-            elevated: rgba(0xf2f2f0ff),
-            text: rgba(0x202124ff),
-            muted: rgba(0x56595eff),
-            border: rgba(0xdedfdcff),
-            selected: rgba(0x0000000a),
+            sidebar: rgba(0xf4f6f8f0),
+            elevated: rgba(0xeef1f4ff),
+            text: rgba(0x1f2328ff),
+            muted: rgba(0x59636eff),
+            border: rgba(0xccd3dbff),
+            selected: rgba(0x0000000f),
             accent: rgba(0x0969daff),
             green: rgba(0x1a7f37ff),
             red: rgba(0xd1242fff),
@@ -2977,6 +1857,8 @@ fn is_dark(window: &Window) -> bool {
     )
 }
 
+/// Style for the rebase panel's plain-text commit-message editor. No syntax
+/// highlighting: this app no longer opens worktree files for editing.
 fn editor_style(colors: LocalPalette) -> InputEditorStyle {
     InputEditorStyle {
         foreground: colors.text.into(),
@@ -2986,7 +1868,6 @@ fn editor_style(colors: LocalPalette) -> InputEditorStyle {
         selection: colors.accent.into(),
         caret: colors.text.into(),
         editor_gutter_background: Some(colors.canvas.into()),
-        highlight_styles: std::sync::Arc::new(LocalHighlightTheme { dark: colors.dark }),
         ..Default::default()
     }
 }
@@ -3011,515 +1892,15 @@ fn new_input(
     })
 }
 
-struct LocalHighlightTheme {
-    dark: bool,
-}
-
-impl HighlightStyleResolver for LocalHighlightTheme {
-    fn style(&self, name: &str) -> Option<HighlightStyle> {
-        let color = match (self.dark, name) {
-            (true, "keyword") => rgba(0xc792eaff),
-            (false, "keyword") => rgba(0x7b2cbfff),
-            (true, "string") => rgba(0xc3e88dff),
-            (false, "string") => rgba(0x2b7a0bff),
-            (true, "comment") => rgba(0x8492a6ff),
-            (false, "comment") => rgba(0x6b7280ff),
-            (true, "number") => rgba(0xf78c6cff),
-            (false, "number") => rgba(0xb45309ff),
-            (true, "type") => rgba(0x82aaffff),
-            (false, "type") => rgba(0x1d4ed8ff),
-            (true, "heading") => rgba(0x89ddffff),
-            (false, "heading") => rgba(0x0369a1ff),
-            _ => return None,
-        };
-        Some(HighlightStyle {
-            color: Some(color.into()),
-            font_weight: matches!(name, "keyword" | "heading").then_some(FontWeight::SEMIBOLD),
-            ..Default::default()
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-struct TokenRange {
-    range: Range<usize>,
-    semantic: &'static str,
-}
-
-struct LocalHighlighter {
-    language: SharedString,
-    text_len: usize,
-    tokens: Vec<TokenRange>,
-}
-
-impl LocalHighlighter {
-    fn new(language: &str) -> Self {
-        Self {
-            language: language.to_owned().into(),
-            text_len: 0,
-            tokens: Vec::new(),
-        }
-    }
-
-    fn parse(&mut self, text: &str) {
-        self.text_len = text.len();
-        self.tokens = match self.language.as_ref() {
-            "rust" => lex_rust(text),
-            "json" => lex_json(text),
-            "toml" => lex_toml(text),
-            "markdown" => lex_markdown(text),
-            _ => Vec::new(),
-        };
-    }
-}
-
-impl InputHighlighter for LocalHighlighter {
-    fn language(&self) -> SharedString {
-        self.language.clone()
-    }
-
-    fn update(
-        &mut self,
-        _edit: Option<gpui_base::input::InputEdit>,
-        text: &Rope,
-        _folding: bool,
-        _window: &mut Window,
-        _cx: &mut Context<EditorState>,
-    ) {
-        self.parse(&text.to_string());
-    }
-
-    fn styles(
-        &self,
-        range: &Range<usize>,
-        resolver: &dyn HighlightStyleResolver,
-    ) -> Vec<(Range<usize>, HighlightStyle)> {
-        let start = range.start.min(self.text_len);
-        let end = range.end.min(self.text_len).max(start);
-        let mut result = Vec::new();
-        let mut cursor = start;
-        for token in &self.tokens {
-            if token.range.end <= start || token.range.start >= end {
-                continue;
-            }
-            let token_start = token.range.start.max(start);
-            let token_end = token.range.end.min(end);
-            if cursor < token_start {
-                result.push((cursor..token_start, HighlightStyle::default()));
-            }
-            result.push((
-                token_start..token_end,
-                resolver.style(token.semantic).unwrap_or_default(),
-            ));
-            cursor = token_end;
-        }
-        if cursor < end {
-            result.push((cursor..end, HighlightStyle::default()));
-        }
-        result
-    }
-
-    fn fold_ranges(&self, _text: &Rope) -> Vec<FoldRange> {
-        Vec::new()
-    }
-}
-
-fn highlighter_factory() -> InputHighlighterFactory {
-    Rc::new(|language| match language {
-        "rust" | "json" | "toml" | "markdown" => {
-            Some(Box::new(LocalHighlighter::new(language)) as Box<dyn InputHighlighter>)
-        }
-        _ => None,
-    })
-}
-
-fn lex_rust(text: &str) -> Vec<TokenRange> {
-    const KEYWORDS: &[&str] = &[
-        "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
-        "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
-        "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait",
-        "true", "type", "unsafe", "use", "where", "while",
-    ];
-    let bytes = text.as_bytes();
-    let mut tokens = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index..].starts_with(b"//") {
-            let end = text[index..]
-                .find('\n')
-                .map_or(bytes.len(), |offset| index + offset);
-            tokens.push(TokenRange {
-                range: index..end,
-                semantic: "comment",
-            });
-            index = end;
-        } else if bytes[index..].starts_with(b"/*") {
-            let end = text[index + 2..]
-                .find("*/")
-                .map_or(bytes.len(), |offset| index + 2 + offset + 2);
-            tokens.push(TokenRange {
-                range: index..end,
-                semantic: "comment",
-            });
-            index = end;
-        } else if bytes[index] == b'"' {
-            let end = quoted_end(bytes, index, b'"');
-            tokens.push(TokenRange {
-                range: index..end,
-                semantic: "string",
-            });
-            index = end;
-        } else if bytes[index].is_ascii_digit() {
-            let start = index;
-            index += 1;
-            while index < bytes.len()
-                && (bytes[index].is_ascii_alphanumeric() || b"_xX.".contains(&bytes[index]))
-            {
-                index += 1;
-            }
-            tokens.push(TokenRange {
-                range: start..index,
-                semantic: "number",
-            });
-        } else if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
-            let start = index;
-            index += 1;
-            while index < bytes.len()
-                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
-            {
-                index += 1;
-            }
-            let word = &text[start..index];
-            if KEYWORDS.contains(&word) {
-                tokens.push(TokenRange {
-                    range: start..index,
-                    semantic: "keyword",
-                });
-            } else if word.chars().next().is_some_and(char::is_uppercase) {
-                tokens.push(TokenRange {
-                    range: start..index,
-                    semantic: "type",
-                });
-            }
-        } else {
-            index += text[index..].chars().next().map_or(1, char::len_utf8);
-        }
-    }
-    tokens
-}
-
-fn lex_json(text: &str) -> Vec<TokenRange> {
-    let bytes = text.as_bytes();
-    let mut tokens = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'"' {
-            let end = quoted_end(bytes, index, b'"');
-            tokens.push(TokenRange {
-                range: index..end,
-                semantic: "string",
-            });
-            index = end;
-        } else if bytes[index].is_ascii_digit() || bytes[index] == b'-' {
-            let start = index;
-            index += 1;
-            while index < bytes.len()
-                && (bytes[index].is_ascii_digit() || b".eE+-".contains(&bytes[index]))
-            {
-                index += 1;
-            }
-            tokens.push(TokenRange {
-                range: start..index,
-                semantic: "number",
-            });
-        } else if bytes[index..].starts_with(b"true")
-            || bytes[index..].starts_with(b"false")
-            || bytes[index..].starts_with(b"null")
-        {
-            let length = if bytes[index..].starts_with(b"false") {
-                5
-            } else {
-                4
-            };
-            tokens.push(TokenRange {
-                range: index..index + length,
-                semantic: "keyword",
-            });
-            index += length;
-        } else {
-            index += 1;
-        }
-    }
-    tokens
-}
-
-fn lex_toml(text: &str) -> Vec<TokenRange> {
-    let mut tokens = lex_json(text);
-    for (line_start, line) in lines_with_offsets(text) {
-        if let Some(comment) = line.find('#') {
-            tokens.retain(|token| {
-                token.range.end <= line_start + comment
-                    || token.range.start >= line_start + line.len()
-            });
-            tokens.push(TokenRange {
-                range: line_start + comment..line_start + line.len(),
-                semantic: "comment",
-            });
-        } else if line.trim_start().starts_with('[') {
-            tokens.retain(|token| {
-                token.range.end <= line_start || token.range.start >= line_start + line.len()
-            });
-            tokens.push(TokenRange {
-                range: line_start..line_start + line.len(),
-                semantic: "heading",
-            });
-        }
-    }
-    tokens.sort_by_key(|token| token.range.start);
-    tokens
-}
-
-fn lex_markdown(text: &str) -> Vec<TokenRange> {
-    let mut tokens = Vec::new();
-    for (start, line) in lines_with_offsets(text) {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('#') {
-            tokens.push(TokenRange {
-                range: start..start + line.len(),
-                semantic: "heading",
-            });
-            continue;
-        }
-        let mut rest = line;
-        let mut offset = start;
-        while let Some(open) = rest.find('`') {
-            let after = offset + open + 1;
-            if let Some(close) = text[after..start + line.len()].find('`') {
-                tokens.push(TokenRange {
-                    range: offset + open..after + close + 1,
-                    semantic: "string",
-                });
-                offset = after + close + 1;
-                rest = &text[offset..start + line.len()];
-            } else {
-                break;
-            }
-        }
-    }
-    tokens.sort_by_key(|token| token.range.start);
-    tokens
-}
-
-fn lines_with_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
-    let mut offset = 0;
-    text.split_inclusive('\n').map(move |line| {
-        let start = offset;
-        offset += line.len();
-        (start, line.trim_end_matches('\n'))
-    })
-}
-
-fn quoted_end(bytes: &[u8], start: usize, quote: u8) -> usize {
-    let mut index = start + 1;
-    let mut escaped = false;
-    while index < bytes.len() {
-        if !escaped && bytes[index] == quote {
-            return index + 1;
-        }
-        escaped = !escaped && bytes[index] == b'\\';
-        if bytes[index] != b'\\' {
-            escaped = false;
-        }
-        index += 1;
-    }
-    bytes.len()
-}
-
 impl Render for LocalWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = palette(self.context.appearance.dark);
-
-        // `set_value` is reserved for initial load and explicit authoritative
-        // reload/reconcile. Routine typing is never mirrored back through it.
-        for tab in self.documents.values_mut() {
-            if let Some(pending) = tab.pending_programmatic_reload.take() {
-                let current = tab.editor.read(cx).value().to_string();
-                if pending.still_applies(tab.generation, &current) {
-                    tab.editor.update(cx, |editor, cx| {
-                        editor.set_value(pending.replacement, window, cx)
-                    });
-                } else {
-                    tab.message = "A newer edit superseded a delayed programmatic reload".into();
-                }
-            }
-        }
-
-        let active = self
-            .active_document
-            .as_ref()
-            .and_then(|path| self.documents.get(path));
-        if let Some(tab) = active
-            && tab.view.status == DocumentStatus::Conflict
-            && let Some(version) = tab.view.displayed_disk_version()
-        {
-            let seed = (tab.path.clone(), version.sha256.clone());
-            if self.proposed_seed.as_ref() != Some(&seed) {
-                let ours = tab.editor.read(cx).value();
-                self.proposed_merge
-                    .update(cx, |editor, cx| editor.set_value(ours, window, cx));
-                self.proposed_seed = Some(seed);
-            }
-        }
-
-        let query = self.quick_open.read(cx).value().to_lowercase();
-        let filtered_browser = self
-            .browser()
-            .map(|browser| {
-                browser
-                    .entries
-                    .iter()
-                    .filter(|entry| {
-                        query.trim().is_empty()
-                            || entry.display.to_lowercase().contains(query.trim())
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let browser_notice = self.browser().and_then(|browser| {
-            if browser.truncated {
-                Some(
-                    browser
-                        .truncation_reason
-                        .clone()
-                        .unwrap_or_else(|| "bounded".into()),
-                )
-            } else if filtered_browser.len() > 500 {
-                Some(format!(
-                    "showing 500 of {} matches; narrow quick-open",
-                    filtered_browser.len()
-                ))
-            } else {
-                None
-            }
-        });
-        let browser_rows = filtered_browser.into_iter().take(500).collect::<Vec<_>>();
-
-        let mut files = div()
-            .id("local-workspace-files")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .px(px(ui::CELL_INSET))
-            .py_2();
-        for entry in browser_rows {
-            let path = entry.relative_path.clone();
-            let selected = self.revealed_path.as_ref() == Some(&path);
-            let icon = match entry.kind {
-                BrowserEntryKind::Directory => "▸",
-                BrowserEntryKind::EditableCandidate => " ",
-                BrowserEntryKind::Symlink => "↗",
-                BrowserEntryKind::UnsupportedMedia => "◇",
-                BrowserEntryKind::Other => "?",
-            };
-            let editable = entry.kind == BrowserEntryKind::EditableCandidate;
-            files = files.child(
-                div()
-                    .id(ElementId::Name(
-                        format!(
-                            "local-file-{:x}",
-                            Sha256::digest(path.as_os_str().as_bytes())
-                        )
-                        .into(),
-                    ))
-                    .h(px(ui::CONTROL_HEIGHT))
-                    .px(px(ui::CELL_INSET))
-                    .flex()
-                    .items_center()
-                    .gap(px(ui::GAP_GROUP))
-                    .rounded(px(ui::CONTROL_RADIUS))
-                    .when(selected, |row| row.bg(colors.selected))
-                    .text_color(if editable { colors.text } else { colors.muted })
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if editable {
-                            this.open_relative_path(&path, window, cx);
-                        } else {
-                            this.reveal_relative_path(&path, cx);
-                            this.status = match entry.kind {
-                                BrowserEntryKind::UnsupportedMedia => {
-                                    "Media is listed but never decoded or edited".into()
-                                }
-                                BrowserEntryKind::Symlink => {
-                                    "Symlink is listed but never followed by the editor".into()
-                                }
-                                BrowserEntryKind::Directory => "Directory selected".into(),
-                                BrowserEntryKind::Other => "Unsupported filesystem entry".into(),
-                                BrowserEntryKind::EditableCandidate => unreachable!(),
-                            };
-                        }
-                    }))
-                    .child(div().w(px(BROWSER_ICON_COLUMN)).flex_none().child(icon))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(entry.display),
-                    ),
-            );
-        }
-
-        let browser_panel = div()
-            .w(px(300.))
-            .min_w(px(220.))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(colors.sidebar)
-            .border_r_1()
-            .border_color(colors.border)
-            .child(
-                div()
-                    .h(px(48.))
-                    .px(px(ui::CONTROL_INSET))
-                    .flex()
-                    .items_center()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("WORKTREE"),
-            )
-            .child(
-                div()
-                    .px(px(ui::CELL_INSET))
-                    .pb_2()
-                    .child(Input::new(&self.quick_open)),
-            )
-            .child(files)
-            .when_some(browser_notice, |panel, reason| {
-                panel.child(
-                    div()
-                        .px(px(ui::CONTROL_INSET))
-                        .py_2()
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.amber)
-                        .child(format!("Enumeration truncated: {reason}")),
-                )
-            });
 
         let rebase_open = self.rebase.open;
         let workspace_content = if rebase_open {
             self.render_rebase_panel(colors, window, cx)
         } else {
-            div()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .flex()
-                .child(self.render_editor_panel(colors, window, cx))
-                .child(self.render_changes_panel(colors, cx))
-                .into_any_element()
+            self.render_changes_panel(colors, cx)
         };
 
         div()
@@ -3528,28 +1909,11 @@ impl Render for LocalWorkspace {
             .size_full()
             .flex()
             .flex_col()
-            .font_family(UI_FONT)
+            .font_family(ui::TEXT_FONT)
             .ui_text(TextRole::Body)
             .bg(colors.canvas)
             .text_color(colors.text)
-            .on_action(cx.listener(|this, _: &LocalSave, _, cx| this.save_active(cx)))
             .on_action(cx.listener(|this, _: &LocalRefresh, _, cx| this.refresh_all(cx)))
-            .on_action(cx.listener(|this, _: &LocalQuickOpen, window, cx| {
-                let query = this.quick_open.read(cx).value().to_lowercase();
-                let candidate = this.browser().and_then(|browser| {
-                    browser
-                        .entries
-                        .iter()
-                        .find(|entry| {
-                            entry.kind == BrowserEntryKind::EditableCandidate
-                                && entry.display.to_lowercase().contains(query.trim())
-                        })
-                        .map(|entry| entry.relative_path.clone())
-                });
-                if let Some(path) = candidate {
-                    this.open_relative_path(path, window, cx);
-                }
-            }))
             .on_action(cx.listener(|this, _: &LocalConfirm, _, cx| {
                 if let Some(id) = this.pending_action.as_ref().map(|pending| pending.id) {
                     this.confirm_action(id, cx);
@@ -3563,27 +1927,6 @@ impl Render for LocalWorkspace {
                 } else if let Some(id) = this.rebase_pending_action_id() {
                     this.cancel_rebase_action(id, cx);
                 }
-            }))
-            .on_action(cx.listener(|this, _: &LocalFind, _, cx| {
-                if let Some(tab) = this
-                    .active_document
-                    .as_ref()
-                    .and_then(|path| this.documents.get(path))
-                {
-                    tab.editor.update(cx, |editor, cx| editor.open_search(false, cx));
-                }
-            }))
-            .on_action(cx.listener(|this, _: &LocalReplace, _, cx| {
-                if let Some(tab) = this
-                    .active_document
-                    .as_ref()
-                    .and_then(|path| this.documents.get(path))
-                {
-                    tab.editor.update(cx, |editor, cx| editor.open_search(true, cx));
-                }
-            }))
-            .on_action(cx.listener(|this, _: &LocalReloadDisk, _, cx| {
-                this.reload_active_from_disk(cx)
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if this.handle_rebase_key(event, cx) {
@@ -3602,7 +1945,7 @@ impl Render for LocalWorkspace {
                     .border_color(colors.border)
                     .child(
                         div()
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(ui::WEIGHT_EMPHASIS)
                             .child(format!("{} · Local workspace", self.context.repository.full_name())),
                     )
                     .child(
@@ -3628,14 +1971,13 @@ impl Render for LocalWorkspace {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(browser_panel)
                     .child(workspace_content),
             )
             .child(
                 div()
                     .min_h(px(34.))
                     .px(px(ui::PANEL_GUTTER))
-                    .py_2()
+                    .py(px(ui::GAP_GROUP))
                     .bg(colors.surface)
                     .border_t_1()
                     .border_color(colors.border)
@@ -3647,241 +1989,6 @@ impl Render for LocalWorkspace {
 }
 
 impl LocalWorkspace {
-    fn render_editor_panel(
-        &mut self,
-        colors: LocalPalette,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(path) = self.active_document.clone() else {
-            return div()
-                .flex_1()
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(colors.muted)
-                .child(match &self.backend {
-                    BackendState::Loading => "Preparing checkout off the UI thread…".to_owned(),
-                    BackendState::Failed(error) => format!("Local workspace unavailable: {error}"),
-                    BackendState::Ready(_) => "Open any unchanged or changed text file".to_owned(),
-                })
-                .into_any_element();
-        };
-        let Some(tab) = self.documents.get(&path) else {
-            return div().into_any_element();
-        };
-        let editor = tab.editor.clone();
-        let status = tab.view.status;
-        let message = tab.message.clone();
-        let recovery = match &tab.view.recovery {
-            RecoveryStatus::None => "",
-            RecoveryStatus::Restored { .. } => " · Local draft recovered",
-            RecoveryStatus::Corrupt { .. } => {
-                " · Recovery needs attention; original copy preserved"
-            }
-            RecoveryStatus::Stale { .. } => " · Earlier recovery copy preserved",
-        };
-        let mut recovery_paths = tab.view.retained_paths.clone();
-        match &tab.view.recovery {
-            RecoveryStatus::Restored { path }
-            | RecoveryStatus::Corrupt { path, .. }
-            | RecoveryStatus::Stale { path, .. } => {
-                if !recovery_paths.contains(path) {
-                    recovery_paths.push(path.clone());
-                }
-            }
-            RecoveryStatus::None => {}
-        }
-        let conflict = status == DocumentStatus::Conflict;
-        let conflict_data = conflict.then(|| {
-            let disk = match &tab.view.disk {
-                DiskState::Present(snapshot) => snapshot.text.clone(),
-                DiskState::Missing => "<file missing>".into(),
-                DiskState::Unsafe(issue) => format!("<unsafe: {issue:?}>"),
-            };
-            (
-                tab.view.base.clone(),
-                tab.editor.read(cx).value().to_string(),
-                disk,
-                tab.view.displayed_disk_version(),
-            )
-        });
-        let mut panel = div()
-            .flex_1()
-            .min_w(px(420.))
-            .h_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .h(px(44.))
-                    .px(px(ui::CONTROL_INSET))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .child(
-                        div()
-                            .font_family(CODE_FONT)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(display_path(&path)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(ui::GAP_GROUP))
-                            .child(action_button(
-                                "Find",
-                                colors,
-                                cx.listener(|this, _, _, cx| {
-                                    if let Some(tab) = this
-                                        .active_document
-                                        .as_ref()
-                                        .and_then(|path| this.documents.get(path))
-                                    {
-                                        tab.editor
-                                            .update(cx, |editor, cx| editor.open_search(false, cx));
-                                    }
-                                }),
-                            ))
-                            .child(action_button(
-                                "Replace",
-                                colors,
-                                cx.listener(|this, _, _, cx| {
-                                    if let Some(tab) = this
-                                        .active_document
-                                        .as_ref()
-                                        .and_then(|path| this.documents.get(path))
-                                    {
-                                        tab.editor
-                                            .update(cx, |editor, cx| editor.open_search(true, cx));
-                                    }
-                                }),
-                            ))
-                            .child(action_button(
-                                "Save ⌘S",
-                                colors,
-                                cx.listener(|this, _, _, cx| this.save_active(cx)),
-                            )),
-                    ),
-            );
-        if let Some((base, ours, disk, version)) = conflict_data {
-            panel = panel
-                .child(
-                    div()
-                        .px(px(ui::CONTROL_INSET))
-                        .py_2()
-                        .bg(if colors.dark {
-                            rgba(0xbb800926)
-                        } else {
-                            rgba(0xfff8c5ff)
-                        })
-                        .text_color(colors.amber)
-                        .child(match tab.view.conflict_kind {
-                            Some(ConflictKind::Missing) => "The file was removed. Your unsaved text is preserved.",
-                            Some(ConflictKind::Unsafe) => "The file cannot be safely updated. Your unsaved text is preserved.",
-                            Some(ConflictKind::SaveRace) => "The file changed during save. Review the preserved versions before continuing.",
-                            _ => "The file changed on disk. Review both versions, then reload or merge your changes.",
-                        }),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .gap(px(ui::GAP_ICON))
-                        .child(conflict_column("BASE", base, colors))
-                        .child(conflict_column("OURS", ours, colors))
-                        .child(conflict_column("CURRENT DISK", disk, colors)),
-                )
-                .child(
-                    div()
-                        .h(px(180.))
-                        .flex()
-                        .flex_col()
-                        .border_t_1()
-                        .border_color(colors.border)
-                        .child(
-                            div()
-                                .h(px(ui::CONTROL_HEIGHT))
-                                .px(px(ui::CONTROL_INSET))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child("EDITABLE PROPOSED RESULT")
-                                .child(
-                                    div()
-                                        .flex()
-                                        .gap(px(ui::GAP_GROUP))
-                                        .child(action_button("Reload disk", colors, cx.listener(|this, _, _, cx| {
-                                            this.reload_active_from_disk(cx)
-                                        })))
-                                        .when_some(version, |buttons, version| {
-                                            buttons.child(action_button("Reconcile displayed version", colors, cx.listener(move |this, _, _, cx| {
-                                                let proposed = this.proposed_merge.read(cx).value().to_string();
-                                                this.reconcile_active(version.clone(), proposed, cx);
-                                            })))
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_h_0()
-                                .font_family(CODE_FONT)
-                                .child(Editor::new(&self.proposed_merge)),
-                        ),
-                );
-        } else {
-            panel = panel.child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .font_family(CODE_FONT)
-                    .child(Editor::new(&editor)),
-            );
-        }
-        panel
-            .child(
-                div()
-                    .min_h(px(32.))
-                    .px(px(ui::CONTROL_INSET))
-                    .py_1()
-                    .border_t_1()
-                    .border_color(colors.border)
-                    .ui_text(TextRole::Caption)
-                    .text_color(match status {
-                        DocumentStatus::Clean => colors.green,
-                        DocumentStatus::Dirty => colors.amber,
-                        DocumentStatus::Conflict
-                        | DocumentStatus::Missing
-                        | DocumentStatus::Unsafe
-                        | DocumentStatus::RecoveryCorrupt => colors.red,
-                    })
-                    .child(format!("{message}{recovery}"))
-                    .when(!recovery_paths.is_empty(), |footer| {
-                        let count = recovery_paths.len();
-                        let paths = recovery_paths
-                            .iter()
-                            .map(|path| path.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        footer.child(action_button(
-                            format!("Copy recovery paths ({count})"),
-                            colors,
-                            cx.listener(move |_, _, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                    paths.clone(),
-                                ));
-                            }),
-                        ))
-                    }),
-            )
-            .into_any_element()
-    }
-
     fn render_changes_panel(&mut self, colors: LocalPalette, cx: &mut Context<Self>) -> AnyElement {
         let Some(snapshot) = self.snapshot.clone() else {
             return div()
@@ -3991,17 +2098,18 @@ impl LocalWorkspace {
                     .py(px(ui::GAP_GROUP))
                     .border_b_1()
                     .border_color(colors.border)
+                    .flex()
+                    .flex_col()
+                    .gap(px(ui::GAP_ICON))
                     .child(ui::kicker("Local changes").text_color(colors.muted))
                     .child(
                         div()
-                            .mt_2()
                             .font_family(CODE_FONT)
                             .ui_text(TextRole::Caption)
                             .child(head),
                     )
                     .child(
                         div()
-                            .mt_1()
                             .ui_text(TextRole::Caption)
                             .text_color(colors.muted)
                             .child(format!(
@@ -4014,7 +2122,6 @@ impl LocalWorkspace {
                     .when_some(remote_observation.clone(), |header, observation| {
                         header.child(
                             div()
-                                .mt_1()
                                 .font_family(CODE_FONT)
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.muted)
@@ -4036,7 +2143,7 @@ impl LocalWorkspace {
                         .overflow_y_scroll()
                         .border_t_1()
                         .border_color(colors.border)
-                        .p_2()
+                        .p(px(ui::GAP_GROUP))
                         .font_family(CODE_FONT)
                         .ui_text(TextRole::Caption)
                         .whitespace_normal()
@@ -4046,14 +2153,20 @@ impl LocalWorkspace {
             .child(
                 div()
                     .px(px(ui::CONTROL_INSET))
-                    .py_2()
+                    .py(px(ui::GAP_GROUP))
                     .border_t_1()
                     .border_color(colors.border)
                     .flex()
                     .flex_col()
                     .gap(px(ui::GAP_GROUP))
-                    .child(Input::new(&self.commit_message))
-                    .child(Input::new(&self.branch_name))
+                    .child(
+                        ui::text_field(colors.elevated, colors.border)
+                            .child(Input::new(&self.commit_message)),
+                    )
+                    .child(
+                        ui::text_field(colors.elevated, colors.border)
+                            .child(Input::new(&self.branch_name)),
+                    )
                     .child(
                         div()
                             .flex()
@@ -4203,13 +2316,17 @@ impl LocalWorkspace {
                 || self.rebase.has_pending_or_running();
             let mut publish = div()
                 .id("pr-source-publish")
-                .p_3()
+                .p(px(ui::GAP_COLUMNS))
                 .border_t_1()
                 .border_color(colors.border)
                 .flex()
                 .flex_col()
                 .gap(px(ui::GAP_ICON))
-                .child(div().font_weight(FontWeight::MEDIUM).child("Publish to PR"))
+                .child(
+                    div()
+                        .font_weight(ui::WEIGHT_EMPHASIS)
+                        .child("Publish to PR"),
+                )
                 .child(
                     div()
                         .ui_text(TextRole::Caption)
@@ -4219,7 +2336,7 @@ impl LocalWorkspace {
                 );
             if let Some(preparation) = preparation.clone() {
                 publish = publish
-                    .child(div().mt_1().ui_text(TextRole::Caption).whitespace_normal().child(format!(
+                    .child(div().ui_text(TextRole::Caption).whitespace_normal().child(format!(
                         "{} #{} · {}",
                         preparation.selected_repository, preparation.pull_request_number,
                         preparation.selected_account,
@@ -4264,7 +2381,7 @@ impl LocalWorkspace {
                     );
                 }
             }
-            let mut buttons = div().mt_2().flex().flex_wrap().gap(px(ui::GAP_GROUP));
+            let mut buttons = div().flex().flex_wrap().gap(px(ui::GAP_GROUP));
             if !controls_locked {
                 buttons = buttons.child(action_button(
                     if preparation.is_some() {
@@ -4299,7 +2416,7 @@ impl LocalWorkspace {
             let id = pending.id;
             panel = panel.child(
                 div()
-                    .p_3()
+                    .p(px(ui::GAP_COLUMNS))
                     .bg(if colors.dark {
                         rgba(0xbb800926)
                     } else {
@@ -4307,20 +2424,21 @@ impl LocalWorkspace {
                     })
                     .border_t_1()
                     .border_color(colors.amber)
+                    .flex()
+                    .flex_col()
+                    .gap(px(ui::GAP_GROUP))
                     .child(
                         div()
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(ui::WEIGHT_EMPHASIS)
                             .child("Confirm Git action"),
                     )
                     .child(
                         div()
-                            .mt_1()
                             .ui_text(TextRole::Caption)
                             .child(pending.action.summary()),
                     )
                     .child(
                         div()
-                            .mt_2()
                             .flex()
                             .gap(px(ui::GAP_GROUP))
                             .child(action_button(
@@ -4339,7 +2457,7 @@ impl LocalWorkspace {
         if let Some(started) = unresolved {
             let publish_attempt = started.pr_publish.clone();
             let mut reconciliation = div()
-                    .p_3()
+                    .p(px(ui::GAP_COLUMNS))
                     .bg(if colors.dark {
                         rgba(0xf851491a)
                     } else {
@@ -4347,42 +2465,41 @@ impl LocalWorkspace {
                     })
                     .border_t_1()
                     .border_color(colors.red)
-                    .child(div().font_weight(FontWeight::MEDIUM).child("Started action needs reconciliation"))
-                    .child(div().mt_1().ui_text(TextRole::Caption).child(started.summary))
-                    .child(div().mt_1().ui_text(TextRole::Caption).child("Refresh and inspect actual state. This control only acknowledges; it never retries."));
+                    .flex()
+                    .flex_col()
+                    .gap(px(ui::GAP_ICON))
+                    .child(div().font_weight(ui::WEIGHT_EMPHASIS).child("Started action needs reconciliation"))
+                    .child(div().ui_text(TextRole::Caption).child(started.summary))
+                    .child(div().ui_text(TextRole::Caption).child("Refresh and inspect actual state. This control only acknowledges; it never retries."));
             if let Some(attempt) = publish_attempt {
-                reconciliation = reconciliation
-                    .child(
-                        div()
-                            .mt_1()
-                            .font_family(CODE_FONT)
-                            .ui_text(TextRole::Caption)
-                            .whitespace_normal()
-                            .child(format!(
-                                "request {} · {} {} @ {} -> {}/{} expected {} · config {}",
-                                attempt.request_id,
-                                attempt.mode.label(),
-                                attempt.local_branch,
-                                attempt.local_oid,
-                                attempt.destination_remote,
-                                attempt.remote_branch,
-                                attempt.expected_remote_oid,
-                                attempt.destination_configuration_fingerprint,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .ui_text(TextRole::Caption)
-                            .whitespace_normal()
-                            .child(format!(
+                reconciliation =
+                    reconciliation
+                        .child(
+                            div()
+                                .font_family(CODE_FONT)
+                                .ui_text(TextRole::Caption)
+                                .whitespace_normal()
+                                .child(format!(
+                                    "request {} · {} {} @ {} -> {}/{} expected {} · config {}",
+                                    attempt.request_id,
+                                    attempt.mode.label(),
+                                    attempt.local_branch,
+                                    attempt.local_oid,
+                                    attempt.destination_remote,
+                                    attempt.remote_branch,
+                                    attempt.expected_remote_oid,
+                                    attempt.destination_configuration_fingerprint,
+                                )),
+                        )
+                        .child(div().ui_text(TextRole::Caption).whitespace_normal().child(
+                            format!(
                                 "target {} · selected {}/{} #{}",
                                 attempt.destination_repository,
                                 attempt.selected_host,
                                 attempt.selected_repository,
                                 attempt.pull_request_number,
-                            )),
-                    );
+                            ),
+                        ));
             }
             reconciliation = reconciliation.child(action_button(
                 "Acknowledge observed current state",
@@ -4431,37 +2548,6 @@ fn action_button(
         .child(label)
 }
 
-fn conflict_column(label: &'static str, text: String, colors: LocalPalette) -> Div {
-    div()
-        .w_1_3()
-        .min_w_0()
-        .flex()
-        .flex_col()
-        .bg(colors.surface)
-        .child(
-            div()
-                .h(px(ui::CONTROL_HEIGHT))
-                .px(px(ui::CELL_INSET))
-                .flex()
-                .items_center()
-                .ui_text(TextRole::Caption)
-                .text_color(colors.muted)
-                .child(label),
-        )
-        .child(
-            div()
-                .id(ElementId::Name(format!("conflict-{label}").into()))
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .p_2()
-                .font_family(CODE_FONT)
-                .ui_text(TextRole::Body)
-                .whitespace_normal()
-                .child(text),
-        )
-}
-
 fn operation_label(operation: &OperationState) -> String {
     let mut active = Vec::new();
     if operation.merge {
@@ -4488,10 +2574,6 @@ fn operation_is_active(operation: &OperationState) -> bool {
         || operation.rebase != cibergit::local_git::RebaseState::None
         || operation.cherry_pick
         || operation.revert
-}
-
-fn document_open_allowed(rebase_effect_in_flight: bool) -> bool {
-    !rebase_effect_in_flight
 }
 
 fn remote_observation_matches(
@@ -4537,11 +2619,8 @@ fn local_change_rows(snapshot: &LocalSnapshot) -> Vec<(&'static str, GitPath, Di
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cibergit::{
-        document::{ReconcileOutcome, TargetIssue},
-        domain::{PullRequestCheckoutSource, Revision},
-    };
-    use std::{os::unix::fs::symlink, process::Command, time::Instant};
+    use cibergit::domain::{PullRequestCheckoutSource, Revision};
+    use std::{process::Command, thread, time::Instant};
     use tempfile::TempDir;
 
     fn git(root: &Path, args: &[&str]) {
@@ -4644,266 +2723,16 @@ mod tests {
         )
     }
 
-    fn document_store(root: &Path, recovery: &Path) -> DocumentStore {
-        fs::create_dir_all(recovery).expect("recovery root");
-        DocumentStore::new(
-            root,
-            recovery,
-            RecoveryScope::new("account", "repository"),
-            DocumentLimits::default(),
-        )
-        .expect("document store")
-    }
-
     #[test]
-    fn browser_preserves_raw_names_excludes_git_and_never_follows_symlinks() {
-        let temporary = tempfile::tempdir().expect("tempdir");
-        let root = temporary.path().join("checkout");
-        let outside = temporary.path().join("outside");
-        fs::create_dir_all(root.join(".git/objects")).expect("git internals");
-        fs::create_dir_all(root.join("nested/.git/objects")).expect("nested Git directory");
-        fs::create_dir_all(root.join("nested/.github/workflows")).expect("GitHub directory");
-        fs::create_dir_all(&outside).expect("outside");
-        fs::write(outside.join("secret.txt"), "outside").expect("outside file");
-        fs::write(root.join("nested/.git/config"), "metadata").expect("nested Git metadata");
-        fs::write(root.join("submodule"), "placeholder").expect("submodule parent");
-        fs::create_dir(root.join("submodule-dir")).expect("submodule directory");
-        fs::write(root.join("submodule-dir/.git"), "gitdir: elsewhere").expect("git file");
-        fs::write(root.join("nested/.gitignore"), "target\n").expect("gitignore");
-        fs::write(
-            root.join("nested/.github/workflows/check.yml"),
-            "name: check\n",
-        )
-        .expect("GitHub workflow");
-        fs::write(root.join(OsStr::from_bytes(b"raw-\nname.txt")), b"raw").expect("raw file");
-        fs::write(root.join("movie.mp4"), b"media").expect("media");
-        symlink(&outside, root.join("escape")).expect("symlink");
-
-        let snapshot = enumerate_worktree(&root, BrowserLimits::default()).expect("enumerate");
-        assert!(snapshot.entries.iter().any(|entry| {
-            entry.relative_path.as_os_str().as_bytes() == b"raw-\nname.txt"
-                && entry.kind == BrowserEntryKind::EditableCandidate
-        }));
-        assert!(snapshot.entries.iter().any(|entry| {
-            entry.relative_path == Path::new("escape") && entry.kind == BrowserEntryKind::Symlink
-        }));
-        assert!(!snapshot.entries.iter().any(|entry| {
-            entry
-                .relative_path
-                .components()
-                .any(|component| matches!(component, Component::Normal(name) if name == ".git"))
-                || entry.display.contains("secret")
-        }));
-        assert!(
-            snapshot
-                .entries
-                .iter()
-                .any(|entry| entry.relative_path == Path::new("nested/.gitignore"))
-        );
-        assert!(snapshot.entries.iter().any(|entry| {
-            entry.relative_path == Path::new("nested/.github/workflows/check.yml")
-        }));
-        assert!(validate_relative_path(Path::new("nested/.git/config")).is_err());
-        assert!(validate_relative_path(Path::new("submodule-dir/.git")).is_err());
-        assert!(validate_relative_path(Path::new("nested/.gitignore")).is_ok());
-        assert!(validate_relative_path(Path::new("nested/.github/check.yml")).is_ok());
-        assert_eq!(
-            snapshot
-                .entries
-                .iter()
-                .find(|entry| entry.relative_path == Path::new("movie.mp4"))
-                .map(|entry| &entry.kind),
-            Some(&BrowserEntryKind::UnsupportedMedia)
-        );
-    }
-
-    #[test]
-    fn browser_reports_bounds_instead_of_silently_omitting() {
-        let temporary = tempfile::tempdir().expect("tempdir");
-        for index in 0..4 {
-            fs::write(temporary.path().join(format!("{index}.txt")), "x").expect("file");
-        }
-        let snapshot = enumerate_worktree(
-            temporary.path(),
-            BrowserLimits {
-                max_entries: 2,
-                max_depth: 2,
-                max_path_bytes: 100,
-            },
-        )
-        .expect("enumerate");
-        assert!(snapshot.truncated);
-        assert_eq!(snapshot.entries.len(), 2);
-        assert!(snapshot.truncation_reason.is_some());
-        assert!(snapshot.entries.windows(2).all(|entries| {
-            entries[0].relative_path.as_os_str().as_bytes()
-                <= entries[1].relative_path.as_os_str().as_bytes()
-        }));
-    }
-
-    #[test]
-    fn browser_does_not_follow_a_directory_replaced_before_descriptor_open() {
-        let temporary = tempfile::tempdir().expect("tempdir");
-        let root = temporary.path().join("checkout");
-        let outside = temporary.path().join("outside");
-        fs::create_dir_all(root.join("victim")).expect("victim directory");
-        fs::create_dir_all(&outside).expect("outside directory");
-        fs::write(root.join("victim/inside.txt"), "inside").expect("inside file");
-        fs::write(outside.join("secret.txt"), "secret").expect("outside secret");
-        let mut replaced = false;
-        let snapshot = enumerate_worktree_with_hook(&root, BrowserLimits::default(), |relative| {
-            if !replaced && relative == Path::new("victim") {
-                fs::rename(root.join("victim"), root.join("detached"))
-                    .expect("detach original directory");
-                symlink(&outside, root.join("victim")).expect("replacement symlink");
-                replaced = true;
-            }
-        })
-        .expect("descriptor enumeration");
-        assert!(replaced);
-        assert!(!snapshot.entries.iter().any(|entry| {
-            entry.relative_path == Path::new("victim/secret.txt")
-                || entry.display.contains("secret")
-        }));
-    }
-
-    #[test]
-    fn recovery_partition_separates_same_relative_file_in_two_checkouts() {
+    fn checkout_partition_separates_two_checkouts() {
         let (_first_temp, first) = checkout_fixture();
         let (_second_temp, mut second) = checkout_fixture();
         second.repository = first.repository.clone();
         second.checkout.association.key = first.checkout.association.key.clone();
         assert_ne!(
-            recovery_partition(&first).expect("partition"),
-            recovery_partition(&second).expect("partition")
+            checkout_partition(&first).expect("partition"),
+            checkout_partition(&second).expect("partition")
         );
-    }
-
-    #[test]
-    fn fifo_worker_saves_captured_buffer_and_preserves_later_edit_for_restart() {
-        let temporary = tempfile::tempdir().expect("tempdir");
-        let root = temporary.path().join("checkout");
-        let recovery = temporary.path().join("recovery");
-        fs::create_dir_all(&root).expect("root");
-        fs::write(root.join("file.txt"), "base").expect("file");
-        let store = document_store(&root, &recovery);
-        let worker = DocumentWorker::start(store.open("file.txt").expect("open"));
-        let send = |command| worker.dispatch(command).expect("dispatch");
-
-        let (tx1, rx1) = mpsc::channel();
-        send(DocumentCommand::Persist {
-            generation: 1,
-            text: "saved value".into(),
-            reply: tx1,
-        });
-        let (tx2, rx2) = mpsc::channel();
-        send(DocumentCommand::Save {
-            generation: 2,
-            text: "saved value".into(),
-            reply: tx2,
-        });
-        let (tx3, rx3) = mpsc::channel();
-        send(DocumentCommand::Persist {
-            generation: 3,
-            text: "newer unsaved value".into(),
-            reply: tx3,
-        });
-        assert!(rx1.recv().expect("reply").result.is_ok());
-        let saved = rx2.recv().expect("reply");
-        assert!(matches!(
-            saved.result,
-            Ok((DocumentReplyKind::Saved { .. }, _))
-        ));
-        let latest = rx3.recv().expect("reply");
-        assert!(latest.result.is_ok());
-        assert_eq!(
-            fs::read_to_string(root.join("file.txt")).expect("disk"),
-            "saved value"
-        );
-        drop(worker);
-        let restored = store.open("file.txt").expect("restart open");
-        assert_eq!(restored.buffer(), "newer unsaved value");
-        assert_eq!(restored.status(), DocumentStatus::Dirty);
-    }
-
-    #[test]
-    fn clean_reload_dirty_conflict_undo_to_base_and_stale_reconcile_are_explicit() {
-        let temporary = tempfile::tempdir().expect("tempdir");
-        let root = temporary.path().join("checkout");
-        fs::create_dir_all(&root).expect("root");
-        fs::write(root.join("file.txt"), "one").expect("file");
-        let store = document_store(&root, &temporary.path().join("recovery"));
-        let mut document = store.open("file.txt").expect("open");
-        fs::write(root.join("file.txt"), "two").expect("external clean change");
-        assert_eq!(
-            document.refresh().expect("refresh"),
-            RefreshOutcome::Reloaded
-        );
-        assert_eq!(document.buffer(), "two");
-        document.set_buffer("ours").expect("dirty");
-        fs::write(root.join("file.txt"), "three").expect("external dirty change");
-        assert_eq!(
-            document.refresh().expect("refresh"),
-            RefreshOutcome::Conflict
-        );
-        assert_eq!(document.status(), DocumentStatus::Conflict);
-        document.set_buffer("two").expect("undo to base");
-        assert_eq!(document.status(), DocumentStatus::Conflict);
-        let displayed = match document.disk() {
-            DiskState::Present(snapshot) => snapshot.version.clone(),
-            _ => panic!("present disk"),
-        };
-        fs::write(root.join("file.txt"), "four").expect("advance disk");
-        assert_eq!(
-            document
-                .reconcile(&displayed, "proposed")
-                .expect("reconcile"),
-            ReconcileOutcome::Stale
-        );
-        assert_eq!(document.buffer(), "proposed");
-        assert_eq!(document.status(), DocumentStatus::Conflict);
-        drop(document);
-        let restarted = store.open("file.txt").expect("restart");
-        assert_eq!(restarted.buffer(), "proposed");
-        assert_eq!(restarted.status(), DocumentStatus::Conflict);
-    }
-
-    #[test]
-    fn unsupported_non_utf8_file_remains_listed_but_document_open_explains() {
-        let temporary = tempfile::tempdir().expect("tempdir");
-        let root = temporary.path().join("checkout");
-        fs::create_dir_all(&root).expect("root");
-        fs::write(root.join("binary.dat"), [0xff, 0xfe]).expect("binary");
-        let browser = enumerate_worktree(&root, BrowserLimits::default()).expect("browser");
-        assert!(
-            browser
-                .entries
-                .iter()
-                .any(|entry| entry.relative_path == Path::new("binary.dat"))
-        );
-        let store = document_store(&root, &temporary.path().join("recovery"));
-        assert!(matches!(
-            store.open("binary.dat"),
-            Err(cibergit::document::DocumentError::UnsafeTarget(
-                TargetIssue::InvalidUtf8
-            ))
-        ));
-    }
-
-    #[test]
-    fn syntax_highlighter_emits_real_colored_token_runs() {
-        let source = "pub struct Demo { value: u64 } // note\n";
-        let mut highlighter = LocalHighlighter::new("rust");
-        highlighter.parse(source);
-        let styles = highlighter.styles(&(0..source.len()), &LocalHighlightTheme { dark: true });
-        assert!(styles.iter().any(|(_, style)| style.color.is_some()));
-        let pub_range = styles
-            .iter()
-            .find(|(range, _)| &source[range.clone()] == "pub")
-            .expect("keyword range");
-        assert_eq!(pub_range.1.font_weight, Some(FontWeight::SEMIBOLD));
-        assert_eq!(styles.first().expect("styles").0.start, 0);
-        assert_eq!(styles.last().expect("styles").0.end, source.len());
     }
 
     #[test]
@@ -5183,24 +3012,6 @@ mod tests {
             active = delayed_path;
         }
         assert_eq!(active, Path::new("new.rs"));
-    }
-
-    #[test]
-    fn document_open_admission_closes_for_the_exact_rebase_effect_lane() {
-        assert!(document_open_allowed(false));
-        assert!(!document_open_allowed(true));
-    }
-
-    #[test]
-    fn delayed_programmatic_reload_cannot_replace_a_newer_editor_value() {
-        let pending = PendingProgrammaticReload {
-            generation: 7,
-            expected_editor_value: "value at reply".into(),
-            replacement: "disk reload".into(),
-        };
-        assert!(pending.still_applies(7, "value at reply"));
-        assert!(!pending.still_applies(8, "newer edit"));
-        assert!(!pending.still_applies(7, "edit in reply-to-render gap"));
     }
 
     #[test]
@@ -5662,25 +3473,5 @@ mod tests {
             local_oid
         );
         assert!(!journal.exists(), "exact successful attempt clears journal");
-    }
-
-    #[test]
-    fn reordered_save_replies_merge_retained_paths_without_regressing_newer_state() {
-        let retained_a = PathBuf::from(OsStr::from_bytes(b"retained-\na"));
-        let retained_b = PathBuf::from(OsStr::from_bytes(b"retained-b"));
-        let mut visible = Vec::new();
-        let newer_message = "Conflict from newer reply".to_owned();
-        let newer_status = DocumentStatus::Conflict;
-
-        assert_eq!(
-            merge_retained_paths(&mut visible, &[retained_a.clone(), retained_b.clone()]),
-            vec![retained_a.clone(), retained_b.clone()]
-        );
-        // The older save callback arrives after the newer callback. Its
-        // cumulative worker view has only A, so replacement would lose B.
-        assert!(merge_retained_paths(&mut visible, std::slice::from_ref(&retained_a)).is_empty());
-        assert_eq!(visible, vec![retained_a, retained_b]);
-        assert_eq!(newer_message, "Conflict from newer reply");
-        assert_eq!(newer_status, DocumentStatus::Conflict);
     }
 }

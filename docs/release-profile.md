@@ -16,10 +16,10 @@ That checkpoint contains a known native reconciliation defect being corrected an
 
 ## App icon
 
-The original branch-graph icon is bundled as `Contents/Resources/cibergit.icns` and declared by `CFBundleIconFile`. Its AppKit vector drawing lives in `scripts/render-app-icon.swift`; the committed PNG is a 1024-pixel preview. To regenerate all ten standard icon representations without replacing existing output:
+The cibergit mark is bundled as `Contents/Resources/cibergit.icns` and declared by `CFBundleIconFile`. The artwork is `assets/icons/cibergit.svg`, the same vector the ciber marketing site uses; the committed PNG is a 1024-pixel preview. `scripts/render-app-icon.swift` reads that SVG, fills its outlines onto the icon tile with AppKit, and hands the set to `iconutil`. To regenerate all ten standard icon representations without replacing existing output:
 
 ```sh
 swift scripts/render-app-icon.swift /tmp/cibergit-icon-new
 ```
 
-The drawing uses system AppKit and `iconutil`, with no external artwork or build dependency. The source and generated artwork use cibergit's MIT license.
+Rendering uses system AppKit and `iconutil`, with no build dependency beyond the committed SVG. The script reads absolute moves, lines and cubics and refuses any other path command rather than approximating it, so replacing the SVG either renders faithfully or fails loudly. The mark and the generated artwork use cibergit's MIT license.

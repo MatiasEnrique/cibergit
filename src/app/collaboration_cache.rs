@@ -1272,6 +1272,7 @@ mod tests {
                 sha_class: CheckShaClass::Unknown,
                 actions_linkage: ActionsLinkage::Unknown,
             }],
+            participant_avatars: Default::default(),
             activity_complete: false,
             checks_complete: false,
             notice: Some("Original partial-evidence notice".into()),

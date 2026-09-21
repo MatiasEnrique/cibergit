@@ -1,6 +1,6 @@
 pub mod comparisons;
-pub mod document;
 pub mod domain;
+pub mod history;
 pub mod local_git;
 pub mod notifications;
 pub mod participation;

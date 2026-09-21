@@ -1,5 +1,5 @@
 use super::ControlPresentation;
-use super::{Palette, Root};
+use super::{Palette, Root, layout};
 use anyhow::{Context as _, Result, ensure};
 use cibergit::ui::{self, Density, TextRole};
 use cibergit::{
@@ -1062,8 +1062,7 @@ impl NotificationController {
                 .map(|repository| render_completeness(repository, colors))
                 .collect::<Vec<_>>();
             Some(
-                div()
-                    .mb(px(ui::GAP_PAGE))
+                layout::block()
                     .child(
                         div()
                             .flex()
@@ -1095,7 +1094,8 @@ impl NotificationController {
                                         "macOS alerts: off"
                                     })
                                     .on_click(cx.listener(move |root, _, _, cx| {
-                                        if let Root::Review(this) = root {
+                                        {
+                                            let this = &mut root.review;
                                             this.set_notification_consent(&account_for_consent, cx);
                                         }
                                     })),
@@ -1103,35 +1103,36 @@ impl NotificationController {
                     )
                     .child(
                         div()
-                            .mt_1()
                             .ui_text(TextRole::Caption)
                             .text_color(colors.faint)
                             .child("In-app unread is always available. macOS alerts are opt-in and requested best effort; this app receives no permission or delivery receipt."),
                     )
-                    .children(completeness)
+                    .child(layout::lines().children(completeness))
                     .when_some(state.stale_notice.clone(), |section, notice| {
-                        section.child(div().mt_2().ui_text(TextRole::Caption).text_color(colors.amber).child(notice))
+                        section.child(div().ui_text(TextRole::Caption).text_color(colors.amber).child(notice))
                     })
                     .when_some(state.server_gate.notice(Instant::now()), |section, notice| {
-                        section.child(div().mt_2().ui_text(TextRole::Caption).text_color(colors.amber).child(notice))
+                        section.child(div().ui_text(TextRole::Caption).text_color(colors.amber).child(notice))
                     })
-                    .child(div().mt_3().children(event_rows))
+                    .child(div().flex().flex_col().gap(px(ui::GAP_FIELD)).children(event_rows))
                     .when(event_count == 0, |section| {
-                        section.child(div().mt_3().text_color(colors.muted).child("No proven unread events."))
+                        section.child(div().text_color(colors.muted).child("No proven unread events."))
                     })
                     .when(incomplete_count > 0, |section| {
-                        section
-                            .child(ui::kicker(&format!("Incomplete candidates · {incomplete_count} · not counted unread")).mt(px(ui::GAP_PAGE)).text_color(colors.amber))
-                            .children(incomplete_rows)
+                        section.child(
+                            layout::block()
+                                .child(ui::kicker(&format!("Incomplete candidates · {incomplete_count} · not counted unread")).text_color(colors.amber))
+                                .child(layout::lines().children(incomplete_rows)),
+                        )
                     })
                     .child(
                         div()
-                            .mt_3()
                             .flex()
                             .gap(px(ui::GAP_COLUMNS))
                             .items_center()
                             .child(enabled_panel_action("Previous", state.page > 0, colors).on_click(cx.listener(move |root, _, _, cx| {
-                                if let Root::Review(this) = root {
+                                {
+                                    let this = &mut root.review;
                                     this.notifications.previous_page(&account_for_previous);
                                     cx.notify();
                                 }
@@ -1140,13 +1141,15 @@ impl NotificationController {
                             // through the pager.
                             .child(div().h(px(ui::CONTROL_HEIGHT)).flex().items_center().ui_text(TextRole::Caption).text_color(colors.faint).child(format!("Page {} of {}", state.page + 1, last_page + 1)))
                             .child(enabled_panel_action("Next", state.page < last_page, colors).on_click(cx.listener(move |root, _, _, cx| {
-                                if let Root::Review(this) = root {
+                                {
+                                    let this = &mut root.review;
                                     this.notifications.next_page(&account_for_next);
                                     cx.notify();
                                 }
                             })))
                             .child(panel_action("Mark displayed read", colors).on_click(cx.listener(move |root, _, _, cx| {
-                                if let Root::Review(this) = root {
+                                {
+                                    let this = &mut root.review;
                                     this.mark_displayed_notifications(&account_for_mark, cx);
                                 }
                             }))),
@@ -1194,10 +1197,9 @@ impl NotificationController {
                             )
                             .child(panel_action("Close", colors).on_click(cx.listener(
                                 |root, _, _, cx| {
-                                    if let Root::Review(this) = root {
-                                        this.notifications.close();
-                                        cx.notify();
-                                    }
+                                    let this = &mut root.review;
+                                    this.notifications.close();
+                                    cx.notify();
                                 },
                             ))),
                     )
@@ -1208,6 +1210,9 @@ impl NotificationController {
                             .min_h_0()
                             .overflow_y_scroll()
                             .p(px(ui::PANEL_GUTTER))
+                            .flex()
+                            .flex_col()
+                            .gap(px(ui::GAP_PAGE))
                             .when(self.runtime.is_none(), |body| {
                                 body.child(div().text_color(colors.muted).child(
                                     self.initialization_error.clone().unwrap_or_else(|| {
@@ -1426,7 +1431,7 @@ fn render_event(
     .items_stretch()
     .justify_start()
     .text_left()
-    .mb_2()
+    .gap(px(ui::GAP_ICON))
     .p(px(ui::CELL_INSET))
     .rounded(px(ui::CONTROL_RADIUS))
     .border_1()
@@ -1458,15 +1463,9 @@ fn render_event(
                     .child(event.occurred_at.clone()),
             ),
     )
+    .child(div().ui_text(TextRole::Body).child(event.summary.clone()))
     .child(
         div()
-            .mt_1()
-            .ui_text(TextRole::Body)
-            .child(event.summary.clone()),
-    )
-    .child(
-        div()
-            .mt_1()
             .ui_text(TextRole::Caption)
             .text_color(colors.muted)
             .child(format!(
@@ -1483,9 +1482,8 @@ fn render_event(
             )),
     )
     .on_click(cx.listener(move |root, _, _, cx| {
-        if let Root::Review(this) = root {
-            this.open_notification_target(&target, cx);
-        }
+        let this = &mut root.review;
+        this.open_notification_target(&target, cx);
     }))
 }
 
@@ -1500,11 +1498,7 @@ fn render_incomplete(candidate: &IncompleteNotificationCandidate, colors: Palett
             )
         })
         .unwrap_or_else(|| "Unresolved pull request".into());
-    div()
-        .mt_2()
-        .p(px(ui::CELL_INSET))
-        .rounded(px(ui::CONTROL_RADIUS))
-        .bg(colors.elevated)
+    layout::lines()
         .ui_text(TextRole::Caption)
         .child(format!(
             "{target} · {}",
@@ -1512,7 +1506,6 @@ fn render_incomplete(candidate: &IncompleteNotificationCandidate, colors: Palett
         ))
         .child(
             div()
-                .mt_1()
                 .text_color(colors.muted)
                 .child(candidate.reason.clone()),
         )
@@ -1532,7 +1525,6 @@ fn incomplete_kind_label(kind: &IncompleteCandidateKind) -> &'static str {
 
 fn render_completeness(repository: &RepositoryNotificationCompleteness, colors: Palette) -> Div {
     div()
-        .mt_2()
         .ui_text(TextRole::Caption)
         .text_color(if repository.complete {
             colors.muted

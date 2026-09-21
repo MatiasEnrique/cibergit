@@ -189,10 +189,6 @@ impl ComparisonPicker {
         if self.range_first.is_none() || self.range_last.is_some() {
             self.range_first = Some(index);
             self.range_last = None;
-            self.notice = Some(
-                "Range start selected. Choose the same or a later contiguous commit as the end."
-                    .into(),
-            );
             return Ok(None);
         }
         let first = self.range_first.expect("checked above");
@@ -240,7 +236,6 @@ impl ComparisonPicker {
         if mode == PickerMode::Range {
             self.range_first = None;
             self.range_last = None;
-            self.notice = Some("Choose the first commit in the contiguous range.".into());
         }
         Ok(())
     }

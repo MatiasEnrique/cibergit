@@ -60,17 +60,19 @@ A combined stack diff shows the net remaining unmerged changes between its effec
 
 The combined view is agreed. Comment routing, grouped review submission, multiple-tip behavior, and stack-wide merge controls remain unresolved. See the [open stack decisions](technical-design.md#unresolved-details).
 
-## Local Git and source editing
+## Local Git
 
 Reviewing does not require a clone. When local operations are needed, create or attach a checkout. Prefer a dedicated worktree for the PR, reuse it on subsequent visits, and allow explicitly attaching an existing checkout. See Q3 and Q20.
 
+Detect an existing checkout instead of asking for one. A worktree already on the pull request's source branch is offered directly; a read-only, offline probe records nothing, and an association is written only when the user opens Local Changes or attaches a folder. One branch can occupy several worktrees when forced, so present every match rather than choosing. Offer to create a checkout only when none is found. This refines Q3 and Q20; explicit attachment remains available.
+
+Offer to open the detected checkout in an installed application of the user's choice. cibergit launches nothing on its own.
+
 Each PR provides two views. Review shows the selected published revision. Local Changes shows uncommitted changes and unpushed commits. Clearly indicate differences between local and remote state, including changes made outside cibergit by agents or other tools. See Q45.
 
-Keep published diffs read-only. An Edit locally action opens the corresponding worktree file inside the same PR tab. Provide the entire worktree through a file browser and quick-open, while keeping changed files as the default review navigation. See Q55–Q56.
+Keep every diff read-only. cibergit does not edit worktree files: there is no built-in text editor, file browser, or quick-open, and a Local changes action selects the corresponding local diff rather than opening the file. Edit source in your own editor. Supersedes Q55–Q56, and retires the focused-editor requirement in Q31 and Q54.
 
-The focused editor includes syntax highlighting, undo/redo, find/replace, indentation, file navigation, and save. Language servers, debugging, extensions, and an integrated terminal are deferred. Use GPUI Kit's editor with compatible pinned dependencies and cibergit-specific diff/conflict interfaces. See Q31 and Q54.
-
-External file edits automatically reload clean buffers. Preserve unsaved buffers and present a comparison when disk contents also change. Observe external commits, branch switches, and rebases. Show the actual Git state, pause incompatible operations, and preserve unsaved text while offering reconciliation or reload. See Q52–Q53.
+Observe external commits, branch switches, rebases, and file edits made outside cibergit by agents or other tools. Show the actual Git state and pause incompatible operations. Because no text is held in memory, an external edit needs no reconciliation: a refresh simply reports what Git reports. Supersedes the unsaved-buffer handling in Q52–Q53.
 
 Local actions include stage/unstage, commit, fetch, pull, push, branch switching, and branch creation. Opening a PR, including a draft, is included but is a secondary workflow. See Q14 and Q25.
 
@@ -82,7 +84,7 @@ Interactive rebase operates on one branch at a time. Support reorder, squash, fi
 
 Before rebasing a dirty worktree, offer commit, stash, or cancel. Restoring the stash after rebase is explicit, including any resulting conflicts. See Q51.
 
-Provide a built-in three-way conflict view with an editable result and explicit continuation and abort controls. Also allow resolving conflicts in an external editor. See Q38.
+Provide a built-in three-way conflict view over Git's immutable base/ours/theirs stages, with explicit staging, continuation, and abort controls. Resolve the result itself in an external editor; cibergit never writes the conflicted file. Supersedes the editable-result half of Q38.
 
 After rebase, show the resulting commits and offer an explicit push of the rewritten branch using a lease. Do not push automatically. See Q39. The handling of affected descendant branches in a stack remains unresolved.
 

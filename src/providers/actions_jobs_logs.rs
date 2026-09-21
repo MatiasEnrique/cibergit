@@ -1861,6 +1861,7 @@ mod tests {
             review_threads: vec![],
             reactions: vec![],
             checks: vec![check.clone()],
+            participant_avatars: Default::default(),
             activity_complete: true,
             checks_complete: true,
             notice: None,

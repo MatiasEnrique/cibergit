@@ -49,13 +49,30 @@ CIBERGIT_DATA_DIR=/tmp/cibergit-data cargo run --locked
 
 Unreadable, foreign, or future-version workspace/session data is reported and preserved. The application does not replace it with defaults on disk.
 
-## Local editing from a pull request
+## Local changes from a pull request
 
-Choose **Edit locally** (Command-Shift-E) in a PR tab. Create a dedicated checkout
-at the pinned canonical published head, never at a narrower selected commit, or verify and attach
-an existing checkout. The selected file opens in the focused editor. The published comparison keeps its
-commit and selection while you work locally. Return with **Published review**
-(Command-Option-Shift-E); Command-Shift-R remains review submission.
+Choose **Local changes** (Command-Shift-E) in a PR tab to open its popover. cibergit
+looks for a worktree already on the pull request's source branch, in the clone recorded
+for the repository. Detection is read-only and offline: it reads `git worktree list` and
+records nothing.
+
+When a checkout is found the popover offers to open it in an installed application —
+VS Code, VS Code Insiders, VSCodium, Cursor, Zed, Trae, Xcode, Ghostty, iTerm, Terminal,
+Finder, or the system default — and to open **Local Changes**. The control in the pull
+request header carries the mark of the application it will launch: the last one used, or
+the first detected until you have picked one. When none is found it offers to create a dedicated
+checkout at the pinned canonical published head, never at a narrower selected commit.
+**Choose a folder…** attaches any existing checkout, and **Reconcile interrupted setup**
+recovers a setup that was interrupted.
+
+An association is recorded only when you ask for Local Changes or attach a folder, so a
+detection that guessed wrong costs nothing. Because `git worktree add --force` can put one
+branch in several worktrees, the popover lists every match and lets you pick rather than
+choosing for you.
+
+The review's selected file selects the matching local diff when that file has one. The
+published comparison keeps its commit and selection while you work locally. Return with
+**Published review** (Command-Option-Shift-E); Command-Shift-R remains review submission.
 
 A saved association reopens its existing checkout after restart. **Reconcile
 interrupted setup** checks actual Git and filesystem identity without replaying
@@ -64,9 +81,8 @@ Initial remote provisioning and explicit object fetch have a three-minute deadli
 local Git actions retain their separate shorter bound. Git network credentials
 and commit authorship come from the installed Git configuration.
 
-File saves use the conflict-aware document store and preserve recovery data and
-retained previous file versions. The old `--edit PATH` prototype no longer writes
-files; it opens a compatibility screen directing you to the PR workspace.
+cibergit never writes worktree files. Edit source in your own editor, then refresh
+to see what Git reports. Stage, commit, push, branch, and rebase from Local changes.
 
 ## Native review controls
 
@@ -159,6 +175,12 @@ files; it opens a compatibility screen directing you to the PR workspace.
   Option-Left/Right adjusts the sidebar; add Shift for the file tree and Command for details.
   Control-Option-0, or **Reset panel layout** in the command palette, restores the native defaults.
   Panel sizes are session-local in this milestone.
+- Command-Comma opens Settings as a page in the tab strip, also reachable from the sidebar's account
+  footer or the command palette. It holds the choices that are yours rather than a repository's, and
+  saves them with the workspace. **Sidebar material** chooses between Clear glass, Tinted glass,
+  Frosted and Solid; both glass choices require macOS 26 and fall back to Frosted on an earlier
+  system. The material is an AppKit view the window server composites behind the renderer, so no
+  in-process capture can show it; `CIBERGIT_GLASS_REPORT=1` names the installed material on stderr.
 - Command-Shift-P opens the command palette.
 - Open **Edit view…** in the sidebar (or choose **Edit sidebar filters and grouping** in the
   command palette) to compose filters and ordered grouping levels. Text fields accept exact
@@ -240,7 +262,7 @@ Each evidence directory receives `native-pr-review.png`,
 `native-submit-confirmation.png`, `native-merge-confirmation.png`,
 `native-merge-confirmation-controls.png`, `native-long-line-end*.png`
 captures, `native-long-line-start-split.png`, `native-view-editor-filters.png`,
-`native-view-editor-groups.png`, and `native-pr-smoke.txt`. The fresh Auto run also writes
+`native-view-editor-groups.png`, one capture per PR tab (`native-pr-tab-commits.png`, `native-pr-tab-checks.png`, `native-pr-tab-files.png`), and `native-pr-smoke.txt`. The fresh Auto run also writes
 `native-pr-review-split.png` before applying an explicit override.
 The harness labels these as
 programmatic native actions: the in-process captures do not prove physical keyboard/mouse input,

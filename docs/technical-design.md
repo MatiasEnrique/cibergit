@@ -12,7 +12,7 @@ This document distinguishes agreed choices from implementation proposals and ups
 | --- | --- | --- |
 | Language and UI | Rust with GPUI | Native desktop rendering and GPUI-managed application state. |
 | Target | macOS, Apple Silicon only | Target `aarch64-apple-darwin`; do not require an Intel or universal build. |
-| Editor | GPUI Kit's focused editor | Pin a compatible GPUI family. Implement review diffs, line comments, and conflict presentation in cibergit. |
+| Text input | GPUI Kit inputs | Pin a compatible GPUI family. Implement review diffs, line comments, and conflict presentation in cibergit. No worktree-file editor ships in V1. |
 | License | MIT for cibergit | Preserve dependency licenses and notices. Do not copy Zed's GPL editor implementation into this design. |
 | Remote integration | GitHub.com through `gh` in V1 | Use structured CLI output and authenticated REST/GraphQL through `gh api`. |
 | Future providers | GitLab and other Git clouds | Isolate provider transport, identifiers, capabilities, and review semantics from views. |
@@ -59,9 +59,9 @@ cibergit
 │       └── Open: ambiguous graphs, comments, grouped reviews and merges
 ├── Local work
 │   ├── Review without clone / worktree when needed
-│   ├── Read-only Review / editable Local Changes
-│   ├── Full worktree file navigation / focused editor
-│   ├── Observe external agent and Git changes / preserve dirty buffers
+│   ├── Read-only Review / Local Changes
+│   ├── Local diffs and Git actions / files edited externally
+│   ├── Observe external agent and Git changes
 │   └── Single-branch graphical rebase / linear history / explicit push
 │       └── Open: stack descendant repair workflow
 └── Delivery
@@ -136,7 +136,7 @@ Read refreshes may resume automatically after reconnect. Publishing reviews, pus
 
 The local watcher should observe worktree files and the actual Git directories, including refs, index, and operation state. Worktree metadata may live outside the checkout. Debounce event bursts and re-read authoritative state after events and app focus. Filesystem events are invalidation hints, not a transaction log.
 
-For external edits, compare the disk version against the buffer's base version. Reload clean buffers. Preserve dirty buffers and show reconciliation when both sides changed. Before saving, check disk state again so a delayed watcher does not overwrite an agent's latest edit.
+cibergit holds no file text in memory and never writes worktree files, so an external edit needs no comparison or reconciliation: re-read authoritative Git state and report it.
 
 ## Local Git and worktrees
 
@@ -181,7 +181,7 @@ The order below implements the accepted runnable-milestone approach. It does not
 | 0. Build foundation | Pinned GPUI/editor dependencies, native Apple Silicon window, license inventory. | Build, render text, edit/save a file, verify dependency notices. |
 | 1. Read and synchronize | Add repositories/accounts, all-open sidebar, filters/groups, PR tabs, local/remote diffs, polling. | Review both cloned and uncloned PRs; new remote commits leave the selected revision stable. |
 | 2. Participate in reviews | Discussions, pending drafts, review submission, progress, checks, PR metadata, merge confirmation. | Revision-correct comments, restart/offline recovery, account separation, and explicit publication. |
-| 3. Work locally | Worktrees, focused editor, full-file navigation, local Git actions, secondary PR creation flow. | External agent edits and branch changes remain visible without losing unsaved text. |
+| 3. Work locally | Worktrees, local diffs, local Git actions, secondary PR creation flow. | External agent edits and branch changes remain visible; a refresh reports the actual Git state. |
 | 4. Stacks and rebase | Combined stack diffs, agreed stack interactions once resolved, graphical rebase and conflicts. | Linear-history editing, conflict continuation/abort, explicit push, correct aggregate comparisons. |
 | 5. Public V1 | Complete PR capability inventory, UI polish, performance validation, signed/notarized Apple Silicon app. | Functional review of agreed scope, install/launch verification, representative local performance results. |
 

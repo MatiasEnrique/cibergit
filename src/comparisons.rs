@@ -615,7 +615,7 @@ fn local_commit_exists(path: &Path, oid: &str) -> Result<bool> {
     }
 }
 
-fn text_field(bytes: &[u8], label: &str) -> Result<String> {
+pub(crate) fn text_field(bytes: &[u8], label: &str) -> Result<String> {
     Ok(std::str::from_utf8(bytes)
         .with_context(|| format!("Invalid UTF-8 in local {label}"))?
         .to_owned())
@@ -642,10 +642,10 @@ fn safe_git(path: &Path) -> Command {
     command
 }
 
-fn git<S: AsRef<OsStr>>(path: &Path, args: &[S]) -> Result<Vec<u8>> {
+pub(crate) fn git<S: AsRef<OsStr>>(path: &Path, args: &[S]) -> Result<Vec<u8>> {
     let mut command = safe_git(path);
     command.args(args).stdout(Stdio::piped()).process_group(0);
-    let mut child = command.spawn().context("Start local commit reader")?;
+    let mut child = command.spawn().context("Start local Git reader")?;
     let mut stdout = child.stdout.take().context("Missing Git output pipe")?;
     let exceeded = Arc::new(AtomicBool::new(false));
     let reader_exceeded = exceeded.clone();
@@ -679,7 +679,7 @@ fn git<S: AsRef<OsStr>>(path: &Path, args: &[S]) -> Result<Vec<u8>> {
                 .status();
             let _ = child.kill();
             let _ = child.wait();
-            bail!("Local commit inventory exceeded its output or time limit");
+            bail!("Local Git read exceeded its output or time limit");
         }
         if bytes.is_none() {
             match receiver.try_recv() {
@@ -687,24 +687,24 @@ fn git<S: AsRef<OsStr>>(path: &Path, args: &[S]) -> Result<Vec<u8>> {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    bail!("Local commit output reader stopped");
+                    bail!("Local Git output reader stopped");
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        if let Some(status) = child.try_wait().context("Wait for local commit reader")?
+        if let Some(status) = child.try_wait().context("Wait for local Git reader")?
             && let Some(bytes) = bytes
         {
             ensure!(
                 !exceeded.load(Ordering::Acquire),
-                "Local commit inventory exceeded its output limit"
+                "Local Git read exceeded its output limit"
             );
             ensure!(
                 status.success(),
-                "Local Git commit read failed (exit {:?})",
+                "Local Git read failed (exit {:?})",
                 status.code()
             );
-            return bytes.context("Read local commit output");
+            return bytes.context("Read local Git output");
         }
         std::thread::sleep(Duration::from_millis(5));
     }

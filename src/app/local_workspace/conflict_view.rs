@@ -1,8 +1,8 @@
 //! Identity-safe presentation state for Git's immutable conflict stages.
 //!
-//! This module never owns or mutates the editable result. `LocalWorkspace`
-//! continues to render the one `DocumentStore`-backed `EditorState`; this state
-//! only binds immutable stage content to the exact Git operation that produced it.
+//! This module never owns or mutates the conflicted file: cibergit does not write
+//! worktree files at all. This state only binds immutable stage content to the
+//! exact Git operation that produced it.
 
 use super::*;
 use cibergit::rebase::{
@@ -90,16 +90,16 @@ impl ConflictContextState {
         match self {
             Self::Current => None,
             Self::StagesChanged => Some(
-                "Git's source stages or the saved result identity changed. The editable result was preserved, but this frozen context cannot be staged. Refresh the source context after reviewing the change.",
+                "Git's source stages or the result on disk changed. This frozen context cannot be staged. Refresh the source context after reviewing the change.",
             ),
             Self::ConflictResolved => Some(
-                "Git no longer reports this path as unmerged. The editable result was preserved; this frozen context cannot advance or stage anything.",
+                "Git no longer reports this path as unmerged. This frozen context cannot advance or stage anything.",
             ),
             Self::OperationChanged => Some(
-                "The rebase or stash-restore identity changed. The editable result was preserved, but this presentation will not attach to the new operation even if the path is the same.",
+                "The rebase or stash-restore identity changed. This presentation will not attach to the new operation even if the path is the same.",
             ),
             Self::OperationUnavailable => Some(
-                "The observed operation ended or became unavailable. The editable result was preserved and this source context is now read-only evidence.",
+                "The observed operation ended or became unavailable. This source context is now read-only evidence.",
             ),
         }
     }
@@ -415,10 +415,10 @@ pub(super) fn source_panel(
             div()
                 .min_h(px(48.))
                 .px(px(ui::CELL_INSET))
-                .py_1()
+                .py(px(ui::GAP_ICON))
                 .border_b_1()
                 .border_color(colors.border)
-                .child(div().font_weight(FontWeight::MEDIUM).child(label))
+                .child(div().font_weight(ui::WEIGHT_EMPHASIS).child(label))
                 .child(
                     div()
                         .font_family(CODE_FONT)
@@ -431,7 +431,7 @@ pub(super) fn source_panel(
             panel.child(
                 div()
                     .px(px(ui::CELL_INSET))
-                    .py_1()
+                    .py(px(ui::GAP_ICON))
                     .border_b_1()
                     .border_color(colors.border)
                     .font_family(CODE_FONT)
@@ -476,7 +476,7 @@ pub(super) fn source_panel(
             .flex_1()
             .min_h_0()
             .w_full()
-            .p_2()
+            .p(px(ui::GAP_GROUP))
             .font_family(CODE_FONT)
             .ui_text(TextRole::Caption),
         )

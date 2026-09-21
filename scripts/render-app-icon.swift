@@ -1,5 +1,5 @@
 #!/usr/bin/env swift
-// Original cibergit artwork, MIT. Regenerate on macOS with AppKit and iconutil.
+// cibergit's mark, MIT. Regenerate on macOS with AppKit and iconutil.
 import AppKit
 
 guard CommandLine.arguments.count == 2 else {
@@ -18,6 +18,109 @@ func color(_ red: CGFloat, _ green: CGFloat, _ blue: CGFloat, _ alpha: CGFloat =
     NSColor(srgbRed: red, green: green, blue: blue, alpha: alpha)
 }
 
+let grid: CGFloat = 1024
+let markCenter = NSPoint(x: 512, y: 512)
+let markHeight: CGFloat = 600
+
+enum PathToken {
+    case command(Character)
+    case number(CGFloat)
+}
+
+func tokenize(_ definition: String) -> [PathToken] {
+    var tokens: [PathToken] = []
+    var digits = ""
+    func flush() {
+        guard !digits.isEmpty else { return }
+        guard let value = Double(digits) else { fatalError("Unreadable number \(digits)") }
+        tokens.append(.number(CGFloat(value)))
+        digits = ""
+    }
+    for character in definition {
+        switch character {
+        case "0"..."9", ".":
+            digits.append(character)
+        case "-", "+":
+            // A sign continues the number only as an exponent's sign.
+            if digits.hasSuffix("e") || digits.hasSuffix("E") {
+                digits.append(character)
+            } else {
+                flush()
+                digits.append(character)
+            }
+        case "e", "E":
+            if digits.isEmpty { fatalError("Unsupported path command \(character)") }
+            digits.append(character)
+        case " ", ",", "\n", "\r", "\t":
+            flush()
+        default:
+            flush()
+            tokens.append(.command(character))
+        }
+    }
+    flush()
+    return tokens
+}
+
+// The mark uses absolute moves, lines and cubics only. Anything else is refused
+// rather than approximated, so editing the SVG cannot silently lose detail.
+func bezierPath(from definition: String) -> NSBezierPath {
+    let path = NSBezierPath()
+    var tokens = tokenize(definition)[...]
+    func number() -> CGFloat {
+        guard case .number(let value)? = tokens.popFirst() else { fatalError("Expected a coordinate") }
+        return value
+    }
+    func point() -> NSPoint { NSPoint(x: number(), y: number()) }
+    var command: Character = " "
+    while let token = tokens.first {
+        if case .command(let letter) = token {
+            command = letter
+            tokens.removeFirst()
+        }
+        switch command {
+        case "M":
+            path.move(to: point())
+            command = "L"    // repeated coordinates after a move are lines
+        case "L":
+            path.line(to: point())
+        case "C":
+            let first = point(), second = point(), end = point()
+            path.curve(to: end, controlPoint1: first, controlPoint2: second)
+        case "Z", "z":
+            path.close()
+        default:
+            fatalError("Unsupported path command \(command)")
+        }
+    }
+    return path
+}
+
+func markPath() throws -> NSBezierPath {
+    let source = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("assets/icons/cibergit.svg")
+    let document = try String(contentsOf: source, encoding: .utf8)
+    let expression = try NSRegularExpression(pattern: "\\bd=\"([^\"]+)\"")
+    let matches = expression.matches(in: document, range: NSRange(document.startIndex..., in: document))
+    guard !matches.isEmpty else { fatalError("No path data in \(source.lastPathComponent)") }
+    let mark = NSBezierPath()
+    for match in matches {
+        mark.append(bezierPath(from: String(document[Range(match.range(at: 1), in: document)!])))
+    }
+    // SVG measures y downwards from the top, so fitting the mark also flips it.
+    let bounds = mark.cgPath.boundingBoxOfPath
+    let scale = markHeight / bounds.height
+    let transform = NSAffineTransform()
+    transform.translateX(by: markCenter.x, yBy: markCenter.y)
+    transform.scaleX(by: scale, yBy: -scale)
+    transform.translateX(by: -bounds.midX, yBy: -bounds.midY)
+    mark.transform(using: transform as AffineTransform)
+    return mark
+}
+
+let mark = try markPath()
+
 func render(size: Int, destination: URL) throws {
     let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: size, pixelsHigh: size,
         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
@@ -26,7 +129,7 @@ func render(size: Int, destination: URL) throws {
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = graphics
     let context = graphics.cgContext
-    context.scaleBy(x: CGFloat(size) / 1024, y: CGFloat(size) / 1024)
+    context.scaleBy(x: CGFloat(size) / grid, y: CGFloat(size) / grid)
     context.setAllowsAntialiasing(true)
 
     let tile = NSBezierPath(roundedRect: NSRect(x: 90, y: 90, width: 844, height: 844),
@@ -37,45 +140,18 @@ func render(size: Int, destination: URL) throws {
     shadow.shadowBlurRadius = 28
     shadow.shadowOffset = NSSize(width: 0, height: -12)
     shadow.set()
-    color(0.90, 0.93, 0.94).setFill()
+    color(0.93, 0.94, 0.95).setFill()
     tile.fill()
     NSGraphicsContext.restoreGraphicsState()
-    NSGradient(starting: color(0.98, 0.99, 0.99), ending: color(0.81, 0.87, 0.89))!
+    NSGradient(starting: color(0.995, 0.995, 1), ending: color(0.87, 0.89, 0.91))!
         .draw(in: tile, angle: -90)
     color(1, 1, 1, 0.72).setStroke()
     tile.lineWidth = 3
     tile.stroke()
 
-    // Two histories converge into a single reviewed path. The nodes stay clear
-    // at Dock and Finder sizes; no type or borrowed product mark is involved.
-    let ink = color(0.15, 0.24, 0.28)
-    let accent = color(0.13, 0.43, 0.43)
-    let main = NSBezierPath()
-    main.move(to: NSPoint(x: 360, y: 284))
-    main.line(to: NSPoint(x: 360, y: 744))
-    main.lineWidth = 58
-    main.lineCapStyle = .round
-    ink.setStroke()
-    main.stroke()
-    let branch = NSBezierPath()
-    branch.move(to: NSPoint(x: 664, y: 730))
-    branch.line(to: NSPoint(x: 664, y: 638))
-    branch.curve(to: NSPoint(x: 512, y: 487), controlPoint1: NSPoint(x: 664, y: 543),
-        controlPoint2: NSPoint(x: 512, y: 568))
-    branch.curve(to: NSPoint(x: 360, y: 368), controlPoint1: NSPoint(x: 512, y: 406),
-        controlPoint2: NSPoint(x: 360, y: 425))
-    branch.lineWidth = 58
-    branch.lineCapStyle = .round
-    accent.setStroke()
-    branch.stroke()
-    for (point, tint) in [(NSPoint(x: 360, y: 738), ink),
-                          (NSPoint(x: 664, y: 738), accent),
-                          (NSPoint(x: 360, y: 284), ink)] {
-        tint.setFill()
-        NSBezierPath(ovalIn: NSRect(x: point.x - 78, y: point.y - 78, width: 156, height: 156)).fill()
-        color(0.95, 0.97, 0.97).setFill()
-        NSBezierPath(ovalIn: NSRect(x: point.x - 32, y: point.y - 32, width: 64, height: 64)).fill()
-    }
+    color(0.05, 0.06, 0.07).setFill()
+    mark.fill()
+
     NSGraphicsContext.restoreGraphicsState()
     try bitmap.representation(using: .png, properties: [:])!.write(to: destination, options: .withoutOverwriting)
 }

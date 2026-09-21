@@ -108,6 +108,119 @@ pub fn checks_page(total: usize, requested_page: usize) -> (usize, usize, std::o
     (page, pages, start..end)
 }
 
+/// What GitHub shows as a check's outcome: the status while it is unfinished,
+/// the conclusion once it has one. A check run reports both; a commit status
+/// carries its whole outcome in `status` and never has a conclusion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CheckState {
+    Success,
+    Failure,
+    Pending,
+    Skipped,
+    Unknown,
+}
+
+impl CheckState {
+    /// The word GitHub puts beside the icon, and what assistive tech hears.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Success => "passed",
+            Self::Failure => "failed",
+            Self::Pending => "in progress",
+            Self::Skipped => "skipped",
+            Self::Unknown => "state unknown",
+        }
+    }
+}
+
+pub fn check_state(check: &PullRequestCheck) -> CheckState {
+    // An unrecognised value stays Unknown rather than being rounded to the
+    // nearest familiar outcome: a check reported in a word this app has never
+    // seen is exactly the case where a green tick would be a lie.
+    if let Some(conclusion) = check.conclusion.as_deref() {
+        return match conclusion.to_ascii_uppercase().as_str() {
+            "SUCCESS" => CheckState::Success,
+            "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED" | "ERROR" => {
+                CheckState::Failure
+            }
+            "NEUTRAL" | "SKIPPED" | "CANCELLED" | "STALE" => CheckState::Skipped,
+            _ => CheckState::Unknown,
+        };
+    }
+    match check.status.to_ascii_uppercase().as_str() {
+        "SUCCESS" => CheckState::Success,
+        "FAILURE" | "ERROR" => CheckState::Failure,
+        "QUEUED" | "IN_PROGRESS" | "WAITING" | "PENDING" | "REQUESTED" | "EXPECTED" => {
+            CheckState::Pending
+        }
+        _ => CheckState::Unknown,
+    }
+}
+
+/// How many observed checks sit in each state. This counts the whole observed
+/// set, not the visible page, and says nothing about checks GitHub did not
+/// return; completeness is reported separately.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct ChecksTally {
+    pub success: usize,
+    pub failure: usize,
+    pub pending: usize,
+    pub skipped: usize,
+    pub unknown: usize,
+}
+
+impl ChecksTally {
+    pub fn total(self) -> usize {
+        self.success + self.failure + self.pending + self.skipped + self.unknown
+    }
+
+    /// The state the whole set reads as. A failure outranks unfinished work,
+    /// which outranks an unreadable state, which outranks success: the worst
+    /// news a reader has to act on comes first.
+    pub fn headline(self) -> CheckState {
+        if self.failure > 0 {
+            CheckState::Failure
+        } else if self.pending > 0 {
+            CheckState::Pending
+        } else if self.unknown > 0 {
+            CheckState::Unknown
+        } else if self.success > 0 {
+            CheckState::Success
+        } else {
+            CheckState::Skipped
+        }
+    }
+
+    /// `3 passed · 1 failed`, naming only the states actually present.
+    pub fn parts(self) -> Vec<String> {
+        [
+            (self.failure, "failed"),
+            (self.pending, "in progress"),
+            (self.success, "passed"),
+            (self.skipped, "skipped"),
+            (self.unknown, "unknown"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, label)| format!("{count} {label}"))
+        .collect()
+    }
+}
+
+pub fn checks_tally(checks: &[PullRequestCheck]) -> ChecksTally {
+    let mut tally = ChecksTally::default();
+    for check in checks {
+        match check_state(check) {
+            CheckState::Success => tally.success += 1,
+            CheckState::Failure => tally.failure += 1,
+            CheckState::Pending => tally.pending += 1,
+            CheckState::Skipped => tally.skipped += 1,
+            CheckState::Unknown => tally.unknown += 1,
+        }
+    }
+    tally
+}
+
 pub fn kind_label(check: &PullRequestCheck) -> &'static str {
     match (&check.kind, &check.actions_linkage) {
         (CheckKind::CheckRun, ActionsLinkage::Linked(_)) => "GitHub Actions",
@@ -262,6 +375,83 @@ mod tests {
                 workflow_name: "CI".into(),
             }),
         }
+    }
+
+    /// The mapping is the whole feature: a green tick on a failed check, or on
+    /// a word this app has never seen, is worse than no icon at all.
+    #[test]
+    fn check_state_reads_conclusion_first_and_never_guesses_an_outcome() {
+        let with = |status: &str, conclusion: Option<&str>| {
+            let mut value = check(1);
+            value.status = status.into();
+            value.conclusion = conclusion.map(str::to_owned);
+            check_state(&value)
+        };
+        assert_eq!(with("COMPLETED", Some("SUCCESS")), CheckState::Success);
+        for failure in ["FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"] {
+            assert_eq!(
+                with("COMPLETED", Some(failure)),
+                CheckState::Failure,
+                "{failure}"
+            );
+        }
+        for skipped in ["NEUTRAL", "SKIPPED", "CANCELLED", "STALE"] {
+            assert_eq!(
+                with("COMPLETED", Some(skipped)),
+                CheckState::Skipped,
+                "{skipped}"
+            );
+        }
+        // Unfinished check runs carry no conclusion at all.
+        for pending in ["QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"] {
+            assert_eq!(with(pending, None), CheckState::Pending, "{pending}");
+        }
+        // A commit status keeps its whole outcome in `status`.
+        assert_eq!(with("SUCCESS", None), CheckState::Success);
+        assert_eq!(with("ERROR", None), CheckState::Failure);
+        assert_eq!(with("PENDING", None), CheckState::Pending);
+        // A conclusion GitHub adds after this was written must not be rounded
+        // to the nearest familiar one.
+        assert_eq!(with("COMPLETED", Some("EMBARGOED")), CheckState::Unknown);
+        assert_eq!(with("SOMETHING_NEW", None), CheckState::Unknown);
+    }
+
+    /// The headline is what a reader acts on, so the worst news has to win.
+    #[test]
+    fn a_tally_leads_with_the_worst_state_present() {
+        let state = |status: &str, conclusion: Option<&str>| {
+            let mut value = check(1);
+            value.status = status.into();
+            value.conclusion = conclusion.map(str::to_owned);
+            value
+        };
+        let passed = state("COMPLETED", Some("SUCCESS"));
+        let failed = state("COMPLETED", Some("FAILURE"));
+        let running = state("IN_PROGRESS", None);
+        let skipped = state("COMPLETED", Some("SKIPPED"));
+
+        assert_eq!(checks_tally(&[]).headline(), CheckState::Skipped);
+        assert_eq!(
+            checks_tally(&[passed.clone(), passed.clone()]).headline(),
+            CheckState::Success
+        );
+        assert_eq!(
+            checks_tally(&[passed.clone(), running.clone()]).headline(),
+            CheckState::Pending
+        );
+        assert_eq!(
+            checks_tally(&[passed.clone(), running.clone(), failed.clone()]).headline(),
+            CheckState::Failure,
+            "one failure outranks any amount of good news"
+        );
+
+        let tally = checks_tally(&[passed, failed, running, skipped]);
+        assert_eq!(tally.total(), 4);
+        assert_eq!(
+            tally.parts(),
+            vec!["1 failed", "1 in progress", "1 passed", "1 skipped"],
+            "only the states actually present are named, worst first"
+        );
     }
 
     #[test]
