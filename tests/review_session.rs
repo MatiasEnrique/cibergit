@@ -32,6 +32,25 @@ fn comparison(revision: Revision, files: Vec<ChangedFile>) -> Comparison {
 }
 
 #[test]
+fn rendered_inventory_keeps_its_snapshot_when_a_lazy_patch_is_installed() {
+    let revision = revision('a', 'b');
+    let mut session = ReviewSession::new(comparison(revision.clone(), vec![file("a", "before")]));
+    let rendered = session.shared_comparison();
+    assert!(std::sync::Arc::ptr_eq(
+        &rendered,
+        &session.shared_comparison()
+    ));
+    session
+        .install_file_patch(&revision, file("a", "after"))
+        .unwrap();
+    assert_eq!(rendered.files[0].patch, file("a", "before").patch);
+    assert_eq!(
+        session.comparison().files[0].patch,
+        file("a", "after").patch
+    );
+}
+
+#[test]
 fn incoming_commits_do_not_move_code_and_advance_rejects_stale_load() {
     let initial = comparison(revision('a', 'b'), vec![file("a", "one")]);
     let mut tab = ReviewSession::new(initial.clone());
@@ -195,6 +214,74 @@ fn cloned_sessions_share_code_but_keep_selection_and_lazy_patches_isolated() {
     );
     let restored: ReviewSession = serde_json::from_value(encoded.clone()).unwrap();
     assert_eq!(serde_json::to_value(restored).unwrap(), encoded);
+}
+
+#[test]
+fn lazy_patch_request_is_rejected_after_a_to_b_to_a_selection() {
+    let revision = revision('a', 'b');
+    let mut session = ReviewSession::new(comparison(
+        revision.clone(),
+        vec![file("a.rs", "a"), file("b.rs", "b")],
+    ));
+    let stale_a = session.begin_file_patch("a.rs").unwrap();
+
+    assert!(session.select_file("b.rs"));
+    assert!(session.select_file("a.rs"));
+    assert!(
+        session
+            .accept_file_patch(&stale_a, file("a.rs", "stale"))
+            .is_err()
+    );
+
+    let current_a = session.begin_file_patch("a.rs").unwrap();
+    session
+        .accept_file_patch(&current_a, file("a.rs", "current"))
+        .unwrap();
+    assert!(
+        session
+            .accept_file_patch(&current_a, file("a.rs", "duplicate"))
+            .is_err(),
+        "acceptance consumes the request"
+    );
+}
+
+#[test]
+fn lazy_patch_request_is_rejected_after_close_and_reopen() {
+    let snapshot = comparison(revision('a', 'b'), vec![file("a.rs", "before")]);
+    let mut original = ReviewSession::new(snapshot.clone());
+    let request = original.begin_file_patch("a.rs").unwrap();
+    drop(original);
+
+    let mut reopened = ReviewSession::new(snapshot);
+    assert!(
+        reopened
+            .accept_file_patch(&request, file("a.rs", "stale"))
+            .is_err()
+    );
+}
+
+#[test]
+fn cloned_reader_has_independent_lazy_patch_lifetime() {
+    let revision = revision('a', 'b');
+    let mut source = ReviewSession::new(comparison(revision.clone(), vec![file("a.rs", "before")]));
+    let request = source.begin_file_patch("a.rs").unwrap();
+    let mut persisted_clone = source.clone();
+
+    assert!(
+        persisted_clone
+            .accept_file_patch(&request, file("a.rs", "wrong reader"))
+            .is_err()
+    );
+    source
+        .accept_file_patch(&request, file("a.rs", "source"))
+        .unwrap();
+    assert!(
+        source.comparison().files[0]
+            .patch
+            .as_deref()
+            .unwrap()
+            .contains("+source")
+    );
 }
 
 #[test]

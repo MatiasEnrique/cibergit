@@ -117,6 +117,711 @@ pub(super) struct DraftSnapshot {
     pub drafts: Vec<SubmittedSummaryDraft>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct SubmittedDraftSave {
+    snapshot: DraftSnapshot,
+    expected_generation: Option<u64>,
+    operation_generation: u64,
+}
+
+impl SubmittedDraftSave {
+    pub fn snapshot(&self) -> &DraftSnapshot {
+        &self.snapshot
+    }
+
+    pub fn expected_generation(&self) -> Option<u64> {
+        self.expected_generation
+    }
+
+    pub fn operation_generation(&self) -> u64 {
+        self.operation_generation
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct SubmittedDraftClear {
+    captured: SubmittedSummaryDraft,
+    expected_generation: Option<u64>,
+    operation_generation: u64,
+}
+
+impl SubmittedDraftClear {
+    pub fn captured(&self) -> &SubmittedSummaryDraft {
+        &self.captured
+    }
+
+    pub fn expected_generation(&self) -> Option<u64> {
+        self.expected_generation
+    }
+
+    pub fn operation_generation(&self) -> u64 {
+        self.operation_generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SubmittedDraftCloseDisposition {
+    Safe,
+    Save,
+    WaitForOperation,
+    RefuseRecovery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SubmittedDraftLoadPhase {
+    Loading,
+    Ready,
+    Failed,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SubmittedDraftActivity {
+    Idle,
+    Saving,
+    Clearing,
+}
+
+#[derive(Clone, Debug)]
+enum SubmittedDraftLoadState {
+    Loading,
+    Ready,
+    Failed,
+    Conflict { disk: DraftSnapshot },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SubmittedDraftLoadAttempt {
+    generation: u64,
+    edit_generation: u64,
+}
+
+impl SubmittedDraftLoadAttempt {
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub fn edit_generation(self) -> u64 {
+        self.edit_generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SubmittedDraftLoadCompletion {
+    Restored { recovered: usize, save_queued: bool },
+    Conflict,
+    Failed,
+}
+
+/// Owns the durable-save protocol state independently of widgets and focus.
+/// The editor supplies current text snapshots; this state records exactly one
+/// active save/clear, one coalesced successor, and the last durable generation.
+#[derive(Clone, Debug, Default)]
+struct SubmittedDraftPersistence {
+    durable: DraftSnapshot,
+    in_flight: Option<SubmittedDraftSave>,
+    pending: Option<DraftSnapshot>,
+    pending_clear: Option<SubmittedSummaryDraft>,
+    clear_in_flight: Option<SubmittedDraftClear>,
+    close_after_save: bool,
+    persistence_error: Option<String>,
+    operation_generation: u64,
+}
+
+impl SubmittedDraftPersistence {
+    fn queue_snapshot(&mut self, snapshot: DraftSnapshot) {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|active| active.snapshot.same_contents(&snapshot))
+            || (self.in_flight.is_none() && self.durable.same_contents(&snapshot))
+        {
+            self.pending = None;
+        } else {
+            self.pending = Some(snapshot);
+        }
+    }
+
+    fn start_next(&mut self, ready: bool) -> Option<SubmittedDraftSave> {
+        if self.in_flight.is_some()
+            || !ready
+            || self.clear_in_flight.is_some()
+            || self.pending_clear.is_some()
+        {
+            return None;
+        }
+        let snapshot = self.pending.take()?;
+        self.operation_generation = self.operation_generation.saturating_add(1);
+        let next = SubmittedDraftSave {
+            snapshot,
+            expected_generation: self.durable.generation,
+            operation_generation: self.operation_generation,
+        };
+        self.in_flight = Some(next.clone());
+        Some(next)
+    }
+
+    fn queue_clear(&mut self, captured: SubmittedSummaryDraft) {
+        self.pending_clear = Some(captured);
+    }
+
+    fn is_current_durable(&self, ready: bool, current: &DraftSnapshot) -> bool {
+        ready
+            && self.in_flight.is_none()
+            && self.pending.is_none()
+            && self.clear_in_flight.is_none()
+            && self.pending_clear.is_none()
+            && self.persistence_error.is_none()
+            && current.same_contents(&self.durable)
+    }
+
+    fn close_disposition(
+        &self,
+        ready: bool,
+        has_recovered_drafts: bool,
+        current: &DraftSnapshot,
+    ) -> SubmittedDraftCloseDisposition {
+        if self.clear_in_flight.is_some()
+            || self.pending_clear.is_some()
+            || self.in_flight.is_some()
+        {
+            SubmittedDraftCloseDisposition::WaitForOperation
+        } else if !ready && has_recovered_drafts {
+            SubmittedDraftCloseDisposition::RefuseRecovery
+        } else if ready && !self.is_current_durable(ready, current) {
+            SubmittedDraftCloseDisposition::Save
+        } else {
+            SubmittedDraftCloseDisposition::Safe
+        }
+    }
+
+    fn complete_save(
+        &mut self,
+        operation_generation: u64,
+        current: DraftSnapshot,
+        result: Result<DraftSnapshot, String>,
+    ) -> Option<Result<(), String>> {
+        let active = self.in_flight.as_ref()?;
+        if active.operation_generation != operation_generation {
+            return None;
+        }
+        let active = self.in_flight.take()?;
+        Some(match result {
+            Ok(saved) if saved.same_contents(&active.snapshot) => {
+                self.durable = saved;
+                self.persistence_error = None;
+                if self.pending.is_none() && !current.same_contents(&self.durable) {
+                    self.queue_snapshot(current);
+                }
+                Ok(())
+            }
+            Ok(_) => {
+                self.pending = None;
+                Err(self.record_failure(
+                    "Submitted-review draft was not made durable; text remains open and close was refused: Submitted-review draft save receipt did not match its exact snapshot."
+                        .into(),
+                ))
+            }
+            Err(error) => {
+                self.pending = None;
+                Err(self.record_failure(format!(
+                    "Submitted-review draft was not made durable; text remains open and close was refused: {error}"
+                )))
+            }
+        })
+    }
+
+    fn start_clear(
+        &mut self,
+        write_in_flight: bool,
+    ) -> Option<Result<SubmittedDraftClear, String>> {
+        if write_in_flight || self.clear_in_flight.is_some() || self.in_flight.is_some() {
+            return None;
+        }
+        let captured = self.pending_clear.take()?;
+        if !self
+            .durable
+            .drafts
+            .iter()
+            .any(|draft| same_draft_history(draft, &captured))
+        {
+            return Some(Err(self.record_failure(
+                "Remote edit was acknowledged, but the durable local predecessor changed before clear. It was preserved and no automatic clear or replay was attempted."
+                    .into(),
+            )));
+        }
+        self.operation_generation = self.operation_generation.saturating_add(1);
+        let clear = SubmittedDraftClear {
+            captured,
+            expected_generation: self.durable.generation,
+            operation_generation: self.operation_generation,
+        };
+        self.clear_in_flight = Some(clear.clone());
+        Some(Ok(clear))
+    }
+
+    fn complete_clear(
+        &mut self,
+        operation_generation: u64,
+        result: Result<DraftSnapshot, String>,
+    ) -> Option<Result<(SubmittedSummaryDraft, DraftSnapshot), String>> {
+        let active = self.clear_in_flight.as_ref()?;
+        if active.operation_generation != operation_generation {
+            return None;
+        }
+        let active = self.clear_in_flight.take()?;
+        Some(match result {
+            Ok(cleared) => {
+                // Any queued snapshot predates this exact tombstone receipt.
+                // Rebuild from the editor's current text after applying the
+                // clear so an old pending save cannot resurrect the capture.
+                self.pending = None;
+                self.durable = cleared.clone();
+                self.persistence_error = None;
+                Ok((active.captured, cleared))
+            }
+            Err(error) => Err(self.record_failure(format!(
+                "Remote edit was acknowledged, but its exact local draft could not be durably cleared; newer or foreign text was preserved: {error}"
+            ))),
+        })
+    }
+
+    fn record_failure(&mut self, message: String) -> String {
+        self.close_after_save = false;
+        self.persistence_error = Some(message.clone());
+        message
+    }
+
+    fn activity(&self) -> SubmittedDraftActivity {
+        if self.clear_in_flight.is_some() || self.pending_clear.is_some() {
+            SubmittedDraftActivity::Clearing
+        } else if self.in_flight.is_some() || self.pending.is_some() {
+            SubmittedDraftActivity::Saving
+        } else {
+            SubmittedDraftActivity::Idle
+        }
+    }
+}
+
+/// Owns the complete submitted-summary draft lifecycle. GPUI supplies current
+/// text and schedules the returned save/clear jobs; it never mutates durable,
+/// in-flight, generation, recovery, or close-barrier state directly.
+#[derive(Clone, Debug)]
+pub(super) struct SubmittedSummaryEditor {
+    active_review: Option<ProviderCoordinates>,
+    drafts: Vec<SubmittedSummaryDraft>,
+    load_state: SubmittedDraftLoadState,
+    load_generation: u64,
+    edit_generation: u64,
+    persistence: SubmittedDraftPersistence,
+}
+
+impl Default for SubmittedSummaryEditor {
+    fn default() -> Self {
+        Self {
+            active_review: None,
+            drafts: Vec::new(),
+            load_state: SubmittedDraftLoadState::Loading,
+            load_generation: 0,
+            edit_generation: 0,
+            persistence: SubmittedDraftPersistence::default(),
+        }
+    }
+}
+
+impl SubmittedSummaryEditor {
+    pub fn active_draft(&self) -> Option<&SubmittedSummaryDraft> {
+        let active = self.active_review.as_ref()?;
+        self.drafts
+            .iter()
+            .find(|draft| same_review_coordinates(&draft.review.coordinates, active))
+    }
+
+    fn active_draft_mut(&mut self) -> Option<&mut SubmittedSummaryDraft> {
+        let active = self.active_review.as_ref()?;
+        self.drafts
+            .iter_mut()
+            .find(|draft| same_review_coordinates(&draft.review.coordinates, active))
+    }
+
+    pub fn draft_for(&self, coordinates: &ProviderCoordinates) -> Option<&SubmittedSummaryDraft> {
+        self.drafts
+            .iter()
+            .find(|draft| same_review_coordinates(&draft.review.coordinates, coordinates))
+    }
+
+    pub fn is_active(&self, coordinates: &ProviderCoordinates) -> bool {
+        self.active_review
+            .as_ref()
+            .is_some_and(|active| same_review_coordinates(active, coordinates))
+    }
+
+    #[cfg(test)]
+    pub fn active_coordinates(&self) -> Option<&ProviderCoordinates> {
+        self.active_review.as_ref()
+    }
+
+    pub fn drafts(&self) -> &[SubmittedSummaryDraft] {
+        &self.drafts
+    }
+
+    pub fn store_active_body(&mut self, body: String) -> bool {
+        if let Some(draft) = self.active_draft_mut()
+            && draft.body != body
+        {
+            draft.body = body;
+            self.edit_generation = self.edit_generation.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
+    /// Selects an exact review draft. Existing text is retained; a newer fresh
+    /// source tuple replaces only the expected source used by preflight.
+    pub fn begin(&mut self, fresh: PullRequestReview) -> (String, bool, bool) {
+        let coordinates = fresh.coordinates.clone();
+        let existing = self
+            .drafts
+            .iter_mut()
+            .find(|draft| same_review_coordinates(&draft.review.coordinates, &coordinates));
+        let (body, source_refreshed, resumed) = if let Some(draft) = existing {
+            let source_refreshed = draft.review != fresh;
+            draft.review = fresh;
+            (draft.body.clone(), source_refreshed, true)
+        } else {
+            let body = fresh.body.clone();
+            self.drafts.push(SubmittedSummaryDraft {
+                review: fresh,
+                body: body.clone(),
+            });
+            (body, false, false)
+        };
+        self.active_review = Some(coordinates);
+        self.edit_generation = self.edit_generation.saturating_add(1);
+        (body, source_refreshed, resumed)
+    }
+
+    fn clear(&mut self, coordinates: &ProviderCoordinates) {
+        self.drafts
+            .retain(|draft| !same_review_coordinates(&draft.review.coordinates, coordinates));
+        if self
+            .active_review
+            .as_ref()
+            .is_some_and(|active| same_review_coordinates(active, coordinates))
+        {
+            self.active_review = None;
+        }
+        self.edit_generation = self.edit_generation.saturating_add(1);
+    }
+
+    pub fn current_snapshot(&self) -> DraftSnapshot {
+        DraftSnapshot {
+            generation: self.persistence.durable.generation,
+            active_review: self.active_review.clone(),
+            drafts: self.drafts.clone(),
+        }
+    }
+
+    pub fn load_phase(&self) -> SubmittedDraftLoadPhase {
+        match self.load_state {
+            SubmittedDraftLoadState::Loading => SubmittedDraftLoadPhase::Loading,
+            SubmittedDraftLoadState::Ready => SubmittedDraftLoadPhase::Ready,
+            SubmittedDraftLoadState::Failed => SubmittedDraftLoadPhase::Failed,
+            SubmittedDraftLoadState::Conflict { .. } => SubmittedDraftLoadPhase::Conflict,
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.load_phase() == SubmittedDraftLoadPhase::Ready
+    }
+
+    pub fn is_current_durable(&self) -> bool {
+        self.persistence
+            .is_current_durable(self.is_ready(), &self.current_snapshot())
+    }
+
+    pub fn close_after_save(&self) -> bool {
+        self.persistence.close_after_save
+    }
+
+    pub fn persistence_error(&self) -> Option<&str> {
+        self.persistence.persistence_error.as_deref()
+    }
+
+    pub fn activity(&self) -> SubmittedDraftActivity {
+        self.persistence.activity()
+    }
+
+    pub fn has_active_operation(&self) -> bool {
+        self.persistence.in_flight.is_some() || self.persistence.clear_in_flight.is_some()
+    }
+
+    pub fn has_clear_work(&self) -> bool {
+        self.persistence.clear_in_flight.is_some() || self.persistence.pending_clear.is_some()
+    }
+
+    pub fn request_close(&mut self) -> SubmittedDraftCloseDisposition {
+        let current = self.current_snapshot();
+        let disposition =
+            self.persistence
+                .close_disposition(self.is_ready(), !self.drafts.is_empty(), &current);
+        match disposition {
+            SubmittedDraftCloseDisposition::WaitForOperation => {
+                self.persistence.close_after_save = true;
+            }
+            SubmittedDraftCloseDisposition::Save => {
+                self.persistence.close_after_save = true;
+                self.persistence.persistence_error = None;
+                self.persistence.queue_snapshot(current);
+            }
+            SubmittedDraftCloseDisposition::Safe
+            | SubmittedDraftCloseDisposition::RefuseRecovery => {}
+        }
+        disposition
+    }
+
+    pub fn start_load(&mut self) -> SubmittedDraftLoadAttempt {
+        self.load_generation = self.load_generation.saturating_add(1);
+        self.load_state = SubmittedDraftLoadState::Loading;
+        SubmittedDraftLoadAttempt {
+            generation: self.load_generation,
+            edit_generation: self.edit_generation,
+        }
+    }
+
+    pub fn load_generation(&self) -> u64 {
+        self.load_generation
+    }
+
+    pub fn edit_generation(&self) -> u64 {
+        self.edit_generation
+    }
+
+    pub fn may_retry_load(&self) -> bool {
+        !self.has_active_operation()
+    }
+
+    pub fn complete_load(
+        &mut self,
+        captured_edit_generation: u64,
+        result: Result<DraftSnapshot, String>,
+    ) -> SubmittedDraftLoadCompletion {
+        let mut disk = match result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.load_state = SubmittedDraftLoadState::Failed;
+                self.persistence.record_failure(format!(
+                    "Submitted-review draft recovery failed; the original was preserved and editing is disabled: {error}"
+                ));
+                return SubmittedDraftLoadCompletion::Failed;
+            }
+        };
+        let recovered = disk.drafts.len();
+        // Restoring selection is history, not authorization. The user must
+        // explicitly choose Edit against fresh Activity before an input opens.
+        disk.active_review = None;
+        if self.edit_generation == captured_edit_generation && self.drafts.is_empty() {
+            self.active_review = None;
+            self.drafts = disk.drafts.clone();
+            self.persistence.durable = disk;
+            self.load_state = SubmittedDraftLoadState::Ready;
+            self.persistence.persistence_error = None;
+            return SubmittedDraftLoadCompletion::Restored {
+                recovered,
+                save_queued: false,
+            };
+        }
+
+        let same_review_conflict = self.drafts.iter().any(|local| {
+            disk.drafts.iter().any(|saved| {
+                same_review_coordinates(&saved.review.coordinates, &local.review.coordinates)
+                    && !same_draft_history(saved, local)
+            })
+        });
+        if same_review_conflict {
+            self.load_state = SubmittedDraftLoadState::Conflict { disk };
+            self.persistence.persistence_error = Some(
+                "A saved draft for this same review loaded after local text. Both versions are preserved; choose which text to keep."
+                    .into(),
+            );
+            return SubmittedDraftLoadCompletion::Conflict;
+        }
+
+        for saved in &disk.drafts {
+            if !self.drafts.iter().any(|local| {
+                same_review_coordinates(&local.review.coordinates, &saved.review.coordinates)
+            }) {
+                self.drafts.push(saved.clone());
+            }
+        }
+        self.persistence.durable = disk;
+        self.load_state = SubmittedDraftLoadState::Ready;
+        self.persistence.persistence_error = None;
+        self.queue_current();
+        SubmittedDraftLoadCompletion::Restored {
+            recovered,
+            save_queued: self.persistence.pending.is_some(),
+        }
+    }
+
+    pub fn retry_save(&mut self) -> bool {
+        if !self.is_ready() || self.has_active_operation() || self.has_clear_work() {
+            return false;
+        }
+        self.persistence.persistence_error = None;
+        self.queue_current();
+        true
+    }
+
+    pub fn queue_current(&mut self) {
+        self.persistence.queue_snapshot(self.current_snapshot());
+    }
+
+    pub fn start_next_save(&mut self) -> Option<SubmittedDraftSave> {
+        self.persistence.start_next(self.is_ready())
+    }
+
+    pub fn complete_save(
+        &mut self,
+        operation_generation: u64,
+        result: Result<DraftSnapshot, String>,
+    ) -> Option<Result<(), String>> {
+        self.persistence
+            .complete_save(operation_generation, self.current_snapshot(), result)
+    }
+
+    pub fn queue_clear(&mut self, captured: SubmittedSummaryDraft) {
+        self.persistence.queue_clear(captured);
+    }
+
+    pub fn start_clear(
+        &mut self,
+        write_in_flight: bool,
+    ) -> Option<Result<SubmittedDraftClear, String>> {
+        self.persistence.start_clear(write_in_flight)
+    }
+
+    pub fn complete_clear(
+        &mut self,
+        operation_generation: u64,
+        result: Result<DraftSnapshot, String>,
+    ) -> Option<Result<bool, String>> {
+        let completion = self
+            .persistence
+            .complete_clear(operation_generation, result)?;
+        Some(completion.map(|(captured, _cleared)| {
+            let unchanged = self
+                .drafts
+                .iter()
+                .any(|draft| same_draft_history(draft, &captured));
+            if unchanged {
+                self.clear(&captured.review.coordinates);
+            }
+            if !self
+                .current_snapshot()
+                .same_contents(&self.persistence.durable)
+            {
+                self.queue_current();
+            }
+            unchanged
+        }))
+    }
+
+    pub fn resolve_conflict_use_saved(&mut self) -> bool {
+        let SubmittedDraftLoadState::Conflict { disk } = self.load_state.clone() else {
+            return false;
+        };
+        let mut replaced_active = false;
+        for saved in &disk.drafts {
+            if let Some(position) = self.drafts.iter().position(|local| {
+                same_review_coordinates(&local.review.coordinates, &saved.review.coordinates)
+            }) {
+                if !same_draft_history(&self.drafts[position], saved) {
+                    replaced_active |= self.active_review.as_ref().is_some_and(|active| {
+                        same_review_coordinates(active, &saved.review.coordinates)
+                    });
+                    self.drafts[position] = saved.clone();
+                }
+            } else {
+                self.drafts.push(saved.clone());
+            }
+        }
+        if replaced_active {
+            self.active_review = None;
+        }
+        self.persistence.durable = disk;
+        self.load_state = SubmittedDraftLoadState::Ready;
+        self.persistence.persistence_error = None;
+        self.queue_current();
+        true
+    }
+
+    pub fn resolve_conflict_keep_current(&mut self) -> bool {
+        let SubmittedDraftLoadState::Conflict { mut disk } = self.load_state.clone() else {
+            return false;
+        };
+        disk.active_review = None;
+        for saved in &disk.drafts {
+            if !self.drafts.iter().any(|local| {
+                same_review_coordinates(&local.review.coordinates, &saved.review.coordinates)
+            }) {
+                self.drafts.push(saved.clone());
+            }
+        }
+        self.persistence.durable = disk;
+        self.load_state = SubmittedDraftLoadState::Ready;
+        self.persistence.persistence_error = None;
+        self.queue_current();
+        true
+    }
+
+    pub fn conflict(&self) -> Option<&DraftSnapshot> {
+        match &self.load_state {
+            SubmittedDraftLoadState::Conflict { disk } => Some(disk),
+            _ => None,
+        }
+    }
+
+    pub fn unavailable_reason(&self) -> Option<&'static str> {
+        match self.load_state {
+            SubmittedDraftLoadState::Loading => {
+                Some("Local submitted-review drafts are still loading.")
+            }
+            SubmittedDraftLoadState::Conflict { .. } => {
+                Some("Resolve the two preserved same-review draft versions first.")
+            }
+            SubmittedDraftLoadState::Failed => {
+                Some("Local submitted-review draft recovery failed; retry it before editing.")
+            }
+            SubmittedDraftLoadState::Ready => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn pending_snapshot(&self) -> Option<&DraftSnapshot> {
+        self.persistence.pending.as_ref()
+    }
+
+    #[cfg(test)]
+    pub fn durable_snapshot(&self) -> &DraftSnapshot {
+        &self.persistence.durable
+    }
+
+    #[cfg(any(test, feature = "ui-smoke"))]
+    pub fn mark_current_durable(&mut self, clear_selection: bool) {
+        if clear_selection {
+            self.active_review = None;
+        }
+        self.persistence.durable = self.current_snapshot();
+        self.persistence.persistence_error = None;
+    }
+
+    #[cfg(test)]
+    pub fn assume_loaded_for_test(&mut self) {
+        self.load_state = SubmittedDraftLoadState::Ready;
+    }
+}
+
 impl DraftSnapshot {
     pub fn same_contents(&self, other: &Self) -> bool {
         let active_matches = match (&self.active_review, &other.active_review) {
@@ -1222,6 +1927,133 @@ mod tests {
             },
             body: body.into(),
         }
+    }
+
+    #[test]
+    fn persistence_serializes_saves_and_rejects_a_stale_receipt() {
+        let repository = repository("alice");
+        let first = review(&repository, "REVIEW_A", "source A", "first body");
+        let mut newer = first.clone();
+        newer.body = "newer body".into();
+        let first_snapshot = DraftSnapshot {
+            generation: None,
+            active_review: Some(first.review.coordinates.clone()),
+            drafts: vec![first],
+        };
+        let newer_snapshot = DraftSnapshot {
+            generation: None,
+            active_review: Some(newer.review.coordinates.clone()),
+            drafts: vec![newer],
+        };
+        let mut persistence = SubmittedDraftPersistence::default();
+
+        persistence.queue_snapshot(first_snapshot.clone());
+        let active = persistence.start_next(true).unwrap();
+        persistence.queue_snapshot(newer_snapshot.clone());
+        assert!(persistence.start_next(true).is_none());
+
+        let mut saved = active.snapshot.clone();
+        saved.generation = Some(1);
+        persistence
+            .complete_save(
+                active.operation_generation(),
+                newer_snapshot.clone(),
+                Ok(saved),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persistence.pending.as_ref().unwrap().drafts[0].body,
+            "newer body"
+        );
+
+        let stale = persistence.start_next(true).unwrap();
+        assert_eq!(
+            persistence.complete_save(
+                stale.operation_generation(),
+                first_snapshot,
+                Ok(DraftSnapshot::default()),
+            ),
+            Some(Err(
+                "Submitted-review draft was not made durable; text remains open and close was refused: Submitted-review draft save receipt did not match its exact snapshot."
+                    .into()
+            ))
+        );
+        assert!(persistence.in_flight.is_none());
+        assert!(persistence.pending.is_none());
+    }
+
+    #[test]
+    fn editor_requires_owned_clear_generation_and_preserves_newer_text() {
+        let repository = repository("alice");
+        let draft = review(&repository, "REVIEW_A", "source A", "sent body");
+        let mut editor = SubmittedSummaryEditor::default();
+        editor.assume_loaded_for_test();
+        editor.begin(draft.review.clone());
+        editor.store_active_body(draft.body.clone());
+        let durable = DraftSnapshot {
+            generation: Some(12),
+            active_review: Some(draft.review.coordinates.clone()),
+            drafts: vec![draft.clone()],
+        };
+        editor.complete_load(editor.edit_generation(), Ok(durable));
+
+        assert_eq!(
+            editor.complete_clear(1, Ok(DraftSnapshot::default())),
+            None,
+            "a completion without an owned clear is stale, not an admission"
+        );
+        editor.queue_clear(draft);
+        let clear = editor.start_clear(false).unwrap().unwrap();
+        editor.queue_current();
+        editor.store_active_body("newer typed body".into());
+        let tombstone = DraftSnapshot {
+            generation: Some(13),
+            active_review: None,
+            drafts: Vec::new(),
+        };
+        assert_eq!(
+            editor.complete_clear(clear.operation_generation() + 1, Ok(tombstone.clone())),
+            None,
+            "a stale callback cannot consume the owned clear"
+        );
+        assert!(editor.has_active_operation());
+        assert_eq!(
+            editor.complete_clear(clear.operation_generation(), Ok(tombstone)),
+            Some(Ok(false))
+        );
+        assert_eq!(editor.active_draft().unwrap().body, "newer typed body");
+        assert_eq!(editor.durable_snapshot().generation, Some(13));
+        assert_eq!(
+            editor.pending_snapshot().unwrap().drafts[0].body,
+            "newer typed body"
+        );
+        assert!(editor.start_clear(false).is_none());
+    }
+
+    #[test]
+    fn close_save_failure_is_recorded_and_reopens_the_barrier() {
+        let repository = repository("alice");
+        let draft = review(&repository, "REVIEW_A", "source A", "must remain");
+        let mut editor = SubmittedSummaryEditor::default();
+        editor.assume_loaded_for_test();
+        editor.begin(draft.review);
+        editor.store_active_body(draft.body);
+
+        assert_eq!(editor.request_close(), SubmittedDraftCloseDisposition::Save);
+        assert!(editor.close_after_save());
+        let save = editor.start_next_save().unwrap();
+        let error = editor
+            .complete_save(
+                save.operation_generation(),
+                Err("injected CAS failure".into()),
+            )
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(editor.persistence_error(), Some(error.as_str()));
+        assert!(!editor.close_after_save());
+        assert_eq!(editor.active_draft().unwrap().body, "must remain");
+        assert_eq!(editor.request_close(), SubmittedDraftCloseDisposition::Save);
     }
 
     #[test]

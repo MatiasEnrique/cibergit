@@ -1,0 +1,15 @@
+# Workspace persistence
+
+`app::workspace_save::WorkspacePersistence` owns navigation writes, review-session writes, and startup restore admission. `workspace::Store` retains the existing bounded JSON formats and validation. GPUI schedules the returned jobs on its background executor and presents their results.
+
+Navigation uses one save lane. Review sessions use a lane for each repository, account, and pull-request identity. A lane serializes writes and skips a queued snapshot if a newer snapshot has already been queued. A failed write stops that lane before releasing its lock, so later tasks cannot overwrite data while the UI is still waiting for the error callback. Later attempts report the retained failure, including attempts from a reopened tab. Other sessions can continue saving. Reopening the workspace creates new lanes after the stored data is loaded and validated.
+
+A session write captures the canonical full revision, canonical progress, selected comparison request and progress, local file-load plan, and remembered comparison sessions in one owned job. The UI no longer owns sequence counters or mutex maps for these writes. Error callbacks check both workspace and tab lifetimes before changing presentation state. Reopening a tab asks the same owner for a session read. That read drains its preceding queued snapshot before loading under the save lock, even if the original save worker has not started. A completed newer save takes precedence. Weak references release comparison data after outstanding jobs finish.
+
+Startup restore has pending, loading, and ready states. It can begin once. Its disk job carries an opaque owner identity, and only the owner that issued it can accept the result. Explicit navigation, including History, the PR browser, and Settings, cancels restore. A rejected result cannot consume a newer owner's pending restore or install tabs after navigation.
+
+On completion, the module checks each restored tab against the exact current repository and account, removes duplicate or already-open tabs from the installation list, and retains the saved order and active selection. An explicit startup destination takes precedence over the saved active tab. GPUI installs the admitted tabs and applies the returned ordering. `WorkspaceState::merge_tabs` preserves unavailable saved slots unless the user has explicitly closed them.
+
+The collaboration cache and participation journals have different failure and authority rules. They keep their own owners and formats. A restored comparison is offline presentation data and grants no authority to write to GitHub.
+
+The module's tests use a real temporary `Store`. They exercise queued writes out of order, per-account and per-PR isolation, immediate close/reopen, delayed reads after newer writes, failure stops, cancellation during restore, foreign restore results, repository changes, duplicate open tabs, active selection, and unavailable saved slots. `tests/workspace_persistence.rs` covers format validation and pinned comparison restoration.

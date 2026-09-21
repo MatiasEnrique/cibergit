@@ -1,11 +1,17 @@
+use super::{
+    journal_identity, journal_operation_description, observe_auxiliary, observe_merge,
+    reconciliation_summary,
+};
 use cibergit::{
     domain::{
         ActionsRunControlRequest, MergeAcknowledgement, MergeExecutionRequest, MergeMethod,
         MergePreparation, MutationAdmissionReceipt, MutationContext, MutationTerminalRecord,
-        PendingFileReviewAbsence, PendingReviewSnapshot, ProviderCoordinates,
-        ProviderMutationOutcome, PullRequestDetails, PullRequestDiscussionRequest,
-        PullRequestLifecycleRequest, ReactionRequest, Repository, ReviewAuxiliaryAcknowledgement,
-        ReviewAuxiliaryRequest, ReviewComment, ReviewThread, SubmittedReviewDismissalRequest,
+        PendingFileReviewAbsence, PendingReviewCreationAcknowledgement, PendingReviewSnapshot,
+        ProviderCoordinates, ProviderMutationOutcome, ProviderReadEvidence, PullRequestDetails,
+        PullRequestDiscussionAction, PullRequestDiscussionRequest, PullRequestLifecycleRequest,
+        ReactionAction, ReactionRequest, Repository, ReviewAuxiliaryAcknowledgement,
+        ReviewAuxiliaryAction, ReviewAuxiliaryRequest, ReviewComment, ReviewThread,
+        ReviewWriteAcknowledgement, SubmittedReviewDismissalRequest,
     },
     participation::{
         CanonicalPublishedPatch, DraftCoordinate, DraftStore, LineSelection, LoadOutcome,
@@ -23,14 +29,17 @@ use cibergit::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::c_int,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::fd::AsRawFd,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -50,6 +59,66 @@ const TARGET_AUTHORITY_WAIT: Duration = Duration::from_millis(150);
 const TARGET_AUTHORITY_POLL: Duration = Duration::from_millis(20);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Process-lifetime sequencing for durable participation state. This owner is
+/// intentionally kept above individual controllers so closing and reopening a
+/// tab cannot reset the sequence and admit a stale background write.
+#[derive(Default)]
+pub struct ParticipationSequencer {
+    latest: HashMap<String, Arc<AtomicU64>>,
+    locks: HashMap<String, Arc<Mutex<()>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParticipationWriteTicket {
+    latest: Arc<AtomicU64>,
+    lock: Arc<Mutex<()>>,
+    sequence: u64,
+}
+
+impl ParticipationSequencer {
+    pub fn issue(&mut self, repository_key: &str, pull_request: u64) -> ParticipationWriteTicket {
+        let key = format!("{repository_key}\n{pull_request}");
+        let latest = self
+            .latest
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        let lock = self
+            .locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let sequence = latest.fetch_add(1, Ordering::AcqRel) + 1;
+        ParticipationWriteTicket {
+            latest,
+            lock,
+            sequence,
+        }
+    }
+}
+
+impl ParticipationWriteTicket {
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.latest.load(Ordering::Acquire) == self.sequence
+    }
+
+    pub(super) fn run<T>(
+        &self,
+        lock_failure: &'static str,
+        operation: impl FnOnce() -> T,
+    ) -> Result<Option<T>, String> {
+        let _guard = self.lock.lock().map_err(|_| lock_failure.to_owned())?;
+        if !self.is_current() {
+            return Ok(None);
+        }
+        Ok(Some(operation()))
+    }
+}
 
 unsafe extern "C" {
     fn flock(fd: c_int, operation: c_int) -> c_int;
@@ -84,10 +153,10 @@ pub enum ControllerLoad {
 
 #[derive(Clone, Debug)]
 pub struct ReviewInteractionController {
-    pub composition: ReviewComposition,
-    pub store: DraftStore,
-    pub authority: ReviewStateAuthority,
-    pub durable_composition: Option<ReviewComposition>,
+    composition: ReviewComposition,
+    store: DraftStore,
+    authority: ReviewStateAuthority,
+    durable_composition: Option<ReviewComposition>,
     undurable_drafts: HashSet<String>,
     pub composer: Option<ComposerState>,
     pub file_composer: Option<FileComposerState>,
@@ -97,6 +166,326 @@ pub struct ReviewInteractionController {
     pub pending_complete: bool,
     pub notice: Option<String>,
     pub reconciliation_results: Vec<ReviewReconciliationItem>,
+}
+
+/// Frozen execution state for one explicitly prepared review operation.
+///
+/// The GPUI shell may move this value to a background task, but it cannot
+/// separate the expected durable snapshot from its store and local authority.
+/// Provider execution is admitted only after the journal transition is durable.
+#[derive(Clone, Debug)]
+pub struct PreparedReviewOperation {
+    composition: ReviewComposition,
+    store: DraftStore,
+    authority: ReviewStateAuthority,
+    expected: Option<ReviewComposition>,
+    operation_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReviewOperationCompletion<T> {
+    composition: ReviewComposition,
+    durable: Option<ReviewComposition>,
+    pub outcome: ProviderMutationOutcome<T>,
+}
+
+impl PreparedReviewOperation {
+    /// Execute the frozen operation under its exact durable-state authority.
+    /// A journal/admission failure returns a zero-write rejection. An uncertain
+    /// provider result remains frozen in the durable composition and is never
+    /// retried here.
+    pub fn execute<T>(
+        mut self,
+        attempt_id: &str,
+        dispatch: impl FnOnce(
+            &mut ReviewComposition,
+            &DraftStore,
+            &str,
+            &str,
+        ) -> ProviderMutationOutcome<T>,
+    ) -> ReviewOperationCompletion<T> {
+        let operation_id = self.operation_id.clone();
+        let execution =
+            self.authority
+                .execute_if_current(&self.store, self.expected.as_ref(), || {
+                    dispatch(
+                        &mut self.composition,
+                        &self.store,
+                        &operation_id,
+                        attempt_id,
+                    )
+                });
+        match execution {
+            Ok((outcome, durable)) => {
+                if matches!(outcome, ProviderMutationOutcome::PreflightRejected { .. }) {
+                    let _ = self.composition.cancel_prepared(&operation_id);
+                }
+                ReviewOperationCompletion {
+                    composition: self.composition,
+                    durable,
+                    outcome,
+                }
+            }
+            Err(reason) => self.reject_without_write(reason),
+        }
+    }
+
+    pub fn execute_sequenced<T>(
+        self,
+        ticket: &ParticipationWriteTicket,
+        attempt_id: &str,
+        superseded_reason: &'static str,
+        dispatch: impl FnOnce(
+            &mut ReviewComposition,
+            &DraftStore,
+            &str,
+            &str,
+        ) -> ProviderMutationOutcome<T>,
+    ) -> ReviewOperationCompletion<T> {
+        let fallback = self.clone();
+        match ticket.run(
+            "Review recovery save lock failed; zero writes sent.",
+            || self.execute(attempt_id, dispatch),
+        ) {
+            Ok(Some(completion)) => completion,
+            Ok(None) => fallback.reject_without_write(superseded_reason.into()),
+            Err(reason) => fallback.reject_without_write(reason),
+        }
+    }
+
+    pub fn reject_without_write<T>(mut self, reason: String) -> ReviewOperationCompletion<T> {
+        let _ = self.composition.cancel_prepared(&self.operation_id);
+        ReviewOperationCompletion {
+            composition: self.composition,
+            durable: self.expected,
+            outcome: ProviderMutationOutcome::PreflightRejected { reason },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedReviewReconciliation {
+    store: DraftStore,
+    authority: ReviewStateAuthority,
+    expected: Option<ReviewComposition>,
+}
+
+impl PreparedReviewReconciliation {
+    pub fn execute(
+        self,
+        repository: &Repository,
+        pull_request: u64,
+        read: impl FnOnce() -> Result<(PullRequestDetails, Option<PendingReviewSnapshot>), String>,
+    ) -> Result<ReviewReconciliationReport, String> {
+        self.authority.reconcile_if_current(
+            &self.store,
+            self.expected.as_ref(),
+            repository,
+            pull_request,
+            read,
+        )
+    }
+
+    pub fn execute_sequenced(
+        self,
+        ticket: &ParticipationWriteTicket,
+        repository: &Repository,
+        pull_request: u64,
+        read: impl FnOnce() -> Result<(PullRequestDetails, Option<PendingReviewSnapshot>), String>,
+    ) -> Result<Option<ReviewReconciliationReport>, String> {
+        ticket
+            .run("Review reconciliation sequencing lock failed.", || {
+                self.execute(repository, pull_request, read)
+            })?
+            .transpose()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedReviewDraftSave {
+    store: DraftStore,
+    authority: ReviewStateAuthority,
+    expected: Option<ReviewComposition>,
+    snapshot: ReviewComposition,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedPendingReviewStart {
+    store: DraftStore,
+    authority: ReviewStateAuthority,
+    expected_composition: Option<ReviewComposition>,
+    expected_record: Option<PendingReviewStartRecord>,
+}
+
+impl PreparedPendingReviewStart {
+    fn execute_sequenced<T>(
+        &self,
+        ticket: &ParticipationWriteTicket,
+        lock_failure: &'static str,
+        superseded: &'static str,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        ticket
+            .run(lock_failure, operation)?
+            .ok_or_else(|| superseded.to_owned())?
+    }
+
+    pub fn execute_create(
+        &self,
+        provider: &GithubProvider,
+        repository: &Repository,
+        intent: &PendingFileReviewStartIntent,
+        attempt_id: &str,
+    ) -> PendingReviewStartStep<PendingReviewCreationAcknowledgement> {
+        execute_pending_review_start_create(
+            &self.authority,
+            &self.store,
+            PendingReviewStartExpected {
+                composition: self.expected_composition.as_ref(),
+                record: self.expected_record.as_ref(),
+            },
+            provider,
+            repository,
+            intent,
+            attempt_id,
+        )
+    }
+
+    pub fn execute_create_sequenced(
+        &self,
+        ticket: &ParticipationWriteTicket,
+        provider: &GithubProvider,
+        repository: &Repository,
+        intent: &PendingFileReviewStartIntent,
+        attempt_id: &str,
+    ) -> Result<PendingReviewStartStep<PendingReviewCreationAcknowledgement>, String> {
+        self.execute_sequenced(
+            ticket,
+            "Review recovery save lock failed; zero writes sent.",
+            "A newer review-state write superseded pending-review creation; zero writes sent.",
+            || Ok(self.execute_create(provider, repository, intent, attempt_id)),
+        )
+    }
+
+    pub fn execute_thread(
+        &self,
+        provider: &GithubProvider,
+        repository: &Repository,
+        attempt_id: &str,
+    ) -> Result<PendingReviewStartStep<ReviewWriteAcknowledgement>, String> {
+        let record = self
+            .expected_record
+            .as_ref()
+            .ok_or_else(|| "The durable pending-review start record disappeared.".to_owned())?;
+        Ok(execute_pending_review_start_thread(
+            &self.authority,
+            &self.store,
+            self.expected_composition.as_ref(),
+            record,
+            provider,
+            repository,
+            attempt_id,
+        ))
+    }
+
+    pub fn execute_thread_sequenced(
+        &self,
+        ticket: &ParticipationWriteTicket,
+        provider: &GithubProvider,
+        repository: &Repository,
+        attempt_id: &str,
+    ) -> Result<PendingReviewStartStep<ReviewWriteAcknowledgement>, String> {
+        self.execute_sequenced(
+            ticket,
+            "Review recovery save lock failed; no FILE write was sent.",
+            "A newer review-state write superseded the FILE stage; no FILE write was sent.",
+            || self.execute_thread(provider, repository, attempt_id),
+        )
+    }
+
+    pub fn stop_after_create(&self) -> Result<PendingReviewStartRecord, String> {
+        stop_pending_review_start_after_create(
+            &self.authority,
+            &self.store,
+            self.expected_composition.as_ref(),
+            self.expected_record
+                .as_ref()
+                .ok_or_else(|| "The durable pending-review start record disappeared.".to_owned())?,
+        )
+    }
+
+    pub fn stop_after_create_sequenced(
+        &self,
+        ticket: &ParticipationWriteTicket,
+    ) -> Result<PendingReviewStartRecord, String> {
+        self.execute_sequenced(
+            ticket,
+            "Review recovery save lock failed; stop disposition is uncertain.",
+            "A newer review-state write superseded the local stop; disposition is uncertain.",
+            || self.stop_after_create(),
+        )
+    }
+
+    pub fn cancel_before_create(&self) -> Result<PendingReviewStartRecord, String> {
+        cancel_pending_review_start_before_create(
+            &self.authority,
+            &self.store,
+            self.expected_composition.as_ref(),
+            self.expected_record
+                .as_ref()
+                .ok_or_else(|| "The durable pending-review start record disappeared.".to_owned())?,
+        )
+    }
+
+    pub fn cancel_before_create_sequenced(
+        &self,
+        ticket: &ParticipationWriteTicket,
+    ) -> Result<PendingReviewStartRecord, String> {
+        self.execute_sequenced(
+            ticket,
+            "Review recovery save lock failed; cancellation is uncertain.",
+            "A newer review-state write superseded cancellation; disposition is uncertain.",
+            || self.cancel_before_create(),
+        )
+    }
+
+    pub fn finish_locally(
+        &self,
+    ) -> Result<PendingReviewStartStep<ReviewWriteAcknowledgement>, String> {
+        Ok(finish_pending_review_start_locally(
+            &self.authority,
+            &self.store,
+            self.expected_composition.as_ref(),
+            self.expected_record
+                .as_ref()
+                .ok_or_else(|| "The durable pending-review start record disappeared.".to_owned())?,
+        ))
+    }
+
+    pub fn finish_locally_sequenced(
+        &self,
+        ticket: &ParticipationWriteTicket,
+    ) -> Result<PendingReviewStartStep<ReviewWriteAcknowledgement>, String> {
+        self.execute_sequenced(
+            ticket,
+            "Review recovery save lock failed; local completion is uncertain.",
+            "A newer review-state write superseded local completion; disposition is uncertain.",
+            || self.finish_locally(),
+        )
+    }
+}
+
+impl PreparedReviewDraftSave {
+    pub fn execute(&self) -> Result<(), String> {
+        self.authority
+            .save_if_current(&self.store, self.expected.as_ref(), &self.snapshot)
+    }
+
+    pub fn execute_sequenced(&self, ticket: &ParticipationWriteTicket) -> Result<bool, String> {
+        ticket
+            .run("Review recovery save lock failed.", || self.execute())?
+            .map_or(Ok(false), |result| result.map(|()| true))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,6 +585,156 @@ impl ReviewInteractionController {
             notice: None,
             reconciliation_results: Vec::new(),
         })))
+    }
+
+    /// Read-only UI projection of the owned participation state.
+    pub fn composition(&self) -> &ReviewComposition {
+        &self.composition
+    }
+
+    pub fn durable_composition(&self) -> Option<&ReviewComposition> {
+        self.durable_composition.as_ref()
+    }
+
+    /// Freeze all state needed to execute an already prepared operation. The
+    /// returned value keeps store, authority and expected snapshot inseparable.
+    pub fn prepared_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<PreparedReviewOperation, String> {
+        let operation = self
+            .composition
+            .operations
+            .iter()
+            .find(|operation| operation.id == operation_id)
+            .ok_or_else(|| format!("Review operation `{operation_id}` does not exist."))?;
+        if !matches!(operation.status, ReviewOperationStatus::Prepared) {
+            return Err(format!(
+                "Review operation `{operation_id}` is not prepared for dispatch."
+            ));
+        }
+        Ok(PreparedReviewOperation {
+            composition: self.composition.clone(),
+            store: self.store.clone(),
+            authority: self.authority.clone(),
+            expected: self.durable_composition.clone(),
+            operation_id: operation_id.to_owned(),
+        })
+    }
+
+    pub fn cancel_prepared(&mut self, operation_id: &str) -> Result<(), String> {
+        self.composition
+            .cancel_prepared(operation_id)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn install_operation_completion<T>(
+        &mut self,
+        completion: ReviewOperationCompletion<T>,
+    ) -> ProviderMutationOutcome<T> {
+        self.composition = completion.composition;
+        self.durable_composition = completion.durable;
+        self.refresh_open_composer_from_owned_state();
+        completion.outcome
+    }
+
+    pub fn prepared_reconciliation(&self) -> PreparedReviewReconciliation {
+        PreparedReviewReconciliation {
+            store: self.store.clone(),
+            authority: self.authority.clone(),
+            expected: self.durable_composition.clone(),
+        }
+    }
+
+    pub fn install_reconciliation(&mut self, report: ReviewReconciliationReport) {
+        self.composition = report.composition.clone();
+        self.durable_composition = Some(report.composition);
+        self.install_pending_snapshot(report.pending);
+        self.reconciliation_results = report.items;
+        self.refresh_open_composer_from_owned_state();
+    }
+
+    pub fn prepared_draft_save(&self, snapshot: ReviewComposition) -> PreparedReviewDraftSave {
+        PreparedReviewDraftSave {
+            store: self.store.clone(),
+            authority: self.authority.clone(),
+            expected: self.durable_composition.clone(),
+            snapshot,
+        }
+    }
+
+    pub fn prepared_pending_review_start(&self) -> PreparedPendingReviewStart {
+        PreparedPendingReviewStart {
+            store: self.store.clone(),
+            authority: self.authority.clone(),
+            expected_composition: self.durable_composition.clone(),
+            expected_record: self.pending_review_start.clone(),
+        }
+    }
+
+    pub fn install_pending_review_start_step<T>(&mut self, step: &PendingReviewStartStep<T>) {
+        if let Some(composition) = &step.composition {
+            self.composition = composition.clone();
+            self.durable_composition = Some(composition.clone());
+        }
+        self.pending_review_start = step.record.clone();
+        self.refresh_open_composer_from_owned_state();
+    }
+
+    pub fn install_pending_review_start_record(&mut self, record: PendingReviewStartRecord) {
+        self.pending_review_start = Some(record);
+    }
+
+    pub fn install_saved_snapshot(&mut self, snapshot: ReviewComposition) {
+        self.durable_composition = Some(snapshot);
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    pub fn persist_smoke_snapshot(&mut self, snapshot: ReviewComposition) -> Result<(), String> {
+        self.store
+            .save(&snapshot)
+            .map_err(|error| error.to_string())?;
+        self.composition = snapshot.clone();
+        self.durable_composition = Some(snapshot);
+        Ok(())
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    pub fn composition_mut_for_smoke(&mut self) -> &mut ReviewComposition {
+        &mut self.composition
+    }
+
+    #[cfg(test)]
+    pub(super) fn store_for_test(&self) -> &DraftStore {
+        &self.store
+    }
+
+    #[cfg(test)]
+    pub(super) fn authority_for_test(&self) -> &ReviewStateAuthority {
+        &self.authority
+    }
+
+    fn refresh_open_composer_from_owned_state(&mut self) {
+        if let Some(composer) = &mut self.composer
+            && let Some(draft) = composer
+                .draft_id
+                .as_deref()
+                .and_then(|id| self.composition.drafts.iter().find(|draft| draft.id == id))
+        {
+            composer.body = draft.body.clone();
+            composer.durable = !self.undurable_drafts.contains(&draft.id);
+        }
+        if let Some(composer) = &mut self.file_composer
+            && let Some(draft) = composer.draft_id.as_deref().and_then(|id| {
+                self.composition
+                    .file_drafts
+                    .iter()
+                    .find(|draft| draft.id == id)
+            })
+        {
+            composer.body = draft.body.clone();
+            composer.durable = !self.undurable_drafts.contains(&draft.id);
+        }
     }
 
     pub fn select_line_with_canonical(
@@ -3403,6 +3942,167 @@ impl ActionJournal {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ActionJournalReconciliation {
+    pub resolved: usize,
+    pub uncertain: Vec<String>,
+    pub operations: Vec<JournalOperation>,
+}
+
+/// Reconcile frozen auxiliary and merge mutations from authoritative reads.
+/// Evidence remains operation-specific; final-state convergence is never
+/// promoted to proof of an exact attempt unless that mutation family permits it.
+pub fn reconcile_action_journal(
+    journal_root: &Path,
+    key: ReviewKey,
+    provider: &GithubProvider,
+    repository: &Repository,
+    pull_request: u64,
+) -> Result<ActionJournalReconciliation, String> {
+    let journal = ActionJournal::open(journal_root, key)?;
+    let operations = journal.operations()?;
+    let details = provider
+        .details(repository, pull_request)
+        .map_err(|error| format!("Details read failed: {error:#}"))?;
+    let pending = provider
+        .pending_review(repository, pull_request)
+        .map_err(|error| format!("Pending-review read failed: {error:#}"))?;
+    let mut resolved = 0usize;
+    let mut uncertain = Vec::new();
+    for operation in operations.iter().filter(|operation| {
+        matches!(
+            operation.status,
+            JournalStatus::InFlight | JournalStatus::Uncertain { .. }
+        )
+    }) {
+        let (operation_id, attempt_id) = journal_identity(&operation.request);
+        let observation = match &operation.request {
+            JournalRequest::Auxiliary(request) => {
+                observe_auxiliary(&request.action, &details, pending.as_ref())
+            }
+            JournalRequest::Merge {
+                preparation,
+                request,
+            } => provider
+                .prepare_merge(repository, pull_request, &preparation.reviewed_head_sha)
+                .ok()
+                .and_then(|fresh| observe_merge(&request.action, preparation, &fresh)),
+            JournalRequest::Lifecycle(_) => None,
+            JournalRequest::Discussion(request) => match &request.action {
+                PullRequestDiscussionAction::Edit {
+                    comment,
+                    selected_author,
+                    body,
+                    ..
+                } => match provider.reconcile_pr_comment(repository, pull_request, comment) {
+                    ProviderReadEvidence::Observed(observed)
+                        if observed.body == *body
+                            && observed.author.as_deref().is_some_and(|author| {
+                                author.eq_ignore_ascii_case(selected_author)
+                            }) =>
+                    {
+                        Some((
+                            true,
+                            true,
+                            format!(
+                                "Exact known comment {} has the frozen edited body.",
+                                comment.remote_id
+                            ),
+                        ))
+                    }
+                    ProviderReadEvidence::Observed(_)
+                    | ProviderReadEvidence::Inconclusive { .. } => None,
+                },
+                PullRequestDiscussionAction::Create { .. }
+                | PullRequestDiscussionAction::Delete { .. } => None,
+            },
+            JournalRequest::Reaction(request) => {
+                match provider.reconcile_reaction(repository, request) {
+                    ProviderReadEvidence::Observed(observed) => match &request.action {
+                        ReactionAction::Add => None,
+                        ReactionAction::Remove { .. }
+                            if !observed.viewer_has_reacted
+                                && observed.own_reaction_id.is_none() =>
+                        {
+                            Some((
+                                true,
+                                true,
+                                "Fresh exact subject/viewer/content state is absent. This records final-state convergence only, not which actor caused it."
+                                    .into(),
+                            ))
+                        }
+                        ReactionAction::Remove { .. } => None,
+                    },
+                    ProviderReadEvidence::Inconclusive { .. } => None,
+                }
+            }
+            JournalRequest::Dismissal(request) => {
+                let _ = provider.reconcile_review_dismissal(repository, request);
+                None
+            }
+            JournalRequest::ActionsRunControl(request) => {
+                let preparation = &request.preparation;
+                let evidence = provider
+                    .reconcile_actions_run_control(repository, &preparation.observation.target);
+                reconciliation_summary(
+                    preparation.action,
+                    preparation.observation.target.run_attempt,
+                    &preparation.observation.run_status,
+                    &evidence,
+                )
+                .map(|(matched, evidence)| (matched, false, evidence))
+            }
+        };
+        match observation {
+            Some((true, completed, evidence)) => {
+                journal.mark_acknowledged(operation_id, attempt_id, completed, evidence)?;
+                resolved += 1;
+            }
+            Some((false, _, evidence)) => uncertain.push(format!(
+                "{} · The current object differs from the request, but that does not prove this attempt was NotApplied after later external changes: {evidence}",
+                journal_operation_description(operation)
+            )),
+            None => {
+                let limitation = match &operation.request {
+                    JournalRequest::Auxiliary(request)
+                        if matches!(request.action, ReviewAuxiliaryAction::Reply { .. }) =>
+                    {
+                        "No safe exact-ID reply observation route exists: the frozen request contains the target thread/review/body but no provider reply ID, and GitHub does not preserve the local attempt ID."
+                    }
+                    JournalRequest::Reaction(request)
+                        if matches!(request.action, ReactionAction::Add) =>
+                    {
+                        "The add acknowledgement was lost before its new reaction ID became known. Current presence can show convergence but cannot identify this attempt."
+                    }
+                    JournalRequest::Reaction(request)
+                        if matches!(request.action, ReactionAction::Remove { .. }) =>
+                    {
+                        "The fresh exact state did not show bounded absence. A different current reaction ID is never removed or adopted automatically."
+                    }
+                    JournalRequest::Dismissal(_) => {
+                        "A later exact DISMISSED review can show state convergence only. No exact dismissal event with the frozen review, parent, selected actor, previous state, and message was recorded, so reason and causation remain unresolved."
+                    }
+                    JournalRequest::ActionsRunControl(_) => {
+                        "The run showed no later attempt or matching cancelled conclusion. GitHub records no per-request Actions control event, so an unmoved run never proves this attempt was NotApplied."
+                    }
+                    _ => {
+                        "The fresh read did not provide complete exact identity and payload evidence for this request."
+                    }
+                };
+                uncertain.push(format!(
+                    "{} · {limitation}",
+                    journal_operation_description(operation)
+                ));
+            }
+        }
+    }
+    Ok(ActionJournalReconciliation {
+        resolved,
+        uncertain,
+        operations: journal.operations()?,
+    })
+}
+
 /// Adapter between the provider's held `MutationAdmission` contract and the
 /// app's one shared per-target action journal.
 pub struct JournalAdmission<'a> {
@@ -5719,6 +6419,33 @@ print(json.dumps(step['response']))
             ProviderMutationOutcome::PreflightRejected { .. }
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn participation_sequencer_survives_controller_reopen_and_supersedes_old_work() {
+        let mut sequencer = ParticipationSequencer::default();
+        let old_controller_ticket = sequencer.issue("github.com/alice/repo", 7);
+        let reopened_controller_ticket = sequencer.issue("github.com/alice/repo", 7);
+        let other_pull_request_ticket = sequencer.issue("github.com/alice/repo", 8);
+        let writes = AtomicUsize::new(0);
+
+        assert!(!old_controller_ticket.is_current());
+        assert!(reopened_controller_ticket.is_current());
+        assert!(other_pull_request_ticket.is_current());
+        assert_eq!(
+            old_controller_ticket
+                .run("poisoned", || writes.fetch_add(1, Ordering::SeqCst))
+                .unwrap(),
+            None
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            reopened_controller_ticket
+                .run("poisoned", || writes.fetch_add(1, Ordering::SeqCst))
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
     }
 
     #[test]

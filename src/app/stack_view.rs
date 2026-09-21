@@ -1,7 +1,7 @@
 //! PR-tab-owned controller and durable personal relationships for the read-only
 //! net remaining stack view.
 
-use super::{DiffRow, build_rows, diff_content_width};
+use super::diff_pane::DiffPaneState;
 use cibergit::{
     domain::{Account, Repository},
     providers::GithubProvider,
@@ -14,7 +14,6 @@ use cibergit::{
         selectable_tips,
     },
 };
-use gpui::{ListAlignment, ListState, ScrollHandle, px};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::c_int,
@@ -134,10 +133,7 @@ pub(crate) struct StackViewController {
     pub state: StackLoadState,
     pub loaded: Option<LoadedStack>,
     pub session: Option<ReviewSession>,
-    pub diff_rows: Vec<DiffRow>,
-    pub diff_scroll: ListState,
-    pub horizontal: ScrollHandle,
-    pub diff_content_width: f32,
+    pub diff: DiffPaneState,
     pub file_scroll: gpui::UniformListScrollHandle,
     pub relationship_scroll: gpui::UniformListScrollHandle,
     pub correction_scroll: gpui::UniformListScrollHandle,
@@ -164,10 +160,7 @@ impl StackViewController {
             state: StackLoadState::Idle,
             loaded: None,
             session: None,
-            diff_rows: Vec::new(),
-            diff_scroll: ListState::new(0, ListAlignment::Top, px(480.)),
-            horizontal: ScrollHandle::new(),
-            diff_content_width: 0.,
+            diff: DiffPaneState::new(),
             file_scroll: gpui::UniformListScrollHandle::new(),
             relationship_scroll: gpui::UniformListScrollHandle::new(),
             correction_scroll: gpui::UniformListScrollHandle::new(),
@@ -303,40 +296,15 @@ impl StackViewController {
     }
 
     pub fn rebuild(&mut self, wide: bool) {
-        let Some(session) = self.session.as_ref() else {
-            self.diff_rows.clear();
-            self.diff_content_width = 0.;
-            return;
-        };
-        let Some(file) = session.selected_file() else {
-            self.diff_rows.clear();
-            self.diff_content_width = 0.;
-            return;
-        };
-        let mode = match session.diff_mode() {
-            DiffMode::Auto if wide => DiffMode::SideBySide,
-            DiffMode::Auto => DiffMode::Unified,
-            mode => mode,
-        };
-        self.diff_rows = build_rows(cibergit::review::parse_file(file), mode);
-        self.diff_content_width = diff_content_width(&self.diff_rows, mode);
-        self.diff_scroll = ListState::new(
-            self.diff_rows.len(),
-            ListAlignment::Top,
-            px(session.scroll_position()),
-        );
-        self.horizontal.set_offset(gpui::point(
-            px(-session.horizontal_scroll_position()),
-            px(0.),
-        ));
+        match self.session.as_ref() {
+            Some(session) => self.diff.rebuild(session, wide),
+            None => self.diff.clear(),
+        }
     }
 
     pub fn capture_scroll(&mut self) {
-        let vertical = self.diff_scroll.scroll_px_offset_for_scrollbar().y.as_f32();
-        let horizontal = (-self.horizontal.offset().x.as_f32()).max(0.);
         if let Some(session) = self.session.as_mut() {
-            session.set_scroll_position(vertical);
-            session.set_horizontal_scroll_position(horizontal);
+            self.diff.capture_into(session);
         }
     }
 

@@ -15,6 +15,39 @@ The application admits these top-level lanes through one `GeneralReadController`
 
 An admitted operation owns one account generation. A recognized rate response stops every later, not-yet-started nested read in that operation immediately. Later admissions for the same credential observe the retained floor; a different account remains independently admissible. Deferred automatic work is distinct from a coalesced explicit refresh, and the rotating follow-up cursor prevents a fast metadata lane from starving details, lifecycle, or later repositories on the same account.
 
+## Implementation ownership
+
+`app/read_sync.rs` owns each recurring read's lifecycle as well as account admission.
+A tab or repository holds an opaque `RefreshLane`, allocated anew when that destination
+is created. The controller keeps the lane in an active or deferred state. An explicit
+request during an active read queues one replacement; periodic requests leave the current
+observation eligible for installation.
+
+The GPUI shell requests work with the current workspace, account-scoped repository,
+resource and observation generation. It runs the provider task off the UI thread, then
+returns the result with the destination's current context. `complete_refresh` distinguishes
+an applied result, a discarded result that released its slot, and an unrelated completion
+that must not trigger work in a replacement controller. Only an accepted successful result
+can replace the conditional cache. Valid server pacing still survives a discarded result.
+
+Metadata, details, lifecycle metadata and sidebar enumeration use this same interface.
+The controller owns deferred intent and rotating resumption order; the shell supplies live
+destinations and dispatches their feature-specific work. A temporarily closing tab remains
+live but refuses new work. A forgotten destination cannot queue further reads, while an
+already running request retains its account slot until completion. Actions jobs/logs retain
+their explicit selection and cancellation protocol and share the same account admission.
+
+Details-specific authority stays with participation: requesting a new details observation
+revokes the prior pending-review absence capability even when account admission is deferred.
+Mutations can invalidate the observation generation without releasing the running task's
+slot. Successful completion still installs details and reconciles participation in the
+existing order; scheduling never grants write authority.
+
+The design uses a GPUI-independent state machine and single-owner scheduling. It adds no
+actor runtime or generic workflow framework. Tests exercise coalescing, stale identities,
+close/reopen, server floors, independent accounts and fair resumption through the read
+module's interface with controlled time and results.
+
 ## Exact conditional representation
 
 The private in-memory cache key contains all of:

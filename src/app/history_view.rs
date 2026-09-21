@@ -11,15 +11,15 @@
 //! changed repository, narrowed the scope, or selected another commit; each
 //! one is dropped rather than mixed into what is now on screen.
 
-use super::{DiffRow, LoadState, build_rows, diff_content_width};
+use super::{LoadState, diff_pane::DiffPaneState};
+use cibergit::workspace::ReadingMode;
 use cibergit::{
     domain::Account,
     history::{
         CommitGraph, GraphRow, HistoryCommit, HistoryScope, RefKind, RepositoryHistory, lay_out,
     },
-    review::{DiffMode, ReviewSession},
+    review::ReviewSession,
 };
-use gpui::{ListAlignment, ListState, ScrollHandle, px};
 use std::rc::Rc;
 
 /// How many branch chips the scope row will show. Past this the row stops
@@ -66,13 +66,16 @@ pub(crate) struct HistoryController {
     /// history must not silently move the selection to a different commit.
     pub selected: Option<String>,
     pub commit_scroll: gpui::UniformListScrollHandle,
+    /// The commit column's width and whether it is collapsed to its rail.
+    /// History owns these rather than the review's `PanelLayout`: the page
+    /// replaces the whole main section, so its column shares no budget with
+    /// the file tree or the inspector.
+    pub commit_width: f32,
+    pub commits_collapsed: bool,
     pub file_scroll: gpui::UniformListScrollHandle,
     pub diff_state: LoadState,
     pub session: Option<ReviewSession>,
-    pub diff_rows: Vec<DiffRow>,
-    pub diff_scroll: ListState,
-    pub horizontal: ScrollHandle,
-    pub diff_content_width: f32,
+    pub diff: DiffPaneState,
     pub feedback: Option<String>,
 }
 
@@ -92,13 +95,12 @@ impl HistoryController {
             rows: Rc::new(Vec::new()),
             selected: None,
             commit_scroll: gpui::UniformListScrollHandle::new(),
+            commit_width: super::HISTORY_COMMIT_COLUMN,
+            commits_collapsed: false,
             file_scroll: gpui::UniformListScrollHandle::new(),
             diff_state: LoadState::Ready,
             session: None,
-            diff_rows: Vec::new(),
-            diff_scroll: ListState::new(0, ListAlignment::Top, px(480.)),
-            horizontal: ScrollHandle::new(),
-            diff_content_width: 0.,
+            diff: DiffPaneState::new(),
             feedback: None,
         }
     }
@@ -252,11 +254,11 @@ impl HistoryController {
             && self.diff_generation == token.generation
     }
 
-    pub fn install_diff(&mut self, session: ReviewSession, wide: bool) {
+    pub fn install_diff(&mut self, session: ReviewSession, wide: bool, mode: ReadingMode) {
         self.session = Some(session);
         self.diff_state = LoadState::Ready;
         self.feedback = None;
-        self.rebuild(wide);
+        self.rebuild(wide, mode);
     }
 
     pub fn fail_diff(&mut self, error: String) {
@@ -266,15 +268,12 @@ impl HistoryController {
 
     fn clear_diff(&mut self) {
         self.session = None;
-        self.diff_rows.clear();
-        self.diff_content_width = 0.;
-        self.diff_scroll = ListState::new(0, ListAlignment::Top, px(480.));
-        self.horizontal = ScrollHandle::new();
+        self.diff.clear();
         self.diff_state = LoadState::Ready;
         self.feedback = None;
     }
 
-    pub fn select_file(&mut self, key: &str, wide: bool) -> bool {
+    pub fn select_file(&mut self, key: &str, wide: bool, mode: ReadingMode) -> bool {
         self.capture_scroll();
         let Some(session) = self.session.as_mut() else {
             return false;
@@ -282,50 +281,42 @@ impl HistoryController {
         if !session.select_file(key) {
             return false;
         }
-        self.rebuild(wide);
+        self.rebuild(wide, mode);
         true
     }
 
     /// Rebuild the rendered diff rows from the selected file. The row list and
     /// its scroll state are replaced wholesale, and the per-file offsets the
     /// session remembers are restored onto the new handles.
-    pub fn rebuild(&mut self, wide: bool) {
-        let Some(file) = self.session.as_ref().and_then(ReviewSession::selected_file) else {
-            self.diff_rows.clear();
-            self.diff_content_width = 0.;
+    /// A commit's diff, either as one scroll over every file it touched or as
+    /// the selected file alone.
+    ///
+    /// History reads one patch at a time, so a streamed commit shows every
+    /// file's header immediately and fills in each patch as it is selected.
+    /// That is the point of the header carrying `loaded`: an unread file says
+    /// so rather than looking like a file that changed nothing.
+    pub fn rebuild(&mut self, wide: bool, mode: ReadingMode) {
+        let Some(session) = self.session.as_ref() else {
+            self.diff.clear();
             return;
         };
-        let mode = match self
-            .session
-            .as_ref()
-            .expect("session is present")
-            .diff_mode()
+        if mode == ReadingMode::Stream && super::stream_budget(&session.comparison().files).is_ok()
         {
-            DiffMode::Auto if wide => DiffMode::SideBySide,
-            DiffMode::Auto => DiffMode::Unified,
-            mode => mode,
-        };
-        self.diff_rows = build_rows(cibergit::review::parse_file(file), mode);
-        self.diff_content_width = diff_content_width(&self.diff_rows, mode);
-        let session = self.session.as_ref().expect("session is present");
-        self.diff_scroll = ListState::new(
-            self.diff_rows.len(),
-            ListAlignment::Top,
-            px(session.scroll_position()),
-        );
-        self.horizontal = ScrollHandle::new();
-        self.horizontal.set_offset(gpui::point(
-            px(-session.horizontal_scroll_position()),
-            px(0.),
-        ));
+            let resolved = session.diff_mode().resolve(wide);
+            let folded = self.diff.collapsed.clone();
+            let (rows, spans, split) = super::build_stream(session, resolved, &[], None, &folded);
+            self.diff.install_stream(rows, spans, split);
+            if let Some(key) = session.selected_file().map(cibergit::review::file_key) {
+                self.diff.reveal_file(&key);
+            }
+            return;
+        }
+        self.diff.rebuild(session, wide);
     }
 
     pub fn capture_scroll(&mut self) {
-        let vertical = self.diff_scroll.scroll_px_offset_for_scrollbar().y.as_f32();
-        let horizontal = (-self.horizontal.offset().x.as_f32()).max(0.);
         if let Some(session) = self.session.as_mut() {
-            session.set_scroll_position(vertical);
-            session.set_horizontal_scroll_position(horizontal);
+            self.diff.capture_into(session);
         }
     }
 }

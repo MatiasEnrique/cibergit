@@ -16,7 +16,7 @@ use cibergit::rebase::{
 use cibergit::ui::{self, Density, TextRole};
 
 #[derive(Clone)]
-enum RebaseCommand {
+pub(super) enum RebaseCommand {
     CreateStash(DirtyPreparation),
     Start {
         preparation: RebasePreparation,
@@ -80,7 +80,7 @@ enum RebaseCommand {
 }
 
 impl RebaseCommand {
-    fn summary(&self) -> String {
+    pub(super) fn summary(&self) -> String {
         match self {
             Self::CreateStash(dirty) => format!(
                 "Stash {} staged, {} unstaged, and {} untracked entries (ignored files excluded)",
@@ -109,7 +109,7 @@ impl RebaseCommand {
         }
     }
 
-    fn guard(&self) -> Option<&SnapshotGuard> {
+    pub(super) fn guard(&self) -> Option<&SnapshotGuard> {
         match self {
             Self::CreateStash(dirty) => Some(&dirty.guard),
             Self::Start { preparation, .. } => Some(&preparation.guard),
@@ -128,19 +128,11 @@ impl RebaseCommand {
     }
 }
 
-#[derive(Clone)]
-struct PendingRebaseCommand {
-    id: u64,
-    command: RebaseCommand,
-    editable_inputs: RebaseEditableInputIdentity,
-    checkout_generation: u64,
-}
-
 /// Only user-editable values that can describe (or supply) the pending
 /// command belong here. Poll generations and observed operation status are
 /// deliberately excluded so a harmless read cannot invalidate confirmation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum RebaseEditableInputIdentity {
+pub(super) enum RebaseEditableInputIdentity {
     None,
     Start {
         steps: Vec<PlanStep>,
@@ -153,7 +145,7 @@ enum RebaseEditableInputIdentity {
 }
 
 impl RebaseEditableInputIdentity {
-    fn frozen_description(&self) -> Option<String> {
+    pub(super) fn frozen_description(&self) -> Option<String> {
         match self {
             Self::None => None,
             Self::Start {
@@ -207,9 +199,6 @@ pub(super) struct RebasePanel {
     selected_step: Option<usize>,
     conflicts: Vec<ConflictFile>,
     conflict_view: Option<ConflictPresentation>,
-    pending: Option<PendingRebaseCommand>,
-    in_flight: Option<u64>,
-    read_generation: u64,
     show_operation_details: bool,
     status: String,
 }
@@ -241,9 +230,6 @@ impl RebasePanel {
             selected_step: None,
             conflicts: Vec::new(),
             conflict_view: None,
-            pending: None,
-            in_flight: None,
-            read_generation: 0,
             show_operation_details: false,
             status: "Choose an immutable local base candidate".into(),
         }
@@ -271,22 +257,6 @@ impl RebasePanel {
         self.message.update(cx, |editor, _| {
             editor.set_editor_style(editor_style(colors))
         });
-    }
-
-    pub(super) fn is_running(&self) -> bool {
-        self.in_flight.is_some()
-    }
-
-    fn invalidate_reads(&mut self) -> u64 {
-        advance_generation(&mut self.read_generation)
-    }
-
-    fn accepts_read(&self, generation: u64) -> bool {
-        read_reply_is_current(self.read_generation, generation, self.in_flight.is_some())
-    }
-
-    pub(super) fn has_pending_or_running(&self) -> bool {
-        self.pending.is_some() || self.in_flight.is_some()
     }
 
     fn set_operation(
@@ -330,7 +300,7 @@ impl LocalWorkspace {
     }
 
     pub fn rebase_pending_action_id(&self) -> Option<u64> {
-        self.rebase.pending.as_ref().map(|pending| pending.id)
+        self.operations.pending_rebase().map(|pending| pending.id)
     }
 
     pub fn rebase_plan_len(&self) -> usize {
@@ -402,7 +372,7 @@ impl LocalWorkspace {
     }
 
     pub fn rebase_confirmation_inputs_locked(&self, cx: &App) -> bool {
-        self.rebase.pending.is_some()
+        self.operations.pending_rebase().is_some()
             && !self.rebase.base.read(cx).is_editable()
             && !self.rebase.message.read(cx).is_editable()
     }
@@ -461,15 +431,17 @@ impl LocalWorkspace {
     }
 
     fn rebase_lane_blocker(&self) -> Option<String> {
-        if self.rebase.in_flight.is_some() {
+        if self.operations.rebase_in_flight() {
             return Some("A rebase effect is already running".into());
         }
-        if self.pending_action.is_some()
-            || self.in_flight_action.is_some()
-            || self.unresolved_started_action.is_some()
-            || self.reconciliation_clear_in_flight.is_some()
-        {
+        if self.operations.local_pending_or_running_or_recovering() {
             return Some("A local Git action or its durable reconciliation is pending".into());
+        }
+        if self
+            .operations
+            .observation_pending(ObservationKind::PrPublish)
+        {
+            return Some("Wait for the fresh PR publication read to finish".into());
         }
         None
     }
@@ -485,12 +457,12 @@ impl LocalWorkspace {
 
     fn refuse_rebase_input_mutation(&mut self, cx: &mut Context<Self>) -> bool {
         if !rebase_input_is_frozen(
-            self.rebase.pending.is_some(),
-            self.rebase.in_flight.is_some(),
+            self.operations.pending_rebase().is_some(),
+            self.operations.rebase_in_flight(),
         ) {
             return false;
         }
-        self.rebase.status = if self.rebase.pending.is_some() {
+        self.rebase.status = if self.operations.pending_rebase().is_some() {
             "Confirmation inputs are frozen. Cancel the exact pending request before editing or preparing different inputs."
                 .into()
         } else {
@@ -507,7 +479,7 @@ impl LocalWorkspace {
     }
 
     pub fn toggle_rebase(&mut self, cx: &mut Context<Self>) {
-        if self.rebase.open && self.rebase.pending.is_some() {
+        if self.rebase.open && self.operations.pending_rebase().is_some() {
             self.refuse_rebase_input_mutation(cx);
             return;
         }
@@ -523,7 +495,7 @@ impl LocalWorkspace {
             self.report_error(error, cx);
             return;
         }
-        if self.rebase.pending.is_some() || self.rebase.operation.is_some() {
+        if self.operations.pending_rebase().is_some() || self.rebase.operation.is_some() {
             self.report_error(
                 "Close the current rebase request before preparing another".into(),
                 cx,
@@ -542,7 +514,9 @@ impl LocalWorkspace {
             self.report_error("Local workspace is not ready".into(), cx);
             return;
         };
-        let generation = self.rebase.invalidate_reads();
+        let Ok(ticket) = self.operations.begin_observation(ObservationKind::Rebase) else {
+            return;
+        };
         let store = backend.rebase.clone();
         let git = backend.git.clone();
         self.rebase.status = format!("Resolving immutable base {candidate}…");
@@ -554,7 +528,7 @@ impl LocalWorkspace {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
-                if !this.rebase.accepts_read(generation) {
+                if !this.operations.finish_observation(ticket) {
                     return;
                 }
                 match result {
@@ -776,15 +750,11 @@ impl LocalWorkspace {
     }
 
     fn request_rebase_command(&mut self, command: RebaseCommand, cx: &mut Context<Self>) {
-        if self.rebase.pending.is_some() {
-            self.report_error("A rebase confirmation is already pending".into(), cx);
-            return;
-        }
         if let Some(error) = self.rebase_lane_blocker() {
             self.report_error(error, cx);
             return;
         }
-        let BackendState::Ready(backend) = &self.backend else {
+        let BackendState::Ready(_) = &self.backend else {
             self.report_error("Local workspace is not ready".into(), cx);
             return;
         };
@@ -806,15 +776,14 @@ impl LocalWorkspace {
                 return;
             }
         };
-        let id = self.next_action_id;
-        self.next_action_id = self.next_action_id.wrapping_add(1);
         let summary = command.summary();
-        self.rebase.pending = Some(PendingRebaseCommand {
-            id,
-            command,
-            editable_inputs,
-            checkout_generation: backend.checkout_generation,
-        });
+        let id = match self.operations.admit_rebase(command, editable_inputs) {
+            Ok(id) => id,
+            Err(error) => {
+                self.report_error(error, cx);
+                return;
+            }
+        };
         self.set_rebase_editors_disabled(true, cx);
         self.rebase.status = format!("Confirmation required: {summary}");
         cx.emit(LocalWorkspaceEvent::MaterialActionConfirmationRequested {
@@ -825,7 +794,7 @@ impl LocalWorkspace {
     }
 
     pub fn confirm_rebase_action(&mut self, request_id: u64, cx: &mut Context<Self>) {
-        let Some(pending) = self.rebase.pending.clone() else {
+        let Some(pending) = self.operations.pending_rebase().cloned() else {
             self.report_error("There is no rebase action awaiting confirmation".into(), cx);
             return;
         };
@@ -836,13 +805,6 @@ impl LocalWorkspace {
         let BackendState::Ready(backend) = &self.backend else {
             return;
         };
-        if pending.checkout_generation != backend.checkout_generation {
-            self.report_error(
-                "Rebase confirmation paused: checkout identity changed".into(),
-                cx,
-            );
-            return;
-        }
         let current_inputs = match self.capture_rebase_editable_inputs(&pending.command, cx) {
             Ok(identity) => identity,
             Err(reason) => {
@@ -850,30 +812,17 @@ impl LocalWorkspace {
                 return;
             }
         };
-        if current_inputs != pending.editable_inputs {
-            self.pause_rebase_confirmation("Rebase confirmation paused: the displayed plan, base, or message input drifted from the frozen request. Nothing was dispatched; the exact pending request was retained. Cancel, edit/reprepare, and request a new confirmation.".into(), cx);
-            return;
-        }
-        if let Some(error) = self.rebase_lane_blocker() {
-            self.report_error(format!("Rebase confirmation paused: {error}"), cx);
-            return;
-        }
-        if pending.command.guard().is_some_and(|guard| {
-            self.snapshot
-                .as_ref()
-                .is_none_or(|snapshot| &snapshot.guard != guard)
-        }) {
-            self.report_error("Rebase confirmation paused: the Git snapshot changed. The pending confirmation was retained.".into(), cx);
-            return;
-        }
+        let dispatch = match self.operations.confirm_rebase(request_id, &current_inputs) {
+            Ok(dispatch) => dispatch,
+            Err(error) => {
+                self.pause_rebase_confirmation(error, cx);
+                return;
+            }
+        };
         let store = backend.rebase.clone();
         let git = backend.git.clone();
-        let command = pending.command;
-        self.rebase.pending = None;
-        self.rebase.in_flight = Some(request_id);
-        // Invalidate preparation/observation replies that began against the
-        // pre-effect checkout before dispatching Git.
-        self.rebase.invalidate_reads();
+        let command = dispatch.intent.command;
+        let ticket = dispatch.ticket;
         self.set_rebase_editors_disabled(true, cx);
         self.rebase.status = "Dispatching the exact confirmed local rebase transition…".into();
         let task = cx.background_spawn(async move {
@@ -884,17 +833,15 @@ impl LocalWorkspace {
         cx.spawn(async move |this, cx| {
             let (effect, refresh) = task.await;
             let _ = this.update(cx, |this, cx| {
-                if this.rebase.in_flight != Some(request_id) {
+                if !this
+                    .operations
+                    .complete_rebase(ticket, refresh.as_ref().ok())
+                {
                     return;
                 }
-                // A read started during the effect cannot become authoritative
-                // after the lane is released, even if its callback is delayed.
-                this.rebase.invalidate_reads();
-                this.rebase.in_flight = None;
                 this.set_rebase_editors_disabled(false, cx);
                 let refresh_error = match refresh {
                     Ok(snapshot) => {
-                        this.git_generation = this.git_generation.wrapping_add(1);
                         this.snapshot = Some(snapshot);
                         None
                     }
@@ -941,13 +888,7 @@ impl LocalWorkspace {
     }
 
     pub fn cancel_rebase_action(&mut self, request_id: u64, cx: &mut Context<Self>) {
-        if self
-            .rebase
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.id == request_id)
-        {
-            self.rebase.pending = None;
+        if self.operations.cancel_rebase(request_id) {
             self.set_rebase_editors_disabled(false, cx);
             self.rebase.status = "Rebase action cancelled; Git was not started".into();
             cx.notify();
@@ -960,16 +901,18 @@ impl LocalWorkspace {
         let BackendState::Ready(backend) = &self.backend else {
             return;
         };
-        if self.rebase.in_flight.is_some() {
+        if self.operations.rebase_in_flight() {
             return;
         }
-        let generation = self.rebase.invalidate_reads();
+        let Ok(ticket) = self.operations.begin_observation(ObservationKind::Rebase) else {
+            return;
+        };
         let store = backend.rebase.clone();
         let task = cx.background_spawn(async move { observe_bundle(&store) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
-                if !this.rebase.accepts_read(generation) {
+                if !this.operations.finish_observation(ticket) {
                     return;
                 }
                 match result {
@@ -1190,10 +1133,10 @@ impl LocalWorkspace {
     }
 
     fn refuse_conflict_control(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.rebase.pending.is_none() && self.rebase.in_flight.is_none() {
+        if self.operations.pending_rebase().is_none() && !self.operations.rebase_in_flight() {
             return false;
         }
-        self.rebase.status = if self.rebase.pending.is_some() {
+        self.rebase.status = if self.operations.pending_rebase().is_some() {
             "Conflict controls are frozen while the exact confirmation is visible; confirm or cancel it first"
         } else {
             "Conflict controls are frozen while the rebase/local effect is running"
@@ -1387,7 +1330,7 @@ impl LocalWorkspace {
     ) -> AnyElement {
         let operation = self.rebase.operation.clone();
         let preparation = self.rebase.preparation.clone();
-        let pending = self.rebase.pending.clone();
+        let pending = self.operations.pending_rebase().cloned();
         let inputs_frozen = pending.is_some();
         let selected = self.rebase.selected_step;
         let inventory = self.rebase_inventory().cloned();
@@ -1715,7 +1658,7 @@ impl LocalWorkspace {
         };
         let pane_width = (window.bounds().size.width.as_f32() - 300.).max(0.);
         let wide = pane_width >= WIDE_CONFLICT_PANE_MIN;
-        let controls_frozen = self.rebase.has_pending_or_running();
+        let controls_frozen = self.operations.rebase_pending_or_running();
         let mut selectors = div().flex().flex_wrap().gap(px(ui::GAP_GROUP));
         for source in ConflictSource::ALL {
             let label = view.source(source).0;
@@ -1981,7 +1924,7 @@ impl LocalWorkspace {
             body = body.child(render_split(split, colors));
         }
         if !self.rebase.conflicts.is_empty() {
-            let conflict_controls_frozen = self.rebase.has_pending_or_running();
+            let conflict_controls_frozen = self.operations.rebase_pending_or_running();
             body = body.child(div().font_weight(ui::WEIGHT_EMPHASIS).child("CONFLICTS"));
             for (index, conflict) in self.rebase.conflicts.clone().into_iter().enumerate() {
                 let detail = conflict_reason(&conflict, self.rebase.show_operation_details);
@@ -2114,7 +2057,7 @@ impl LocalWorkspace {
     }
 
     fn render_edit_message(&self, label: &'static str, colors: LocalPalette) -> AnyElement {
-        let inputs_frozen = self.rebase.pending.is_some();
+        let inputs_frozen = self.operations.pending_rebase().is_some();
         div()
             .h(px(150.))
             .flex()
@@ -2154,15 +2097,6 @@ fn resolve_base_candidate(git: &LocalGit, candidate: &str) -> Result<String, Str
     }
     git.resolve_commit_reference(candidate)
         .map_err(|error| error.to_string())
-}
-
-fn advance_generation(generation: &mut u64) -> u64 {
-    *generation = generation.wrapping_add(1);
-    *generation
-}
-
-fn read_reply_is_current(current: u64, reply: u64, effect_in_flight: bool) -> bool {
-    current == reply && !effect_in_flight
 }
 
 fn rebase_input_is_frozen(confirmation_pending: bool, effect_in_flight: bool) -> bool {
@@ -2786,7 +2720,7 @@ mod tests {
             workspace.rebase.steps[0].action = PlanAction::Drop;
             workspace.confirm_rebase_action(request_id, cx);
             assert_eq!(workspace.rebase_pending_action_id(), Some(request_id));
-            assert!(workspace.rebase.in_flight.is_none());
+            assert!(!workspace.operations.rebase_in_flight());
             assert!(workspace.rebase_status_message().contains("paused"));
         });
         assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), original_head);
@@ -2806,7 +2740,7 @@ mod tests {
             workspace.rebase.steps.swap(0, 1);
             workspace.confirm_rebase_action(reorder_id, cx);
             assert_eq!(workspace.rebase_pending_action_id(), Some(reorder_id));
-            assert!(workspace.rebase.in_flight.is_none());
+            assert!(!workspace.operations.rebase_in_flight());
             workspace.cancel_rebase_action(reorder_id, cx);
             workspace.rebase.steps.swap(0, 1);
         });
@@ -2822,7 +2756,7 @@ mod tests {
             });
             workspace.confirm_rebase_action(base_id, cx);
             assert_eq!(workspace.rebase_pending_action_id(), Some(base_id));
-            assert!(workspace.rebase.in_flight.is_none());
+            assert!(!workspace.operations.rebase_in_flight());
             workspace.cancel_rebase_action(base_id, cx);
             workspace.set_rebase_base_candidate(base.clone(), window, cx);
             workspace.prepare_rebase(cx);
@@ -2852,7 +2786,7 @@ mod tests {
             });
             workspace.confirm_rebase_action(reword_id, cx);
             assert_eq!(workspace.rebase_pending_action_id(), Some(reword_id));
-            assert!(workspace.rebase.in_flight.is_none());
+            assert!(!workspace.operations.rebase_in_flight());
             workspace.cancel_rebase_action(reword_id, cx);
             workspace.set_rebase_step_action(0, PlanAction::Edit, cx);
         });
@@ -2916,7 +2850,7 @@ mod tests {
             });
             workspace.confirm_rebase_action(id, cx);
             assert_eq!(workspace.rebase_pending_action_id(), Some(id));
-            assert!(workspace.rebase.in_flight.is_none());
+            assert!(!workspace.operations.rebase_in_flight());
             workspace.cancel_rebase_action(id, cx);
         });
         assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), before_amend);
@@ -2951,7 +2885,7 @@ mod tests {
             });
             workspace.confirm_rebase_action(id, cx);
             assert_eq!(workspace.rebase_pending_action_id(), Some(id));
-            assert!(workspace.rebase.in_flight.is_none());
+            assert!(!workspace.operations.rebase_in_flight());
         });
         assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), before_part);
         assert_eq!(
@@ -3004,28 +2938,6 @@ mod tests {
         assert!(!("feature" == "HEAD" || "feature".starts_with("refs/") || "feature".len() == 40));
         assert!("refs/heads/feature".starts_with("refs/"));
         assert_eq!(oid('a').len(), 40);
-    }
-
-    #[test]
-    fn effect_epochs_reject_reads_completed_out_of_order_across_both_lane_edges() {
-        let mut epoch = 17;
-        let prepared_before_admission = epoch;
-        advance_generation(&mut epoch);
-        assert!(!read_reply_is_current(
-            epoch,
-            prepared_before_admission,
-            true
-        ));
-
-        let observed_during_effect = epoch;
-        advance_generation(&mut epoch);
-        assert!(!read_reply_is_current(epoch, observed_during_effect, false));
-        assert!(read_reply_is_current(epoch, epoch, false));
-
-        let mut open_generation = 9;
-        let open_started_before_effect = open_generation;
-        advance_generation(&mut open_generation);
-        assert_ne!(open_started_before_effect, open_generation);
     }
 
     #[test]

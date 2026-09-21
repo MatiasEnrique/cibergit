@@ -8,11 +8,13 @@ Implementation is underway. The native application can open real PRs, display pi
 
 ## Current app
 
-The review workspace has full-width Conversation, Commits, Checks, and Files changed tabs, a resizable repository sidebar, and a Unified / Side by side button in the file header. Large PR and file lists render visible rows instead of building every row on each redraw.
+The review workspace has Conversation, Commits, Checks, and Files changed tabs on one header bar, a resizable repository sidebar, and a display menu carrying the reading mode and the Unified / Side by side choice. A comparison opens as one continuous scroll over every changed file, with each file's own header, its own horizontal scrolling, and a strip down the right edge showing which file you are in; one file at a time remains a choice. Large PR and file lists render visible rows instead of building every row on each redraw.
 
 This implementation also includes explicit selection among stack tips and confirmed Actions run controls for re-running all jobs, re-running failed jobs, or cancelling a run. See [stack navigation](docs/stack-ui.md), [Actions jobs and logs](docs/actions-jobs-logs.md), and [run controls](docs/actions-run-controls.md) for their behavior and limits.
 
-A read-only History page shows the repository's own commit graph over every branch, with the selected commit's full diff beside it. See [commit history](docs/commit-history.md) for its scope chips, bounds, and what a repository with no local clone cannot show.
+A read-only History page shows the repository's own commit graph over every branch, with the selected commit's full diff beside it. Its commit column is resizable and collapses to a rail of lane-coloured dots, so the diff can have the width. See [commit history](docs/commit-history.md) for its scope chips, bounds, and what a repository with no local clone cannot show.
+
+The review, History and Stack diffs are one pane with different things around it, and they read by keyboard: a cursor that moves by row, by hunk and by comment thread, plus one key that marks a file viewed and advances to the next one that is not. See [interface direction](docs/ui-direction.md) for the keys, for why they are modifier-based, and for what a comparison too large to stream does instead.
 
 Full V1 remains unfinished. Stack-wide review and merge operations, automatic descendant rewriting, broader GitHub Actions management, and signed/notarized distribution are not complete.
 

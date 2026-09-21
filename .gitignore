@@ -1,3 +1,7 @@
 /target/
 /.coordination/
 .DS_Store
+
+/.bb-artifacts/
+/.local/
+/.claude/worktrees/

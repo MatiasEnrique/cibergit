@@ -86,6 +86,25 @@ actions!(
         DiffScrollEnd,
     ]
 );
+// Reading a diff with the keyboard. The cursor is a row, so every one of these
+// is a move to another row; the pane brings whichever row it lands on into
+// view. Modifier-based rather than single letters, because the diff pane also
+// answers `c` and a bare-letter scheme would fight the composer it opens.
+actions!(
+    cibergit,
+    [
+        DiffCursorDown,
+        DiffCursorUp,
+        DiffNextHunk,
+        DiffPreviousHunk,
+        DiffNextThread,
+        DiffPreviousThread,
+        DiffCursorToStart,
+        DiffCursorToEnd,
+        MarkViewedAndAdvance,
+        ToggleAllFileSections,
+    ]
+);
 actions!(
     cibergit,
     [
@@ -262,6 +281,21 @@ fn main() {
             KeyBinding::new("right", DiffScrollRight, Some("DiffPane")),
             KeyBinding::new("home", DiffScrollHome, Some("DiffPane")),
             KeyBinding::new("end", DiffScrollEnd, Some("DiffPane")),
+            // Bare arrows stay with the list's own scrolling; the cursor takes
+            // the command pair, hunks the option pair, and threads both.
+            KeyBinding::new("cmd-down", DiffCursorDown, Some("DiffPane")),
+            KeyBinding::new("cmd-up", DiffCursorUp, Some("DiffPane")),
+            KeyBinding::new("alt-down", DiffNextHunk, Some("DiffPane")),
+            KeyBinding::new("alt-up", DiffPreviousHunk, Some("DiffPane")),
+            KeyBinding::new("cmd-alt-down", DiffNextThread, Some("DiffPane")),
+            KeyBinding::new("cmd-alt-up", DiffPreviousThread, Some("DiffPane")),
+            KeyBinding::new("cmd-home", DiffCursorToStart, Some("DiffPane")),
+            KeyBinding::new("cmd-end", DiffCursorToEnd, Some("DiffPane")),
+            KeyBinding::new("cmd-shift-v", MarkViewedAndAdvance, Some("DiffPane")),
+            // Folding is a property of the whole scroll, so it is not
+            // scoped to the pane: the button on the bar and this key do
+            // the same thing from wherever focus happens to be.
+            KeyBinding::new("cmd-shift-j", ToggleAllFileSections, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         let root_slot = std::rc::Rc::new(std::cell::RefCell::new(None));

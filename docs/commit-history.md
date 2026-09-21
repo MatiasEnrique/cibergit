@@ -2,7 +2,9 @@
 
 Choose **Commit history** in the sidebar's Repositories header, press `Shift Command H`, or pick it from the command palette. The page opens on the repository of the pull request you are reading, or the first one you have configured, and keeps a chip in the tab strip beside Settings. It is read-only: there is no checkout, cherry-pick, revert, tag or branch action anywhere on it.
 
-The left column lists commits newest first. Beside each one, the gutter draws the lane it sits on and the lanes crossing it. A lane keeps its colour from the moment it opens until it is merged or ends, so a branch is one colour for its whole length. An ordinary commit is a filled dot; a merge is a ring, with a line arriving from each parent. Lane colours come from Primer's data-visualization scale — GitHub's own palette for telling series in a graph apart — and are deliberately not the semantic colours used elsewhere, so a lane drawn in red means "the seventh branch" and never "something failed".
+The left column lists commits newest first, and is resizable and collapsible on the same terms as a review's file tree: drag its seam, or use the control in its header. Collapsed, it keeps its job and loses its names — one dot per commit in its lane's colour, at the same pitch the full rows use, so where you are in the history is still on screen and still answers a click. The column exists to let you choose a commit, and once you have chosen one it is the diff that you are reading; at its old fixed width the diff was left about a third of the window, which is too narrow for side by side to be usable at all.
+
+Beside each commit, the gutter draws the lane it sits on and the lanes crossing it. A lane keeps its colour from the moment it opens until it is merged or ends, so a branch is one colour for its whole length. An ordinary commit is a filled dot; a merge is a ring, with a line arriving from each parent. Lane colours come from Primer's data-visualization scale — GitHub's own palette for telling series in a graph apart — and are deliberately not the semantic colours used elsewhere, so a lane drawn in red means "the seventh branch" and never "something failed".
 
 ## Choosing what the graph covers
 
@@ -19,6 +21,8 @@ Select a commit and the right-hand side shows what it says and what it changed: 
 The diff is the comparison between the commit and its **first parent**, which is what GitHub's own commit page shows. For a merge, that means you see what the merge brought onto the branch it landed on; the other parents are named in the metadata so you can go to them. A root commit has no parent at all, so it is compared against an empty tree and reads as the addition of every file in it.
 
 Changed files are listed without their patches, and the patch for a file loads when you select it. Binary and media content is never loaded. Unified and side-by-side views work as they do in a review, and long lines scroll horizontally.
+
+The diff reads by keyboard here exactly as it does in a review: `⌘↓` and `⌘↑` move the cursor a row at a time, `⌥↓` and `⌥↑` jump between hunks, and `⌘Home` and `⌘End` go to the ends of the patch. `←`, `→`, `Home` and `End` scroll a long line sideways — those four are bound to every diff pane and, until this page took the shared one, History's diff was the one that answered none of them. The comment-thread jumps exist in the same keymap but have nothing to find here, because a commit's diff carries no threads.
 
 ## Repositories with no local clone
 

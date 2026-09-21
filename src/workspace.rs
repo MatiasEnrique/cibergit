@@ -183,6 +183,24 @@ pub struct Preferences {
     /// which has no bundle identifier of its own.
     #[serde(default)]
     pub preferred_editor: Option<String>,
+    /// Whether a comparison opens as one scroll or one file at a time.
+    /// Additive with a `Default`, so a workspace written before this existed
+    /// loads unchanged rather than being rejected as a foreign version.
+    #[serde(default)]
+    pub reading_mode: ReadingMode,
+}
+
+/// Mirrors `app::diff_pane::ReadingMode`, which is where it is used. It is
+/// declared here because this is the crate that persists it and the app module
+/// is not part of the library.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReadingMode {
+    /// Every file in one scroll. What a comparison opens in.
+    #[default]
+    Stream,
+    /// The selected file alone.
+    File,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

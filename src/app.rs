@@ -2,24 +2,27 @@ use crate::glass;
 use crate::{
     AddPendingComment, ApplyPrDiscussion, ApplyPrMetadata, CancelPrMutation, CloseTab,
     ComposeInlineComment, ConfirmPrMutation, CycleDiffMode, DetailsNarrower, DetailsWider,
-    DiffScrollEnd, DiffScrollHome, DiffScrollLeft, DiffScrollRight, EditPrMetadata,
-    FileTreeActivate, FileTreeDown, FileTreeLeft, FileTreeNarrower, FileTreeRight, FileTreeUp,
-    FileTreeWider, MergePullRequest, NewPrDiscussion, NextFile, OpenHistory,
-    OpenPullRequestBrowser, OpenPullRequestCreation, OpenRepositorySetup, OpenSettings,
-    OpenStackView,
+    DiffCursorDown, DiffCursorToEnd, DiffCursorToStart, DiffCursorUp, DiffNextHunk, DiffNextThread,
+    DiffPreviousHunk, DiffPreviousThread, DiffScrollEnd, DiffScrollHome, DiffScrollLeft,
+    DiffScrollRight, EditPrMetadata, FileTreeActivate, FileTreeDown, FileTreeLeft,
+    FileTreeNarrower, FileTreeRight, FileTreeUp, FileTreeWider, MarkViewedAndAdvance,
+    MergePullRequest, NewPrDiscussion, NextFile, OpenHistory, OpenPullRequestBrowser,
+    OpenPullRequestCreation, OpenRepositorySetup, OpenSettings, OpenStackView,
     PostImmediateComment, PreviousFile, Refresh, RefreshStackView, ResetLayout,
     ReturnToPullRequest, Save, SaveReviewDraft, SelectFullComparison, SelectNextComparisonCommit,
     SelectNextStackTip, SelectPreviousComparisonCommit, SelectSinceLastReview, SidebarNarrower,
-    SidebarWider, SubmitReview, ToggleComparisonPicker, ToggleFileTree, ToggleInspector,
-    TogglePalette, ToggleSidebar, ToggleStackRelationships,
+    SidebarWider, SubmitReview, ToggleAllFileSections, ToggleComparisonPicker, ToggleFileTree,
+    ToggleInspector, TogglePalette, ToggleSidebar, ToggleStackRelationships,
 };
 use cibergit::ui::{self, Density, TextRole};
+use diff_pane::{DiffRow, ReadingMode, build_rows, diff_text_metrics, display_columns};
 mod avatars;
 mod checks_view;
 mod ci_actions;
 mod ci_read;
 mod collaboration_cache;
 mod comparison_picker;
+mod diff_pane;
 mod file_tree;
 mod history_view;
 #[allow(dead_code)] // The vocabulary is complete by design; not every block exists yet.
@@ -37,6 +40,7 @@ mod review_interactions;
 mod stack_view;
 mod submitted_review_drafts;
 mod view_editor;
+mod workspace_save;
 
 use checks_view::{
     CheckState, ChecksSelection, LoadSelectedJobLog, NextCheck, NextCheckPage, NextJob,
@@ -70,10 +74,10 @@ use cibergit::{
     },
     domain::{
         ActionsAttemptLocator, ActionsHeadRelation, ActionsRunControlAcknowledgement,
-        ActionsRunControlAction, ActionsRunControlRequest, DismissalAuthority, MergeAction,
-        MergeExecutionRequest, MergeMethod, MergePreparation, PendingFileReviewAbsence,
-        PendingReviewCreationAcknowledgement, PendingReviewSnapshot, ProviderCoordinates,
-        ProviderMutationOutcome, ProviderReadEvidence, PullRequest, PullRequestDetails,
+        ActionsRunControlAction, ActionsRunControlRequest, ChangedFile, DismissalAuthority,
+        MergeAction, MergeExecutionRequest, MergeMethod, MergePreparation,
+        PendingFileReviewAbsence, PendingReviewCreationAcknowledgement, PendingReviewSnapshot,
+        ProviderCoordinates, ProviderMutationOutcome, PullRequest, PullRequestDetails,
         PullRequestDiscussionAction, PullRequestLifecycleAction, ReactableKind, ReactionAction,
         ReactionContent, ReactionIntent, ReactionSubjectSnapshot, Repository,
         ReviewAuxiliaryAction, ReviewAuxiliaryRequest, Revision,
@@ -89,12 +93,12 @@ use cibergit::{
         ActionsReadError, ActionsReadErrorCategory, GeneralReadFailureKind, GithubProvider,
     },
     review::{
-        AlignedRow, DiffLine, DiffLineKind, DiffMode, ParsedDiff, PatchStatus, ReviewSession,
+        AlignedRow, DiffLine, DiffLineKind, DiffMode, LazyPatchRequest, ReviewSession,
         empty_tree_oid, file_key, load_local_file, local_inventory, local_pr_inventory, parse_file,
     },
     workspace::{
         Filter, GroupBy, PersistedComparisonContext, PersistedComparisonSession, PersonalFilter,
-        PollSchedule, SidebarMaterial, Store, TabState, WorkspaceRestorePlan, WorkspaceState,
+        PollSchedule, SidebarMaterial, Store, TabState, WorkspaceState,
     },
 };
 use collaboration_cache::{CachedObservation, CollaborationCache, PreparedWrite, now_unix_ms};
@@ -111,12 +115,9 @@ use history_view::HistoryController;
 use pr_lifecycle::{ChoiceKind, FrozenMutation, PrLifecycleController, reviewer};
 use review_interactions::{
     ActionJournal, ComposerState, ControllerLoad, InlineThread, JournalOperation, JournalRequest,
-    JournalStatus, PendingReviewStartExpected, ReviewInteractionController,
-    ReviewReconciliationItem, ReviewReconciliationOutcome,
-    cancel_pending_review_start_before_create, dispatch_auxiliary, dispatch_merge,
-    execute_pending_review_start_create, execute_pending_review_start_thread,
-    finish_pending_review_start_locally, load_merge_preference, next_attempt_id,
-    place_threads_with_canonical, save_merge_preference, stop_pending_review_start_after_create,
+    JournalStatus, ParticipationSequencer, ParticipationWriteTicket, ReviewInteractionController,
+    ReviewReconciliationItem, ReviewReconciliationOutcome, dispatch_auxiliary, dispatch_merge,
+    load_merge_preference, next_attempt_id, place_threads_with_canonical, save_merge_preference,
 };
 use stack_view::{
     StackLoadState, StackViewController, boundary_label, load_stack, provenance_label,
@@ -130,14 +131,15 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 use submitted_review_drafts::{
-    DraftSnapshot as SubmittedDraftStoreSnapshot, SubmittedReviewDraftStore, SubmittedSummaryDraft,
-    same_draft_history, same_review_coordinates,
+    DraftSnapshot as SubmittedDraftStoreSnapshot, SubmittedDraftActivity,
+    SubmittedDraftCloseDisposition, SubmittedDraftLoadCompletion, SubmittedReviewDraftStore,
+    SubmittedSummaryDraft, SubmittedSummaryEditor, same_review_coordinates,
 };
 use view_editor::{SidebarRow, ViewEditorController};
 
@@ -223,6 +225,7 @@ const MIN_FILE_TREE_WIDTH: f32 = 180.;
 const MIN_DETAILS_WIDTH: f32 = 220.;
 const MAX_PANEL_WIDTH: f32 = 460.;
 const COLLAPSED_PANEL_WIDTH: f32 = 34.;
+const WINDOW_CONTROLS_INSET: f32 = 88.;
 // The splitter's drag band. It is painted and hit at this width but takes no
 // width in layout: an 8px column between the panes cut every diff line in half
 // at the file tree's edge. The tree already carries its own right hairline, so
@@ -239,7 +242,18 @@ const PANEL_KEYBOARD_STEP: f32 = 16.;
 // Menlo at the diff's 12px text size advances about 7.225px per ASCII cell on
 // the pinned renderer. Round upward; Unicode is conservatively two cells.
 const DIFF_CELL_WIDTH: f32 = 7.23;
-const DIFF_FIXED_COLUMNS: f32 = 122.;
+/// One palette row: its element id, its label, the keys it prints, and the
+/// action it dispatches.
+type DiffCommand = (
+    &'static str,
+    &'static str,
+    &'static str,
+    fn() -> Box<dyn gpui::Action>,
+);
+
+/// The position ruler's column. Narrow enough to be chrome, wide enough to
+/// be a pointer target on the window's own edge.
+const DIFF_RULER_WIDTH: f32 = 10.;
 #[cfg(feature = "ui-smoke")]
 const SPLIT_GUTTER_WIDTH: f32 = 66.;
 #[cfg(feature = "ui-smoke")]
@@ -713,7 +727,7 @@ struct RepoRuntime {
     pull_requests: Arc<Vec<PullRequest>>,
     state: LoadState,
     generation: u64,
-    refresh: RefreshGate,
+    refresh: read_sync::RefreshLane,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -721,6 +735,11 @@ enum PanelKind {
     Sidebar,
     FileTree,
     Details,
+    /// History's commit graph. It resizes and collapses through the same
+    /// splitter the three above use, but its width belongs to the History
+    /// page rather than to the review layout: History replaces the whole main
+    /// section, so it is never on screen beside the file tree or the inspector.
+    HistoryCommits,
 }
 
 #[derive(Clone, Debug)]
@@ -753,6 +772,8 @@ impl PanelLayout {
             PanelKind::FileTree => self.file_tree_width,
             PanelKind::Details if !inspector_open => 0.,
             PanelKind::Details => self.details_width,
+            // Not part of the review layout's budget; see the variant.
+            PanelKind::HistoryCommits => 0.,
         }
     }
 
@@ -773,6 +794,9 @@ impl PanelLayout {
                     (self.details_width + delta).clamp(MIN_DETAILS_WIDTH, MAX_PANEL_WIDTH);
                 return;
             }
+            // History owns its own width; the keyboard panel actions address
+            // the review layout and never reach this kind.
+            PanelKind::HistoryCommits => return,
         };
         if *collapsed && delta > 0. {
             *collapsed = false;
@@ -847,79 +871,17 @@ impl Render for SplitterDragPreview {
     }
 }
 
-/// Periodic polls never supersede an unfinished read. An explicit refresh
-/// coalesces one follow-up and prevents installing the earlier observation.
-#[derive(Default)]
-struct RefreshGate {
-    active: bool,
-    explicit_pending: bool,
-    automatic_pending: bool,
+#[derive(Clone, Copy)]
+enum TabReadKind {
+    Metadata,
+    Details,
+    Lifecycle,
 }
 
 #[derive(Clone, Copy)]
 enum GeneralReadFollowup {
-    Tab { index: usize, kind: u8 },
+    Tab { index: usize, kind: TabReadKind },
     Repository { index: usize },
-}
-
-fn rotate_general_read_followups<T>(followups: &mut [T], cursor: &mut usize) {
-    if followups.is_empty() {
-        return;
-    }
-    followups.rotate_left(*cursor % followups.len());
-    *cursor = cursor.wrapping_add(1);
-}
-
-impl RefreshGate {
-    #[cfg(test)]
-    fn request(&mut self, explicit: bool) -> bool {
-        self.begin_admission(explicit).is_some()
-    }
-
-    /// Begin a server-admitted refresh, carrying one explicit intent that may
-    /// have been deferred before any provider work started.
-    fn begin_admission(&mut self, explicit: bool) -> Option<bool> {
-        if self.active {
-            self.explicit_pending |= explicit;
-            None
-        } else {
-            self.active = true;
-            self.automatic_pending = false;
-            Some(explicit || std::mem::take(&mut self.explicit_pending))
-        }
-    }
-
-    fn defer_admission(&mut self, explicit: bool) {
-        self.active = false;
-        if explicit {
-            self.explicit_pending = true;
-        } else {
-            self.automatic_pending = true;
-        }
-    }
-
-    fn has_deferred(&self) -> bool {
-        !self.active && (self.explicit_pending || self.automatic_pending)
-    }
-
-    #[cfg(feature = "ui-smoke")]
-    fn clear_smoke_pending_after_witness(&mut self) {
-        debug_assert!(!self.active);
-        self.explicit_pending = false;
-        self.automatic_pending = false;
-    }
-
-    fn superseded_by_explicit(&self) -> bool {
-        self.active && self.explicit_pending
-    }
-
-    /// Call only after matching the callback's repository/tab lifetime.
-    /// Result generation must still be checked before installing it.
-    /// A true result requires a fresh read instead of installing this result.
-    fn complete(&mut self) -> bool {
-        self.active = false;
-        std::mem::take(&mut self.explicit_pending)
-    }
 }
 
 /// A read can complete after its PR tab has closed and reopened. Per-tab read
@@ -972,18 +934,6 @@ impl CiCompletionToken {
                     .is_some_and(|snapshot| snapshot.observation_id == observation)
             })
             && tab.ci_read.owns(&self.operation)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct StartupRestoreToken {
-    workspace_instance: u64,
-    generation: u64,
-}
-
-impl StartupRestoreToken {
-    fn matches(self, workspace_instance: u64, generation: u64, pending: bool) -> bool {
-        pending && self.workspace_instance == workspace_instance && self.generation == generation
     }
 }
 
@@ -1045,45 +995,62 @@ fn admit_open_pr_completion(
         .unwrap_or(OpenPrCompletion::Install)
 }
 
-fn saved_repository_is_current(repositories: &[Repository], restored: &Repository) -> bool {
-    repositories
-        .iter()
-        .any(|repository| repository.cache_key() == restored.cache_key() && repository == restored)
+#[derive(Debug, PartialEq, Eq)]
+enum SelectedLocalFileCompletion {
+    NotRequested,
+    Stale,
+    Installed,
+    Failed(String),
 }
 
-fn startup_tab_order(current: &[TabIdentity], saved: &[TabIdentity]) -> Vec<usize> {
-    let mut order = Vec::with_capacity(current.len());
-    for identity in saved {
-        if let Some(index) = current
-            .iter()
-            .enumerate()
-            .find(|(index, candidate)| !order.contains(index) && *candidate == identity)
-            .map(|(index, _)| index)
-        {
-            order.push(index);
-        }
-    }
-    for index in 0..current.len() {
-        if !order.contains(&index) {
-            order.push(index);
-        }
-    }
-    order
+#[derive(Debug, PartialEq, Eq)]
+struct LocalFileLoadCompletion {
+    selected: SelectedLocalFileCompletion,
+    canonical_installed: bool,
 }
 
-fn startup_active_identity(
-    available: &BTreeSet<TabIdentity>,
-    explicit: Option<TabIdentity>,
-    saved: Option<TabIdentity>,
-    prior: Option<TabIdentity>,
-    admitted: &[TabIdentity],
-) -> Option<TabIdentity> {
-    explicit
-        .filter(|identity| available.contains(identity))
-        .or_else(|| saved.filter(|identity| available.contains(identity)))
-        .or_else(|| prior.filter(|identity| available.contains(identity)))
-        .or_else(|| admitted.first().cloned())
-        .or_else(|| available.first().cloned())
+/// Admit the two patch results against their issuing readers independently.
+/// Only the selected result carries presentation authority; canonical hydration
+/// can still succeed after the displayed reader has moved.
+fn accept_local_file_load_results(
+    selected_session: Option<&mut ReviewSession>,
+    selected_request: &LazyPatchRequest,
+    selected_result: Option<anyhow::Result<ChangedFile>>,
+    canonical_session: Option<&mut ReviewSession>,
+    canonical_request: Option<&LazyPatchRequest>,
+    canonical_result: Option<anyhow::Result<ChangedFile>>,
+) -> LocalFileLoadCompletion {
+    let selected_current = selected_session
+        .as_deref()
+        .is_some_and(|session| session.accepts_file_patch(selected_request));
+    let selected = match selected_result {
+        None => SelectedLocalFileCompletion::NotRequested,
+        Some(_) if !selected_current => SelectedLocalFileCompletion::Stale,
+        Some(Err(error)) => SelectedLocalFileCompletion::Failed(format!("{error:#}")),
+        Some(Ok(file)) => match selected_session {
+            Some(session) => match session.accept_file_patch(selected_request, file) {
+                Ok(()) => SelectedLocalFileCompletion::Installed,
+                Err(error) => SelectedLocalFileCompletion::Failed(format!("{error:#}")),
+            },
+            None => SelectedLocalFileCompletion::Stale,
+        },
+    };
+
+    let canonical_installed =
+        canonical_request
+            .zip(canonical_result)
+            .is_some_and(|(request, result)| {
+                let Some(session) = canonical_session else {
+                    return false;
+                };
+                session.accepts_file_patch(request)
+                    && result.is_ok_and(|file| session.accept_file_patch(request, file).is_ok())
+            });
+
+    LocalFileLoadCompletion {
+        selected,
+        canonical_installed,
+    }
 }
 
 impl TabReadEpoch {
@@ -1135,10 +1102,6 @@ fn collaboration_completion_matches(
     current_tab: u64,
 ) -> bool {
     expected_workspace == current_workspace && expected_tab == current_tab
-}
-
-fn general_read_callback_is_current(expected_workspace: u64, current_workspace: u64) -> bool {
-    expected_workspace == current_workspace
 }
 
 fn general_read_tab_can_start(close_after_save: bool) -> bool {
@@ -1404,9 +1367,10 @@ fn apply_submitted_draft_save_if_current(
             tab_instance,
             repository_key,
             pull_request,
-            editor.save_generation,
+            token.generation,
         )
-        .then(|| editor.complete_save(result))
+        .then(|| editor.complete_save(token.generation, result))
+        .flatten()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1521,13 +1485,10 @@ struct ReviewTab {
     request_generation: u64,
     inventory_generation: u64,
     metadata_generation: u64,
-    metadata_refresh: RefreshGate,
-    diff_rows: Rc<Vec<DiffRow>>,
-    diff_split: bool,
-    diff_text_width: f32,
-    diff_scroll: ListState,
-    diff_horizontal: ScrollHandle,
-    diff_content_width: f32,
+    metadata_refresh: read_sync::RefreshLane,
+    diff: diff_pane::DiffPaneState,
+    /// Why this comparison is not streaming, when it was asked to.
+    stream_notice: Option<String>,
     log_scroll: UniformListScrollHandle,
     log_horizontal: ScrollHandle,
     file_tree: FileTree,
@@ -1550,11 +1511,11 @@ struct ReviewTab {
     journal_error: Option<String>,
     details_state: LoadState,
     details_generation: u64,
-    details_refresh: RefreshGate,
+    details_refresh: read_sync::RefreshLane,
     lifecycle: PrLifecycleController,
     lifecycle_state: LoadState,
     lifecycle_generation: u64,
-    lifecycle_refresh: RefreshGate,
+    lifecycle_refresh: read_sync::RefreshLane,
     interactions: InteractionState,
     interaction_generation: u64,
     confirmation: Option<NativeConfirmation>,
@@ -1581,6 +1542,37 @@ struct ReviewTab {
     /// Kept alive so the checkout can ask this tab for the full surface.
     _local_subscription: Option<Subscription>,
     stack: StackViewController,
+}
+
+impl ReviewTab {
+    fn read_lane(&self, kind: TabReadKind) -> read_sync::RefreshLane {
+        match kind {
+            TabReadKind::Metadata => self.metadata_refresh,
+            TabReadKind::Details => self.details_refresh,
+            TabReadKind::Lifecycle => self.lifecycle_refresh,
+        }
+    }
+
+    fn read_generation_mut(&mut self, kind: TabReadKind) -> &mut u64 {
+        match kind {
+            TabReadKind::Metadata => &mut self.metadata_generation,
+            TabReadKind::Details => &mut self.details_generation,
+            TabReadKind::Lifecycle => &mut self.lifecycle_generation,
+        }
+    }
+
+    fn read_context(&self, workspace: u64, kind: TabReadKind) -> read_sync::RefreshContext {
+        read_sync::RefreshContext {
+            workspace,
+            repository: self.repository.cache_key(),
+            resource: Some(self.pull_request.number),
+            revision: match kind {
+                TabReadKind::Metadata => self.metadata_generation,
+                TabReadKind::Details => self.details_generation,
+                TabReadKind::Lifecycle => self.lifecycle_generation,
+            },
+        }
+    }
 }
 
 enum InteractionState {
@@ -1653,364 +1645,6 @@ enum NativeConfirmation {
         generation: u64,
         request: Box<ActionsRunControlRequest>,
     },
-}
-
-#[derive(Clone, Debug)]
-struct SubmittedDraftSave {
-    snapshot: SubmittedDraftStoreSnapshot,
-}
-
-#[derive(Clone, Debug)]
-struct SubmittedDraftClear {
-    captured: SubmittedSummaryDraft,
-}
-
-#[derive(Clone, Debug)]
-enum SubmittedDraftLoadState {
-    Loading,
-    Ready,
-    Failed,
-    Conflict { disk: SubmittedDraftStoreSnapshot },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SubmittedDraftCloseDisposition {
-    Safe,
-    WaitForOperation,
-    Save,
-    RefuseRecovery,
-}
-
-#[derive(Clone)]
-struct SubmittedSummaryEditor {
-    active_review: Option<cibergit::domain::ProviderCoordinates>,
-    drafts: Vec<SubmittedSummaryDraft>,
-    load_state: SubmittedDraftLoadState,
-    load_generation: u64,
-    edit_generation: u64,
-    save_generation: u64,
-    durable: SubmittedDraftStoreSnapshot,
-    in_flight: Option<SubmittedDraftSave>,
-    pending: Option<SubmittedDraftSave>,
-    pending_clear: Option<SubmittedDraftClear>,
-    clear_in_flight: bool,
-    close_after_save: bool,
-    persistence_error: Option<String>,
-}
-
-impl Default for SubmittedSummaryEditor {
-    fn default() -> Self {
-        Self {
-            active_review: None,
-            drafts: Vec::new(),
-            load_state: SubmittedDraftLoadState::Loading,
-            load_generation: 0,
-            edit_generation: 0,
-            save_generation: 0,
-            durable: SubmittedDraftStoreSnapshot::default(),
-            in_flight: None,
-            pending: None,
-            pending_clear: None,
-            clear_in_flight: false,
-            close_after_save: false,
-            persistence_error: None,
-        }
-    }
-}
-
-impl SubmittedSummaryEditor {
-    fn active_draft(&self) -> Option<&SubmittedSummaryDraft> {
-        let active = self.active_review.as_ref()?;
-        self.drafts
-            .iter()
-            .find(|draft| same_review_coordinates(&draft.review.coordinates, active))
-    }
-
-    fn active_draft_mut(&mut self) -> Option<&mut SubmittedSummaryDraft> {
-        let active = self.active_review.as_ref()?;
-        self.drafts
-            .iter_mut()
-            .find(|draft| same_review_coordinates(&draft.review.coordinates, active))
-    }
-
-    fn draft_for(
-        &self,
-        coordinates: &cibergit::domain::ProviderCoordinates,
-    ) -> Option<&SubmittedSummaryDraft> {
-        self.drafts
-            .iter()
-            .find(|draft| same_review_coordinates(&draft.review.coordinates, coordinates))
-    }
-
-    fn store_active_body(&mut self, body: String) -> bool {
-        if let Some(draft) = self.active_draft_mut()
-            && draft.body != body
-        {
-            draft.body = body;
-            self.edit_generation = self.edit_generation.saturating_add(1);
-            return true;
-        }
-        false
-    }
-
-    /// Selects an exact review draft. Existing text is retained; a newer fresh
-    /// source tuple replaces only the expected source used by preflight.
-    fn begin(&mut self, fresh: cibergit::domain::PullRequestReview) -> (String, bool, bool) {
-        let coordinates = fresh.coordinates.clone();
-        let existing = self
-            .drafts
-            .iter_mut()
-            .find(|draft| same_review_coordinates(&draft.review.coordinates, &coordinates));
-        let (body, source_refreshed, resumed) = if let Some(draft) = existing {
-            let source_refreshed = draft.review != fresh;
-            draft.review = fresh;
-            (draft.body.clone(), source_refreshed, true)
-        } else {
-            let body = fresh.body.clone();
-            self.drafts.push(SubmittedSummaryDraft {
-                review: fresh,
-                body: body.clone(),
-            });
-            (body, false, false)
-        };
-        self.active_review = Some(coordinates);
-        self.edit_generation = self.edit_generation.saturating_add(1);
-        (body, source_refreshed, resumed)
-    }
-
-    fn clear(&mut self, coordinates: &cibergit::domain::ProviderCoordinates) {
-        self.drafts
-            .retain(|draft| !same_review_coordinates(&draft.review.coordinates, coordinates));
-        if self
-            .active_review
-            .as_ref()
-            .is_some_and(|active| same_review_coordinates(active, coordinates))
-        {
-            self.active_review = None;
-        }
-        self.edit_generation = self.edit_generation.saturating_add(1);
-    }
-
-    fn current_snapshot(&self) -> SubmittedDraftStoreSnapshot {
-        SubmittedDraftStoreSnapshot {
-            generation: self.durable.generation,
-            active_review: self.active_review.clone(),
-            drafts: self.drafts.clone(),
-        }
-    }
-
-    fn is_ready(&self) -> bool {
-        matches!(self.load_state, SubmittedDraftLoadState::Ready)
-    }
-
-    fn is_current_durable(&self) -> bool {
-        self.is_ready()
-            && self.in_flight.is_none()
-            && self.pending.is_none()
-            && !self.clear_in_flight
-            && self.pending_clear.is_none()
-            && self.persistence_error.is_none()
-            && self.current_snapshot().same_contents(&self.durable)
-    }
-
-    fn close_disposition(&self) -> SubmittedDraftCloseDisposition {
-        if self.clear_in_flight || self.pending_clear.is_some() || self.in_flight.is_some() {
-            SubmittedDraftCloseDisposition::WaitForOperation
-        } else if !self.is_ready() && !self.drafts.is_empty() {
-            SubmittedDraftCloseDisposition::RefuseRecovery
-        } else if self.is_ready() && !self.is_current_durable() {
-            SubmittedDraftCloseDisposition::Save
-        } else {
-            SubmittedDraftCloseDisposition::Safe
-        }
-    }
-
-    fn queue_current(&mut self) {
-        let save = SubmittedDraftSave {
-            snapshot: self.current_snapshot(),
-        };
-        if self
-            .in_flight
-            .as_ref()
-            .is_some_and(|active| active.snapshot.same_contents(&save.snapshot))
-            || (self.in_flight.is_none() && self.durable.same_contents(&save.snapshot))
-        {
-            self.pending = None;
-        } else {
-            self.pending = Some(save);
-        }
-    }
-
-    fn start_next(&mut self) -> Option<SubmittedDraftSave> {
-        if self.in_flight.is_some()
-            || !self.is_ready()
-            || self.clear_in_flight
-            || self.pending_clear.is_some()
-        {
-            return None;
-        }
-        let next = self.pending.take()?;
-        self.in_flight = Some(next.clone());
-        Some(next)
-    }
-
-    fn queue_clear(&mut self, captured: SubmittedSummaryDraft) {
-        self.pending_clear = Some(SubmittedDraftClear { captured });
-    }
-
-    fn complete_save(
-        &mut self,
-        result: Result<SubmittedDraftStoreSnapshot, String>,
-    ) -> Result<(), String> {
-        let active = self
-            .in_flight
-            .take()
-            .ok_or_else(|| "Submitted-review draft save has no owned snapshot.".to_owned())?;
-        match result {
-            Ok(saved) if saved.same_contents(&active.snapshot) => {
-                self.durable = saved;
-                self.persistence_error = None;
-                if self.pending.is_none() && !self.current_snapshot().same_contents(&self.durable) {
-                    self.queue_current();
-                }
-                Ok(())
-            }
-            Ok(_) => {
-                self.pending = None;
-                Err("Submitted-review draft save receipt did not match its exact snapshot.".into())
-            }
-            Err(error) => {
-                self.pending = None;
-                Err(error)
-            }
-        }
-    }
-
-    fn complete_clear(
-        &mut self,
-        captured: &SubmittedSummaryDraft,
-        result: Result<SubmittedDraftStoreSnapshot, String>,
-    ) -> Result<bool, String> {
-        if !self.clear_in_flight {
-            return Err("Submitted-review draft clear has no owned operation.".into());
-        }
-        self.clear_in_flight = false;
-        let cleared = result?;
-        self.durable = cleared;
-        let unchanged = self
-            .drafts
-            .iter()
-            .any(|draft| same_draft_history(draft, captured));
-        if unchanged {
-            self.clear(&captured.review.coordinates);
-        }
-        if !self.current_snapshot().same_contents(&self.durable) {
-            self.queue_current();
-        }
-        self.persistence_error = None;
-        Ok(unchanged)
-    }
-
-    fn merge_loaded(
-        &mut self,
-        captured_edit_generation: u64,
-        mut disk: SubmittedDraftStoreSnapshot,
-    ) -> bool {
-        // Restoring selection is history, not authorization. The user must
-        // explicitly choose Edit against fresh Activity before an input opens.
-        disk.active_review = None;
-        if self.edit_generation == captured_edit_generation && self.drafts.is_empty() {
-            self.active_review = None;
-            self.drafts = disk.drafts.clone();
-            self.durable = disk;
-            self.load_state = SubmittedDraftLoadState::Ready;
-            self.persistence_error = None;
-            return false;
-        }
-
-        let same_review_conflict = self.drafts.iter().any(|local| {
-            disk.drafts.iter().any(|saved| {
-                same_review_coordinates(&saved.review.coordinates, &local.review.coordinates)
-                    && !same_draft_history(saved, local)
-            })
-        });
-        if same_review_conflict {
-            self.load_state = SubmittedDraftLoadState::Conflict { disk };
-            self.persistence_error = Some(
-                "A saved draft for this same review loaded after local text. Both versions are preserved; choose which text to keep."
-                    .into(),
-            );
-            return false;
-        }
-
-        for saved in &disk.drafts {
-            if !self.drafts.iter().any(|local| {
-                same_review_coordinates(&local.review.coordinates, &saved.review.coordinates)
-            }) {
-                self.drafts.push(saved.clone());
-            }
-        }
-        self.durable = disk;
-        self.load_state = SubmittedDraftLoadState::Ready;
-        self.persistence_error = None;
-        self.queue_current();
-        self.pending.is_some()
-    }
-
-    fn resolve_conflict_use_saved(&mut self) -> bool {
-        let SubmittedDraftLoadState::Conflict { disk } = self.load_state.clone() else {
-            return false;
-        };
-        let mut replaced_active = false;
-        for saved in &disk.drafts {
-            if let Some(position) = self.drafts.iter().position(|local| {
-                same_review_coordinates(&local.review.coordinates, &saved.review.coordinates)
-            }) {
-                if !same_draft_history(&self.drafts[position], saved) {
-                    replaced_active |= self.active_review.as_ref().is_some_and(|active| {
-                        same_review_coordinates(active, &saved.review.coordinates)
-                    });
-                    self.drafts[position] = saved.clone();
-                }
-            } else {
-                self.drafts.push(saved.clone());
-            }
-        }
-        if replaced_active {
-            self.active_review = None;
-        }
-        self.durable = disk;
-        self.load_state = SubmittedDraftLoadState::Ready;
-        self.persistence_error = None;
-        self.queue_current();
-        true
-    }
-
-    fn resolve_conflict_keep_current(&mut self) -> bool {
-        let SubmittedDraftLoadState::Conflict { mut disk } = self.load_state.clone() else {
-            return false;
-        };
-        disk.active_review = None;
-        for saved in &disk.drafts {
-            if !self.drafts.iter().any(|local| {
-                same_review_coordinates(&local.review.coordinates, &saved.review.coordinates)
-            }) {
-                self.drafts.push(saved.clone());
-            }
-        }
-        self.durable = disk;
-        self.load_state = SubmittedDraftLoadState::Ready;
-        self.persistence_error = None;
-        self.queue_current();
-        true
-    }
-
-    fn conflict(&self) -> Option<&SubmittedDraftStoreSnapshot> {
-        match &self.load_state {
-            SubmittedDraftLoadState::Conflict { disk } => Some(disk),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2236,20 +1870,6 @@ struct SmokeActions {
     expectations: Vec<SmokeExpectation>,
 }
 
-#[derive(Clone)]
-enum DiffRow {
-    Hunk(String),
-    Unified(DiffLine),
-    Split(AlignedRow),
-    Thread(Box<InlineThread>),
-    Composer {
-        side: DiffSide,
-        start_line: u64,
-        line: u64,
-        canonical_reanchored: bool,
-    },
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InspectorSection {
     Overview,
@@ -2267,7 +1887,6 @@ pub struct ReviewWorkspace {
     stack_data_root: PathBuf,
     notifications: notifications_view::NotificationController,
     general_reads: read_sync::GeneralReadController,
-    general_read_followup_cursor: usize,
     workspace: WorkspaceState,
     persistence_error: Option<String>,
     accounts: Vec<cibergit::domain::Account>,
@@ -2364,17 +1983,13 @@ pub struct ReviewWorkspace {
     status: String,
     schedule: PollSchedule,
     startup_pr: Option<u64>,
-    startup_restore_generation: u64,
-    startup_restore_pending: bool,
     startup_restore_notice: Option<String>,
     explicit_startup_selection: Option<(String, u64)>,
     closed_workspace_tabs: BTreeSet<(String, u64)>,
     user_intent_generation: u64,
     explicit_startup_generation: Option<u64>,
-    session_save_latest: HashMap<String, Arc<AtomicU64>>,
-    session_save_locks: HashMap<String, Arc<Mutex<()>>>,
-    review_state_latest: HashMap<String, Arc<AtomicU64>>,
-    review_state_locks: HashMap<String, Arc<Mutex<()>>>,
+    persistence: workspace_save::WorkspacePersistence,
+    participation_sequencer: ParticipationSequencer,
     collaboration_write_latest: HashMap<String, Arc<AtomicU64>>,
     #[cfg(feature = "ui-smoke")]
     collaboration_read_disabled: bool,
@@ -2445,7 +2060,7 @@ impl ReviewWorkspace {
                     let opening =
                         matches!(event, local_checkout::LocalCheckoutEvent::OpenWorkspace);
                     if let local_checkout::LocalCheckoutEvent::Launched(preference) = event {
-                        this.remember_editor(preference.clone());
+                        this.remember_editor(preference.clone(), cx);
                     }
                     if let Some(tab) = this.tabs.iter_mut().find(|tab| {
                         tab.repository.cache_key() == key && tab.pull_request.number == number
@@ -2764,7 +2379,8 @@ impl ReviewWorkspace {
     }
 
     fn start_actions_jobs(&mut self, index: usize, cx: &mut Context<Root>) -> bool {
-        if !general_read_tab_can_start(self.tabs[index].submitted_summary_editor.close_after_save) {
+        if !general_read_tab_can_start(self.tabs[index].submitted_summary_editor.close_after_save())
+        {
             self.status =
                 "Finish the pending local draft save before starting an Actions read.".into();
             cx.notify();
@@ -2870,7 +2486,8 @@ impl ReviewWorkspace {
     }
 
     fn start_actions_log(&mut self, index: usize, cx: &mut Context<Root>) -> bool {
-        if !general_read_tab_can_start(self.tabs[index].submitted_summary_editor.close_after_save) {
+        if !general_read_tab_can_start(self.tabs[index].submitted_summary_editor.close_after_save())
+        {
             self.status =
                 "Finish the pending local draft save before starting an Actions read.".into();
             cx.notify();
@@ -3051,7 +2668,8 @@ impl ReviewWorkspace {
                 Some(format!("Cannot open workspace data: {error:#}")),
             ),
         };
-        let startup_restore_pending = store.is_some() && !workspace.tabs.is_empty();
+        let persistence = workspace_save::WorkspacePersistence::new(store.clone(), &workspace);
+        let startup_restore_pending = persistence.restore_pending();
         let explicit_startup_generation = startup.pull_request.map(|_| 0);
         let query = new_input(
             workspace.view().filter.search,
@@ -3125,7 +2743,7 @@ impl ReviewWorkspace {
                         LoadState::Loading("Loading pull requests…".into())
                     },
                     generation: 0,
-                    refresh: RefreshGate::default(),
+                    refresh: read_sync::RefreshLane::default(),
                 }
             })
             .collect();
@@ -3138,7 +2756,6 @@ impl ReviewWorkspace {
             stack_data_root: data_root,
             notifications,
             general_reads: read_sync::GeneralReadController::default(),
-            general_read_followup_cursor: 0,
             workspace,
             persistence_error,
             accounts: Vec::new(),
@@ -3211,17 +2828,13 @@ impl ReviewWorkspace {
             status: "Native review workspace".into(),
             schedule: PollSchedule::default(),
             startup_pr: startup.pull_request,
-            startup_restore_generation: u64::from(startup_restore_pending),
-            startup_restore_pending,
             startup_restore_notice: None,
             explicit_startup_selection: None,
             closed_workspace_tabs: BTreeSet::new(),
             user_intent_generation: 0,
             explicit_startup_generation,
-            session_save_latest: HashMap::new(),
-            session_save_locks: HashMap::new(),
-            review_state_latest: HashMap::new(),
-            review_state_locks: HashMap::new(),
+            persistence,
+            participation_sequencer: ParticipationSequencer::default(),
             collaboration_write_latest: HashMap::new(),
             #[cfg(feature = "ui-smoke")]
             collaboration_read_disabled: std::env::var_os(
@@ -3294,7 +2907,7 @@ impl ReviewWorkspace {
                 }
                 cx.notify();
             } else if let Some(index) = this.active_tab {
-                this.tabs[index].diff_scroll.remeasure();
+                this.tabs[index].diff.vertical.remeasure();
                 cx.notify();
             }
         });
@@ -3479,6 +3092,19 @@ impl ReviewWorkspace {
             discussion_changes,
             submitted_summary_changes,
         ]);
+        this._subscriptions.push(cx.on_app_quit(|root, cx| {
+            let this = &root.review;
+            let pending = this
+                .persistence_error
+                .is_none()
+                .then(|| this.persistence.save_workspace(&this.workspace))
+                .flatten();
+            cx.background_spawn(async move {
+                if let Some(write) = pending {
+                    let _ = write.execute();
+                }
+            })
+        }));
         this.start_workspace_restore(cx);
         #[cfg(feature = "ui-smoke")]
         if provider_reads_disabled {
@@ -3574,42 +3200,33 @@ impl ReviewWorkspace {
     }
 
     fn start_workspace_restore(&mut self, cx: &mut Context<Root>) {
-        if !self.startup_restore_pending {
-            return;
-        }
-        let Some(store) = self.store.clone() else {
-            self.startup_restore_pending = false;
+        let Some(restore) = self.persistence.begin_restore(&self.workspace) else {
             return;
         };
-        let workspace = self.workspace.clone();
-        let token = StartupRestoreToken {
-            workspace_instance: self.workspace_instance,
-            generation: self.startup_restore_generation,
-        };
-        let task = cx.background_spawn(async move { store.load_workspace_restore(&workspace) });
+        let task = cx.background_spawn(async move { restore.execute() });
         cx.spawn(async move |root, cx| {
-            let plan = task.await;
+            let loaded = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
-                if !token.matches(
-                    this.workspace_instance,
-                    this.startup_restore_generation,
-                    this.startup_restore_pending,
+                let current = this
+                    .tabs
+                    .iter()
+                    .map(|tab| (tab.repository.cache_key(), tab.pull_request.number))
+                    .collect::<Vec<_>>();
+                if let Some(plan) = this.persistence.complete_restore(
+                    loaded,
+                    &this.workspace.repositories,
+                    &current,
                 ) {
-                    return;
+                    this.apply_workspace_restore(plan, cx);
                 }
-                this.startup_restore_pending = false;
-                this.apply_workspace_restore(plan, cx);
             });
         })
         .detach();
     }
 
     fn cancel_startup_restore(&mut self) {
-        if self.startup_restore_pending {
-            self.startup_restore_pending = false;
-            self.startup_restore_generation = self.startup_restore_generation.saturating_add(1);
-        }
+        self.persistence.cancel_restore();
     }
 
     fn record_user_navigation(&mut self) {
@@ -3618,40 +3235,17 @@ impl ReviewWorkspace {
         self.cancel_startup_restore();
     }
 
-    fn apply_workspace_restore(&mut self, plan: WorkspaceRestorePlan, cx: &mut Context<Root>) {
+    fn apply_workspace_restore(
+        &mut self,
+        mut plan: workspace_save::AdmittedWorkspace,
+        cx: &mut Context<Root>,
+    ) {
         let prior_active = self.active_tab.and_then(|index| {
             self.tabs
                 .get(index)
                 .map(|tab| (tab.repository.cache_key(), tab.pull_request.number))
         });
-        let saved_active = plan.active_tab.and_then(|index| {
-            plan.tabs
-                .get(index)
-                .map(|tab| (tab.repository.cache_key(), tab.pull_request.number))
-        });
-        let mut notices = plan.notices;
-        let mut admitted_order = Vec::new();
-        for restored in plan.tabs {
-            let identity = (
-                restored.repository.cache_key(),
-                restored.pull_request.number,
-            );
-            if !saved_repository_is_current(&self.workspace.repositories, &restored.repository) {
-                notices.push(cibergit::workspace::WorkspaceRestoreNotice {
-                    saved_index: Some(restored.saved_index),
-                    message: format!(
-                        "Saved tab #{} was not restored because its exact repository/account was removed while startup data loaded",
-                        restored.pull_request.number
-                    ),
-                });
-                continue;
-            }
-            admitted_order.push(identity.clone());
-            if self.tabs.iter().any(|tab| {
-                tab.repository.cache_key() == identity.0 && tab.pull_request.number == identity.1
-            }) {
-                continue;
-            }
+        for restored in std::mem::take(&mut plan.tabs) {
             self.install_tab_with_restore(
                 restored.repository,
                 restored.pull_request,
@@ -3664,18 +3258,16 @@ impl ReviewWorkspace {
                 cx,
             );
         }
-        self.reorder_tabs_for_startup(&admitted_order);
+        self.reorder_tabs_for_startup(&plan);
         let available = self
             .tabs
             .iter()
             .map(|tab| (tab.repository.cache_key(), tab.pull_request.number))
             .collect::<BTreeSet<_>>();
-        let desired = startup_active_identity(
+        let desired = plan.active(
             &available,
             self.explicit_startup_selection.clone(),
-            saved_active,
             prior_active,
-            &admitted_order,
         );
         let desired_index = desired.and_then(|(repository_key, number)| {
             self.tabs.iter().position(|tab| {
@@ -3689,6 +3281,7 @@ impl ReviewWorkspace {
             self.active_tab_input_restore = None;
         }
         self.setup_open = self.tabs.is_empty() && self.startup_pr.is_none();
+        let notices = plan.notices;
         self.startup_restore_notice = if notices.is_empty() {
             None
         } else {
@@ -3703,17 +3296,17 @@ impl ReviewWorkspace {
                 )
             })
         };
-        self.save_workspace();
+        self.save_workspace(cx);
         cx.notify();
     }
 
-    fn reorder_tabs_for_startup(&mut self, saved_order: &[(String, u64)]) {
+    fn reorder_tabs_for_startup(&mut self, plan: &workspace_save::AdmittedWorkspace) {
         let current = self
             .tabs
             .iter()
             .map(|tab| (tab.repository.cache_key(), tab.pull_request.number))
             .collect::<Vec<_>>();
-        let order = startup_tab_order(&current, saved_order);
+        let order = plan.order(&current);
         let mut tabs = std::mem::take(&mut self.tabs)
             .into_iter()
             .map(Some)
@@ -4163,7 +3756,7 @@ impl ReviewWorkspace {
                         .update(|window, cx| {
                             let split = weak
                                 .read_with(cx, |root, _| {
-                                    matches!(&root.review, this if this.active_tab.is_some_and(|index| this.tabs[index].diff_rows.iter().any(|row| matches!(row, DiffRow::Split(_)))))
+                                    matches!(&root.review, this if this.active_tab.is_some_and(|index| this.tabs[index].diff.rows.iter().any(|row| matches!(row, DiffRow::Split(_)))))
                                 })
                                 .unwrap_or(false);
                             split
@@ -4205,7 +3798,7 @@ impl ReviewWorkspace {
                                 matches!(&root.review, this if this.active_tab.is_some_and(|index| {
                                     this.wide
                                         && this.tabs[index].session.as_ref().is_some_and(|session| session.diff_mode() == DiffMode::Unified)
-                                        && this.tabs[index].diff_rows.iter().all(|row| !matches!(row, DiffRow::Split(_)))
+                                        && this.tabs[index].diff.rows.iter().all(|row| !matches!(row, DiffRow::Split(_)))
                                 }))
                             })
                             .unwrap_or(false)
@@ -4240,10 +3833,10 @@ impl ReviewWorkspace {
                             weak.read_with(cx, |root, _| {
                                 matches!(&root.review, this if this.active_tab.is_some_and(|index| {
                                     !this.wide
-                                        && this.tabs[index].diff_horizontal.bounds().size.width
+                                        && this.tabs[index].diff.horizontal.bounds().size.width
                                             < px(MIN_SPLIT_DIFF_WIDTH)
                                         && this.tabs[index].session.as_ref().is_some_and(|session| session.diff_mode() == DiffMode::Auto)
-                                        && this.tabs[index].diff_rows.iter().all(|row| !matches!(row, DiffRow::Split(_)))
+                                        && this.tabs[index].diff.rows.iter().all(|row| !matches!(row, DiffRow::Split(_)))
                                 }))
                             })
                             .unwrap_or(false)
@@ -4261,10 +3854,10 @@ impl ReviewWorkspace {
                             weak.read_with(cx, |root, _| {
                                 matches!(&root.review, this if this.active_tab.is_some_and(|index| {
                                     this.wide
-                                        && effective_diff_viewport_width(&this.tabs[index].diff_rows, &this.tabs[index].diff_horizontal)
+                                        && effective_diff_viewport_width(&this.tabs[index].diff.rows, &this.tabs[index].diff.horizontal)
                                             >= MIN_SPLIT_DIFF_WIDTH
                                         && this.tabs[index].session.as_ref().is_some_and(|session| session.diff_mode() == DiffMode::Auto)
-                                        && this.tabs[index].diff_rows.iter().any(|row| matches!(row, DiffRow::Split(_)))
+                                        && this.tabs[index].diff.rows.iter().any(|row| matches!(row, DiffRow::Split(_)))
                                 }))
                             })
                             .unwrap_or(false)
@@ -5283,9 +4876,9 @@ impl ReviewWorkspace {
                         {
                             let this = &mut root.review;
                             if let Some(index) = this.active_tab {
-                                this.tabs[index]
-                                    .metadata_refresh
-                                    .clear_smoke_pending_after_witness();
+                                this.general_reads.clear_smoke_pending_after_witness(
+                                    this.tabs[index].metadata_refresh,
+                                );
                             }
                             this.status = read_sync::POLL_DEFERRED_NOTICE.into();
                             cx.notify();
@@ -5454,7 +5047,7 @@ impl ReviewWorkspace {
                 .coordinate
                 .clone();
             controller
-                .composition
+                .composition_mut_for_smoke()
                 .add_draft(coordinate, "synthetic retained line draft")
                 .map_err(|error| error.to_string())?;
             controller.composer = None;
@@ -5466,7 +5059,7 @@ impl ReviewWorkspace {
                 .target
                 .clone();
             controller
-                .composition
+                .composition_mut_for_smoke()
                 .add_file_draft(target, "synthetic retained FILE draft")
                 .map_err(|error| error.to_string())?;
             let editor = &mut tab.submitted_summary_editor;
@@ -5499,7 +5092,7 @@ impl ReviewWorkspace {
             serde_json::to_vec(&self.tabs[index].session).map_err(|error| error.to_string())?;
         let canonical_before = self.tabs[index].canonical_full_revision.clone();
         let composition_before = match &self.tabs[index].interactions {
-            InteractionState::Ready(controller) => controller.composition.clone(),
+            InteractionState::Ready(controller) => controller.composition().clone(),
             _ => return Err("general-sync smoke interaction controller disappeared".into()),
         };
         let submitted_before = self.tabs[index].submitted_summary_editor.current_snapshot();
@@ -5554,7 +5147,9 @@ impl ReviewWorkspace {
         }
         self.refresh_metadata(index, true, cx);
         if self.status != read_sync::RATE_DEFERRED_NOTICE
-            || !self.tabs[index].metadata_refresh.has_deferred()
+            || !self
+                .general_reads
+                .refresh_deferred(self.tabs[index].metadata_refresh)
         {
             return Err("real Root metadata path did not retain the rate deferral".into());
         }
@@ -5588,7 +5183,7 @@ impl ReviewWorkspace {
         }
 
         let composition_after = match &self.tabs[index].interactions {
-            InteractionState::Ready(controller) => &controller.composition,
+            InteractionState::Ready(controller) => controller.composition(),
             _ => return Err("general-sync smoke interaction controller disappeared".into()),
         };
         let preserved = pinned_before
@@ -5714,7 +5309,7 @@ impl ReviewWorkspace {
                 pull_requests: Arc::new(Vec::new()),
                 state: LoadState::Ready,
                 generation: 0,
-                refresh: RefreshGate::default(),
+                refresh: read_sync::RefreshLane::default(),
             });
         }
         let sha = |seed: char| std::iter::repeat_n(seed, 40).collect::<String>();
@@ -5804,7 +5399,7 @@ impl ReviewWorkspace {
             pull_requests: Arc::new(vec![pull.clone()]),
             state: LoadState::Ready,
             generation: 0,
-            refresh: RefreshGate::default(),
+            refresh: read_sync::RefreshLane::default(),
         });
         self.install_tab_with_restore(
             repository,
@@ -6331,7 +5926,7 @@ impl ReviewWorkspace {
                             }).collect();
                             this.repositories.push(RepoRuntime {
                                 repository, pull_requests: Arc::new(pull_requests), state: LoadState::Ready,
-                                generation: 0, refresh: RefreshGate::default(),
+                                generation: 0, refresh: read_sync::RefreshLane::default(),
                             });
                         }
                         cx.notify();
@@ -7105,7 +6700,7 @@ impl ReviewWorkspace {
         let pinned_before = serde_json::to_vec(&tab.session).map_err(|error| error.to_string())?;
         let canonical_before = tab.canonical_full_revision.clone();
         let composition_before = match &tab.interactions {
-            InteractionState::Ready(controller) => controller.composition.clone(),
+            InteractionState::Ready(controller) => controller.composition().clone(),
             _ => return Err("Checks smoke interaction controller is not ready".into()),
         };
         let submitted_before = tab.submitted_summary_editor.current_snapshot();
@@ -7205,7 +6800,7 @@ impl ReviewWorkspace {
             && canonical_before == tab.canonical_full_revision
             && composition_before
                 == match &tab.interactions {
-                    InteractionState::Ready(controller) => controller.composition.clone(),
+                    InteractionState::Ready(controller) => controller.composition().clone(),
                     _ => return Err("Checks smoke interaction controller disappeared".into()),
                 }
             && submitted_before == tab.submitted_summary_editor.current_snapshot()
@@ -7469,7 +7064,7 @@ impl ReviewWorkspace {
                                                     && composer.body == changed_body
                                                     && composer.target == *target
                                             })
-                                                && controller.composition.operations.is_empty()
+                                                && controller.composition().operations.is_empty()
                                     ))
                             })
                             .unwrap_or_else(|error| {
@@ -7587,7 +7182,7 @@ impl ReviewWorkspace {
                                 let retained_after_cancel = matches!(
                                     &this.tabs[index].interactions,
                                     InteractionState::Ready(controller)
-                                        if controller.composition.file_draft(&draft_id).is_some()
+                                        if controller.composition().file_draft(&draft_id).is_some()
                                             && controller.file_composer.as_ref().is_some_and(|composer| {
                                                 composer.body == body && composer.target == original_target
                                             })
@@ -7660,7 +7255,7 @@ impl ReviewWorkspace {
                                                 && composer.body == body
                                                 && composer.target == original_target
                                         })
-                                            && controller.composition.operations.is_empty()
+                                            && controller.composition().operations.is_empty()
                                 );
                                 Ok((
                                     readonly_target,
@@ -7732,7 +7327,7 @@ impl ReviewWorkspace {
                                 let this = &root.review;
                                 let Some(index) = this.active_tab else { return false };
                                 this.tabs[index].details.is_some()
-                                    && !this.tabs[index].details_refresh.active
+                                    && !this.general_reads.refresh_active(this.tabs[index].details_refresh)
                                     && this.tabs[index].submitted_summary_editor.is_ready()
                                     && matches!(
                                         this.tabs[index].interactions,
@@ -7994,8 +7589,7 @@ impl ReviewWorkspace {
                                 let editor = &mut this.tabs[index].submitted_summary_editor;
                                 editor.begin(review.clone());
                                 editor.store_active_body(submitted_body.into());
-                                editor.active_review = None;
-                                editor.durable = editor.current_snapshot();
+                                editor.mark_current_durable(true);
                             }
                             let key = ReviewKey::for_repository("github", &repository, number)
                                 .map_err(|error| error.to_string())?;
@@ -8022,9 +7616,9 @@ impl ReviewWorkspace {
                             let before = (
                                 match &this.tabs[index].interactions {
                                     InteractionState::Ready(controller) => Some((
-                                        controller.composition.drafts.clone(),
-                                        controller.composition.file_drafts.clone(),
-                                        controller.composition.operations.clone(),
+                                        controller.composition().drafts.clone(),
+                                        controller.composition().file_drafts.clone(),
+                                        controller.composition().operations.clone(),
                                     )),
                                     _ => None,
                                 },
@@ -8224,9 +7818,9 @@ impl ReviewWorkspace {
                             let after = (
                                 match &this.tabs[index].interactions {
                                     InteractionState::Ready(controller) => Some((
-                                        controller.composition.drafts.clone(),
-                                        controller.composition.file_drafts.clone(),
-                                        controller.composition.operations.clone(),
+                                        controller.composition().drafts.clone(),
+                                        controller.composition().file_drafts.clone(),
+                                        controller.composition().operations.clone(),
                                     )),
                                     _ => None,
                                 },
@@ -8362,7 +7956,7 @@ impl ReviewWorkspace {
                                 let this = &root.review;
                                 let Some(index) = this.active_tab else { return false };
                                 this.tabs[index].details.is_some()
-                                    && !this.tabs[index].details_refresh.active
+                                    && !this.general_reads.refresh_active(this.tabs[index].details_refresh)
                                     && this.tabs[index].submitted_summary_editor.is_ready()
                                     && matches!(
                                         this.tabs[index].interactions,
@@ -8664,8 +8258,7 @@ impl ReviewWorkspace {
                                 let editor = &mut this.tabs[index].submitted_summary_editor;
                                 editor.begin(synthetic_review);
                                 editor.store_active_body(submitted_body.into());
-                                editor.active_review = None;
-                                editor.durable = editor.current_snapshot();
+                                editor.mark_current_durable(true);
                             }
                             let journal_request = JournalRequest::Reaction(Box::new(
                                 cibergit::domain::ReactionRequest {
@@ -8714,9 +8307,9 @@ impl ReviewWorkspace {
                                 let tab = &this.tabs[index];
                                 let composition = match &tab.interactions {
                                     InteractionState::Ready(controller) => Some((
-                                        controller.composition.drafts.clone(),
-                                        controller.composition.file_drafts.clone(),
-                                        controller.composition.operations.clone(),
+                                        controller.composition().drafts.clone(),
+                                        controller.composition().file_drafts.clone(),
+                                        controller.composition().operations.clone(),
                                     )),
                                     _ => None,
                                 };
@@ -9051,9 +8644,9 @@ impl ReviewWorkspace {
                             let tab = &this.tabs[setup.0];
                             let composition = match &tab.interactions {
                                 InteractionState::Ready(controller) => Some((
-                                    controller.composition.drafts.clone(),
-                                    controller.composition.file_drafts.clone(),
-                                    controller.composition.operations.clone(),
+                                    controller.composition().drafts.clone(),
+                                    controller.composition().file_drafts.clone(),
+                                    controller.composition().operations.clone(),
                                 )),
                                 _ => None,
                             };
@@ -9145,7 +8738,7 @@ impl ReviewWorkspace {
                                         tab.session.is_some()
                                             && tab.details.is_some()
                                             && matches!(tab.interactions, InteractionState::Ready(_))
-                                            && !tab.details_refresh.active
+                                            && !this.general_reads.refresh_active(tab.details_refresh)
                                     }
                                     "offline" => {
                                         tab.session.is_some()
@@ -9153,7 +8746,7 @@ impl ReviewWorkspace {
                                             && tab.cached_collaboration.is_some()
                                             && tab.lifecycle.snapshot.is_some()
                                             && matches!(tab.interactions, InteractionState::Ready(_))
-                                            && !tab.details_refresh.active
+                                            && !this.general_reads.refresh_active(tab.details_refresh)
                                             && matches!(tab.details_state, LoadState::Cached(_))
                                     }
                                     "refused" => {
@@ -9163,10 +8756,10 @@ impl ReviewWorkspace {
                                             && tab.lifecycle.snapshot.is_none()
                                             && tab.pending_snapshot.is_none()
                                             && matches!(tab.interactions, InteractionState::Ready(_))
-                                            && !tab.details_refresh.active
-                                            && !tab.lifecycle_refresh.active
-                                            && !tab.metadata_refresh.active
-                                            && this.repositories.iter().all(|repository| !repository.refresh.active)
+                                            && !this.general_reads.refresh_active(tab.details_refresh)
+                                            && !this.general_reads.refresh_active(tab.lifecycle_refresh)
+                                            && !this.general_reads.refresh_active(tab.metadata_refresh)
+                                            && this.repositories.iter().all(|repository| !this.general_reads.refresh_active(repository.refresh))
                                             && matches!(tab.details_state, LoadState::Cached(_))
                                     }
                                     _ => false,
@@ -9232,7 +8825,7 @@ impl ReviewWorkspace {
                                     let this = &root.review;
                                     let Some(index) = this.active_tab else { return false };
                                     matches!(&this.tabs[index].interactions, InteractionState::Ready(controller)
-                                        if controller.durable_composition.as_ref().is_some_and(|composition| {
+                                        if controller.durable_composition().is_some_and(|composition| {
                                             composition.drafts.iter().any(|draft| draft.body == SMOKE_OFFLINE_DRAFT)
                                         }))
                                 })
@@ -9263,7 +8856,7 @@ impl ReviewWorkspace {
                                     .ok_or_else(|| "smoke has no active tab".to_owned())?;
                                 let durable = match &this.tabs[index].interactions {
                                     InteractionState::Ready(controller) => {
-                                        controller.durable_composition.clone()
+                                        controller.durable_composition().cloned()
                                     }
                                     _ => None,
                                 };
@@ -9294,7 +8887,7 @@ impl ReviewWorkspace {
                                     let Some(index) = this.active_tab else { return false };
                                     let durable = match &this.tabs[index].interactions {
                                         InteractionState::Ready(controller) => {
-                                            controller.durable_composition.as_ref()
+                                            controller.durable_composition()
                                         }
                                         _ => None,
                                     };
@@ -9400,7 +8993,7 @@ impl ReviewWorkspace {
                                     );
                                 }
                                 let draft_saved = matches!(&tab.interactions, InteractionState::Ready(controller)
-                                    if controller.composition.drafts.iter().any(|draft| draft.body == SMOKE_OFFLINE_DRAFT));
+                                    if controller.composition().drafts.iter().any(|draft| draft.body == SMOKE_OFFLINE_DRAFT));
                                 if !draft_saved {
                                     return Err("local draft did not survive refused-provider restart".into());
                                 }
@@ -9514,7 +9107,7 @@ impl ReviewWorkspace {
                                 return Err("offline cache changed the pinned comparison".into());
                             }
                             let draft_saved = matches!(&tab.interactions, InteractionState::Ready(controller)
-                                if controller.composition.drafts.iter().any(|draft| draft.body == SMOKE_OFFLINE_DRAFT));
+                                if controller.composition().drafts.iter().any(|draft| draft.body == SMOKE_OFFLINE_DRAFT));
                             if !draft_saved {
                                 return Err("local draft did not survive restart".into());
                             }
@@ -9687,7 +9280,7 @@ impl ReviewWorkspace {
                                 let this = &root.review;
                                 let Some(index) = this.active_tab else { return false };
                                 this.collaboration_read_attempts.load(Ordering::Acquire) > state.7
-                                    && !this.tabs[index].details_refresh.active
+                                    && !this.general_reads.refresh_active(this.tabs[index].details_refresh)
                                     && this.tabs[index].details.is_none()
                                     && this.tabs[index].cached_collaboration.is_some()
                                     && this.tabs[index].canonical_full_revision == baseline
@@ -10141,12 +9734,14 @@ impl ReviewWorkspace {
                             let Some(index) = this.active_tab else { return 0. };
                             let maximum = this.tabs[index]
                                 .stack
+                                .diff
                                 .horizontal
                                 .max_offset()
                                 .x
                                 .as_f32();
                             this.tabs[index]
                                 .stack
+                                .diff
                                 .horizontal
                                 .set_offset(point(px(-maximum), px(0.)));
                             cx.notify();
@@ -10252,7 +9847,8 @@ impl ReviewWorkspace {
                         .new_line
                         .map(|line| (DiffSide::New, line))
                         .or_else(|| line.old_line.map(|line| (DiffSide::Old, line))),
-                    DiffRow::Hunk(_)
+                    DiffRow::FileHeader { .. }
+                    | DiffRow::Hunk(_)
                     | DiffRow::Split(_)
                     | DiffRow::Thread(_)
                     | DiffRow::Composer { .. } => None,
@@ -10380,7 +9976,7 @@ impl ReviewWorkspace {
         let long = "review-interaction-horizontal-smoke-".repeat(150);
         match mode {
             DiffMode::SideBySide => {
-                Rc::make_mut(&mut self.tabs[index].diff_rows).push(DiffRow::Split(AlignedRow {
+                Rc::make_mut(&mut self.tabs[index].diff.rows).push(DiffRow::Split(AlignedRow {
                     old: Some(DiffLine {
                         kind: DiffLineKind::Deletion,
                         old_line: Some(99_999),
@@ -10396,7 +9992,7 @@ impl ReviewWorkspace {
                 }))
             }
             DiffMode::Auto | DiffMode::Unified => {
-                Rc::make_mut(&mut self.tabs[index].diff_rows).push(DiffRow::Unified(DiffLine {
+                Rc::make_mut(&mut self.tabs[index].diff.rows).push(DiffRow::Unified(DiffLine {
                     kind: DiffLineKind::Addition,
                     old_line: None,
                     new_line: Some(99_999),
@@ -10405,23 +10001,24 @@ impl ReviewWorkspace {
             }
         }
         (
-            self.tabs[index].diff_split,
-            self.tabs[index].diff_text_width,
-        ) = diff_text_metrics(&self.tabs[index].diff_rows);
-        self.tabs[index].diff_content_width = diff_content_width(&self.tabs[index].diff_rows, mode);
-        self.tabs[index].diff_scroll = ListState::new(
-            self.tabs[index].diff_rows.len(),
+            self.tabs[index].diff.split,
+            self.tabs[index].diff.text_width,
+        ) = diff_text_metrics(&self.tabs[index].diff.rows);
+        self.tabs[index].diff.vertical = ListState::new(
+            self.tabs[index].diff.rows.len(),
             ListAlignment::Top,
             px(480.),
         );
-        self.tabs[index].diff_horizontal = ScrollHandle::new();
+        self.tabs[index].diff.horizontal = ScrollHandle::new();
         let composer_row = self.tabs[index]
-            .diff_rows
+            .diff
+            .rows
             .iter()
             .position(|row| matches!(row, DiffRow::Composer { .. }))
             .ok_or_else(|| "composer was not attached to its exact diff row".to_owned())?;
         if self.tabs[index]
-            .diff_rows
+            .diff
+            .rows
             .iter()
             .filter(|row| matches!(row, DiffRow::Thread(_)))
             .count()
@@ -10430,7 +10027,8 @@ impl ReviewWorkspace {
             return Err("wrapped review threads were not attached to diff rows".into());
         }
         self.tabs[index]
-            .diff_scroll
+            .diff
+            .vertical
             .scroll_to_reveal_item(composer_row);
         cx.notify();
         Ok(())
@@ -10452,13 +10050,15 @@ impl ReviewWorkspace {
             ));
         }
         let thread_rows = tab
-            .diff_rows
+            .diff
+            .rows
             .iter()
             .enumerate()
             .filter_map(|(index, row)| matches!(row, DiffRow::Thread(_)).then_some(index))
             .collect::<Vec<_>>();
         let composer_row = tab
-            .diff_rows
+            .diff
+            .rows
             .iter()
             .position(|row| matches!(row, DiffRow::Composer { .. }))
             .ok_or_else(|| "interaction scene has no inline composer".to_owned())?;
@@ -10466,7 +10066,8 @@ impl ReviewWorkspace {
             return Err("interaction scene has fewer than two inline thread rows".into());
         }
         let composer_bounds = tab
-            .diff_scroll
+            .diff
+            .vertical
             .bounds_for_item(composer_row)
             .ok_or_else(|| {
                 "focused composer was not measured in the variable-height list".to_owned()
@@ -10478,7 +10079,8 @@ impl ReviewWorkspace {
             ));
         }
         let measured_thread = thread_rows.iter().find_map(|row| {
-            tab.diff_scroll
+            tab.diff
+                .vertical
                 .bounds_for_item(*row)
                 .filter(|bounds| bounds.size.height > px(72.))
         });
@@ -10486,16 +10088,16 @@ impl ReviewWorkspace {
             return Err("wrapped discussion rows were not measured above base row height".into());
         }
         let mut previous_bottom = None;
-        for row in 0..tab.diff_rows.len() {
-            if let Some(bounds) = tab.diff_scroll.bounds_for_item(row) {
+        for row in 0..tab.diff.rows.len() {
+            if let Some(bounds) = tab.diff.vertical.bounds_for_item(row) {
                 if previous_bottom.is_some_and(|bottom| bounds.top() < bottom) {
                     return Err(format!("variable-height rows overlap at list item {row}"));
                 }
                 previous_bottom = Some(bounds.bottom());
             }
         }
-        let maximum = tab.diff_horizontal.max_offset().x.as_f32();
-        let offset = tab.diff_horizontal.offset().x.as_f32();
+        let maximum = tab.diff.horizontal.max_offset().x.as_f32();
+        let offset = tab.diff.horizontal.offset().x.as_f32();
         if maximum < 1_000. || (offset + maximum).abs() > 1. {
             return Err(format!(
                 "interaction scene is not at meaningful horizontal end (offset={offset}, maximum={maximum})"
@@ -10555,10 +10157,7 @@ impl ReviewWorkspace {
         controller.select_line(&session, selection)?;
         let frozen_body = "Exact frozen reconciliation smoke body";
         let snapshot = controller.stage_composer_text(frozen_body.into())?;
-        controller
-            .store
-            .save(&snapshot)
-            .map_err(|error| error.to_string())?;
+        controller.persist_smoke_snapshot(snapshot.clone())?;
         let draft_id = controller
             .composer
             .as_ref()
@@ -10567,7 +10166,7 @@ impl ReviewWorkspace {
         controller.finish_composer_save(&snapshot, &draft_id, frozen_body, Ok(()));
         if exact_known_id {
             let draft = controller
-                .composition
+                .composition_mut_for_smoke()
                 .drafts
                 .iter_mut()
                 .find(|draft| draft.id == draft_id)
@@ -10578,30 +10177,22 @@ impl ReviewWorkspace {
             });
             draft.dirty = true;
         }
-        controller
-            .store
-            .save(&controller.composition)
-            .map_err(|error| error.to_string())?;
-        controller.durable_composition = Some(controller.composition.clone());
+        controller.persist_smoke_snapshot(controller.composition().clone())?;
         let operation_id = controller.prepare_pending(&session)?;
         controller
-            .composition
+            .composition_mut_for_smoke()
             .mark_in_flight(&operation_id, "cibergit-reconcile-attempt")
             .map_err(|error| error.to_string())?;
         controller
-            .composition
+            .composition_mut_for_smoke()
             .mark_uncertain(
                 &operation_id,
                 "fixture acknowledgement was deliberately lost",
             )
             .map_err(|error| error.to_string())?;
-        controller
-            .store
-            .save(&controller.composition)
-            .map_err(|error| error.to_string())?;
-        controller.durable_composition = Some(controller.composition.clone());
+        controller.persist_smoke_snapshot(controller.composition().clone())?;
         let intent = controller
-            .composition
+            .composition()
             .operations
             .iter()
             .find(|operation| operation.id == operation_id)
@@ -10691,32 +10282,21 @@ impl ReviewWorkspace {
             }],
             comments_complete: true,
         });
-        let report = controller.authority.reconcile_if_current(
-            &controller.store,
-            controller.durable_composition.as_ref(),
-            &repository,
-            number,
-            || Ok((details, Some(pending))),
-        )?;
+        let report = controller
+            .prepared_reconciliation()
+            .execute(&repository, number, || Ok((details, Some(pending))))?;
         if exact_known_id {
             if report.resolved() != 1 || report.unresolved() != 0 {
                 return Err("exact-ID reconciliation smoke did not resolve durably".into());
             }
-            controller.composition = report.composition.clone();
-            controller.durable_composition = Some(report.composition.clone());
+            controller.install_reconciliation(report.clone());
             controller.reopen_draft(&draft_id)?;
             let next = controller.prepare_pending(&session)?;
-            controller
-                .composition
-                .cancel_prepared(&next)
-                .map_err(|error| error.to_string())?;
+            controller.cancel_prepared(&next)?;
         } else if report.resolved() != 0 || report.unresolved() != 1 {
             return Err("ambiguous reconciliation smoke did not remain frozen".into());
         }
-        controller.composition = report.composition.clone();
-        controller.durable_composition = Some(report.composition);
-        controller.install_pending_snapshot(report.pending.clone());
-        controller.reconciliation_results = report.items;
+        controller.install_reconciliation(report.clone());
         self.tabs[index].details = Some(report.details);
         self.tabs[index].pending_snapshot = report.pending;
         self.tabs[index].journal_operations.clear();
@@ -10924,19 +10504,18 @@ impl ReviewWorkspace {
         if let Some(session) = &mut self.tabs[index].session {
             session.set_diff_mode(mode);
         }
-        self.tabs[index].diff_content_width = diff_content_width(&rows, mode);
-        self.tabs[index].diff_rows = Rc::new(rows);
+        self.tabs[index].diff.rows = Rc::new(rows);
         (
-            self.tabs[index].diff_split,
-            self.tabs[index].diff_text_width,
-        ) = diff_text_metrics(&self.tabs[index].diff_rows);
-        self.tabs[index].diff_scroll = ListState::new(
-            self.tabs[index].diff_rows.len(),
+            self.tabs[index].diff.split,
+            self.tabs[index].diff.text_width,
+        ) = diff_text_metrics(&self.tabs[index].diff.rows);
+        self.tabs[index].diff.vertical = ListState::new(
+            self.tabs[index].diff.rows.len(),
             ListAlignment::Top,
             px(480.),
         );
-        self.tabs[index].diff_horizontal = ScrollHandle::new();
-        self.tabs[index].diff_scroll.scroll_to_reveal_item(1);
+        self.tabs[index].diff.horizontal = ScrollHandle::new();
+        self.tabs[index].diff.vertical.scroll_to_reveal_item(1);
         cx.notify();
         Ok(())
     }
@@ -10946,7 +10525,7 @@ impl ReviewWorkspace {
         let index = self
             .active_tab
             .ok_or_else(|| "long-line smoke has no active tab".to_owned())?;
-        let handle = &self.tabs[index].diff_horizontal;
+        let handle = &self.tabs[index].diff.horizontal;
         let maximum = handle.max_offset().x.as_f32();
         if maximum < 1_000. {
             return Err(format!(
@@ -10971,7 +10550,7 @@ impl ReviewWorkspace {
         {
             return Err(format!("long-line scene did not expose {mode:?} mode"));
         }
-        let rendered_source_has_token = tab.diff_rows.iter().any(|row| match (mode, row) {
+        let rendered_source_has_token = tab.diff.rows.iter().any(|row| match (mode, row) {
             (DiffMode::Unified, DiffRow::Unified(line)) => {
                 line.text.ends_with(SMOKE_LONG_LINE_TOKEN)
             }
@@ -10986,7 +10565,7 @@ impl ReviewWorkspace {
             }
             _ => false,
         });
-        let offset = tab.diff_horizontal.offset().x.as_f32();
+        let offset = tab.diff.horizontal.offset().x.as_f32();
         if !rendered_source_has_token || (offset + maximum).abs() > 1. {
             return Err(format!(
                 "long-line far-end render state is invalid (token={rendered_source_has_token}, offset={offset}, maximum={maximum})"
@@ -11001,10 +10580,10 @@ impl ReviewWorkspace {
             .active_tab
             .ok_or_else(|| "split long-line smoke has no active tab".to_owned())?;
         let tab = &self.tabs[index];
-        if tab.diff_horizontal.offset().x.as_f32().abs() > 1. {
+        if tab.diff.horizontal.offset().x.as_f32().abs() > 1. {
             return Err("split long-line fixture did not begin at its left edge".to_owned());
         }
-        let sentinels_are_side_specific = tab.diff_rows.iter().any(|row| {
+        let sentinels_are_side_specific = tab.diff.rows.iter().any(|row| {
             let DiffRow::Split(row) = row else {
                 return false;
             };
@@ -11072,7 +10651,7 @@ impl ReviewWorkspace {
         let branches = format!("{} -> {}", source_branch, target_branch);
         let revision = session.revision().head_sha.clone();
         let initial_mode = session.diff_mode();
-        let actual_diff_width = effective_diff_viewport_width(&tab.diff_rows, &tab.diff_horizontal);
+        let actual_diff_width = effective_diff_viewport_width(&tab.diff.rows, &tab.diff.horizontal);
         let calculated_diff_width = self.available_diff_width(window);
         if actual_diff_width <= 0.
             || (actual_diff_width - calculated_diff_width).abs() > SPLITTER_WIDTH + 2.
@@ -11116,7 +10695,7 @@ impl ReviewWorkspace {
             .map(file_key)
             .ok_or_else(|| "selected file has no next file for tree reveal smoke".to_owned())?;
         let saved_view_report =
-            self.exercise_saved_view_smoke(&source_branch, &target_branch, expect_restore)?;
+            self.exercise_saved_view_smoke(&source_branch, &target_branch, expect_restore, cx)?;
 
         if self.tabs[index]
             .file_tree
@@ -11230,6 +10809,7 @@ impl ReviewWorkspace {
         source_branch: &str,
         target_branch: &str,
         expect_restore: bool,
+        cx: &mut Context<Root>,
     ) -> Result<String, String> {
         const NAME: &str = "Smoke · target → repository → source prefix";
         let prefix = source_branch
@@ -11249,7 +10829,7 @@ impl ReviewWorkspace {
                 GroupBy::SourcePrefix(prefix.clone()),
             ]);
             self.view_editor.save_as(&mut self.workspace, NAME)?;
-            self.save_workspace();
+            self.save_workspace(cx);
         }
         let view = self.workspace.view();
         if view.name != NAME
@@ -11358,7 +10938,7 @@ impl ReviewWorkspace {
         {
             return Err("explicit side-by-side diff mode was lost after wide resize".to_owned());
         }
-        self.save_workspace();
+        self.save_workspace(cx);
         Ok(())
     }
 
@@ -11604,7 +11184,7 @@ impl ReviewWorkspace {
                             };
                             let restored = this.tabs[index]
                                 .submitted_summary_editor
-                                .drafts
+                                .drafts()
                                 .iter()
                                 .find(|draft| {
                                     draft.review.coordinates.remote_id
@@ -12528,9 +12108,9 @@ impl ReviewWorkspace {
                                 pull_requests: Arc::default(),
                                 state: LoadState::Loading("Loading pull requests…".into()),
                                 generation: 0,
-                                refresh: RefreshGate::default(),
+                                refresh: read_sync::RefreshLane::default(),
                             });
-                            this.save_workspace();
+                            this.save_workspace(cx);
                             this.repositories.len() - 1
                         };
                         this.refresh_repository(index, cx);
@@ -13029,8 +12609,8 @@ impl ReviewWorkspace {
             .detach();
     }
 
-    fn save_workspace(&mut self) {
-        if self.persistence_error.is_some() || self.startup_restore_pending {
+    fn save_workspace(&mut self, cx: &mut Context<Root>) {
+        if self.persistence_error.is_some() || self.persistence.restore_pending() {
             return;
         }
         let active_identity = self.active_tab.and_then(|index| {
@@ -13069,11 +12649,23 @@ impl ReviewWorkspace {
         });
         self.workspace
             .merge_tabs(tabs, &self.closed_workspace_tabs, active_identity);
-        if let Some(store) = &self.store
-            && let Err(error) = store.save_workspace(&self.workspace)
-        {
-            self.persistence_error = Some(format!("Workspace was not saved: {error:#}"));
-        }
+        let Some(write) = self.persistence.save_workspace(&self.workspace) else {
+            return;
+        };
+        let workspace_instance = self.workspace_instance;
+        let task = cx.background_spawn(async move { write.execute() });
+        cx.spawn(async move |root, cx| {
+            if let Err(error) = task.await {
+                let _ = root.update(cx, |root, cx| {
+                    if root.review.workspace_instance == workspace_instance {
+                        root.review.persistence_error =
+                            Some(format!("Workspace was not saved: {error:#}"));
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
     fn save_current_request_progress(&mut self, index: usize) {
@@ -13098,9 +12690,6 @@ impl ReviewWorkspace {
 
     fn persist_session(&mut self, index: usize, cx: &mut Context<Root>) {
         self.save_current_request_progress(index);
-        let Some(store) = self.store.clone() else {
-            return;
-        };
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
@@ -13131,34 +12720,22 @@ impl ReviewWorkspace {
         let repository = tab.repository.clone();
         let number = tab.pull_request.number;
         let key = repository.cache_key();
-        let save_key = format!("{key}\n{number}");
-        let latest = self
-            .session_save_latest
-            .entry(save_key.clone())
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-            .clone();
-        let lock = self
-            .session_save_locks
-            .entry(save_key)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let sequence = latest.fetch_add(1, Ordering::AcqRel) + 1;
-        let task = cx.background_spawn(async move {
-            let _guard = lock
-                .lock()
-                .map_err(|_| anyhow::anyhow!("review session save lock failed"))?;
-            if latest.load(Ordering::Acquire) != sequence {
-                return Ok(());
-            }
-            store.save_review_context(&repository, number, &context)
-        });
+        let workspace_instance = self.workspace_instance;
+        let tab_instance = tab.instance_generation;
+        let Some(write) = self.persistence.save_session(repository, number, context) else {
+            return;
+        };
+        let task = cx.background_spawn(async move { write.execute() });
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
-                if let Err(error) = result
+                if this.workspace_instance == workspace_instance
+                    && let Err(error) = result
                     && let Some(tab) = this.tabs.iter_mut().find(|tab| {
-                        tab.repository.cache_key() == key && tab.pull_request.number == number
+                        tab.instance_generation == tab_instance
+                            && tab.repository.cache_key() == key
+                            && tab.pull_request.number == number
                     })
                 {
                     tab.session_persistence_error = Some(format!(
@@ -13171,24 +12748,13 @@ impl ReviewWorkspace {
         .detach();
     }
 
-    fn next_review_state_write(
+    fn issue_participation_write(
         &mut self,
         repository_key: &str,
         pull_request: u64,
-    ) -> (Arc<AtomicU64>, Arc<Mutex<()>>, u64) {
-        let save_key = format!("{repository_key}\n{pull_request}");
-        let latest = self
-            .review_state_latest
-            .entry(save_key.clone())
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-            .clone();
-        let lock = self
-            .review_state_locks
-            .entry(save_key)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let sequence = latest.fetch_add(1, Ordering::AcqRel) + 1;
-        (latest, lock, sequence)
+    ) -> ParticipationWriteTicket {
+        self.participation_sequencer
+            .issue(repository_key, pull_request)
     }
 
     fn load_commit_inventory(&mut self, index: usize, cx: &mut Context<Root>) {
@@ -13569,11 +13135,10 @@ impl ReviewWorkspace {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
-        let generation = tab.request_generation;
         let Some(path) = tab.repository.local_path.clone() else {
             return;
         };
-        let Some(session) = tab.session.as_ref() else {
+        let Some(session) = tab.session.as_mut() else {
             return;
         };
         let Some(file) = session.selected_file() else {
@@ -13585,15 +13150,6 @@ impl ReviewWorkspace {
                 "The selected local comparison has no exact lazy-load plan.".into(),
             );
             return;
-        };
-        let repository_key = tab.repository.cache_key();
-        let number = tab.pull_request.number;
-        let canonical_revision = tab.canonical_full_revision.clone();
-        let token = RequestToken {
-            repository_key: repository_key.clone(),
-            pull_request: number,
-            canonical_full_revision: canonical_revision.clone(),
-            generation,
         };
         let selected_key = file_key(file);
         let hydrate_canonical = tab
@@ -13611,93 +13167,102 @@ impl ReviewWorkspace {
             self.persist_session(index, cx);
             return;
         }
-        tab.state = LoadState::Loading("Loading selected local file…".into());
-        let request_key = selected_key.clone();
-        let task_canonical_revision = canonical_revision.clone();
+        let selected_request = match session.begin_file_patch(&selected_key) {
+            Ok(request) => request,
+            Err(error) => {
+                tab.state = LoadState::Error(format!(
+                    "The selected file can no longer be loaded: {error:#}"
+                ));
+                return;
+            }
+        };
+        let canonical_request = if hydrate_canonical {
+            match tab
+                .canonical_session
+                .as_mut()
+                .map(|session| session.begin_file_patch(&selected_key))
+                .transpose()
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    tab.state = LoadState::Error(format!(
+                        "The canonical file can no longer be loaded: {error:#}"
+                    ));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if selected_needs_load {
+            tab.state = LoadState::Loading("Loading selected local file…".into());
+        }
+        let request_key = selected_key;
+        let selected_revision = selected_needs_load.then(|| selected_request.revision().clone());
+        let canonical_revision = canonical_request
+            .as_ref()
+            .map(|request| request.revision().clone());
         let task = cx.background_spawn(async move {
-            let selected = if selected_needs_load {
-                Some(load_local_file(
-                    &path,
-                    &plan.revision,
-                    &request_key,
-                    plan.full_pr,
-                )?)
-            } else {
-                None
-            };
-            let canonical = if hydrate_canonical {
-                if plan.full_pr && plan.revision == task_canonical_revision {
-                    match selected.clone() {
-                        Some(file) => Some(file),
-                        None => Some(load_local_file(
-                            &path,
-                            &task_canonical_revision,
-                            &request_key,
-                            true,
-                        )?),
+            let selected = selected_revision.as_ref().map(|selected_revision| {
+                load_local_file(&path, selected_revision, &request_key, plan.full_pr)
+            });
+            let canonical = canonical_revision.as_ref().map(|canonical_revision| {
+                if plan.full_pr && selected_revision.as_ref() == Some(canonical_revision) {
+                    match selected.as_ref() {
+                        Some(Ok(file)) => Ok(file.clone()),
+                        _ => load_local_file(&path, canonical_revision, &request_key, true),
                     }
                 } else {
-                    Some(load_local_file(
-                        &path,
-                        &task_canonical_revision,
-                        &request_key,
-                        true,
-                    )?)
+                    load_local_file(&path, canonical_revision, &request_key, true)
                 }
-            } else {
-                None
-            };
-            Ok::<_, anyhow::Error>((selected, canonical, plan))
+            });
+            (selected, canonical)
         });
         cx.spawn(async move |root, cx| {
-            let result = task.await;
+            let (selected_result, canonical_result) = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
                 let Some(tab_index) = this.tabs.iter().position(|tab| {
-                    token.matches(
-                        &tab.repository.cache_key(),
-                        tab.pull_request.number,
-                        &tab.canonical_full_revision,
-                        tab.request_generation,
-                    ) && tab.local_inventory
-                        && tab
-                            .session
-                            .as_ref()
-                            .and_then(ReviewSession::selected_file)
-                            .is_some_and(|file| file_key(file) == selected_key)
+                    tab.session
+                        .as_ref()
+                        .is_some_and(|session| session.accepts_file_patch(&selected_request))
+                        || canonical_request.as_ref().is_some_and(|request| {
+                            tab.canonical_session
+                                .as_ref()
+                                .is_some_and(|session| session.accepts_file_patch(request))
+                        })
                 }) else {
                     return;
                 };
-                match result {
-                    Ok((file, canonical_file, plan)) => {
-                        let installed = file.is_none_or(|file| {
-                            this.tabs[tab_index]
-                                .session
-                                .as_mut()
-                                .is_some_and(|session| {
-                                    session.install_file_patch(&plan.revision, file).is_ok()
-                                })
-                        });
-                        let canonical_installed = canonical_file.is_none_or(|file| {
-                            this.tabs[tab_index]
-                                .canonical_session
-                                .as_mut()
-                                .is_some_and(|session| {
-                                    session
-                                        .install_file_patch(&canonical_revision, file)
-                                        .is_ok()
-                                })
-                        });
-                        if installed && canonical_installed {
-                            this.tabs[tab_index].state = LoadState::Ready;
-                            this.rebuild_diff(tab_index, this.wide);
-                            this.persist_session(tab_index, cx);
-                        }
+                let completion = {
+                    let tab = &mut this.tabs[tab_index];
+                    accept_local_file_load_results(
+                        tab.session.as_mut(),
+                        &selected_request,
+                        selected_result,
+                        tab.canonical_session.as_mut(),
+                        canonical_request.as_ref(),
+                        canonical_result,
+                    )
+                };
+                let selected_installed = match completion.selected {
+                    SelectedLocalFileCompletion::Installed => {
+                        this.tabs[tab_index].state = LoadState::Ready;
+                        true
                     }
-                    Err(error) => {
+                    SelectedLocalFileCompletion::Failed(error) => {
                         this.tabs[tab_index].state =
                             LoadState::Error(format!("Selected local file unavailable: {error:#}"));
+                        false
                     }
+                    SelectedLocalFileCompletion::NotRequested
+                    | SelectedLocalFileCompletion::Stale => false,
+                };
+                if selected_installed {
+                    this.rebuild_diff(tab_index, this.wide);
+                }
+                if selected_installed || completion.canonical_installed {
+                    this.persist_session(tab_index, cx);
                 }
                 cx.notify();
             });
@@ -13712,55 +13277,97 @@ impl ReviewWorkspace {
     }
 
     fn resume_general_read_followups(&mut self, cx: &mut Context<Root>) {
-        let mut followups = self
+        let mut destinations: Vec<_> = self
             .tabs
             .iter()
             .enumerate()
-            .filter(|(_, tab)| {
-                general_read_tab_can_start(tab.submitted_summary_editor.close_after_save)
-            })
             .flat_map(|(index, tab)| {
                 [
-                    tab.metadata_refresh
-                        .has_deferred()
-                        .then_some(GeneralReadFollowup::Tab { index, kind: 0 }),
-                    tab.details_refresh
-                        .has_deferred()
-                        .then_some(GeneralReadFollowup::Tab { index, kind: 1 }),
-                    tab.lifecycle_refresh
-                        .has_deferred()
-                        .then_some(GeneralReadFollowup::Tab { index, kind: 2 }),
+                    TabReadKind::Metadata,
+                    TabReadKind::Details,
+                    TabReadKind::Lifecycle,
                 ]
-                .into_iter()
-                .flatten()
+                .map(|kind| {
+                    (
+                        tab.read_lane(kind),
+                        GeneralReadFollowup::Tab { index, kind },
+                    )
+                })
             })
-            .collect::<Vec<_>>();
-        followups.extend(
+            .collect();
+        destinations.extend(
             self.repositories
                 .iter()
                 .enumerate()
-                .filter_map(|(index, runtime)| {
-                    runtime
-                        .refresh
-                        .has_deferred()
-                        .then_some(GeneralReadFollowup::Repository { index })
+                .map(|(index, runtime)| {
+                    (runtime.refresh, GeneralReadFollowup::Repository { index })
                 }),
         );
-        rotate_general_read_followups(&mut followups, &mut self.general_read_followup_cursor);
-        for followup in followups {
-            match followup {
-                GeneralReadFollowup::Tab { index, kind: 0 } => {
-                    self.refresh_metadata(index, false, cx)
-                }
-                GeneralReadFollowup::Tab { index, kind: 1 } => {
-                    self.refresh_details_with_intent(index, false, cx)
-                }
-                GeneralReadFollowup::Tab { index, .. } => {
-                    self.refresh_lifecycle_with_intent(index, false, cx)
-                }
+        let live: Vec<_> = destinations.iter().map(|(lane, _)| *lane).collect();
+        for lane in self.general_reads.pending_refreshes(&live) {
+            let Some((_, destination)) = destinations
+                .iter()
+                .find(|(candidate, _)| *candidate == lane)
+            else {
+                continue;
+            };
+            match *destination {
+                GeneralReadFollowup::Tab {
+                    index,
+                    kind: TabReadKind::Metadata,
+                } => self.refresh_metadata(index, false, cx),
+                GeneralReadFollowup::Tab {
+                    index,
+                    kind: TabReadKind::Details,
+                } => self.refresh_details_with_intent(index, false, cx),
+                GeneralReadFollowup::Tab {
+                    index,
+                    kind: TabReadKind::Lifecycle,
+                } => self.refresh_lifecycle_with_intent(index, false, cx),
                 GeneralReadFollowup::Repository { index } => {
                     self.refresh_repository_with_intent(index, false, cx)
                 }
+            }
+        }
+    }
+
+    fn begin_tab_refresh(
+        &mut self,
+        index: usize,
+        kind: TabReadKind,
+        explicit: bool,
+        cx: &mut Context<Root>,
+    ) -> Option<(Repository, u64, read_sync::RefreshAdmission)> {
+        let tab = self.tabs.get_mut(index)?;
+        if !general_read_tab_can_start(tab.submitted_summary_editor.close_after_save()) {
+            return None;
+        }
+        let lane = tab.read_lane(kind);
+        // Requesting new details revokes old absence authority even if account
+        // admission is deferred. Coalescing an already active read leaves its
+        // existing revocation in place.
+        if matches!(kind, TabReadKind::Details)
+            && !self.general_reads.refresh_active(lane)
+            && let InteractionState::Ready(controller) = &mut tab.interactions
+        {
+            controller.mark_pending_observation_unavailable(None);
+        }
+        let mut context = tab.read_context(self.workspace_instance, kind);
+        context.revision = context.revision.saturating_add(1);
+        let generation = context.revision;
+        match self
+            .general_reads
+            .request_refresh(lane, &tab.repository.account, context, explicit)
+        {
+            Ok(Some(admission)) => {
+                *tab.read_generation_mut(kind) = generation;
+                Some((tab.repository.clone(), tab.pull_request.number, admission))
+            }
+            Ok(None) | Err(read_sync::ReadDeferral::Busy) => None,
+            Err(read_sync::ReadDeferral::Server(notice)) => {
+                self.status = notice.into();
+                cx.notify();
+                None
             }
         }
     }
@@ -13775,43 +13382,37 @@ impl ReviewWorkspace {
         explicit: bool,
         cx: &mut Context<Root>,
     ) {
-        let Some((repository, effective_explicit)) =
-            self.repositories.get_mut(index).and_then(|runtime| {
-                runtime
-                    .refresh
-                    .begin_admission(explicit)
-                    .map(|effective| (runtime.repository.clone(), effective))
-            })
-        else {
+        let Some(runtime) = self.repositories.get_mut(index) else {
             return;
         };
-        let admission = match self.general_reads.begin(&repository.account) {
-            Ok(admission) => admission,
-            Err(read_sync::ReadDeferral::Busy) => {
-                self.repositories[index]
-                    .refresh
-                    .defer_admission(effective_explicit);
-                return;
-            }
+        let repository = runtime.repository.clone();
+        let generation = runtime.generation.saturating_add(1);
+        let context = read_sync::RefreshContext {
+            workspace: self.workspace_instance,
+            repository: repository.cache_key(),
+            resource: None,
+            revision: generation,
+        };
+        let admission = match self.general_reads.request_refresh(
+            runtime.refresh,
+            &repository.account,
+            context,
+            explicit,
+        ) {
+            Ok(Some(admission)) => admission,
+            Ok(None) | Err(read_sync::ReadDeferral::Busy) => return,
             Err(read_sync::ReadDeferral::Server(notice)) => {
-                self.repositories[index]
-                    .refresh
-                    .defer_admission(effective_explicit);
                 self.status = notice.into();
                 cx.notify();
                 return;
             }
         };
-        // A removed and re-added repository must not reuse the old read ID.
-        let generation = self.issue_request_generation();
-        let runtime = &mut self.repositories[index];
         runtime.generation = generation;
         let repo_key = repository.cache_key();
         if runtime.pull_requests.is_empty() {
             runtime.state = LoadState::Loading("Loading pull requests…".into());
         }
         let provider = GithubProvider::new(repository.account.clone());
-        let read_workspace_instance = self.workspace_instance;
         let requested_state = {
             let state = self.workspace.view().filter.state;
             if state.is_empty() {
@@ -13831,40 +13432,37 @@ impl ReviewWorkspace {
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
                 let (result, cache, directive, failure) = outcome.into_parts();
-                if !general_read_callback_is_current(
-                    read_workspace_instance,
-                    this.workspace_instance,
-                ) {
-                    this.general_reads
-                        .complete(&read_token, &directive, cache, false);
-                    return;
-                }
-                let matching_index = this.repositories.iter().position(|runtime| {
-                    runtime.repository.cache_key() == repo_key && runtime.generation == generation
+                let matching_index = this
+                    .repositories
+                    .iter()
+                    .position(|runtime| runtime.refresh == read_token.lane());
+                let current = matching_index.map(|index| {
+                    let runtime = &this.repositories[index];
+                    read_sync::RefreshContext {
+                        workspace: this.workspace_instance,
+                        repository: runtime.repository.cache_key(),
+                        resource: None,
+                        revision: runtime.generation,
+                    }
                 });
-                let superseded = matching_index
-                    .is_some_and(|index| this.repositories[index].refresh.superseded_by_explicit());
-                let accept_payload = matching_index.is_some() && !superseded && result.is_ok();
-                let disposition =
-                    this.general_reads
-                        .complete(&read_token, &directive, cache, accept_payload);
-                if !disposition.matching_operation_released {
-                    return;
-                }
-                let follow_up = matching_index
-                    .map(|index| this.repositories[index].refresh.complete())
-                    .unwrap_or(false);
-                if let Some(index) = matching_index
-                    && follow_up
-                {
-                    this.refresh_repository(index, cx);
-                    this.resume_general_read_followups(cx);
-                    return;
-                }
+                let result = match this.general_reads.complete_refresh(
+                    read_token,
+                    current.as_ref(),
+                    result,
+                    cache,
+                    &directive,
+                ) {
+                    read_sync::RefreshCompletion::Applied(result) => result,
+                    read_sync::RefreshCompletion::Discarded => {
+                        this.resume_general_read_followups(cx);
+                        return;
+                    }
+                    read_sync::RefreshCompletion::Ignored => return,
+                };
                 if let Some(index) = matching_index {
                     let runtime = &mut this.repositories[index];
                     match result {
-                        Ok(pull_requests) if disposition.payload_accepted => {
+                        Ok(pull_requests) => {
                             if let Some(store) = &this.store {
                                 let _ =
                                     store.save_pull_requests(&runtime.repository, &pull_requests);
@@ -13873,7 +13471,6 @@ impl ReviewWorkspace {
                             runtime.state = LoadState::Ready;
                             this.schedule.succeeded(&format!("sidebar:{repo_key}"));
                         }
-                        Ok(_) => {}
                         Err(_) => {
                             this.schedule.failed(&format!("sidebar:{repo_key}"));
                             let notice = general_read_failure_notice(failure);
@@ -13911,7 +13508,7 @@ impl ReviewWorkspace {
         repo_index: usize,
         number: u64,
         intent: OpenPrIntent,
-        mut window: Option<&mut Window>,
+        window: Option<&mut Window>,
         cx: &mut Context<Root>,
     ) {
         let Some(repository) = self
@@ -13944,26 +13541,18 @@ impl ReviewWorkspace {
         if let Some(index) = self.tabs.iter().position(|tab| {
             tab.repository.cache_key() == identity.0 && tab.pull_request.number == identity.1
         }) {
-            if let Some(window) = window.as_deref_mut() {
+            if let Some(window) = window {
                 self.activate_tab_in_window(index, false, window, cx);
             } else {
                 self.activate_tab_context(index, false, cx);
             }
             return;
         }
-        if let Some(pull_request) = self.repositories[repo_index]
+        let listed_pull_request = self.repositories[repo_index]
             .pull_requests
             .iter()
             .find(|pull_request| pull_request.number == number)
-            .cloned()
-        {
-            if let Some(window) = window {
-                self.install_tab_in_window(repository, pull_request, window, cx);
-            } else {
-                self.install_tab(repository, pull_request, cx);
-            }
-            return;
-        }
+            .cloned();
         self.status = format!("Loading #{} from {}…", number, repository.full_name());
         let key = repository.cache_key();
         let expected_repository = repository.clone();
@@ -13974,8 +13563,15 @@ impl ReviewWorkspace {
             identity: identity.clone(),
             intent,
         };
+        let session_read = self.persistence.load_session(repository.clone(), number);
         let task = cx.background_spawn(async move {
-            GithubProvider::new(request_repo.account.clone()).pull_request(&request_repo, number)
+            let pull_request = match listed_pull_request {
+                Some(pull_request) => pull_request,
+                None => GithubProvider::new(request_repo.account.clone())
+                    .pull_request(&request_repo, number)?,
+            };
+            let restored = session_read.map(workspace_save::SessionRead::execute);
+            Ok::<_, anyhow::Error>((pull_request, restored))
         });
         cx.spawn(async move |root, cx| {
             let result = task.await;
@@ -13996,7 +13592,7 @@ impl ReviewWorkspace {
                     return;
                 }
                 match result {
-                    Ok(pull_request) => {
+                    Ok((pull_request, restored)) => {
                         match completion {
                             OpenPrCompletion::Refused => unreachable!("checked above"),
                             OpenPrCompletion::Existing(index) => {
@@ -14006,7 +13602,7 @@ impl ReviewWorkspace {
                                 if token.intent == OpenPrIntent::ExplicitStartup {
                                     this.activate_tab_context(index, false, cx);
                                 }
-                                this.save_workspace();
+                                this.save_workspace(cx);
                                 cx.notify();
                                 return;
                             }
@@ -14033,7 +13629,17 @@ impl ReviewWorkspace {
                         else {
                             return;
                         };
-                        this.install_tab(repository, pull_request, cx);
+                        this.install_tab_with_restore(
+                            repository,
+                            pull_request,
+                            restored,
+                            InstallTabOptions {
+                                activate: true,
+                                window: None,
+                                start_background_work: true,
+                            },
+                            cx,
+                        );
                     }
                     Err(error) => {
                         this.status = format!("Cannot load PR #{number}: {error:#}");
@@ -14096,10 +13702,11 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) -> bool {
         if index < self.tabs.len() {
-            if self
-                .active_tab
-                .is_some_and(|active| self.tabs[active].submitted_summary_editor.close_after_save)
-            {
+            if self.active_tab.is_some_and(|active| {
+                self.tabs[active]
+                    .submitted_summary_editor
+                    .close_after_save()
+            }) {
                 self.status = "Wait for the submitted-review draft close barrier to finish.".into();
                 cx.notify();
                 return false;
@@ -14230,11 +13837,8 @@ impl ReviewWorkspace {
         let dismissal_reason = tab.dismissal_editor.active_reason().to_owned();
         let dismissal_owner = DismissalReasonInputOwner::for_tab(self.workspace_instance, tab);
         let mutation_disabled =
-            tab.write_in_flight || tab.submitted_summary_editor.close_after_save;
-        let submitted_disabled = mutation_disabled
-            || tab.submitted_summary_editor.clear_in_flight
-            || tab.submitted_summary_editor.pending_clear.is_some()
-            || tab.submitted_summary_editor.close_after_save;
+            tab.write_in_flight || tab.submitted_summary_editor.close_after_save();
+        let submitted_disabled = mutation_disabled || tab.submitted_summary_editor.has_clear_work();
         let metadata_form = tab
             .lifecycle
             .metadata_form
@@ -14306,6 +13910,7 @@ impl ReviewWorkspace {
         true
     }
 
+    #[cfg(feature = "ui-smoke")]
     fn install_tab(
         &mut self,
         repository: Repository,
@@ -14313,9 +13918,9 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) {
         let restored = self
-            .store
-            .as_ref()
-            .map(|store| store.load_review_context(&repository, pull_request.number));
+            .persistence
+            .load_session(repository.clone(), pull_request.number)
+            .map(workspace_save::SessionRead::execute);
         self.install_tab_with_restore(
             repository,
             pull_request,
@@ -14323,30 +13928,6 @@ impl ReviewWorkspace {
             InstallTabOptions {
                 activate: true,
                 window: None,
-                start_background_work: true,
-            },
-            cx,
-        );
-    }
-
-    fn install_tab_in_window(
-        &mut self,
-        repository: Repository,
-        pull_request: PullRequest,
-        window: &mut Window,
-        cx: &mut Context<Root>,
-    ) {
-        let restored = self
-            .store
-            .as_ref()
-            .map(|store| store.load_review_context(&repository, pull_request.number));
-        self.install_tab_with_restore(
-            repository,
-            pull_request,
-            restored,
-            InstallTabOptions {
-                activate: true,
-                window: Some(window),
                 start_background_work: true,
             },
             cx,
@@ -14467,13 +14048,9 @@ impl ReviewWorkspace {
             request_generation,
             inventory_generation: request_generation,
             metadata_generation: 0,
-            metadata_refresh: RefreshGate::default(),
-            diff_rows: Rc::default(),
-            diff_split: false,
-            diff_text_width: 1.,
-            diff_scroll: ListState::new(0, ListAlignment::Top, px(480.)),
-            diff_horizontal: ScrollHandle::new(),
-            diff_content_width: 0.,
+            metadata_refresh: read_sync::RefreshLane::default(),
+            diff: diff_pane::DiffPaneState::new(),
+            stream_notice: None,
             log_scroll: UniformListScrollHandle::new(),
             log_horizontal: ScrollHandle::new(),
             file_tree,
@@ -14496,11 +14073,11 @@ impl ReviewWorkspace {
             journal_error: None,
             details_state: LoadState::Loading("Loading PR details…".into()),
             details_generation: 0,
-            details_refresh: RefreshGate::default(),
+            details_refresh: read_sync::RefreshLane::default(),
             lifecycle,
             lifecycle_state: LoadState::Loading("Loading lifecycle metadata…".into()),
             lifecycle_generation: 0,
-            lifecycle_refresh: RefreshGate::default(),
+            lifecycle_refresh: read_sync::RefreshLane::default(),
             interactions: InteractionState::Loading,
             interaction_generation: 0,
             confirmation: None,
@@ -14620,7 +14197,7 @@ impl ReviewWorkspace {
         self.active_tab == Some(index)
             && self.active_tab_input_restore.is_none()
             && self.tabs.get(index).is_some_and(|tab| {
-                !tab.write_in_flight && !tab.submitted_summary_editor.close_after_save
+                !tab.write_in_flight && !tab.submitted_summary_editor.close_after_save()
             })
     }
 
@@ -14807,7 +14384,7 @@ impl ReviewWorkspace {
 
     fn compose_first_selectable(&mut self, window: &mut Window, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
-        let selection = self.tabs[index].diff_rows.iter().find_map(|row| match row {
+        let selection = self.tabs[index].diff.rows.iter().find_map(|row| match row {
             DiffRow::Unified(line) => line
                 .new_line
                 .map(|line| (DiffSide::New, line))
@@ -14823,7 +14400,10 @@ impl ReviewWorkspace {
                         .and_then(|line| line.old_line)
                         .map(|line| (DiffSide::Old, line))
                 }),
-            DiffRow::Hunk(_) | DiffRow::Thread(_) | DiffRow::Composer { .. } => None,
+            DiffRow::FileHeader { .. }
+            | DiffRow::Hunk(_)
+            | DiffRow::Thread(_)
+            | DiffRow::Composer { .. } => None,
         });
         if let Some((side, line)) = selection {
             self.open_inline_composer(side, line, false, window, cx);
@@ -15024,7 +14604,7 @@ impl ReviewWorkspace {
             return;
         }
         let body = self.composer_input.read(cx).value().to_string();
-        let (snapshot, store, authority, expected, draft_id, identity, number) = {
+        let (snapshot, save, draft_id, identity, number) = {
             let tab = &mut self.tabs[index];
             let InteractionState::Ready(controller) = &mut tab.interactions else {
                 self.status = "Review recovery is unavailable.".into();
@@ -15049,34 +14629,21 @@ impl ReviewWorkspace {
                 })
                 .expect("staging creates a draft identity");
             (
-                snapshot,
-                controller.store.clone(),
-                controller.authority.clone(),
-                controller.durable_composition.clone(),
+                snapshot.clone(),
+                controller.prepared_draft_save(snapshot),
                 draft_id,
                 tab.repository.cache_key(),
                 tab.pull_request.number,
             )
         };
         self.status = "Saving local review recovery…".into();
-        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let ticket = self.issue_participation_write(&identity, number);
         let save_epoch = TabReadEpoch {
             instance: self.tabs[index].instance_generation,
-            generation: sequence,
+            generation: ticket.sequence(),
         };
-        let completion_latest = latest.clone();
-        let snapshot_for_save = snapshot.clone();
-        let task = cx.background_spawn(async move {
-            let _guard = lock
-                .lock()
-                .map_err(|_| "Review recovery save lock failed.".to_owned())?;
-            if latest.load(Ordering::Acquire) != sequence {
-                return Ok(false);
-            }
-            authority
-                .save_if_current(&store, expected.as_ref(), &snapshot_for_save)
-                .map(|()| true)
-        });
+        let completion_ticket = ticket.clone();
+        let task = cx.background_spawn(async move { save.execute_sequenced(&ticket) });
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
@@ -15084,10 +14651,8 @@ impl ReviewWorkspace {
                 let Some(index) = this.tabs.iter().position(|tab| {
                     tab.repository.cache_key() == identity
                         && tab.pull_request.number == number
-                        && save_epoch.matches(
-                            tab.instance_generation,
-                            completion_latest.load(Ordering::Acquire),
-                        )
+                        && completion_ticket.is_current()
+                        && tab.instance_generation == save_epoch.instance
                 }) else {
                     return;
                 };
@@ -15179,7 +14744,7 @@ impl ReviewWorkspace {
                     .into();
             return;
         }
-        let (repository, number, mut composition, store, authority, expected, operation_id) = {
+        let (repository, number, prepared, operation_id) = {
             let tab = &mut self.tabs[index];
             let (Some(session), Some(canonical)) =
                 (tab.session.as_ref(), tab.canonical_session.as_ref())
@@ -15203,54 +14768,45 @@ impl ReviewWorkspace {
             };
             tab.details_generation += 1;
             tab.write_in_flight = true;
+            let prepared = match controller.prepared_operation(&operation_id) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    tab.write_in_flight = false;
+                    self.status = error;
+                    return;
+                }
+            };
             (
                 tab.repository.clone(),
                 tab.pull_request.number,
-                controller.composition.clone(),
-                controller.store.clone(),
-                controller.authority.clone(),
-                controller.durable_composition.clone(),
+                prepared,
                 operation_id,
             )
         };
         self.composer_input
             .update(cx, |input, cx| input.set_disabled(true, cx));
         let identity = repository.cache_key();
-        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let ticket = self.issue_participation_write(&identity, number);
         let attempt_id = next_attempt_id(&operation_id);
         let provider = GithubProvider::new(repository.account.clone());
         let task = cx.background_spawn(async move {
-            let fallback = expected.clone();
-            let execution = match lock.lock() {
-                Err(_) => Err("Review recovery save lock failed; zero writes sent.".to_owned()),
-                Ok(_guard) if latest.load(Ordering::Acquire) != sequence => Err(
-                    "A newer review-state write superseded this preparation; zero writes sent."
-                        .to_owned(),
-                ),
-                Ok(_guard) => authority.execute_if_current(&store, expected.as_ref(), || {
+            prepared.execute_sequenced(
+                &ticket,
+                &attempt_id,
+                "A newer review-state write superseded this preparation; zero writes sent.",
+                |composition, store, operation_id, attempt_id| {
                     provider.execute_review_operation(
                         &repository,
-                        &mut composition,
-                        &store,
-                        &operation_id,
-                        &attempt_id,
+                        composition,
+                        store,
+                        operation_id,
+                        attempt_id,
                     )
-                }),
-            };
-            let (outcome, durable) = match execution {
-                Ok((outcome, durable)) => (outcome, durable),
-                Err(reason) => (
-                    ProviderMutationOutcome::PreflightRejected { reason },
-                    fallback,
-                ),
-            };
-            if matches!(outcome, ProviderMutationOutcome::PreflightRejected { .. }) {
-                let _ = composition.cancel_prepared(&operation_id);
-            }
-            (composition, durable, outcome)
+                },
+            )
         });
         cx.spawn(async move |root, cx| {
-            let (composition, durable, outcome) = task.await;
+            let completion = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
                 let Some(index) = this.tabs.iter().position(|tab| {
@@ -15260,19 +14816,10 @@ impl ReviewWorkspace {
                     return;
                 };
                 this.tabs[index].write_in_flight = false;
-                if let InteractionState::Ready(controller) = &mut this.tabs[index].interactions {
-                    controller.composition = composition;
-                    controller.durable_composition = durable;
-                    if let Some(composer) = &mut controller.composer
-                        && let Some(draft) = composer
-                            .draft_id
-                            .as_deref()
-                            .and_then(|id| controller.composition.drafts.iter().find(|d| d.id == id))
-                    {
-                        composer.body = draft.body.clone();
-                        composer.durable = true;
-                    }
-                }
+                let InteractionState::Ready(controller) = &mut this.tabs[index].interactions else {
+                    return;
+                };
+                let outcome = controller.install_operation_completion(completion);
                 if this.active_tab == Some(index) {
                     this.composer_input
                         .update(cx, |input, cx| input.set_disabled(false, cx));
@@ -15302,7 +14849,7 @@ impl ReviewWorkspace {
 
     fn open_submit_confirmation(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
-        if self.tabs[index].submitted_summary_editor.close_after_save {
+        if self.tabs[index].submitted_summary_editor.close_after_save() {
             self.status = "Wait for the local draft close operation to finish.".into();
             return;
         }
@@ -15320,7 +14867,7 @@ impl ReviewWorkspace {
 
     fn prepare_merge_confirmation(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
-        if self.tabs[index].submitted_summary_editor.close_after_save {
+        if self.tabs[index].submitted_summary_editor.close_after_save() {
             self.status = "Wait for the local draft close operation to finish.".into();
             return;
         }
@@ -15419,7 +14966,7 @@ impl ReviewWorkspace {
 
     fn confirm_submission(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
-        if self.tabs[index].submitted_summary_editor.close_after_save {
+        if self.tabs[index].submitted_summary_editor.close_after_save() {
             self.status = "Wait for the local draft close operation to finish.".into();
             return;
         }
@@ -15431,7 +14978,7 @@ impl ReviewWorkspace {
             _ => return,
         };
         let body = self.review_summary_input.read(cx).value().to_string();
-        let (repository, number, mut composition, store, authority, expected, operation_id) = {
+        let (repository, number, prepared, operation_id) = {
             let tab = &mut self.tabs[index];
             let current_head = tab.pull_request.head_sha.as_str();
             let (Some(displayed), Some(canonical)) =
@@ -15457,54 +15004,45 @@ impl ReviewWorkspace {
             };
             tab.details_generation += 1;
             tab.write_in_flight = true;
+            let prepared = match controller.prepared_operation(&operation_id) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    tab.write_in_flight = false;
+                    self.status = error;
+                    return;
+                }
+            };
             (
                 tab.repository.clone(),
                 tab.pull_request.number,
-                controller.composition.clone(),
-                controller.store.clone(),
-                controller.authority.clone(),
-                controller.durable_composition.clone(),
+                prepared,
                 operation_id,
             )
         };
         self.review_summary_input
             .update(cx, |input, cx| input.set_disabled(true, cx));
         let identity = repository.cache_key();
-        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let ticket = self.issue_participation_write(&identity, number);
         let attempt_id = next_attempt_id(&operation_id);
         let provider = GithubProvider::new(repository.account.clone());
         let task = cx.background_spawn(async move {
-            let fallback = expected.clone();
-            let execution = match lock.lock() {
-                Err(_) => Err("Review recovery save lock failed; zero writes sent.".to_owned()),
-                Ok(_guard) if latest.load(Ordering::Acquire) != sequence => Err(
-                    "A newer review-state write superseded this preparation; zero writes sent."
-                        .to_owned(),
-                ),
-                Ok(_guard) => authority.execute_if_current(&store, expected.as_ref(), || {
+            prepared.execute_sequenced(
+                &ticket,
+                &attempt_id,
+                "A newer review-state write superseded this preparation; zero writes sent.",
+                |composition, store, operation_id, attempt_id| {
                     provider.execute_review_operation(
                         &repository,
-                        &mut composition,
-                        &store,
-                        &operation_id,
-                        &attempt_id,
+                        composition,
+                        store,
+                        operation_id,
+                        attempt_id,
                     )
-                }),
-            };
-            let (outcome, durable) = match execution {
-                Ok((outcome, durable)) => (outcome, durable),
-                Err(reason) => (
-                    ProviderMutationOutcome::PreflightRejected { reason },
-                    fallback,
-                ),
-            };
-            if matches!(outcome, ProviderMutationOutcome::PreflightRejected { .. }) {
-                let _ = composition.cancel_prepared(&operation_id);
-            }
-            (composition, durable, outcome)
+                },
+            )
         });
         cx.spawn(async move |root, cx| {
-            let (composition, durable, outcome) = task.await;
+            let completion = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
                 let Some(index) = this.tabs.iter().position(|tab| {
@@ -15513,10 +15051,10 @@ impl ReviewWorkspace {
                     return;
                 };
                 this.tabs[index].write_in_flight = false;
-                if let InteractionState::Ready(controller) = &mut this.tabs[index].interactions {
-                    controller.composition = composition;
-                    controller.durable_composition = durable;
-                }
+                let InteractionState::Ready(controller) = &mut this.tabs[index].interactions else {
+                    return;
+                };
+                let outcome = controller.install_operation_completion(completion);
                 if this.active_tab == Some(index) {
                     this.review_summary_input
                         .update(cx, |input, cx| input.set_disabled(false, cx));
@@ -15545,7 +15083,7 @@ impl ReviewWorkspace {
 
     fn confirm_merge(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
-        if self.tabs[index].submitted_summary_editor.close_after_save {
+        if self.tabs[index].submitted_summary_editor.close_after_save() {
             self.status = "Wait for the local draft close operation to finish.".into();
             return;
         }
@@ -15684,12 +15222,7 @@ impl ReviewWorkspace {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
-        tab.submitted_summary_editor.load_generation = tab
-            .submitted_summary_editor
-            .load_generation
-            .saturating_add(1);
-        tab.submitted_summary_editor.load_state = SubmittedDraftLoadState::Loading;
-        let captured_edit_generation = tab.submitted_summary_editor.edit_generation;
+        let attempt = tab.submitted_summary_editor.start_load();
         let repository = tab.repository.clone();
         let pull_request = tab.pull_request.number;
         let token = SubmittedDraftCallbackToken {
@@ -15697,7 +15230,7 @@ impl ReviewWorkspace {
             tab_instance: tab.instance_generation,
             repository_key: repository.cache_key(),
             pull_request,
-            generation: tab.submitted_summary_editor.load_generation,
+            generation: attempt.generation(),
         };
         let store = self.submitted_draft_store.clone();
         let task = cx.background_spawn(async move {
@@ -15711,7 +15244,7 @@ impl ReviewWorkspace {
                 let this = &mut root.review;
                 this.apply_submitted_draft_load_completion(
                     &token,
-                    captured_edit_generation,
+                    attempt.edit_generation(),
                     result,
                     cx,
                 );
@@ -15733,40 +15266,38 @@ impl ReviewWorkspace {
                 tab.instance_generation,
                 &tab.repository.cache_key(),
                 tab.pull_request.number,
-                tab.submitted_summary_editor.load_generation,
+                tab.submitted_summary_editor.load_generation(),
             )
         }) else {
             return false;
         };
-        match result {
-            Ok(snapshot) => {
-                let recovered = snapshot.drafts.len();
-                let queued = self.tabs[index]
-                    .submitted_summary_editor
-                    .merge_loaded(captured_edit_generation, snapshot);
-                if self.tabs[index]
-                    .submitted_summary_editor
-                    .conflict()
-                    .is_some()
-                {
-                    self.status = "A same-review saved draft and newer local text are both preserved. Choose which version to keep; no overwrite was scheduled.".into();
-                } else if recovered > 0 {
+        match self.tabs[index]
+            .submitted_summary_editor
+            .complete_load(captured_edit_generation, result)
+        {
+            SubmittedDraftLoadCompletion::Conflict => {
+                self.status = "A same-review saved draft and newer local text are both preserved. Choose which version to keep; no overwrite was scheduled.".into();
+            }
+            SubmittedDraftLoadCompletion::Restored {
+                recovered,
+                save_queued,
+            } => {
+                if recovered > 0 {
                     self.status = format!(
                         "Recovered {recovered} unsent submitted-review draft{} as local history. Choose Edit against fresh Activity to continue.",
                         if recovered == 1 { "" } else { "s" }
                     );
                 }
-                if queued {
+                if save_queued {
                     self.start_next_submitted_draft_save(index, cx);
                 }
             }
-            Err(error) => {
-                let editor = &mut self.tabs[index].submitted_summary_editor;
-                editor.load_state = SubmittedDraftLoadState::Failed;
-                editor.persistence_error = Some(format!(
-                    "Submitted-review draft recovery failed; the original was preserved and editing is disabled: {error}"
-                ));
-                self.status = editor.persistence_error.clone().unwrap_or_default();
+            SubmittedDraftLoadCompletion::Failed => {
+                self.status = self.tabs[index]
+                    .submitted_summary_editor
+                    .persistence_error()
+                    .unwrap_or_default()
+                    .to_owned();
             }
         }
         cx.notify();
@@ -15775,12 +15306,7 @@ impl ReviewWorkspace {
 
     fn retry_submitted_draft_load(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
-        if self.tabs[index]
-            .submitted_summary_editor
-            .in_flight
-            .is_some()
-            || self.tabs[index].submitted_summary_editor.clear_in_flight
-        {
+        if !self.tabs[index].submitted_summary_editor.may_retry_load() {
             self.status =
                 "Wait for the current local draft operation before retrying recovery.".into();
             cx.notify();
@@ -15829,15 +15355,9 @@ impl ReviewWorkspace {
     fn retry_submitted_draft_save(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
         let editor = &mut self.tabs[index].submitted_summary_editor;
-        if !editor.is_ready()
-            || editor.in_flight.is_some()
-            || editor.clear_in_flight
-            || editor.pending_clear.is_some()
-        {
+        if !editor.retry_save() {
             return;
         }
-        editor.persistence_error = None;
-        editor.queue_current();
         self.start_next_submitted_draft_save(index, cx);
         cx.notify();
     }
@@ -15846,7 +15366,7 @@ impl ReviewWorkspace {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
-        let edit_generation = tab.submitted_summary_editor.edit_generation;
+        let edit_generation = tab.submitted_summary_editor.edit_generation();
         let tab_instance = tab.instance_generation;
         let repository_key = tab.repository.cache_key();
         let pull_request = tab.pull_request.number;
@@ -15864,7 +15384,7 @@ impl ReviewWorkspace {
                     tab.instance_generation == tab_instance
                         && tab.repository.cache_key() == repository_key
                         && tab.pull_request.number == pull_request
-                        && tab.submitted_summary_editor.edit_generation == edit_generation
+                        && tab.submitted_summary_editor.edit_generation() == edit_generation
                 }) else {
                     return;
                 };
@@ -15887,30 +15407,26 @@ impl ReviewWorkspace {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
-        let Some(save) = tab.submitted_summary_editor.start_next() else {
-            if tab.submitted_summary_editor.close_after_save
+        let Some(save) = tab.submitted_summary_editor.start_next_save() else {
+            if tab.submitted_summary_editor.close_after_save()
                 && tab.submitted_summary_editor.is_current_durable()
             {
                 self.finish_close_tab(index, cx);
             }
             return;
         };
-        tab.submitted_summary_editor.save_generation = tab
-            .submitted_summary_editor
-            .save_generation
-            .saturating_add(1);
         let token = SubmittedDraftCallbackToken {
             workspace_instance: self.workspace_instance,
             tab_instance: tab.instance_generation,
             repository_key: tab.repository.cache_key(),
             pull_request: tab.pull_request.number,
-            generation: tab.submitted_summary_editor.save_generation,
+            generation: save.operation_generation(),
         };
-        let expected_generation = tab.submitted_summary_editor.durable.generation;
+        let expected_generation = save.expected_generation();
         let repository = tab.repository.clone();
         let pull_request = tab.pull_request.number;
-        let active_review = save.snapshot.active_review.clone();
-        let drafts = save.snapshot.drafts.clone();
+        let active_review = save.snapshot().active_review.clone();
+        let drafts = save.snapshot().drafts.clone();
         let store = self.submitted_draft_store.clone();
         self.status = "Saving submitted-review draft… durability pending.".into();
         let task = cx.background_spawn(async move {
@@ -15966,24 +15482,14 @@ impl ReviewWorkspace {
                 saved = true;
             }
             Err(error) => {
-                let editor = &mut self.tabs[index].submitted_summary_editor;
-                editor.pending = None;
-                editor.close_after_save = false;
-                editor.persistence_error = Some(format!(
-                    "Submitted-review draft was not made durable; text remains open and close was refused: {error}"
-                ));
-                self.status = editor.persistence_error.clone().unwrap_or_default();
+                self.status = error;
                 if self.active_tab == Some(index) {
                     self.submitted_summary_input
                         .update(cx, |input, cx| input.set_disabled(false, cx));
                 }
             }
         }
-        if self.tabs[index]
-            .submitted_summary_editor
-            .pending_clear
-            .is_some()
-        {
+        if self.tabs[index].submitted_summary_editor.has_clear_work() {
             self.start_pending_submitted_draft_clear(index, cx);
         } else if saved {
             self.start_next_submitted_draft_save(index, cx);
@@ -16010,55 +15516,36 @@ impl ReviewWorkspace {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
-        if tab.write_in_flight
-            || tab.submitted_summary_editor.clear_in_flight
-            || tab.submitted_summary_editor.in_flight.is_some()
-        {
-            return;
-        }
-        let Some(clear) = tab.submitted_summary_editor.pending_clear.take() else {
+        let Some(clear) = tab
+            .submitted_summary_editor
+            .start_clear(tab.write_in_flight)
+        else {
             return;
         };
-        let durable_has_predecessor = tab
-            .submitted_summary_editor
-            .durable
-            .drafts
-            .iter()
-            .any(|draft| same_draft_history(draft, &clear.captured));
-        if !durable_has_predecessor {
-            tab.submitted_summary_editor.persistence_error = Some(
-                "Remote edit was acknowledged, but the durable local predecessor changed before clear. It was preserved and no automatic clear or replay was attempted."
-                    .into(),
-            );
-            self.status = tab
-                .submitted_summary_editor
-                .persistence_error
-                .clone()
-                .unwrap_or_default();
-            if self.active_tab == Some(index) {
-                self.submitted_summary_input
-                    .update(cx, |input, cx| input.set_disabled(false, cx));
+        let clear = match clear {
+            Ok(clear) => clear,
+            Err(error) => {
+                self.status = error;
+                if self.active_tab == Some(index) {
+                    self.submitted_summary_input
+                        .update(cx, |input, cx| input.set_disabled(false, cx));
+                }
+                return;
             }
-            return;
-        }
-        let expected_generation = tab.submitted_summary_editor.durable.generation;
-        tab.submitted_summary_editor.clear_in_flight = true;
-        tab.submitted_summary_editor.save_generation = tab
-            .submitted_summary_editor
-            .save_generation
-            .saturating_add(1);
+        };
+        let expected_generation = clear.expected_generation();
         let token = SubmittedDraftCallbackToken {
             workspace_instance: self.workspace_instance,
             tab_instance: tab.instance_generation,
             repository_key: tab.repository.cache_key(),
             pull_request: tab.pull_request.number,
-            generation: tab.submitted_summary_editor.save_generation,
+            generation: clear.operation_generation(),
         };
         let repository = tab.repository.clone();
         let pull_request = tab.pull_request.number;
         let store = self.submitted_draft_store.clone();
-        let clear_review = clear.captured.review.coordinates.clone();
-        let clear_body = clear.captured.body.clone();
+        let clear_review = clear.captured().review.coordinates.clone();
+        let clear_body = clear.captured().body.clone();
         let task = cx.background_spawn(async move {
             store
                 .clear_if_current(
@@ -16074,7 +15561,7 @@ impl ReviewWorkspace {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
-                this.apply_submitted_draft_clear_completion(&token, &clear.captured, result, cx);
+                this.apply_submitted_draft_clear_completion(&token, result, cx);
             });
         })
         .detach();
@@ -16083,7 +15570,6 @@ impl ReviewWorkspace {
     fn apply_submitted_draft_clear_completion(
         &mut self,
         token: &SubmittedDraftCallbackToken,
-        captured: &SubmittedSummaryDraft,
         result: Result<SubmittedDraftStoreSnapshot, String>,
         cx: &mut Context<Root>,
     ) -> bool {
@@ -16093,14 +15579,17 @@ impl ReviewWorkspace {
                 tab.instance_generation,
                 &tab.repository.cache_key(),
                 tab.pull_request.number,
-                tab.submitted_summary_editor.save_generation,
+                token.generation,
             )
         }) else {
             return false;
         };
-        let completion = self.tabs[index]
+        let Some(completion) = self.tabs[index]
             .submitted_summary_editor
-            .complete_clear(captured, result);
+            .complete_clear(token.generation, result)
+        else {
+            return false;
+        };
         match completion {
             Ok(still_exact) => {
                 if still_exact {
@@ -16115,12 +15604,7 @@ impl ReviewWorkspace {
                 self.start_next_submitted_draft_save(index, cx);
             }
             Err(error) => {
-                let editor = &mut self.tabs[index].submitted_summary_editor;
-                editor.close_after_save = false;
-                editor.persistence_error = Some(format!(
-                    "Remote edit was acknowledged, but its exact local draft could not be durably cleared; newer or foreign text was preserved: {error}"
-                ));
-                self.status = editor.persistence_error.clone().unwrap_or_default();
+                self.status = error;
                 if self.active_tab == Some(index) {
                     self.submitted_summary_input
                         .update(cx, |input, cx| input.set_disabled(false, cx));
@@ -16145,11 +15629,7 @@ impl ReviewWorkspace {
             return;
         }
         if self.tabs[index].write_in_flight
-            || self.tabs[index].submitted_summary_editor.clear_in_flight
-            || self.tabs[index]
-                .submitted_summary_editor
-                .pending_clear
-                .is_some()
+            || self.tabs[index].submitted_summary_editor.has_clear_work()
         {
             self.status =
                 "Wait for the submitted-review write and exact local clear to settle before selecting another review."
@@ -16785,7 +16265,7 @@ impl ReviewWorkspace {
             cx.notify();
             return;
         }
-        if self.tabs[index].submitted_summary_editor.close_after_save {
+        if self.tabs[index].submitted_summary_editor.close_after_save() {
             self.status = "Wait for the local draft close operation to finish.".into();
             cx.notify();
             return;
@@ -17087,11 +16567,7 @@ impl ReviewWorkspace {
             return;
         }
         if self.tabs[index].write_in_flight
-            || self.tabs[index].submitted_summary_editor.clear_in_flight
-            || self.tabs[index]
-                .submitted_summary_editor
-                .pending_clear
-                .is_some()
+            || self.tabs[index].submitted_summary_editor.has_clear_work()
         {
             self.status = "Another mutation is still in progress.".into();
             return;
@@ -17667,51 +17143,28 @@ impl ReviewWorkspace {
         else {
             return;
         };
-        let (repository, number, store, authority, expected_composition, expected_start) =
-            match &self.tabs[index].interactions {
-                InteractionState::Ready(controller) => (
-                    self.tabs[index].repository.clone(),
-                    self.tabs[index].pull_request.number,
-                    controller.store.clone(),
-                    controller.authority.clone(),
-                    controller.durable_composition.clone(),
-                    controller.pending_review_start.clone(),
-                ),
-                _ => return,
-            };
+        let (repository, number, prepared) = match &self.tabs[index].interactions {
+            InteractionState::Ready(controller) => (
+                self.tabs[index].repository.clone(),
+                self.tabs[index].pull_request.number,
+                controller.prepared_pending_review_start(),
+            ),
+            _ => return,
+        };
         let identity = repository.cache_key();
-        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
-        let completion_latest = latest.clone();
+        let ticket = self.issue_participation_write(&identity, number);
+        let completion_ticket = ticket.clone();
         let provider = GithubProvider::new(repository.account.clone());
         let intent = token.intent.clone();
         let attempt_id = next_attempt_id(&intent.create_operation_id);
         let task = cx.background_spawn(async move {
-            let _guard = lock
-                .lock()
-                .map_err(|_| "Review recovery save lock failed; zero writes sent.".to_owned())?;
-            if latest.load(Ordering::Acquire) != sequence {
-                return Err(
-                    "A newer review-state write superseded pending-review creation; zero writes sent."
-                        .to_owned(),
-                );
-            }
-            Ok(execute_pending_review_start_create(
-                &authority,
-                &store,
-                PendingReviewStartExpected { composition: expected_composition.as_ref(), record: expected_start.as_ref() },
-                &provider,
-                &repository,
-                &intent,
-                &attempt_id,
-            ))
+            prepared.execute_create_sequenced(&ticket, &provider, &repository, &intent, &attempt_id)
         });
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
-                if this.workspace_instance != token.workspace_instance
-                    || completion_latest.load(Ordering::Acquire) != sequence
-                {
+                if this.workspace_instance != token.workspace_instance || !completion_ticket.is_current() {
                     return;
                 }
                 let Some(index) = this
@@ -17733,11 +17186,7 @@ impl ReviewWorkspace {
                     }
                 };
                 if let InteractionState::Ready(controller) = &mut this.tabs[index].interactions {
-                    if let Some(composition) = step.composition.clone() {
-                        controller.composition = composition.clone();
-                        controller.durable_composition = Some(composition);
-                    }
-                    controller.pending_review_start = step.record.clone();
+                    controller.install_pending_review_start_step(&step);
                 }
                 match step.outcome {
                     ProviderMutationOutcome::Acknowledged(creation) => {
@@ -17766,7 +17215,7 @@ impl ReviewWorkspace {
                             && this.active_tab_input_restore.is_none()
                             && !this.tabs[index]
                                 .submitted_summary_editor
-                                .close_after_save;
+                                .close_after_save();
                         let visible_exact = if input_owned {
                             this.composer_input.read(cx).value() == token.intent.body
                         } else {
@@ -17826,29 +17275,26 @@ impl ReviewWorkspace {
         else {
             return;
         };
-        let (repository, number, store, authority, expected_composition, expected_start) =
-            match &self.tabs[index].interactions {
-                InteractionState::Ready(controller) => {
-                    let Some(record) = controller.pending_review_start.clone() else {
-                        self.finish_pending_review_start_live(
-                            index,
-                            "The durable created-review state disappeared. No FILE write was sent."
-                                .into(),
-                            cx,
-                        );
-                        return;
-                    };
-                    (
-                        self.tabs[index].repository.clone(),
-                        self.tabs[index].pull_request.number,
-                        controller.store.clone(),
-                        controller.authority.clone(),
-                        controller.durable_composition.clone(),
-                        record,
-                    )
-                }
-                _ => return,
-            };
+        let (repository, number, prepared, expected_start) = match &self.tabs[index].interactions {
+            InteractionState::Ready(controller) => {
+                let Some(record) = controller.pending_review_start.clone() else {
+                    self.finish_pending_review_start_live(
+                        index,
+                        "The durable created-review state disappeared. No FILE write was sent."
+                            .into(),
+                        cx,
+                    );
+                    return;
+                };
+                (
+                    self.tabs[index].repository.clone(),
+                    self.tabs[index].pull_request.number,
+                    controller.prepared_pending_review_start(),
+                    record,
+                )
+            }
+            _ => return,
+        };
         if expected_start.intent != token.intent || !expected_start.may_continue_file_thread() {
             let review = expected_start
                 .creation()
@@ -17864,37 +17310,18 @@ impl ReviewWorkspace {
             return;
         }
         let identity = repository.cache_key();
-        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
-        let completion_latest = latest.clone();
+        let ticket = self.issue_participation_write(&identity, number);
+        let completion_ticket = ticket.clone();
         let provider = GithubProvider::new(repository.account.clone());
         let attempt_id = next_attempt_id(&token.intent.thread_operation_id);
         let task = cx.background_spawn(async move {
-            let _guard = lock.lock().map_err(|_| {
-                "Review recovery save lock failed; no FILE write was sent.".to_owned()
-            })?;
-            if latest.load(Ordering::Acquire) != sequence {
-                return Err(
-                    "A newer review-state write superseded the FILE stage; no FILE write was sent."
-                        .to_owned(),
-                );
-            }
-            Ok(execute_pending_review_start_thread(
-                &authority,
-                &store,
-                expected_composition.as_ref(),
-                &expected_start,
-                &provider,
-                &repository,
-                &attempt_id,
-            ))
+            prepared.execute_thread_sequenced(&ticket, &provider, &repository, &attempt_id)
         });
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
-                if this.workspace_instance != token.workspace_instance
-                    || completion_latest.load(Ordering::Acquire) != sequence
-                {
+                if this.workspace_instance != token.workspace_instance || !completion_ticket.is_current() {
                     return;
                 }
                 let Some(index) = this
@@ -17912,11 +17339,7 @@ impl ReviewWorkspace {
                     }
                 };
                 if let InteractionState::Ready(controller) = &mut this.tabs[index].interactions {
-                    if let Some(composition) = step.composition.clone() {
-                        controller.composition = composition.clone();
-                        controller.durable_composition = Some(composition);
-                    }
-                    controller.pending_review_start = step.record.clone();
+                    controller.install_pending_review_start_step(&step);
                     if matches!(&step.outcome, ProviderMutationOutcome::Acknowledged(_))
                         && controller.file_composer.as_ref().is_some_and(|composer| {
                             composer.draft_id.as_deref()
@@ -18082,28 +17505,25 @@ impl ReviewWorkspace {
             self.status = "Pending-review stop identity is exhausted; reopen this tab.".into();
             return;
         };
-        let (repository, number, store, authority, expected_composition, expected_start) =
-            match &self.tabs[index].interactions {
-                InteractionState::Ready(controller) => {
-                    let Some(record) = controller.pending_review_start.as_ref().filter(|record| {
-                        record.intent.flow_id == flow_id && record.may_continue_file_thread()
-                    }) else {
-                        self.status =
-                            "Only a durable ReviewCreated state with no FILE dispatch can be stopped."
-                                .into();
-                        return;
-                    };
-                    (
-                        self.tabs[index].repository.clone(),
-                        self.tabs[index].pull_request.number,
-                        controller.store.clone(),
-                        controller.authority.clone(),
-                        controller.durable_composition.clone(),
-                        record.clone(),
-                    )
-                }
-                _ => return,
-            };
+        let (repository, number, prepared, expected_start) = match &self.tabs[index].interactions {
+            InteractionState::Ready(controller) => {
+                let Some(record) = controller.pending_review_start.as_ref().filter(|record| {
+                    record.intent.flow_id == flow_id && record.may_continue_file_thread()
+                }) else {
+                    self.status =
+                        "Only a durable ReviewCreated state with no FILE dispatch can be stopped."
+                            .into();
+                    return;
+                };
+                (
+                    self.tabs[index].repository.clone(),
+                    self.tabs[index].pull_request.number,
+                    controller.prepared_pending_review_start(),
+                    record.clone(),
+                )
+            }
+            _ => return,
+        };
         let token = PendingReviewStartStopToken {
             workspace_instance: self.workspace_instance,
             tab_instance: self.tabs[index].instance_generation,
@@ -18120,32 +17540,15 @@ impl ReviewWorkspace {
             .map(|creation| creation.review.remote_id.clone())
             .unwrap_or_else(|| "unknown".into());
         let identity = repository.cache_key();
-        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
-        let completion_latest = latest.clone();
-        let task = cx.background_spawn(async move {
-            let _guard = lock.lock().map_err(|_| {
-                "Review recovery save lock failed; stop disposition is uncertain.".to_owned()
-            })?;
-            if latest.load(Ordering::Acquire) != sequence {
-                return Err(
-                    "A newer review-state write superseded the local stop; disposition is uncertain."
-                        .to_owned(),
-                );
-            }
-            stop_pending_review_start_after_create(
-                &authority,
-                &store,
-                expected_composition.as_ref(),
-                &expected_start,
-            )
-        });
+        let ticket = self.issue_participation_write(&identity, number);
+        let completion_ticket = ticket.clone();
+        let task =
+            cx.background_spawn(async move { prepared.stop_after_create_sequenced(&ticket) });
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
-                if this.workspace_instance != token.workspace_instance
-                    || completion_latest.load(Ordering::Acquire) != sequence
-                {
+                if this.workspace_instance != token.workspace_instance || !completion_ticket.is_current() {
                     return;
                 }
                 let Some(index) = this
@@ -18161,7 +17564,7 @@ impl ReviewWorkspace {
                         if let InteractionState::Ready(controller) =
                             &mut this.tabs[index].interactions
                         {
-                            controller.pending_review_start = Some(record);
+                            controller.install_pending_review_start_record(record);
                         }
                         format!(
                             "Stopped before the FILE write. Pending review {review_id}, local draft, and history were kept; zero additional remote writes were sent. Future actions require fresh existing-pending evidence."
@@ -18191,29 +17594,26 @@ impl ReviewWorkspace {
                 "Pending-review cancellation identity is exhausted; reopen this tab.".into();
             return;
         };
-        let (repository, number, store, authority, expected_composition, expected_start) =
-            match &self.tabs[index].interactions {
-                InteractionState::Ready(controller) => {
-                    let Some(record) = controller.pending_review_start.as_ref().filter(|record| {
-                        record.intent.flow_id == flow_id
-                            && matches!(&record.stage, PendingReviewStartStage::PreparedCreate)
-                    }) else {
-                        self.status =
-                            "Only a durable PreparedCreate state can be cancelled as zero transport."
-                                .into();
-                        return;
-                    };
-                    (
-                        self.tabs[index].repository.clone(),
-                        self.tabs[index].pull_request.number,
-                        controller.store.clone(),
-                        controller.authority.clone(),
-                        controller.durable_composition.clone(),
-                        record.clone(),
-                    )
-                }
-                _ => return,
-            };
+        let (repository, number, prepared, expected_start) = match &self.tabs[index].interactions {
+            InteractionState::Ready(controller) => {
+                let Some(record) = controller.pending_review_start.as_ref().filter(|record| {
+                    record.intent.flow_id == flow_id
+                        && matches!(&record.stage, PendingReviewStartStage::PreparedCreate)
+                }) else {
+                    self.status =
+                        "Only a durable PreparedCreate state can be cancelled as zero transport."
+                            .into();
+                    return;
+                };
+                (
+                    self.tabs[index].repository.clone(),
+                    self.tabs[index].pull_request.number,
+                    controller.prepared_pending_review_start(),
+                    record.clone(),
+                )
+            }
+            _ => return,
+        };
         let token = PendingReviewStartStopToken {
             workspace_instance: self.workspace_instance,
             tab_instance: self.tabs[index].instance_generation,
@@ -18226,32 +17626,15 @@ impl ReviewWorkspace {
         self.tabs[index].file_confirmation_generation = generation;
         self.tabs[index].write_in_flight = true;
         let identity = repository.cache_key();
-        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
-        let completion_latest = latest.clone();
-        let task = cx.background_spawn(async move {
-            let _guard = lock.lock().map_err(|_| {
-                "Review recovery save lock failed; cancellation is uncertain.".to_owned()
-            })?;
-            if latest.load(Ordering::Acquire) != sequence {
-                return Err(
-                    "A newer review-state write superseded cancellation; disposition is uncertain."
-                        .to_owned(),
-                );
-            }
-            cancel_pending_review_start_before_create(
-                &authority,
-                &store,
-                expected_composition.as_ref(),
-                &expected_start,
-            )
-        });
+        let ticket = self.issue_participation_write(&identity, number);
+        let completion_ticket = ticket.clone();
+        let task =
+            cx.background_spawn(async move { prepared.cancel_before_create_sequenced(&ticket) });
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
-                if this.workspace_instance != token.workspace_instance
-                    || completion_latest.load(Ordering::Acquire) != sequence
-                {
+                if this.workspace_instance != token.workspace_instance || !completion_ticket.is_current() {
                     return;
                 }
                 let Some(index) = this
@@ -18267,7 +17650,7 @@ impl ReviewWorkspace {
                         if let InteractionState::Ready(controller) =
                             &mut this.tabs[index].interactions
                         {
-                            controller.pending_review_start = Some(record);
+                            controller.install_pending_review_start_record(record);
                         }
                         "Recovered prepared start cancelled locally; zero provider writes were sent and the FILE draft was kept."
                             .into()
@@ -18296,32 +17679,29 @@ impl ReviewWorkspace {
                 "Pending-review local completion identity is exhausted; reopen this tab.".into();
             return;
         };
-        let (repository, number, store, authority, expected_composition, expected_start) =
-            match &self.tabs[index].interactions {
-                InteractionState::Ready(controller) => {
-                    let Some(record) = controller.pending_review_start.as_ref().filter(|record| {
-                        record.intent.flow_id == flow_id
-                            && matches!(
-                                &record.stage,
-                                PendingReviewStartStage::ThreadAcknowledged { .. }
-                            )
-                    }) else {
-                        self.status =
+        let (repository, number, prepared, expected_start) = match &self.tabs[index].interactions {
+            InteractionState::Ready(controller) => {
+                let Some(record) = controller.pending_review_start.as_ref().filter(|record| {
+                    record.intent.flow_id == flow_id
+                        && matches!(
+                            &record.stage,
+                            PendingReviewStartStage::ThreadAcknowledged { .. }
+                        )
+                }) else {
+                    self.status =
                             "Only a durable ThreadAcknowledged state can finish locally without another provider write."
                                 .into();
-                        return;
-                    };
-                    (
-                        self.tabs[index].repository.clone(),
-                        self.tabs[index].pull_request.number,
-                        controller.store.clone(),
-                        controller.authority.clone(),
-                        controller.durable_composition.clone(),
-                        record.clone(),
-                    )
-                }
-                _ => return,
-            };
+                    return;
+                };
+                (
+                    self.tabs[index].repository.clone(),
+                    self.tabs[index].pull_request.number,
+                    controller.prepared_pending_review_start(),
+                    record.clone(),
+                )
+            }
+            _ => return,
+        };
         let token = PendingReviewStartStopToken {
             workspace_instance: self.workspace_instance,
             tab_instance: self.tabs[index].instance_generation,
@@ -18336,32 +17716,14 @@ impl ReviewWorkspace {
         let predecessor_draft_id = expected_start.intent.draft_id.clone();
         let predecessor_body = expected_start.intent.body.clone();
         let identity = repository.cache_key();
-        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
-        let completion_latest = latest.clone();
-        let task = cx.background_spawn(async move {
-            let _guard = lock.lock().map_err(|_| {
-                "Review recovery save lock failed; local completion is uncertain.".to_owned()
-            })?;
-            if latest.load(Ordering::Acquire) != sequence {
-                return Err(
-                    "A newer review-state write superseded local completion; disposition is uncertain."
-                        .to_owned(),
-                );
-            }
-            Ok(finish_pending_review_start_locally(
-                &authority,
-                &store,
-                expected_composition.as_ref(),
-                &expected_start,
-            ))
-        });
+        let ticket = self.issue_participation_write(&identity, number);
+        let completion_ticket = ticket.clone();
+        let task = cx.background_spawn(async move { prepared.finish_locally_sequenced(&ticket) });
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
-                if this.workspace_instance != token.workspace_instance
-                    || completion_latest.load(Ordering::Acquire) != sequence
-                {
+                if this.workspace_instance != token.workspace_instance || !completion_ticket.is_current() {
                     return;
                 }
                 let Some(index) = this
@@ -18376,11 +17738,7 @@ impl ReviewWorkspace {
                         if let InteractionState::Ready(controller) =
                             &mut this.tabs[index].interactions
                         {
-                            if let Some(composition) = step.composition.clone() {
-                                controller.composition = composition.clone();
-                                controller.durable_composition = Some(composition);
-                            }
-                            controller.pending_review_start = step.record.clone();
+                            controller.install_pending_review_start_step(&step);
                             if matches!(&step.outcome, ProviderMutationOutcome::Acknowledged(_))
                                 && controller.file_composer.as_ref().is_some_and(|composer| {
                                     composer.draft_id.as_deref()
@@ -18425,7 +17783,7 @@ impl ReviewWorkspace {
         if !self.shared_composer_admitted(index) {
             return;
         }
-        let (repository, number, mut composition, store, authority, expected, operation_id) = {
+        let (repository, number, prepared, operation_id) = {
             let tab = &mut self.tabs[index];
             let InteractionState::Ready(controller) = &mut tab.interactions else {
                 self.status = "Review recovery is unavailable.".into();
@@ -18438,7 +17796,7 @@ impl ReviewWorkspace {
                     return;
                 }
             };
-            let exact = controller.composition.operations.iter().any(|operation| {
+            let exact = controller.composition().operations.iter().any(|operation| {
                 operation.id == operation_id
                     && matches!(
                         operation.payload.as_ref(),
@@ -18450,19 +17808,24 @@ impl ReviewWorkspace {
                     )
             });
             if !exact {
-                let _ = controller.composition.cancel_prepared(&operation_id);
+                let _ = controller.cancel_prepared(&operation_id);
                 self.status = "Frozen file-comment preparation changed; zero writes sent.".into();
                 return;
             }
             tab.details_generation += 1;
             tab.write_in_flight = true;
+            let prepared = match controller.prepared_operation(&operation_id) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    tab.write_in_flight = false;
+                    self.status = error;
+                    return;
+                }
+            };
             (
                 tab.repository.clone(),
                 tab.pull_request.number,
-                controller.composition.clone(),
-                controller.store.clone(),
-                controller.authority.clone(),
-                controller.durable_composition.clone(),
+                prepared,
                 operation_id,
             )
         };
@@ -18471,47 +17834,33 @@ impl ReviewWorkspace {
         let workspace_instance = self.workspace_instance;
         let tab_instance = self.tabs[index].instance_generation;
         let identity = repository.cache_key();
-        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
-        let completion_latest = latest.clone();
+        let ticket = self.issue_participation_write(&identity, number);
+        let completion_ticket = ticket.clone();
         let completion_operation_id = operation_id.clone();
         let attempt_id = next_attempt_id(&operation_id);
         let provider = GithubProvider::new(repository.account.clone());
         let task = cx.background_spawn(async move {
-            let fallback = expected.clone();
-            let execution = match lock.lock() {
-                Err(_) => Err("Review recovery save lock failed; zero writes sent.".to_owned()),
-                Ok(_guard) if latest.load(Ordering::Acquire) != sequence => Err(
-                    "A newer review-state write superseded this file-comment preparation; zero writes sent."
-                        .to_owned(),
-                ),
-                Ok(_guard) => authority.execute_if_current(&store, expected.as_ref(), || {
+            prepared.execute_sequenced(
+                &ticket,
+                &attempt_id,
+                "A newer review-state write superseded this file-comment preparation; zero writes sent.",
+                |composition, store, operation_id, attempt_id| {
                     provider.execute_review_operation(
                         &repository,
-                        &mut composition,
-                        &store,
-                        &operation_id,
-                        &attempt_id,
+                        composition,
+                        store,
+                        operation_id,
+                        attempt_id,
                     )
-                }),
-            };
-            let (outcome, durable) = match execution {
-                Ok((outcome, durable)) => (outcome, durable),
-                Err(reason) => (
-                    ProviderMutationOutcome::PreflightRejected { reason },
-                    fallback,
-                ),
-            };
-            if matches!(outcome, ProviderMutationOutcome::PreflightRejected { .. }) {
-                let _ = composition.cancel_prepared(&operation_id);
-            }
-            (composition, durable, outcome)
+                },
+            )
         });
         cx.spawn(async move |root, cx| {
-            let (composition, durable, outcome) = task.await;
+            let completion = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
                 if this.workspace_instance != workspace_instance
-                    || completion_latest.load(Ordering::Acquire) != sequence
+                    || !completion_ticket.is_current()
                 {
                     return;
                 }
@@ -18525,7 +17874,7 @@ impl ReviewWorkspace {
                 let owns_action = matches!(
                     &this.tabs[index].interactions,
                     InteractionState::Ready(controller)
-                        if controller.composition.operations.iter().any(|operation| {
+                        if controller.composition().operations.iter().any(|operation| {
                             operation.id == completion_operation_id
                                 && matches!(
                                     operation.target,
@@ -18538,8 +17887,7 @@ impl ReviewWorkspace {
                 }
                 this.tabs[index].write_in_flight = false;
                 if let InteractionState::Ready(controller) = &mut this.tabs[index].interactions {
-                    controller.composition = composition;
-                    controller.durable_composition = durable;
+                    let outcome = controller.install_operation_completion(completion);
                     if matches!(outcome, ProviderMutationOutcome::Acknowledged(_))
                         && controller.file_composer.as_ref().is_some_and(|composer| {
                             composer.draft_id.as_deref() == Some(confirmed.draft_id.as_str())
@@ -18549,21 +17897,21 @@ impl ReviewWorkspace {
                     {
                         controller.file_composer = None;
                     }
+                    this.status = match outcome {
+                        ProviderMutationOutcome::Acknowledged(_) => "File-level comment added to the exact selected-account pending review; the review remains unsubmitted."
+                            .into(),
+                        ProviderMutationOutcome::PreflightRejected { reason } => format!(
+                            "File-level comment was not sent; the local draft is retained: {reason}"
+                        ),
+                        ProviderMutationOutcome::Uncertain { reason, .. } => format!(
+                            "File-level comment outcome is uncertain and will not replay automatically; the frozen operation remains recoverable: {reason}"
+                        ),
+                    };
                 }
                 if this.active_tab == Some(index) {
                     this.composer_input
                         .update(cx, |input, cx| input.set_disabled(false, cx));
                 }
-                this.status = match outcome {
-                    ProviderMutationOutcome::Acknowledged(_) => "File-level comment added to the exact selected-account pending review; the review remains unsubmitted."
-                        .into(),
-                    ProviderMutationOutcome::PreflightRejected { reason } => format!(
-                        "File-level comment was not sent; the local draft is retained: {reason}"
-                    ),
-                    ProviderMutationOutcome::Uncertain { reason, .. } => format!(
-                        "File-level comment outcome is uncertain and will not replay automatically; the frozen operation remains recoverable: {reason}"
-                    ),
-                };
                 this.rebuild_diff(index, this.wide);
                 this.refresh_details(index, cx);
                 cx.notify();
@@ -18574,7 +17922,8 @@ impl ReviewWorkspace {
 
     fn dispatch_auxiliary_action(&mut self, action: ReviewAuxiliaryAction, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
-        if !general_read_tab_can_start(self.tabs[index].submitted_summary_editor.close_after_save) {
+        if !general_read_tab_can_start(self.tabs[index].submitted_summary_editor.close_after_save())
+        {
             return;
         }
         if self.tabs[index].write_in_flight {
@@ -18697,7 +18046,7 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) {
         let Some(index) = self.active_tab else { return };
-        if self.tabs[index].submitted_summary_editor.close_after_save {
+        if self.tabs[index].submitted_summary_editor.close_after_save() {
             self.status = "Wait for the submitted-review draft close barrier to finish.".into();
             cx.notify();
             return;
@@ -18826,12 +18175,8 @@ impl ReviewWorkspace {
         self.tabs[index].write_in_flight = false;
         self.update_shared_composer_disabled(cx);
         if self.active_tab == Some(index) {
-            let disabled = self.tabs[index].submitted_summary_editor.clear_in_flight
-                || self.tabs[index]
-                    .submitted_summary_editor
-                    .pending_clear
-                    .is_some()
-                || self.tabs[index].submitted_summary_editor.close_after_save;
+            let disabled = self.tabs[index].submitted_summary_editor.has_clear_work()
+                || self.tabs[index].submitted_summary_editor.close_after_save();
             self.submitted_summary_input
                 .update(cx, |input, cx| input.set_disabled(disabled, cx));
         }
@@ -18854,7 +18199,7 @@ impl ReviewWorkspace {
 
     fn reconcile_action_journal(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
-        if self.tabs[index].submitted_summary_editor.close_after_save {
+        if self.tabs[index].submitted_summary_editor.close_after_save() {
             self.status = "Wait for the local draft close operation to finish.".into();
             return;
         }
@@ -18882,157 +18227,17 @@ impl ReviewWorkspace {
         self.status = "Reading authoritative state to reconcile started actions…".into();
         let provider = GithubProvider::new(repository.account.clone());
         let task = cx.background_spawn(async move {
-            let journal = ActionJournal::open(&journal_root, key).map_err(anyhow::Error::msg)?;
-            let operations = journal.operations().map_err(anyhow::Error::msg)?;
-            let details = provider.details(&repository, number)?;
-            let pending = provider.pending_review(&repository, number)?;
-            let mut resolved = 0usize;
-            let mut still_uncertain = Vec::new();
-            for operation in operations.iter().filter(|operation| {
-                matches!(
-                    operation.status,
-                    JournalStatus::InFlight | JournalStatus::Uncertain { .. }
-                )
-            }) {
-                let (operation_id, attempt_id) = journal_identity(&operation.request);
-                let observation = match &operation.request {
-                    JournalRequest::Auxiliary(request) => {
-                        observe_auxiliary(&request.action, &details, pending.as_ref())
-                    }
-                    JournalRequest::Merge {
-                        preparation,
-                        request,
-                    } => provider
-                        .prepare_merge(&repository, number, &preparation.reviewed_head_sha)
-                        .ok()
-                        .and_then(|fresh| observe_merge(&request.action, preparation, &fresh)),
-                    JournalRequest::Lifecycle(_) => None,
-                    JournalRequest::Discussion(request) => match &request.action {
-                        PullRequestDiscussionAction::Edit {
-                            comment,
-                            selected_author,
-                            body,
-                            ..
-                        } => match provider.reconcile_pr_comment(&repository, number, comment) {
-                            ProviderReadEvidence::Observed(observed)
-                                if observed.body == *body
-                                    && observed.author.as_deref().is_some_and(|author| {
-                                        author.eq_ignore_ascii_case(selected_author)
-                                    }) => Some((
-                                true,
-                                true,
-                                format!(
-                                    "Exact known comment {} has the frozen edited body.",
-                                    comment.remote_id
-                                ),
-                            )),
-                            ProviderReadEvidence::Observed(_) => None,
-                            ProviderReadEvidence::Inconclusive { .. } => None,
-                        },
-                        // Create has no returned ID in a lost acknowledgement,
-                        // and absence after delete is explicitly inconclusive.
-                        PullRequestDiscussionAction::Create { .. }
-                        | PullRequestDiscussionAction::Delete { .. } => None,
-                    },
-                    JournalRequest::Reaction(request) => match provider
-                        .reconcile_reaction(&repository, request)
-                    {
-                        ProviderReadEvidence::Observed(observed) => match &request.action {
-                            // The new reaction ID was unknown at dispatch. A
-                            // later present state proves convergence only, not
-                            // that this attempt created that exact reaction.
-                            ReactionAction::Add => None,
-                            ReactionAction::Remove { .. }
-                                if !observed.viewer_has_reacted
-                                    && observed.own_reaction_id.is_none() =>
-                            {
-                                Some((
-                                    true,
-                                    true,
-                                    "Fresh exact subject/viewer/content state is absent. This records final-state convergence only, not which actor caused it."
-                                        .into(),
-                                ))
-                            }
-                            ReactionAction::Remove { .. } => None,
-                        },
-                        ProviderReadEvidence::Inconclusive { .. } => None,
-                    },
-                    JournalRequest::Dismissal(request) => {
-                        // Exact DISMISSED state is convergence only; it does
-                        // not prove the frozen reason or local causation.
-                        let _ = provider.reconcile_review_dismissal(&repository, request);
-                        None
-                    }
-                    JournalRequest::ActionsRunControl(request) => {
-                        let preparation = &request.preparation;
-                        let evidence = provider.reconcile_actions_run_control(
-                            &repository,
-                            &preparation.observation.target,
-                        );
-                        reconciliation_summary(
-                            preparation.action,
-                            preparation.observation.target.run_attempt,
-                            &preparation.observation.run_status,
-                            &evidence,
-                        )
-                        // An accepted control only ever schedules work, so
-                        // convergence is recorded as observed movement, never
-                        // as a completed effect attributed to this attempt.
-                        .map(|(resolved, evidence)| (resolved, false, evidence))
-                    }
-                };
-                match observation {
-                    Some((true, completed, evidence)) => {
-                        journal
-                            .mark_acknowledged(operation_id, attempt_id, completed, evidence)
-                            .map_err(anyhow::Error::msg)?;
-                        resolved += 1;
-                    }
-                    Some((false, _, evidence)) => {
-                        still_uncertain.push(format!(
-                            "{} · The current object differs from the request, but that does not prove this attempt was NotApplied after later external changes: {evidence}",
-                            journal_operation_description(operation)
-                        ));
-                    }
-                    None => {
-                        let limitation = match &operation.request {
-                            JournalRequest::Auxiliary(request)
-                                if matches!(request.action, ReviewAuxiliaryAction::Reply { .. }) =>
-                            {
-                                "No safe exact-ID reply observation route exists: the frozen request contains the target thread/review/body but no provider reply ID, and GitHub does not preserve the local attempt ID."
-                            }
-                            JournalRequest::Reaction(request)
-                                if matches!(request.action, ReactionAction::Add) =>
-                            {
-                                "The add acknowledgement was lost before its new reaction ID became known. Current presence can show convergence but cannot identify this attempt."
-                            }
-                            JournalRequest::Reaction(request)
-                                if matches!(request.action, ReactionAction::Remove { .. }) =>
-                            {
-                                "The fresh exact state did not show bounded absence. A different current reaction ID is never removed or adopted automatically."
-                            }
-                            JournalRequest::Dismissal(_) => {
-                                "A later exact DISMISSED review can show state convergence only. No exact dismissal event with the frozen review, parent, selected actor, previous state, and message was recorded, so reason and causation remain unresolved."
-                            }
-                            JournalRequest::ActionsRunControl(_) => {
-                                "The run showed no later attempt or matching cancelled conclusion. GitHub records no per-request Actions control event, so an unmoved run never proves this attempt was NotApplied."
-                            }
-                            _ => {
-                                "The fresh read did not provide complete exact identity and payload evidence for this request."
-                            }
-                        };
-                        still_uncertain.push(format!(
-                            "{} · {limitation}",
-                            journal_operation_description(operation)
-                        ));
-                    }
-                }
-            }
-            let operations = journal.operations().map_err(anyhow::Error::msg)?;
-            Ok::<_, anyhow::Error>((resolved, still_uncertain, operations))
+            review_interactions::reconcile_action_journal(
+                &journal_root,
+                key,
+                &provider,
+                &repository,
+                number,
+            )
+            .map(|report| (report.resolved, report.uncertain, report.operations))
         });
         cx.spawn(async move |root, cx| {
-            let result = task.await.map_err(|error| format!("{error:#}"));
+            let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
                 let Some(index) = this.apply_action_journal_completion(&completion, result) else {
@@ -19084,7 +18289,7 @@ impl ReviewWorkspace {
 
     fn reconcile_review_operations(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
-        if self.tabs[index].submitted_summary_editor.close_after_save {
+        if self.tabs[index].submitted_summary_editor.close_after_save() {
             return;
         }
         if self.tabs[index].write_in_flight {
@@ -19092,7 +18297,7 @@ impl ReviewWorkspace {
                 "Wait for the active operation before reconciling review outcomes.".into();
             return;
         }
-        let (repository, number, store, authority, expected, read_epoch) = {
+        let (repository, number, prepared, read_epoch) = {
             let tab = &mut self.tabs[index];
             let InteractionState::Ready(controller) = &tab.interactions else {
                 self.status = "Review recovery must load before reconciliation.".into();
@@ -19107,9 +18312,7 @@ impl ReviewWorkspace {
             (
                 tab.repository.clone(),
                 tab.pull_request.number,
-                controller.store.clone(),
-                controller.authority.clone(),
-                controller.durable_composition.clone(),
+                controller.prepared_reconciliation(),
                 TabReadEpoch {
                     instance: tab.instance_generation,
                     generation: tab.interaction_generation,
@@ -19126,26 +18329,18 @@ impl ReviewWorkspace {
             "Reading exact review identities under local authority; no write will be dispatched…"
                 .into();
         let identity = repository.cache_key();
-        let (latest, lock, sequence) = self.next_review_state_write(&identity, number);
+        let ticket = self.issue_participation_write(&identity, number);
         let provider = GithubProvider::new(repository.account.clone());
         let task = cx.background_spawn(async move {
-            let _guard = lock
-                .lock()
-                .map_err(|_| "Review reconciliation sequencing lock failed.".to_owned())?;
-            if latest.load(Ordering::Acquire) != sequence {
-                return Ok(None);
-            }
-            authority
-                .reconcile_if_current(&store, expected.as_ref(), &repository, number, || {
-                    let details = provider
-                        .details(&repository, number)
-                        .map_err(|error| format!("Details read failed: {error:#}"))?;
-                    let pending = provider
-                        .pending_review(&repository, number)
-                        .map_err(|error| format!("Pending-review read failed: {error:#}"))?;
-                    Ok((details, pending))
-                })
-                .map(Some)
+            prepared.execute_sequenced(&ticket, &repository, number, || {
+                let details = provider
+                    .details(&repository, number)
+                    .map_err(|error| format!("Details read failed: {error:#}"))?;
+                let pending = provider
+                    .pending_review(&repository, number)
+                    .map_err(|error| format!("Pending-review read failed: {error:#}"))?;
+                Ok((details, pending))
+            })
         });
         cx.spawn(async move |root, cx| {
             let result = task.await;
@@ -19175,10 +18370,7 @@ impl ReviewWorkspace {
                         if let InteractionState::Ready(controller) =
                             &mut this.tabs[index].interactions
                         {
-                            controller.composition = report.composition.clone();
-                            controller.durable_composition = Some(report.composition);
-                            controller.install_pending_snapshot(report.pending);
-                            controller.reconciliation_results = report.items;
+                            controller.install_reconciliation(report);
                         }
                         if unresolved == 0 {
                             format!(
@@ -19239,10 +18431,18 @@ impl ReviewWorkspace {
                     revision: comparison.revision.clone(),
                     full_pr: true,
                 };
+                if let Some(store) = &store {
+                    let _ = store.save_comparison(&repository, number, &comparison);
+                }
                 return Ok((comparison, false, true, Some(plan)));
             }
             match provider.comparison(&repository, number, &revision) {
-                Ok(comparison) => Ok((comparison, false, false, None)),
+                Ok(comparison) => {
+                    if let Some(store) = &store {
+                        let _ = store.save_comparison(&repository, number, &comparison);
+                    }
+                    Ok((comparison, false, false, None))
+                }
                 Err(error) => match store
                     .as_ref()
                     .and_then(|store| store.load_comparison(&repository, number, &revision).ok())
@@ -19266,13 +18466,6 @@ impl ReviewWorkspace {
                 };
                 match result {
                     Ok((comparison, cached, local_inventory, load_plan)) => {
-                        if !cached && let Some(store) = &this.store {
-                            let _ = store.save_comparison(
-                                &this.tabs[tab_index].repository,
-                                number,
-                                &comparison,
-                            );
-                        }
                         if advancing {
                             if let Some(session) =
                                 &mut this.tabs[tab_index].canonical_session
@@ -19338,13 +18531,11 @@ impl ReviewWorkspace {
                         this.rebuild_diff(tab_index, this.wide);
                         this.load_interactions(tab_index, cx);
                         this.schedule.succeeded(&format!("pr:{key}:{number}"));
-                        this.save_workspace();
+                        this.save_workspace(cx);
                         this.persist_session(tab_index, cx);
                         this.load_commit_inventory(tab_index, cx);
                         if local_inventory {
                             this.load_selected_local_file(tab_index, cx);
-                        } else {
-                            this.persist_session(tab_index, cx);
                         }
                     }
                     Err(error) => {
@@ -19365,7 +18556,7 @@ impl ReviewWorkspace {
 
     fn refresh_active_with_intent(&mut self, explicit: bool, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
-        if self.tabs[index].submitted_summary_editor.close_after_save {
+        if self.tabs[index].submitted_summary_editor.close_after_save() {
             return;
         }
         self.refresh_metadata(index, explicit, cx);
@@ -19374,42 +18565,11 @@ impl ReviewWorkspace {
     }
 
     fn refresh_metadata(&mut self, index: usize, explicit: bool, cx: &mut Context<Root>) {
-        let Some((repository, number, effective_explicit)) =
-            self.tabs.get_mut(index).and_then(|tab| {
-                if !general_read_tab_can_start(tab.submitted_summary_editor.close_after_save) {
-                    return None;
-                }
-                tab.metadata_refresh
-                    .begin_admission(explicit)
-                    .map(|effective| (tab.repository.clone(), tab.pull_request.number, effective))
-            })
+        let Some((repository, number, admission)) =
+            self.begin_tab_refresh(index, TabReadKind::Metadata, explicit, cx)
         else {
             return;
         };
-        let admission = match self.general_reads.begin(&repository.account) {
-            Ok(admission) => admission,
-            Err(read_sync::ReadDeferral::Busy) => {
-                self.tabs[index]
-                    .metadata_refresh
-                    .defer_admission(effective_explicit);
-                return;
-            }
-            Err(read_sync::ReadDeferral::Server(notice)) => {
-                self.tabs[index]
-                    .metadata_refresh
-                    .defer_admission(effective_explicit);
-                self.status = notice.into();
-                cx.notify();
-                return;
-            }
-        };
-        let tab = &mut self.tabs[index];
-        tab.metadata_generation += 1;
-        let read_epoch = TabReadEpoch {
-            instance: tab.instance_generation,
-            generation: tab.metadata_generation,
-        };
-        let read_workspace_instance = self.workspace_instance;
         let key = repository.cache_key();
         let (read_token, cache) = admission.into_parts();
         let task =
@@ -19423,43 +18583,31 @@ impl ReviewWorkspace {
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
                 let (result, cache, directive, failure) = outcome.into_parts();
-                if !general_read_callback_is_current(
-                    read_workspace_instance,
-                    this.workspace_instance,
+                let matching_index = this
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.read_lane(TabReadKind::Metadata) == read_token.lane());
+                let current = matching_index.map(|index| {
+                    this.tabs[index].read_context(this.workspace_instance, TabReadKind::Metadata)
+                });
+                let result = match this.general_reads.complete_refresh(
+                    read_token,
+                    current.as_ref(),
+                    result,
+                    cache,
+                    &directive,
                 ) {
-                    this.general_reads
-                        .complete(&read_token, &directive, cache, false);
-                    return;
-                }
-                let matching_index = this.tabs.iter().position(|tab| {
-                    tab.repository.cache_key() == key
-                        && tab.pull_request.number == number
-                        && read_epoch.matches(tab.instance_generation, tab.metadata_generation)
-                });
-                let superseded = matching_index.is_some_and(|index| {
-                    this.tabs[index].metadata_refresh.superseded_by_explicit()
-                });
-                let accept_payload = matching_index.is_some() && !superseded && result.is_ok();
-                let disposition =
-                    this.general_reads
-                        .complete(&read_token, &directive, cache, accept_payload);
-                if !disposition.matching_operation_released {
-                    return;
-                }
-                let follow_up = matching_index
-                    .map(|index| this.tabs[index].metadata_refresh.complete())
-                    .unwrap_or(false);
-                if let Some(index) = matching_index
-                    && follow_up
-                {
-                    this.refresh_metadata(index, true, cx);
-                    this.resume_general_read_followups(cx);
-                    return;
-                }
+                    read_sync::RefreshCompletion::Applied(result) => result,
+                    read_sync::RefreshCompletion::Discarded => {
+                        this.resume_general_read_followups(cx);
+                        return;
+                    }
+                    read_sync::RefreshCompletion::Ignored => return,
+                };
                 if let Some(index) = matching_index {
                     let tab = &mut this.tabs[index];
                     match result {
-                        Ok(pull_request) if disposition.payload_accepted => {
+                        Ok(pull_request) => {
                             tab.stack.observe_selected_revision(&pull_request.head_sha);
                             if let Some(session) = &mut tab.canonical_session {
                                 session.observe_revision(pull_request.revision());
@@ -19474,7 +18622,6 @@ impl ReviewWorkspace {
                             tab.pull_request = pull_request;
                             this.schedule.succeeded(&format!("pr:{key}:{number}"));
                         }
-                        Ok(_) => {}
                         Err(_) => {
                             this.status = general_read_failure_notice(failure).into();
                             this.schedule.failed(&format!("pr:{key}:{number}"));
@@ -19498,43 +18645,12 @@ impl ReviewWorkspace {
         explicit: bool,
         cx: &mut Context<Root>,
     ) {
-        let Some((repository, number, effective_explicit)) =
-            self.tabs.get_mut(index).and_then(|tab| {
-                if !general_read_tab_can_start(tab.submitted_summary_editor.close_after_save) {
-                    return None;
-                }
-                tab.lifecycle_refresh
-                    .begin_admission(explicit)
-                    .map(|effective| (tab.repository.clone(), tab.pull_request.number, effective))
-            })
+        let Some((repository, number, admission)) =
+            self.begin_tab_refresh(index, TabReadKind::Lifecycle, explicit, cx)
         else {
             return;
         };
-        let admission = match self.general_reads.begin(&repository.account) {
-            Ok(admission) => admission,
-            Err(read_sync::ReadDeferral::Busy) => {
-                self.tabs[index]
-                    .lifecycle_refresh
-                    .defer_admission(effective_explicit);
-                return;
-            }
-            Err(read_sync::ReadDeferral::Server(notice)) => {
-                self.tabs[index]
-                    .lifecycle_refresh
-                    .defer_admission(effective_explicit);
-                self.status = notice.into();
-                cx.notify();
-                return;
-            }
-        };
         let tab = &mut self.tabs[index];
-        tab.lifecycle_generation = tab.lifecycle_generation.saturating_add(1);
-        let read_epoch = TabReadEpoch {
-            instance: tab.instance_generation,
-            generation: tab.lifecycle_generation,
-        };
-        let read_workspace_instance = self.workspace_instance;
-        let identity = repository.cache_key();
         if tab.lifecycle.snapshot.is_none() {
             tab.lifecycle_state = LoadState::Loading("Loading lifecycle metadata…".into());
         }
@@ -19553,48 +18669,26 @@ impl ReviewWorkspace {
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
                 let (result, cache, directive, failure) = outcome.into_parts();
-                if !general_read_callback_is_current(
-                    read_workspace_instance,
-                    this.workspace_instance,
-                ) {
-                    this.general_reads
-                        .complete(&read_token, &directive, cache, false);
-                    return;
-                }
                 let matching_index = this.tabs.iter().position(|tab| {
-                    tab.repository.cache_key() == identity
-                        && tab.pull_request.number == number
-                        && read_epoch.matches(tab.instance_generation, tab.lifecycle_generation)
+                    tab.read_lane(TabReadKind::Lifecycle) == read_token.lane()
                 });
-                let superseded = matching_index.is_some_and(|index| {
-                    this.tabs[index]
-                        .lifecycle_refresh
-                        .superseded_by_explicit()
+                let current = matching_index.map(|index| {
+                    this.tabs[index].read_context(this.workspace_instance, TabReadKind::Lifecycle)
                 });
-                let accept_payload = matching_index.is_some() && !superseded && result.is_ok();
-                let disposition = this.general_reads.complete(
-                    &read_token,
-                    &directive,
-                    cache,
-                    accept_payload,
-                );
-                if !disposition.matching_operation_released {
-                    return;
-                }
-                let follow_up = matching_index
-                    .map(|index| this.tabs[index].lifecycle_refresh.complete())
-                    .unwrap_or(false);
-                if let Some(index) = matching_index
-                    && follow_up
-                {
-                    this.refresh_lifecycle(index, cx);
-                    this.resume_general_read_followups(cx);
-                    return;
-                }
+                let result = match this.general_reads.complete_refresh(
+                    read_token, current.as_ref(), result, cache, &directive,
+                ) {
+                    read_sync::RefreshCompletion::Applied(result) => result,
+                    read_sync::RefreshCompletion::Discarded => {
+                        this.resume_general_read_followups(cx);
+                        return;
+                    }
+                    read_sync::RefreshCompletion::Ignored => return,
+                };
                 if let Some(index) = matching_index {
                     let tab = &mut this.tabs[index];
                     match result {
-                    Ok((snapshot, choices)) if disposition.payload_accepted => {
+                    Ok((snapshot, choices)) => {
                         let install = tab
                             .lifecycle
                             .install_snapshot(snapshot)
@@ -19608,7 +18702,6 @@ impl ReviewWorkspace {
                             }
                         }
                     }
-                    Ok(_) => {}
                     Err(_) => {
                         tab.lifecycle_state = LoadState::Error(
                             general_read_failure_notice(failure).into(),
@@ -19809,7 +18902,7 @@ impl ReviewWorkspace {
 
     fn confirm_lifecycle_mutation(&mut self, cx: &mut Context<Root>) {
         let Some(index) = self.active_tab else { return };
-        if self.tabs[index].submitted_summary_editor.close_after_save {
+        if self.tabs[index].submitted_summary_editor.close_after_save() {
             self.status = "Wait for the local draft close operation to finish.".into();
             return;
         }
@@ -19967,9 +19060,11 @@ impl ReviewWorkspace {
                             Some(error) => format!(
                                 "Cached collaboration observed {age} · current read failed: {error}"
                             ),
-                            None if tab.details_refresh.active => format!(
-                                "Cached collaboration observed {age} · refreshing current data"
-                            ),
+                            None if this.general_reads.refresh_active(tab.details_refresh) => {
+                                format!(
+                                    "Cached collaboration observed {age} · refreshing current data"
+                                )
+                            }
                             None => format!("Cached collaboration observed {age}"),
                         });
                         tab.collaboration_cache_notice = None;
@@ -20071,49 +19166,12 @@ impl ReviewWorkspace {
         explicit: bool,
         cx: &mut Context<Root>,
     ) {
-        let Some((repository, number, effective_explicit)) =
-            self.tabs.get_mut(index).and_then(|tab| {
-                if !general_read_tab_can_start(tab.submitted_summary_editor.close_after_save) {
-                    return None;
-                }
-                tab.details_refresh
-                    .begin_admission(explicit)
-                    .map(|effective| (tab.repository.clone(), tab.pull_request.number, effective))
-            })
+        let Some((repository, number, admission)) =
+            self.begin_tab_refresh(index, TabReadKind::Details, explicit, cx)
         else {
             return;
         };
-        // A requested details/pending refresh immediately revokes the prior
-        // nonserialized absence capability. Busy/server deferral, a failed
-        // details read, or an incomplete pending subread must never leave the
-        // old observation available to arm a new two-write confirmation.
-        if let InteractionState::Ready(controller) = &mut self.tabs[index].interactions {
-            controller.mark_pending_observation_unavailable(None);
-        }
-        let admission = match self.general_reads.begin(&repository.account) {
-            Ok(admission) => admission,
-            Err(read_sync::ReadDeferral::Busy) => {
-                self.tabs[index]
-                    .details_refresh
-                    .defer_admission(effective_explicit);
-                return;
-            }
-            Err(read_sync::ReadDeferral::Server(notice)) => {
-                self.tabs[index]
-                    .details_refresh
-                    .defer_admission(effective_explicit);
-                self.status = notice.into();
-                cx.notify();
-                return;
-            }
-        };
         let tab = &mut self.tabs[index];
-        tab.details_generation += 1;
-        let read_epoch = TabReadEpoch {
-            instance: tab.instance_generation,
-            generation: tab.details_generation,
-        };
-        let read_workspace_instance = self.workspace_instance;
         let key = repository.cache_key();
         let journal_root = self.interaction_root.clone();
         let collaboration_cache = self.collaboration_cache.clone();
@@ -20160,57 +19218,25 @@ impl ReviewWorkspace {
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
                 let (result, cache, directive, failure) = outcome.into_parts();
-                if !general_read_callback_is_current(
-                    read_workspace_instance,
-                    this.workspace_instance,
-                ) {
-                    this.general_reads
-                        .complete(&read_token, &directive, cache, false);
-                    return;
-                }
                 let tab_index = this.tabs.iter().position(|tab| {
-                    tab.repository.cache_key() == key
-                        && tab.pull_request.number == number
-                        && tab.instance_generation == read_epoch.instance
+                    tab.read_lane(TabReadKind::Details) == read_token.lane()
                 });
-                // Mutations can invalidate the observation while this read
-                // still owns the slot. Release that slot even when its result
-                // is obsolete, then honor an explicitly queued post-effect read.
-                let generation_matches = tab_index.is_some_and(|index| {
-                    this.tabs[index].details_generation == read_epoch.generation
+                let current = tab_index.map(|index| {
+                    this.tabs[index].read_context(this.workspace_instance, TabReadKind::Details)
                 });
-                let superseded = tab_index.is_some_and(|index| {
-                    this.tabs[index]
-                        .details_refresh
-                        .superseded_by_explicit()
-                });
-                let accept_payload = generation_matches && !superseded && result.is_ok();
-                let disposition = this.general_reads.complete(
-                    &read_token,
-                    &directive,
-                    cache,
-                    accept_payload,
-                );
-                if !disposition.matching_operation_released {
-                    return;
-                }
-                let follow_up = tab_index
-                    .map(|index| this.tabs[index].details_refresh.complete())
-                    .unwrap_or(false);
-                if let Some(tab_index) = tab_index
-                    && follow_up
-                {
-                    this.refresh_details(tab_index, cx);
-                    this.resume_general_read_followups(cx);
-                    return;
-                }
-                let Some(tab_index) = tab_index.filter(|_| generation_matches) else {
-                    this.resume_general_read_followups(cx);
-                    return;
+                let result = match this.general_reads.complete_refresh(
+                    read_token, current.as_ref(), result, cache, &directive,
+                ) {
+                    read_sync::RefreshCompletion::Applied(result) => result,
+                    read_sync::RefreshCompletion::Discarded => {
+                        this.resume_general_read_followups(cx);
+                        return;
+                    }
+                    read_sync::RefreshCompletion::Ignored => return,
                 };
+                let Some(tab_index) = tab_index else { return };
                 match result {
-                    Ok((details, pending, journal, cache_write))
-                        if disposition.payload_accepted =>
+                    Ok((details, pending, journal, cache_write)) =>
                     {
                         let observation = match pending {
                             Ok(observation) => observation,
@@ -20291,38 +19317,21 @@ impl ReviewWorkspace {
                                     pending,
                                     pending_absence,
                                 );
-                                Some((
-                                    controller.composition.clone(),
-                                    controller.store.clone(),
-                                    controller.authority.clone(),
-                                    controller.durable_composition.clone(),
-                                ))
+                                let snapshot = controller.composition().clone();
+                                Some((snapshot.clone(), controller.prepared_draft_save(snapshot)))
                             } else {
                                 None
                             }
                         };
-                        if let Some((snapshot, store, authority, expected)) = save {
-                            let (latest, lock, sequence) =
-                                this.next_review_state_write(&key, number);
+                        if let Some((snapshot, save)) = save {
+                            let ticket = this.issue_participation_write(&key, number);
                             let save_epoch = TabReadEpoch {
-                                instance: read_epoch.instance,
-                                generation: sequence,
+                                instance: this.tabs[tab_index].instance_generation,
+                                generation: ticket.sequence(),
                             };
-                            let completion_latest = latest.clone();
-                            let saved_snapshot = snapshot.clone();
+                            let completion_ticket = ticket.clone();
                             let task = cx.background_spawn(async move {
-                                let _guard = lock.lock().map_err(|_| {
-                                    "Review recovery save lock failed.".to_owned()
-                                })?;
-                                if latest.load(Ordering::Acquire) != sequence {
-                                    return Ok::<bool, String>(false);
-                                }
-                                authority.save_if_current(
-                                    &store,
-                                    expected.as_ref(),
-                                    &saved_snapshot,
-                                )?;
-                                Ok::<bool, String>(true)
+                                save.execute_sequenced(&ticket)
                             });
                             let saved_key = key.clone();
                             cx.spawn(async move |root, cx| {
@@ -20334,8 +19343,9 @@ impl ReviewWorkspace {
                                             && tab.pull_request.number == number
                                             && save_epoch.matches(
                                                 tab.instance_generation,
-                                                completion_latest.load(Ordering::Acquire),
+                                                completion_ticket.sequence(),
                                             )
+                                            && completion_ticket.is_current()
                                     }) else {
                                         return;
                                     };
@@ -20344,8 +19354,7 @@ impl ReviewWorkspace {
                                             if let InteractionState::Ready(controller) =
                                                 &mut this.tabs[index].interactions
                                             {
-                                                controller.durable_composition =
-                                                    Some(snapshot.clone());
+                                                controller.install_saved_snapshot(snapshot.clone());
                                             }
                                         }
                                         Ok(false) => {}
@@ -20373,7 +19382,6 @@ impl ReviewWorkspace {
                             this.scroll_selected_check_into_view(tab_index);
                         }
                     }
-                    Ok(_) => {}
                     Err(_) => {
                         let tab = &mut this.tabs[tab_index];
                         let notice = general_read_failure_notice(failure);
@@ -20397,21 +19405,18 @@ impl ReviewWorkspace {
     }
 
     fn rebuild_diff(&mut self, index: usize, wide: bool) {
+        let requested = self.workspace.preferences.reading_mode;
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
         let Some(session) = &tab.session else { return };
         let Some(file) = session.selected_file() else {
-            tab.diff_rows = Rc::default();
-            tab.diff_split = false;
-            tab.diff_text_width = 1.;
+            tab.diff.clear();
+            tab.stream_notice = None;
             return;
         };
         let selected_key = file_key(file);
-        let scroll_position = session.scroll_position();
-        let horizontal_position = session.horizontal_scroll_position();
         let resolved_mode = session.diff_mode().resolve(wide);
-        let base_rows = build_rows(parse_file(file), resolved_mode);
         let threads = tab
             .details
             .as_ref()
@@ -20425,32 +19430,39 @@ impl ReviewWorkspace {
             InteractionState::Ready(controller) => controller.composer.as_ref(),
             InteractionState::Loading | InteractionState::RecoveryRequired(_) => None,
         };
-        tab.diff_rows = Rc::new(attach_inline_rows(
-            base_rows,
-            &selected_key,
-            &threads,
-            composer,
-        ));
-        (tab.diff_split, tab.diff_text_width) = diff_text_metrics(&tab.diff_rows);
-        tab.diff_content_width = diff_content_width(&tab.diff_rows, resolved_mode);
-        tab.diff_scroll = ListState::new(tab.diff_rows.len(), ListAlignment::Top, px(480.));
-        if scroll_position > 0. {
-            tab.diff_scroll.scroll_by(px(scroll_position));
+        if requested == ReadingMode::Stream {
+            match stream_budget(&session.comparison().files) {
+                Ok(()) => {
+                    let folded = tab.diff.collapsed.clone();
+                    let (rows, spans, split) =
+                        build_stream(session, resolved_mode, &threads, composer, &folded);
+                    tab.diff.install_stream(rows, spans, split);
+                    // Stream opens where File mode would have: on the file the
+                    // reader last had selected.
+                    tab.diff.reveal_file(&selected_key);
+                    tab.stream_notice = None;
+                    return;
+                }
+                // Too much patch text to parse in one go. Fall through to one
+                // file at a time and say why, rather than rendering one file
+                // and letting the reader conclude the rest were unchanged.
+                Err(notice) => tab.stream_notice = Some(notice),
+            }
+        } else {
+            tab.stream_notice = None;
         }
-        tab.diff_horizontal = ScrollHandle::new();
-        tab.diff_horizontal
-            .set_offset(point(px(-horizontal_position), px(0.)));
+        let base_rows = build_rows(parse_file(file), resolved_mode);
+        let rows = attach_inline_rows(base_rows, &selected_key, &threads, composer);
+        let Some(session) = &tab.session else { return };
+        tab.diff.install(rows, session);
     }
 
     fn capture_scroll(&mut self, index: usize) {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
-        let position = tab.diff_scroll.scroll_px_offset_for_scrollbar().y.as_f32();
         if let Some(session) = &mut tab.session {
-            session.set_scroll_position(position);
-            let horizontal = (-tab.diff_horizontal.offset().x.as_f32()).max(0.);
-            session.set_horizontal_scroll_position(horizontal);
+            tab.diff.capture_into(session);
         }
     }
 
@@ -20480,8 +19492,16 @@ impl ReviewWorkspace {
                     .file_tree_scroll
                     .scroll_to_item(row, ScrollStrategy::Nearest);
             }
-            self.rebuild_diff(index, wide);
-            self.save_workspace();
+            // Streaming already holds every file, so choosing one is a scroll
+            // rather than a rebuild. Rebuilding would throw away the rows the
+            // reader is looking at to produce the identical vector.
+            let revealed = self.tabs[index].diff.streaming()
+                && self.tabs[index].diff.reveal_file(key)
+                && !self.tabs[index].local_inventory;
+            if !revealed {
+                self.rebuild_diff(index, wide);
+            }
+            self.save_workspace(cx);
             if self.tabs[index].local_inventory {
                 self.load_selected_local_file(index, cx);
                 return;
@@ -20523,19 +19543,31 @@ impl ReviewWorkspace {
             }
         });
         if changed {
-            if let Some(key) = self.tabs[index]
+            let selected = self.tabs[index]
                 .session
                 .as_ref()
                 .and_then(ReviewSession::selected_file)
-                .map(file_key)
-                && let Some(row) = self.tabs[index].file_tree.reveal_file(&key)
+                .map(file_key);
+            if let Some(key) = selected.as_deref()
+                && let Some(row) = self.tabs[index].file_tree.reveal_file(key)
             {
                 self.tabs[index]
                     .file_tree_scroll
                     .scroll_to_item(row, ScrollStrategy::Nearest);
             }
-            self.rebuild_diff(index, self.wide);
-            self.save_workspace();
+            // Streaming already holds the file being moved to, so this is a
+            // scroll. Rebuilding would discard the rows on screen to produce
+            // the identical vector — and throw away every other file's
+            // horizontal offset on the way.
+            let revealed = self.tabs[index].diff.streaming()
+                && !self.tabs[index].local_inventory
+                && selected
+                    .as_deref()
+                    .is_some_and(|key| self.tabs[index].diff.reveal_file(key));
+            if !revealed {
+                self.rebuild_diff(index, self.wide);
+            }
+            self.save_workspace(cx);
             if self.tabs[index].local_inventory {
                 self.load_selected_local_file(index, cx);
             } else {
@@ -20646,16 +19678,13 @@ impl ReviewWorkspace {
     }
 
     fn load_selected_stack_local_file(&mut self, index: usize, cx: &mut Context<Root>) {
-        let Some(tab) = self.tabs.get(index) else {
+        let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
         let Some(path) = tab.repository.local_path.clone() else {
             return;
         };
-        let Some(token) = tab.stack.current_token() else {
-            return;
-        };
-        let Some(session) = tab.stack.session.as_ref() else {
+        let Some(session) = tab.stack.session.as_mut() else {
             return;
         };
         let Some(file) = session.selected_file() else {
@@ -20664,36 +19693,35 @@ impl ReviewWorkspace {
         if file.patch.is_some() {
             return;
         }
-        let revision = session.revision().clone();
         let selected_key = file_key(file);
-        let requested_key = selected_key.clone();
-        let task = cx.background_spawn(async move {
-            load_local_file(&path, &revision, &requested_key, false).map(|file| (revision, file))
-        });
+        let Ok(request) = session.begin_file_patch(&selected_key) else {
+            return;
+        };
+        let revision = request.revision().clone();
+        let requested_key = request.file_key().to_owned();
+        let task =
+            cx.background_spawn(
+                async move { load_local_file(&path, &revision, &requested_key, false) },
+            );
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
                 let Some(tab_index) = this.tabs.iter().position(|tab| {
-                    tab.stack.accepts(&token)
-                        && tab
-                            .stack
-                            .session
-                            .as_ref()
-                            .and_then(ReviewSession::selected_file)
-                            .is_some_and(|file| file_key(file) == selected_key)
+                    tab.stack
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| session.accepts_file_patch(&request))
                 }) else {
                     return;
                 };
                 match result {
-                    Ok((revision, file)) => {
+                    Ok(file) => {
                         let installed = this.tabs[tab_index]
                             .stack
                             .session
                             .as_mut()
-                            .is_some_and(|session| {
-                                session.install_file_patch(&revision, file).is_ok()
-                            });
+                            .is_some_and(|session| session.accept_file_patch(&request, file).is_ok());
                         if installed {
                             this.tabs[tab_index].stack.rebuild(this.wide);
                         }
@@ -20883,9 +19911,8 @@ impl ReviewWorkspace {
                 .submitted_summary_editor
                 .store_active_body(submitted_body);
             let editor = &mut self.tabs[index].submitted_summary_editor;
-            match editor.close_disposition() {
+            match editor.request_close() {
                 SubmittedDraftCloseDisposition::WaitForOperation => {
-                    editor.close_after_save = true;
                     self.composer_input
                         .update(cx, |input, cx| input.set_disabled(true, cx));
                     self.submitted_summary_input
@@ -20900,11 +19927,8 @@ impl ReviewWorkspace {
                     return;
                 }
                 SubmittedDraftCloseDisposition::Save => {
-                    editor.close_after_save = true;
                     self.composer_input
                         .update(cx, |input, cx| input.set_disabled(true, cx));
-                    editor.persistence_error = None;
-                    editor.queue_current();
                     self.submitted_summary_input
                         .update(cx, |input, cx| input.set_disabled(true, cx));
                     self.status = "Saving the latest submitted-review draft before close…".into();
@@ -20921,11 +19945,11 @@ impl ReviewWorkspace {
 
     fn finish_close_tab(&mut self, index: usize, cx: &mut Context<Root>) {
         let Some(next_active) = self.remove_closed_tab(index, cx) else {
-            self.save_workspace();
+            self.save_workspace(cx);
             return;
         };
         self.activate_tab_context(next_active, false, cx);
-        self.save_workspace();
+        self.save_workspace(cx);
     }
 
     fn finish_close_tab_in_window(
@@ -20935,11 +19959,11 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) {
         let Some(next_active) = self.remove_closed_tab(index, cx) else {
-            self.save_workspace();
+            self.save_workspace(cx);
             return;
         };
         self.activate_tab_in_window(next_active, false, window, cx);
-        self.save_workspace();
+        self.save_workspace(cx);
     }
 
     fn remove_closed_tab(&mut self, index: usize, cx: &mut Context<Root>) -> Option<usize> {
@@ -20982,7 +20006,7 @@ impl ReviewWorkspace {
                 DiffMode::SideBySide => DiffMode::Auto,
             });
             self.rebuild_diff(index, self.wide);
-            self.save_workspace();
+            self.save_workspace(cx);
             self.persist_session(index, cx);
             cx.notify();
         }
@@ -20997,7 +20021,7 @@ impl ReviewWorkspace {
                 _ => DiffMode::SideBySide,
             });
             self.rebuild_diff(index, self.wide);
-            self.save_workspace();
+            self.save_workspace(cx);
             self.persist_session(index, cx);
             cx.notify();
         }
@@ -21008,7 +20032,7 @@ impl ReviewWorkspace {
         if let Some(session) = &mut self.tabs[index].session {
             let viewed = !session.is_viewed(key);
             if session.mark_viewed(key, viewed) {
-                self.save_workspace();
+                self.save_workspace(cx);
                 self.persist_session(index, cx);
                 cx.notify();
             }
@@ -21064,12 +20088,168 @@ impl ReviewWorkspace {
         cx.notify();
     }
 
-    fn scroll_diff_horizontally(&mut self, amount: Option<f32>, cx: &mut Context<Root>) {
-        let Some(index) = self.active_tab else { return };
-        let handle = if self.tabs[index].stack.visible {
-            &self.tabs[index].stack.horizontal
+    /// The diff pane the keyboard is addressing. History replaces the whole
+    /// main section, so it wins whenever it is up; within a tab, Stack covers
+    /// the review pane the same way.
+    ///
+    /// Before this existed, each diff action reached for the pane it wanted by
+    /// hand and only two of the three were ever branched on, so History's diff
+    /// answered none of them.
+    fn active_diff(&self) -> Option<&diff_pane::DiffPaneState> {
+        if self.history_active {
+            return self.history.as_ref().map(|history| &history.diff);
+        }
+        let tab = self.tabs.get(self.active_tab?)?;
+        Some(if tab.stack.visible {
+            &tab.stack.diff
         } else {
-            &self.tabs[index].diff_horizontal
+            &tab.diff
+        })
+    }
+
+    fn active_diff_mut(&mut self) -> Option<&mut diff_pane::DiffPaneState> {
+        if self.history_active {
+            return self.history.as_mut().map(|history| &mut history.diff);
+        }
+        let tab = self.tabs.get_mut(self.active_tab?)?;
+        Some(if tab.stack.visible {
+            &mut tab.stack.diff
+        } else {
+            &mut tab.diff
+        })
+    }
+
+    /// Rebuild whichever diff is on screen. Folding a file, like changing the
+    /// reading mode, changes what the rows are rather than where the reader is
+    /// in them, so every surface goes back through its own builder.
+    fn rebuild_active_diff(&mut self, cx: &mut Context<Root>) {
+        let wide = self.wide;
+        let mode = self.workspace.preferences.reading_mode;
+        if self.history_active {
+            if let Some(history) = self.history.as_mut() {
+                history.rebuild(wide, mode);
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(index) = self.active_tab {
+            self.rebuild_diff(index, wide);
+        }
+        cx.notify();
+    }
+
+    /// Fold or unfold one file, and leave the cursor on the header that did it
+    /// so the keyboard keeps its place rather than jumping to the top.
+    fn toggle_diff_file(&mut self, key: &str, _window: &mut Window, cx: &mut Context<Root>) {
+        let Some(diff) = self.active_diff_mut() else {
+            return;
+        };
+        diff.toggle_file(key);
+        self.rebuild_active_diff(cx);
+        if let Some(diff) = self.active_diff_mut()
+            && let Some(start) = diff.span_for_key(key).map(|span| span.rows.start)
+        {
+            diff.cursor = Some(start);
+            diff.vertical.scroll_to_reveal_item(start);
+        }
+        cx.notify();
+    }
+
+    /// Fold the whole comparison, or open it again. One control rather than
+    /// two: a mixed scroll folds first, and only an entirely folded one offers
+    /// to open, so the button always does the thing its label says.
+    fn toggle_all_diff_files(&mut self, cx: &mut Context<Root>) {
+        let Some(diff) = self.active_diff_mut() else {
+            return;
+        };
+        let collapse = !diff.all_collapsed();
+        diff.set_all_collapsed(collapse);
+        self.rebuild_active_diff(cx);
+        cx.notify();
+    }
+
+    fn move_diff_cursor(&mut self, delta: isize, cx: &mut Context<Root>) {
+        if self
+            .active_diff_mut()
+            .is_some_and(|diff| diff.move_cursor(delta))
+        {
+            cx.notify();
+        }
+    }
+
+    fn jump_diff_cursor(
+        &mut self,
+        forward: bool,
+        accept: fn(&DiffRow) -> bool,
+        cx: &mut Context<Root>,
+    ) {
+        if self
+            .active_diff_mut()
+            .is_some_and(|diff| diff.jump(forward, accept))
+        {
+            cx.notify();
+        }
+    }
+
+    /// Mark the open file viewed and move to the next one that is not. The
+    /// pair is one action because marking without advancing leaves the reader
+    /// on a file they have just finished with, and every reviewer then reaches
+    /// for the next-file key anyway.
+    ///
+    /// Only the review pane keeps viewed state; History and Stack are
+    /// read-only, so there the action does nothing rather than advancing a
+    /// selection the reader did not ask to move.
+    fn mark_viewed_and_advance(&mut self, cx: &mut Context<Root>) {
+        let Some(index) = self.active_tab else { return };
+        if self.history_active || self.tabs[index].stack.visible {
+            return;
+        }
+        let Some(session) = self.tabs[index].session.as_ref() else {
+            return;
+        };
+        let Some(current) = session.selected_file().map(file_key) else {
+            return;
+        };
+        // The next unviewed file after this one, wrapping once so finishing
+        // the last file lands on whatever is still outstanding above it.
+        let files = session.comparison().files.clone();
+        let position = files.iter().position(|file| file_key(file) == current);
+        let next = position.and_then(|position| {
+            files
+                .iter()
+                .cycle()
+                .skip(position + 1)
+                .take(files.len().saturating_sub(1))
+                .map(file_key)
+                .find(|key| {
+                    self.tabs[index]
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| !session.is_viewed(key))
+                })
+        });
+        if let Some(session) = self.tabs[index].session.as_mut()
+            && session.mark_viewed(&current, true)
+        {
+            self.save_workspace(cx);
+            self.persist_session(index, cx);
+        }
+        match next {
+            Some(key) => self.select_file(&key, self.wide, cx),
+            // Nothing left unviewed: stay put and say so rather than moving.
+            None => self.status = "Every changed file is marked viewed".into(),
+        }
+        cx.notify();
+    }
+
+    fn scroll_diff_horizontally(&mut self, amount: Option<f32>, cx: &mut Context<Root>) {
+        // Streaming gives every file its own offset, so "scroll the diff
+        // sideways" means the file the cursor is in, not the whole scroll.
+        let Some(handle) = self
+            .active_diff()
+            .map(|diff| diff.scroll_context(diff.cursor.unwrap_or(0)).0)
+        else {
+            return;
         };
         let current = handle.offset();
         let maximum = handle.max_offset().x.as_f32();
@@ -21088,7 +20268,7 @@ impl ReviewWorkspace {
         view.filter.search = self.query.read(cx).value().trim().to_owned();
         view.filter.personal = personal;
         self.workspace.views[self.workspace.selected_view] = view;
-        self.save_workspace();
+        self.save_workspace(cx);
         cx.notify();
     }
 
@@ -21145,7 +20325,7 @@ impl ReviewWorkspace {
                 self.query.update(cx, |query, cx| {
                     query.set_value(view.filter.search.clone(), window, cx)
                 });
-                self.save_workspace();
+                self.save_workspace(cx);
                 if old_state != view.filter.state {
                     self.refresh_all(cx);
                 }
@@ -21177,7 +20357,7 @@ impl ReviewWorkspace {
         self.query.update(cx, |query, cx| {
             query.set_value(view.filter.search.clone(), window, cx)
         });
-        self.save_workspace();
+        self.save_workspace(cx);
         if old_state != view.filter.state {
             self.refresh_all(cx);
         }
@@ -21197,7 +20377,7 @@ impl ReviewWorkspace {
         let search = self.workspace.view().filter.search;
         self.query
             .update(cx, |query, cx| query.set_value(search, window, cx));
-        self.save_workspace();
+        self.save_workspace(cx);
         self.refresh_all(cx);
         cx.notify();
     }
@@ -21575,12 +20755,8 @@ impl ReviewWorkspace {
             }))
             .on_action(cx.listener(|root, _: &DiffScrollHome, _, cx| {
                 let this = &mut root.review;
-                if let Some(index) = this.active_tab {
-                    let handle = if this.tabs[index].stack.visible {
-                        &this.tabs[index].stack.horizontal
-                    } else {
-                        &this.tabs[index].diff_horizontal
-                    };
+                if let Some(diff) = this.active_diff() {
+                    let (handle, _) = diff.scroll_context(diff.cursor.unwrap_or(0));
                     handle.set_offset(point(px(0.), px(0.)));
                     cx.notify();
                 }
@@ -21588,6 +20764,48 @@ impl ReviewWorkspace {
             .on_action(cx.listener(|root, _: &DiffScrollEnd, _, cx| {
                 let this = &mut root.review;
                 this.scroll_diff_horizontally(None, cx);
+            }))
+            .on_action(cx.listener(|root, _: &DiffCursorDown, _, cx| {
+                root.review.move_diff_cursor(1, cx);
+            }))
+            .on_action(cx.listener(|root, _: &DiffCursorUp, _, cx| {
+                root.review.move_diff_cursor(-1, cx);
+            }))
+            .on_action(cx.listener(|root, _: &DiffNextHunk, _, cx| {
+                root.review.jump_diff_cursor(true, is_hunk_row, cx);
+            }))
+            .on_action(cx.listener(|root, _: &DiffPreviousHunk, _, cx| {
+                root.review.jump_diff_cursor(false, is_hunk_row, cx);
+            }))
+            .on_action(cx.listener(|root, _: &DiffNextThread, _, cx| {
+                root.review.jump_diff_cursor(true, is_thread_row, cx);
+            }))
+            .on_action(cx.listener(|root, _: &DiffPreviousThread, _, cx| {
+                root.review.jump_diff_cursor(false, is_thread_row, cx);
+            }))
+            .on_action(cx.listener(|root, _: &DiffCursorToStart, _, cx| {
+                let this = &mut root.review;
+                if this
+                    .active_diff_mut()
+                    .is_some_and(|diff| diff.cursor_to_start())
+                {
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|root, _: &DiffCursorToEnd, _, cx| {
+                let this = &mut root.review;
+                if this
+                    .active_diff_mut()
+                    .is_some_and(|diff| diff.cursor_to_end())
+                {
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|root, _: &MarkViewedAndAdvance, _, cx| {
+                root.review.mark_viewed_and_advance(cx);
+            }))
+            .on_action(cx.listener(|root, _: &ToggleAllFileSections, _, cx| {
+                root.review.toggle_all_diff_files(cx);
             }))
             .on_key_down(cx.listener(|root, event: &KeyDownEvent, window, cx| {
                 let this = &mut root.review;
@@ -21631,6 +20849,11 @@ impl ReviewWorkspace {
             PanelKind::Sidebar => sidebar,
             PanelKind::FileTree => tree,
             PanelKind::Details => details,
+            PanelKind::HistoryCommits => self
+                .history
+                .as_ref()
+                .map(|history| history.commit_width)
+                .unwrap_or(HISTORY_COMMIT_COLUMN),
         };
         let drag = PanelResizeDrag {
             panel,
@@ -21669,6 +20892,7 @@ impl ReviewWorkspace {
                                 PanelKind::Sidebar => MIN_SIDEBAR_WIDTH,
                                 PanelKind::FileTree => MIN_FILE_TREE_WIDTH,
                                 PanelKind::Details => MIN_DETAILS_WIDTH,
+                                PanelKind::HistoryCommits => MIN_HISTORY_COMMIT_COLUMN,
                             },
                             MAX_PANEL_WIDTH,
                         );
@@ -21684,6 +20908,12 @@ impl ReviewWorkspace {
                             PanelKind::Details => {
                                 this.panel_layout.details_width = width;
                                 this.inspector_open = true;
+                            }
+                            PanelKind::HistoryCommits => {
+                                if let Some(history) = this.history.as_mut() {
+                                    history.commit_width = width;
+                                    history.commits_collapsed = false;
+                                }
                             }
                         }
                         this.refresh_auto_layout(window);
@@ -21985,7 +21215,7 @@ impl ReviewWorkspace {
                     .id("sidebar-titlebar")
                     .h(px(48.))
                     .flex_none()
-                    .pl(px(88.))
+                    .pl(px(WINDOW_CONTROLS_INSET))
                     .pr(px(ui::CONTROL_INSET))
                     .flex()
                     .items_center()
@@ -22880,6 +22110,11 @@ impl ReviewWorkspace {
             .id("tab-strip")
             .debug_selector(|| "tab-strip".to_owned())
             .h(px(ui::DESKTOP_HIT))
+            // Keep the scroll viewport beyond the macOS window controls;
+            // padding inside it would let scrolled tabs pass beneath them.
+            .when(self.panel_layout.sidebar_collapsed, |strip| {
+                strip.ml(px(WINDOW_CONTROLS_INSET - COLLAPSED_PANEL_WIDTH))
+            })
             .px(px(ui::GAP_FIELD))
             .flex()
             .items_center()
@@ -22958,6 +22193,7 @@ impl ReviewWorkspace {
             cx.notify();
             return;
         };
+        self.record_user_navigation();
         let key = repository.cache_key();
         let account = repository.account.clone();
         let fresh = match self.history.as_mut() {
@@ -22999,6 +22235,7 @@ impl ReviewWorkspace {
             cx.notify();
             return;
         };
+        self.record_user_navigation();
         let key = repository.cache_key();
         let account = repository.account.clone();
         let fresh = match self.browser.as_mut() {
@@ -23284,12 +22521,15 @@ impl ReviewWorkspace {
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
                 let wide = this.wide;
+                let mode = this.workspace.preferences.reading_mode;
                 let Some(history) = this.history.as_mut().filter(|it| it.accepts_diff(&token))
                 else {
                     return;
                 };
                 match result {
-                    Ok(comparison) => history.install_diff(ReviewSession::new(comparison), wide),
+                    Ok(comparison) => {
+                        history.install_diff(ReviewSession::new(comparison), wide, mode)
+                    }
                     Err(error) => {
                         history.fail_diff(format!("This commit's changes are unavailable: {error}"))
                     }
@@ -23312,10 +22552,10 @@ impl ReviewWorkspace {
         let Some(path) = repository.local_path.clone() else {
             return;
         };
-        let Some(history) = self.history.as_ref() else {
+        let Some(history) = self.history.as_mut() else {
             return;
         };
-        let Some(session) = history.session.as_ref() else {
+        let Some(session) = history.session.as_mut() else {
             return;
         };
         let Some(file) = session.selected_file() else {
@@ -23324,41 +22564,39 @@ impl ReviewWorkspace {
         if file.patch.is_some() {
             return;
         }
-        let repository_key = history.repository_key().to_owned();
-        let selected_sha = history.selected.clone();
-        let revision = session.revision().clone();
         let selected_key = file_key(file);
-        let requested_key = selected_key.clone();
-        let task = cx.background_spawn(async move {
-            load_local_file(&path, &revision, &requested_key, false).map(|file| (revision, file))
-        });
+        let Ok(request) = session.begin_file_patch(&selected_key) else {
+            return;
+        };
+        let revision = request.revision().clone();
+        let requested_key = request.file_key().to_owned();
+        let task =
+            cx.background_spawn(
+                async move { load_local_file(&path, &revision, &requested_key, false) },
+            );
         cx.spawn(async move |root, cx| {
             let result = task.await;
             let _ = root.update(cx, |root, cx| {
                 let this = &mut root.review;
                 let wide = this.wide;
+                let mode = this.workspace.preferences.reading_mode;
                 let Some(history) = this.history.as_mut() else {
                     return;
                 };
-                // The patch belongs to one repository, one commit and one file.
-                // Any of the three having moved on makes it the wrong patch.
-                let current = history.repository_key() == repository_key
-                    && history.selected == selected_sha
-                    && history
-                        .session
-                        .as_ref()
-                        .and_then(ReviewSession::selected_file)
-                        .is_some_and(|file| file_key(file) == selected_key);
-                if !current {
+                if !history
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.accepts_file_patch(&request))
+                {
                     return;
                 }
                 match result {
-                    Ok((revision, file)) => {
+                    Ok(file) => {
                         let installed = history.session.as_mut().is_some_and(|session| {
-                            session.install_file_patch(&revision, file).is_ok()
+                            session.accept_file_patch(&request, file).is_ok()
                         });
                         if installed {
-                            history.rebuild(wide);
+                            history.rebuild(wide, mode);
                         }
                     }
                     Err(error) => {
@@ -23376,6 +22614,7 @@ impl ReviewWorkspace {
     /// they change is the window itself, and a modal covering the window is the
     /// one place from which that cannot be judged.
     fn open_settings(&mut self, cx: &mut Context<Root>) {
+        self.record_user_navigation();
         self.settings_open = true;
         self.settings_active = true;
         self.history_active = false;
@@ -23398,7 +22637,7 @@ impl ReviewWorkspace {
             return;
         }
         self.workspace.preferences.sidebar_material = material;
-        self.save_workspace();
+        self.save_workspace(cx);
         cx.notify();
     }
 
@@ -23424,6 +22663,7 @@ impl ReviewWorkspace {
                     .min_w_0()
                     .flex()
                     .child(self.render_history_commits(colors, dark, cx))
+                    .child(self.render_splitter(PanelKind::HistoryCommits, colors, window, cx))
                     .child(self.render_history_commit(colors, cx)),
             )
     }
@@ -23489,6 +22729,7 @@ impl ReviewWorkspace {
                             .child(title),
                     )
                     .child(div().flex_1())
+                    .children(self.render_fold_all_control(colors, cx))
                     .child(
                         Button::new("history-refresh")
                             .debug_selector(|| "history-refresh".to_owned())
@@ -23591,14 +22832,132 @@ impl ReviewWorkspace {
         let root = cx.entity();
         let loading = matches!(history.state, LoadState::Loading(_));
 
+        // Collapsed, the column keeps its job and loses its names: one dot per
+        // commit in its lane's colour, at the pitch the full rows use, so the
+        // position of what you are reading is still on screen and still
+        // answers a click.
+        if history.commits_collapsed {
+            let rail_commits = commits.clone();
+            let rail_rows = rows.clone();
+            let rail_selected = selected.clone();
+            let rail_root = root.clone();
+            return div()
+                .w(px(COLLAPSED_PANEL_WIDTH))
+                .flex_none()
+                .h_full()
+                .flex()
+                .flex_col()
+                .border_r_1()
+                .border_color(colors.border)
+                .child(
+                    div()
+                        .id("restore-history-commits")
+                        .debug_selector(|| "restore-history-commits".to_owned())
+                        .h(px(ui::DESKTOP_HIT))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .text_color(colors.accent)
+                        .aria_label("Show the commit graph")
+                        .border_b_1()
+                        .border_color(colors.border)
+                        .child("\u{203a}")
+                        .on_click(cx.listener(|root, _, _, cx| {
+                            if let Some(history) = root.review.history.as_mut() {
+                                history.commits_collapsed = false;
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    uniform_list(
+                        "history-commit-rail",
+                        count,
+                        move |range: Range<usize>, _, _| {
+                            range
+                                .map(|index| {
+                                    let commit = &rail_commits[index];
+                                    let row = &rail_rows[index];
+                                    let chosen =
+                                        rail_selected.as_deref() == Some(commit.sha.as_str());
+                                    let sha = commit.sha.clone();
+                                    let click_root = rail_root.clone();
+                                    let color = lane_color(row.node_color, dark);
+                                    div()
+                                        .id(SharedString::from(format!("history-rail-{index}")))
+                                        .h(px(ui::TWO_LINE_ROW))
+                                        .w_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .when(chosen, |row| row.bg(colors.selected))
+                                        .when(!chosen, |row| {
+                                            row.hover(|row| row.bg(colors.selected))
+                                        })
+                                        .child(
+                                            div()
+                                                .size(px(8.))
+                                                .rounded(px(4.))
+                                                .when(row.merge, |dot| {
+                                                    dot.border_1().border_color(color)
+                                                })
+                                                .when(!row.merge, |dot| dot.bg(color)),
+                                        )
+                                        .on_click(move |_, _, cx| {
+                                            let sha = sha.clone();
+                                            click_root.update(cx, |root, cx| {
+                                                root.review.select_history_commit(&sha, cx);
+                                            });
+                                        })
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    )
+                    .track_scroll(&history.commit_scroll)
+                    .w_full()
+                    .flex_1(),
+                );
+        }
+
         div()
-            .w(px(HISTORY_COMMIT_COLUMN))
-            .min_w(px(240.))
+            .w(px(history.commit_width))
+            .min_w(px(MIN_HISTORY_COMMIT_COLUMN))
+            .flex_none()
             .h_full()
             .flex()
             .flex_col()
             .border_r_1()
             .border_color(colors.border)
+            .child(
+                div()
+                    .h(px(ui::DESKTOP_HIT))
+                    .px(px(ui::CONTROL_INSET))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(format!("Commits  {count}"))
+                    .child(
+                        div()
+                            .id("collapse-history-commits")
+                            .debug_selector(|| "collapse-history-commits".to_owned())
+                            .cursor_pointer()
+                            .text_color(colors.accent)
+                            .aria_label("Collapse the commit graph")
+                            .child("\u{2039}")
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                if let Some(history) = root.review.history.as_mut() {
+                                    history.commits_collapsed = true;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
             .child(if count == 0 {
                 div()
                     .flex_1()
@@ -23869,7 +23228,7 @@ impl ReviewWorkspace {
                     .min_w_0()
                     .flex()
                     .child(self.render_history_files(colors, cx))
-                    .child(self.render_history_diff(colors)),
+                    .child(self.render_history_diff(colors, cx)),
             )
     }
 
@@ -23877,17 +23236,18 @@ impl ReviewWorkspace {
         let Some(history) = self.history.as_ref() else {
             return div();
         };
-        let files = history
+        let comparison = history
             .session
             .as_ref()
-            .map(|session| session.comparison().files.clone())
-            .unwrap_or_default();
+            .map(ReviewSession::shared_comparison);
         let selected = history
             .session
             .as_ref()
             .and_then(ReviewSession::selected_file)
             .map(file_key);
-        let count = files.len();
+        let count = comparison
+            .as_ref()
+            .map_or(0, |comparison| comparison.files.len());
         let scroll = history.file_scroll.clone();
         let root = cx.entity();
         div()
@@ -23916,9 +23276,12 @@ impl ReviewWorkspace {
                     .relative()
                     .child(
                         uniform_list("history-files", count, move |range: Range<usize>, _, _| {
+                            let Some(comparison) = comparison.as_ref() else {
+                                return Vec::new();
+                            };
                             range
                                 .map(|row| {
-                                    let file = &files[row];
+                                    let file = &comparison.files[row];
                                     let key = file_key(file);
                                     let click_key = key.clone();
                                     let click_root = root.clone();
@@ -23964,9 +23327,10 @@ impl ReviewWorkspace {
                                             click_root.update(cx, |root, cx| {
                                                 let this = &mut root.review;
                                                 let wide = this.wide;
+                                                let mode = this.workspace.preferences.reading_mode;
                                                 let changed =
                                                     this.history.as_mut().is_some_and(|history| {
-                                                        history.select_file(&click_key, wide)
+                                                        history.select_file(&click_key, wide, mode)
                                                     });
                                                 if changed {
                                                     this.load_selected_history_file(cx);
@@ -23994,132 +23358,45 @@ impl ReviewWorkspace {
     /// The selected file's patch, through the same read-only row renderer the
     /// Stack view uses. There are no threads and no composer here, so the two
     /// interactive row variants are never built and never rendered.
-    fn render_history_diff(&self, colors: Palette) -> Div {
+    /// The selected file's patch, through the same read-only pane the Stack
+    /// view uses. There are no threads and no composer here, so the two
+    /// interactive row variants are never built and never rendered.
+    fn render_history_diff(&self, colors: Palette, cx: &mut Context<Root>) -> Div {
         let Some(history) = self.history.as_ref() else {
             return div().flex_1().min_w_0();
         };
-        let header = history
+        let selected = history
             .session
             .as_ref()
-            .and_then(ReviewSession::selected_file)
-            .map(|file| {
-                if file.patch.is_some() {
-                    format!("{}   +{} −{}", file.path, file.additions, file.deletions)
-                } else {
-                    format!("{}   metadata only", file.path)
-                }
-            })
-            .unwrap_or_else(|| "Select a changed file".into());
-        let rows = history.diff_rows.clone();
-        let count = rows.len();
-        let split = rows.iter().any(|row| matches!(row, DiffRow::Split(_)));
-        let vertical = history.diff_scroll.clone();
-        let horizontal = history.horizontal.clone();
-        let row_horizontal = horizontal.clone();
-        let text_width = if split {
-            split_text_content_width(&rows)
-        } else {
-            unified_text_content_width(&rows)
-        };
-        let waiting = matches!(history.diff_state, LoadState::Loading(_));
-        let unselected = history.selected.is_none();
+            .and_then(ReviewSession::selected_file);
         let changed_files = history
             .session
             .as_ref()
             .map(|session| session.comparison().files.len())
             .unwrap_or_default();
-        div()
-            .flex_1()
-            // A real minimum rather than `min_w_0`. The diff is the only
-            // flexible column of the three, so with a zero minimum the commit
-            // list and the file list keep their full widths and leave it a
-            // strip too narrow to read. Declaring what it needs is what makes
-            // the other two yield.
-            .min_w(px(260.))
-            .h_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .h(px(ui::DESKTOP_HIT))
-                    .px(px(ui::PANEL_GUTTER))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .font_family(CODE_FONT)
-                    .ui_text(TextRole::Body)
-                    .child(header),
-            )
-            .when(split, |pane| {
-                pane.child(
-                    div()
-                        .h(px(ui::ROW_HEIGHT))
-                        .flex_none()
-                        .flex()
-                        .font_family(CODE_FONT)
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.muted)
-                        .bg(colors.elevated)
-                        .border_b_1()
-                        .border_color(colors.border)
-                        .child(div().w_1_2().px(px(ui::CONTROL_INSET)).child("OLD"))
-                        .child(
-                            div()
-                                .w_1_2()
-                                .px(px(ui::CONTROL_INSET))
-                                .border_l_1()
-                                .border_color(colors.border)
-                                .child("NEW"),
-                        ),
-                )
-            })
-            .child(if count == 0 {
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .px(px(ui::PANEL_GUTTER))
-                    .text_center()
-                    .text_color(colors.muted)
-                    .child(if unselected {
-                        "Select a commit to read what it changed."
-                    } else if waiting {
-                        "Loading this commit's changes…"
-                    } else if changed_files == 0 {
-                        "This commit changed no files."
-                    } else {
-                        "No text patch is available. Binary and media content is never loaded."
-                    })
-                    .into_any_element()
-            } else {
-                div()
-                    .id("history-diff-horizontal")
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .child(
-                        list(vertical, move |row, _, _| {
-                            render_read_only_diff_row(
-                                &rows[row],
-                                colors,
-                                &row_horizontal,
-                                text_width,
-                            )
-                        })
-                        .w_full()
-                        .h_full(),
-                    )
-                    // The stack diff already offsets its scrollbar id by 10,000
-                    // to clear the interactive diff's; History takes the next
-                    // band so the three can coexist in one window.
-                    .child(diff_horizontal_scrollbar(20_000, &horizontal))
-                    .into_any_element()
-            })
+        let empty = if history.selected.is_none() {
+            "Select a commit to read what it changed."
+        } else if matches!(history.diff_state, LoadState::Loading(_)) {
+            "Loading this commit's changes…"
+        } else if changed_files == 0 {
+            "This commit changed no files."
+        } else {
+            "No text patch is available. Binary and media content is never loaded."
+        };
+        render_read_only_diff_pane(
+            &history.diff,
+            selected_file_header(selected),
+            empty,
+            SharedString::from("history-diff-horizontal"),
+            20_000,
+            // The diff is the only flexible column of History's three, so it
+            // declares what it needs and the commit and file lists yield.
+            260.,
+            &self.diff_focus,
+            render_diff_ruler(&history.diff, colors, &cx.entity()),
+            &cx.entity(),
+            colors,
+        )
     }
 
     /// The pull-request index: one repository's pull requests, open and closed,
@@ -24167,22 +23444,26 @@ impl ReviewWorkspace {
                     })
                     .when(count > 0, |list| {
                         list.child(
-                            uniform_list("browse-rows", count, move |range: Range<usize>, _, cx| {
-                                let rows = rows.clone();
-                                let root = root.clone();
-                                root.read_with(cx, |workspace, _| {
-                                    let this = &workspace.review;
-                                    range
-                                        .map(|row| {
-                                            this.render_browse_row(
-                                                rows.get(row).copied(),
-                                                colors,
-                                                root.clone(),
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                            })
+                            uniform_list(
+                                "browse-rows",
+                                count,
+                                move |range: Range<usize>, _, cx| {
+                                    let rows = rows.clone();
+                                    let root = root.clone();
+                                    root.read_with(cx, |workspace, _| {
+                                        let this = &workspace.review;
+                                        range
+                                            .map(|row| {
+                                                this.render_browse_row(
+                                                    rows.get(row).copied(),
+                                                    colors,
+                                                    root.clone(),
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                },
+                            )
                             .track_scroll(&self.browser_scroll)
                             .h_full()
                             .w_full(),
@@ -24266,7 +23547,10 @@ impl ReviewWorkspace {
                             .iter()
                             .position(|runtime| runtime.repository == repository);
                         layout::chip(
-                            SharedString::from(format!("browse-repository-{}", repository.cache_key())),
+                            SharedString::from(format!(
+                                "browse-repository-{}",
+                                repository.cache_key()
+                            )),
                             &repository.full_name(),
                             None,
                             selected,
@@ -24286,22 +23570,23 @@ impl ReviewWorkspace {
                     .flex()
                     .items_center()
                     .gap(px(ui::GAP_GROUP))
-                    .child(
-                        layout::chip_row()
-                            .children(pr_browser::BrowseState::ALL.into_iter().map(|choice| {
-                                layout::chip(
-                                    choice.element_id(),
-                                    choice.label(),
-                                    None,
-                                    choice == state,
-                                    colors,
-                                )
-                                .on_click(cx.listener(move |root, _, _, cx| {
+                    .child(layout::chip_row().children(
+                        pr_browser::BrowseState::ALL.into_iter().map(|choice| {
+                            layout::chip(
+                                choice.element_id(),
+                                choice.label(),
+                                None,
+                                choice == state,
+                                colors,
+                            )
+                            .on_click(cx.listener(
+                                move |root, _, _, cx| {
                                     let this = &mut root.review;
                                     this.set_pr_browser_state(choice, cx);
-                                }))
-                            })),
-                    )
+                                },
+                            ))
+                        }),
+                    ))
                     .child(div().flex_1())
                     .child(
                         div()
@@ -24390,10 +23675,9 @@ impl ReviewWorkspace {
         };
         let number = summary.number;
         let repository_key = self.repositories[repository_index].repository.cache_key();
-        let open = self
-            .tabs
-            .iter()
-            .any(|tab| tab.repository.cache_key() == repository_key && tab.pull_request.number == number);
+        let open = self.tabs.iter().any(|tab| {
+            tab.repository.cache_key() == repository_key && tab.pull_request.number == number
+        });
         let labels = summary
             .labels
             .iter()
@@ -24970,6 +24254,12 @@ impl ReviewWorkspace {
                             }
                         } else {
                             this.inspector_open = false;
+                            // The Commits page opens the picker as part of
+                            // being that page. Leaving it open on the way out
+                            // would hand the diff a popover it never asked
+                            // for, since off the Commits page the same flag
+                            // means "the Compare popover is showing".
+                            this.tabs[index].comparison_picker.expanded = false;
                             this.focus.focus(window, cx);
                         }
                         this.inspector_scroll.set_offset(point(px(0.), px(0.)));
@@ -25041,10 +24331,25 @@ impl ReviewWorkspace {
             .as_ref()
             .and_then(|session| session.available_revision())
             .is_some();
-        // The Compare bar sits under the tabs on the diff, and is the whole
-        // Commits section; on those screens the header would only repeat it.
-        let compare_visible =
-            !self.inspector_open || tab.inspector_section == InspectorSection::Commits;
+        // The Compare bar *is* the Commits page — that section renders no
+        // content of its own — so it stays inline there and becomes a popover
+        // only where it is chrome over a diff.
+        let compare_inline =
+            self.inspector_open && tab.inspector_section == InspectorSection::Commits;
+        let compare_visible = !compare_inline;
+        // Below this the branch chips come off the bar; the title and the page
+        // tabs are what the row exists to carry.
+        let roomy = window.viewport_size().width.as_f32() >= 1_180.;
+        // One bar, not four bands. The title, the branches, the page tabs and
+        // the actions share a single `DESKTOP_HIT` row, and the Compare bar
+        // moves behind the ⌥⌘K it already owns. Before this the chrome above a
+        // review's first line of code was 156px — a title block at 44, a chip
+        // row at 36, the Compare bar at 36 and the pane's own file header at
+        // 40 — on a diff that is the whole reason the window is open.
+        //
+        // The file header is not lost: streaming puts it in the scroll as a
+        // `FileHeader` row, where it names the file you are actually reading
+        // rather than the one selected in the tree.
         div()
             .flex_1()
             .min_h_0()
@@ -25052,155 +24357,124 @@ impl ReviewWorkspace {
             .flex()
             .flex_col()
             .child(
-                div().px(px(ui::PANEL_GUTTER)).py(px(ui::GAP_GROUP)).child(
-                    div()
-                        .id("pr-header-row")
-                        .debug_selector(|| "pr-header-row".to_owned())
-                        .flex()
-                        .items_center()
-                        .gap(px(ui::GAP_ICON))
-                        .child(
-                            div()
-                                .badge()
-                                .bg(colors.elevated)
-                                .child(format!("#{}", tab.pull_request.number)),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .ui_text(TextRole::Title)
-                                .font_weight(ui::WEIGHT_EMPHASIS)
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .child(tab.pull_request.title.clone()),
-                        )
-                        // Source → target rides beside the title rather
-                        // than on a row of its own; the diff wants the height.
-                        .child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap(px(ui::GAP_ICON))
-                                .ui_text(TextRole::Body)
-                                .text_color(colors.muted)
-                                .child(branch_chip(&tab.pull_request.source_branch, colors))
-                                .child("→")
-                                .child(branch_chip(&tab.pull_request.target_branch, colors))
-                                .when(!compare_visible, |row| {
-                                    row.child("·").child(format!(
-                                        "{} · {revision}",
-                                        tab.comparison_picker.request_label()
-                                    ))
-                                })
-                                .when(newer, |row| {
-                                    row.child(
-                                        div()
-                                            .id("advance-revision")
-                                            .control()
-                                            .bg(colors.amber)
-                                            .text_color(colors.canvas)
-                                            .cursor_pointer()
-                                            .child("New head available · Advance manually")
-                                            .on_click(cx.listener(|root, _, _, cx| {
-                                                let this = &mut root.review;
-                                                this.advance_revision(cx)
-                                            })),
-                                    )
-                                }),
-                        )
-                        .child(div().flex_1().min_w_0())
-                        // One row of five, left to right by weight: the view
-                        // control, then navigation in accent blue, the review
-                        // action in its green outline, the one irreversible
-                        // action as the single filled primary, and the editor
-                        // handoff as an icon past the end of the row.
-                        .child(
-                            div()
-                                .id("diff-mode")
-                                .control()
-                                .flex_none()
-                                .border_1()
-                                .border_color(colors.border)
-                                .cursor_pointer()
-                                .text_color(colors.accent)
-                                .hover(|button| button.bg(colors.selected))
-                                .child(
-                                    session
-                                        .map(|session| match session.diff_mode() {
-                                            DiffMode::Auto => "Diff: Auto",
-                                            DiffMode::Unified => "Diff: Unified",
-                                            DiffMode::SideBySide => "Diff: Side by side",
-                                        })
-                                        .unwrap_or("Diff: Auto"),
-                                )
-                                .on_click(cx.listener(|root, _, window, cx| {
-                                    let this = &mut root.review;
-                                    this.cycle_diff(&CycleDiffMode, window, cx)
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("open-stack-view")
-                                .control()
-                                .border_1()
-                                .border_color(colors.border)
-                                .cursor_pointer()
-                                .text_color(colors.accent)
-                                .hover(|button| button.bg(colors.accent_subtle))
-                                .child("Stack  ⇧⌘S")
-                                .on_click(cx.listener(|root, _, _, cx| {
-                                    let this = &mut root.review;
-                                    this.open_stack(cx);
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("open-review-confirmation")
-                                .control()
-                                .border_1()
-                                .border_color(colors.green)
-                                .cursor_pointer()
-                                .text_color(colors.green)
-                                .hover(|button| button.bg(colors.add_line))
-                                .child("Review")
-                                .on_click(cx.listener(|root, _, _, cx| {
-                                    let this = &mut root.review;
-                                    this.open_submit_confirmation(cx);
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("open-merge-confirmation")
-                                .control()
-                                .border_1()
-                                .border_color(colors.success_emphasis)
-                                .bg(colors.success_emphasis)
-                                .cursor_pointer()
-                                // White on Primer's green in both schemes;
-                                // the dark canvas would not read here.
-                                .text_color(rgba(0xffffffff))
-                                .hover(|button| button.bg(colors.green))
-                                .child("Merge…")
-                                .on_click(cx.listener(|root, _, _, cx| {
-                                    let this = &mut root.review;
-                                    this.prepare_merge_confirmation(cx);
-                                })),
-                        )
-                        .child(self.render_local_changes_control(index, colors, cx)),
-                ),
-            )
-            .child(self.render_pr_tabs(index, colors, cx))
-            .when(
-                !self.inspector_open || tab.inspector_section == InspectorSection::Commits,
-                |view| {
-                    view.child(
+                div()
+                    .h(px(ui::DESKTOP_HIT))
+                    .flex_none()
+                    .px(px(ui::PANEL_GUTTER))
+                    .flex()
+                    .child(
                         div()
-                            .px(px(ui::PANEL_GUTTER))
-                            .child(self.render_comparison_picker(index, colors, cx)),
-                    )
-                },
+                            .id("pr-header-row")
+                            .debug_selector(|| "pr-header-row".to_owned())
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(ui::GAP_GROUP))
+                            .child(
+                                div()
+                                    .badge()
+                                    .flex_none()
+                                    .bg(colors.elevated)
+                                    .child(format!("#{}", tab.pull_request.number)),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .ui_text(TextRole::Body)
+                                    .font_weight(ui::WEIGHT_EMPHASIS)
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(tab.pull_request.title.clone()),
+                            )
+                            // The branches are the predictable half of the header, so
+                            // they are what a narrow window drops first — the title
+                            // and the tabs are what is being read and used.
+                            .when(roomy, |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(ui::GAP_ICON))
+                                        .ui_text(TextRole::Caption)
+                                        .text_color(colors.muted)
+                                        .child(branch_chip(&tab.pull_request.source_branch, colors))
+                                        .child("\u{2192}")
+                                        .child(branch_chip(
+                                            &tab.pull_request.target_branch,
+                                            colors,
+                                        )),
+                                )
+                            })
+                            .child(self.render_pr_tabs(index, colors, cx).flex_none())
+                            .child(div().flex_1().min_w_0())
+                            .when(newer, |row| {
+                                row.child(
+                                    div()
+                                        .id("advance-revision")
+                                        .control()
+                                        .flex_none()
+                                        .bg(colors.amber)
+                                        .text_color(colors.canvas)
+                                        .cursor_pointer()
+                                        .child("New head \u{00b7} Advance")
+                                        .on_click(cx.listener(|root, _, _, cx| {
+                                            root.review.advance_revision(cx)
+                                        })),
+                                )
+                            })
+                            .when(compare_visible, |row| {
+                                row.child(self.render_compare_trigger(index, colors, revision, cx))
+                            })
+                            .child(
+                                div()
+                                    .id("open-review-confirmation")
+                                    .control()
+                                    .flex_none()
+                                    .border_1()
+                                    .border_color(colors.green)
+                                    .cursor_pointer()
+                                    .text_color(colors.green)
+                                    .hover(|button| button.bg(colors.add_line))
+                                    .child("Review")
+                                    .on_click(cx.listener(|root, _, _, cx| {
+                                        root.review.open_submit_confirmation(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("open-merge-confirmation")
+                                    .control()
+                                    .flex_none()
+                                    .border_1()
+                                    .border_color(colors.success_emphasis)
+                                    .bg(colors.success_emphasis)
+                                    .cursor_pointer()
+                                    // White on Primer's green in both schemes; the
+                                    // dark canvas would not read here.
+                                    .text_color(rgba(0xffffffff))
+                                    .hover(|button| button.bg(colors.green))
+                                    .child("Merge\u{2026}")
+                                    .on_click(cx.listener(|root, _, _, cx| {
+                                        root.review.prepare_merge_confirmation(cx);
+                                    })),
+                            )
+                            .children(self.render_fold_all_control(colors, cx))
+                            .child(self.render_view_menu(index, colors, cx))
+                            .child(self.render_local_changes_control(index, colors, cx)),
+                    ),
             )
+            .when(compare_inline, |view| {
+                view.child(
+                    div()
+                        .px(px(ui::PANEL_GUTTER))
+                        .child(self.render_comparison_picker(index, colors, cx)),
+                )
+            })
+            .when_some(tab.stream_notice.clone(), |view, notice| {
+                view.child(layout::notice(notice, colors.amber))
+            })
             .when_some(
                 match &tab.state {
                     LoadState::Error(error) => Some(error.clone()),
@@ -25442,7 +24716,7 @@ impl ReviewWorkspace {
                     })
                     .when(self.wide || !stack.narrow_relationships_open, |body| {
                         body.child(self.render_stack_files(index, colors, cx))
-                            .child(self.render_stack_diff(index, colors))
+                            .child(self.render_stack_diff(index, colors, cx))
                     }),
             )
     }
@@ -25745,17 +25019,15 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) -> impl IntoElement {
         let stack = &self.tabs[index].stack;
-        let files = stack
-            .session
-            .as_ref()
-            .map(|session| session.comparison().files.clone())
-            .unwrap_or_default();
+        let comparison = stack.session.as_ref().map(ReviewSession::shared_comparison);
         let selected = stack
             .session
             .as_ref()
             .and_then(ReviewSession::selected_file)
             .map(file_key);
-        let count = files.len();
+        let count = comparison
+            .as_ref()
+            .map_or(0, |comparison| comparison.files.len());
         let scroll = stack.file_scroll.clone();
         let root = cx.entity();
         div()
@@ -25788,9 +25060,12 @@ impl ReviewWorkspace {
                     SharedString::from(format!("stack-files-{index}")),
                     count,
                     move |range: Range<usize>, _, _| {
+                        let Some(comparison) = comparison.as_ref() else {
+                            return Vec::new();
+                        };
                         range
                             .map(|row| {
-                                let file = &files[row];
+                                let file = &comparison.files[row];
                                 let key = file_key(file);
                                 let click_key = key.clone();
                                 let click_root = root.clone();
@@ -25855,116 +25130,69 @@ impl ReviewWorkspace {
             )
     }
 
-    fn render_stack_diff(&self, index: usize, colors: Palette) -> impl IntoElement {
+    fn render_stack_diff(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> impl IntoElement {
         let stack = &self.tabs[index].stack;
-        let header = stack
-            .session
-            .as_ref()
-            .and_then(ReviewSession::selected_file)
-            .map(|file| {
-                if file.patch.is_some() {
-                    format!("{}   +{} −{}", file.path, file.additions, file.deletions)
-                } else {
-                    format!("{}   metadata only", file.path)
-                }
-            })
-            .unwrap_or_else(|| "Select a changed file".into());
-        let rows = stack.diff_rows.clone();
-        let count = rows.len();
-        let split = rows.iter().any(|row| matches!(row, DiffRow::Split(_)));
-        let vertical = stack.diff_scroll.clone();
-        let horizontal = stack.horizontal.clone();
-        let row_horizontal = horizontal.clone();
-        let text_width = if split {
-            split_text_content_width(&rows)
+        let empty = if stack.session.is_none() {
+            "Choose a tip to compare its path."
         } else {
-            unified_text_content_width(&rows)
+            "No text patch is available. Binary and media content is never loaded."
         };
-        div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .h(px(ui::DESKTOP_HIT))
-                    .px(px(ui::PANEL_GUTTER))
-                    .flex()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .font_family(CODE_FONT)
-                    .ui_text(TextRole::Body)
-                    .child(header),
-            )
-            .when(split, |pane| {
-                pane.child(
-                    div()
-                        .h(px(ui::ROW_HEIGHT))
-                        .flex()
-                        .font_family(CODE_FONT)
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.muted)
-                        .bg(colors.elevated)
-                        .border_b_1()
-                        .border_color(colors.border)
-                        .child(div().w_1_2().px(px(ui::CONTROL_INSET)).child("OLD"))
-                        .child(
-                            div()
-                                .w_1_2()
-                                .px(px(ui::CONTROL_INSET))
-                                .border_l_1()
-                                .border_color(colors.border)
-                                .child("NEW"),
-                        ),
-                )
-            })
-            .child(if count == 0 {
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(colors.muted)
-                    .child(if stack.session.is_none() {
-                        "Choose a tip to compare its path."
-                    } else {
-                        "No text patch is available. Binary and media content is never loaded."
-                    })
-                    .into_any_element()
-            } else {
-                div()
-                    .id(SharedString::from(format!("stack-diff-horizontal-{index}")))
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .child(
-                        list(vertical, move |row, _, _| {
-                            render_read_only_diff_row(
-                                &rows[row],
-                                colors,
-                                &row_horizontal,
-                                text_width,
-                            )
-                        })
-                        .w_full()
-                        .h_full(),
-                    )
-                    .child(diff_horizontal_scrollbar(index + 10_000, &horizontal))
-                    .into_any_element()
-            })
+        render_read_only_diff_pane(
+            &stack.diff,
+            selected_file_header(
+                stack
+                    .session
+                    .as_ref()
+                    .and_then(ReviewSession::selected_file),
+            ),
+            empty,
+            SharedString::from(format!("stack-diff-horizontal-{index}")),
+            // The interactive diff takes the band at `index`; Stack offsets by
+            // 10,000 and History by 20,000 so the three can coexist in one window.
+            index + 10_000,
+            0.,
+            &self.diff_focus,
+            render_diff_ruler(&stack.diff, colors, &cx.entity()),
+            &cx.entity(),
+            colors,
+        )
+    }
+
+    /// Switch between one scroll and one file, and rebuild whatever is on
+    /// screen. Saved, because it is how this reader reads rather than a
+    /// property of the pull request they happen to have open.
+    fn set_reading_mode(&mut self, mode: ReadingMode, window: &mut Window, cx: &mut Context<Root>) {
+        if self.workspace.preferences.reading_mode == mode {
+            return;
+        }
+        self.workspace.preferences.reading_mode = mode;
+        self.save_workspace(cx);
+        let wide = self.wide;
+        if let Some(index) = self.active_tab {
+            self.capture_scroll(index);
+            self.rebuild_diff(index, wide);
+        }
+        if let Some(history) = self.history.as_mut() {
+            history.rebuild(wide, mode);
+        }
+        self.focus.focus(window, cx);
+        cx.notify();
     }
 
     /// Records the application Local changes last launched. Saved rather than
     /// held for the session: the control is icon-only, so a forgotten choice
     /// would leave the user looking at a different brand each launch.
-    fn remember_editor(&mut self, preference: String) {
+    fn remember_editor(&mut self, preference: String, cx: &mut Context<Root>) {
         if self.workspace.preferences.preferred_editor.as_deref() == Some(preference.as_str()) {
             return;
         }
         self.workspace.preferences.preferred_editor = Some(preference);
-        self.save_workspace();
+        self.save_workspace(cx);
     }
 
     /// Icon and accessible name for the Local changes control. Falls back to the
@@ -26016,6 +25244,249 @@ impl ReviewWorkspace {
     /// The Local changes control and its popover. Detection is read-only, so
     /// the controller is provisioned when the popover first opens rather than
     /// for every tab that merely exists.
+    /// The Compare bar's trigger. The bar itself is a page on the Commits tab
+    /// and a popover everywhere else, so the diff does not pay a row for a
+    /// control most screens never touch.
+    fn render_compare_trigger(
+        &self,
+        index: usize,
+        colors: Palette,
+        revision: &str,
+        cx: &mut Context<Root>,
+    ) -> impl IntoElement {
+        let tab = &self.tabs[index];
+        let open = tab.comparison_picker.expanded;
+        let label = format!(
+            "{} \u{00b7} {revision}",
+            tab.comparison_picker.request_label()
+        );
+        let spoken = label.clone();
+        let root = cx.entity();
+        let change_root = root.clone();
+        Popover::new("compare-popover")
+            .anchor(Anchor::TopRight)
+            .open(open)
+            .on_open_change(move |open, _, cx| {
+                let opening = *open;
+                change_root.update(cx, |root, cx| {
+                    root.review.tabs[index].comparison_picker.expanded = opening;
+                    cx.notify();
+                });
+            })
+            .trigger(
+                Button::new("toggle-compare-popover")
+                    .debug_selector(|| "toggle-compare-popover".to_owned())
+                    .control()
+                    .flex_none()
+                    .border_1()
+                    .border_color(colors.border)
+                    .cursor_pointer()
+                    .text_color(colors.accent)
+                    .hover(|button| button.bg(colors.selected))
+                    .focus_ring(colors.accent, colors.selected)
+                    .accessibility_label(format!(
+                        "Comparison: {spoken}. Choose commit or range, \u{2325}\u{2318}K"
+                    ))
+                    .child(label),
+            )
+            .content(move |_, _, cx| {
+                root.update(cx, |root, cx| {
+                    div()
+                        .id("compare-popover-card")
+                        .debug_selector(|| "compare-popover-card".to_owned())
+                        .w(px(520.))
+                        .p(px(ui::CONTROL_INSET))
+                        .rounded(px(ui::POPOVER_RADIUS))
+                        .bg(colors.surface)
+                        .border_1()
+                        .border_color(colors.border)
+                        .child(root.review.render_comparison_picker(index, colors, cx))
+                        .into_any_element()
+                })
+            })
+    }
+
+    /// Fold or open every file in the streamed scroll.
+    ///
+    /// One control rather than a pair, because the two are never both useful:
+    /// with anything still open the thing you want is to fold, and only once
+    /// everything is folded does opening mean anything. It renders only while
+    /// streaming — folding is a property of a scroll with more than one file
+    /// in it.
+    fn render_fold_all_control(&self, colors: Palette, cx: &mut Context<Root>) -> Option<Button> {
+        let diff = self.active_diff()?;
+        if !diff.streaming() {
+            return None;
+        }
+        let collapsed = diff.all_collapsed();
+        Some(
+            Button::new("toggle-all-file-sections")
+                .debug_selector(|| "toggle-all-file-sections".to_owned())
+                .size(px(ui::CONTROL_HEIGHT))
+                .p_0()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(ui::CONTROL_RADIUS))
+                .border_1()
+                .border_color(colors.border)
+                .cursor_pointer()
+                .text_color(colors.accent)
+                .hover(|button| button.bg(colors.selected))
+                .focus_ring(colors.accent, colors.selected)
+                .accessibility_label(if collapsed {
+                    "Expand every file, \u{21e7}\u{2318}J"
+                } else {
+                    "Collapse every file, \u{21e7}\u{2318}J"
+                })
+                .child(if collapsed { "\u{00bb}" } else { "\u{00ab}" })
+                .on_click(cx.listener(|root, _, _, cx| {
+                    root.review.toggle_all_diff_files(cx);
+                })),
+        )
+    }
+
+    /// How the diff is displayed, in one menu: the reading mode, the
+    /// unified/side-by-side choice, and the Stack view. These are settings
+    /// rather than actions, and a settings control parked on the bar costs the
+    /// same width on every screen whether or not anyone touches it.
+    fn render_view_menu(
+        &self,
+        index: usize,
+        colors: Palette,
+        cx: &mut Context<Root>,
+    ) -> impl IntoElement {
+        let mode = self.workspace.preferences.reading_mode;
+        let layout = self.tabs[index]
+            .session
+            .as_ref()
+            .map(|session| session.diff_mode())
+            .unwrap_or(DiffMode::Auto);
+        let root = cx.entity();
+        Popover::new("view-menu")
+            .anchor(Anchor::TopRight)
+            .trigger(
+                Button::new("open-view-menu")
+                    .debug_selector(|| "open-view-menu".to_owned())
+                    .size(px(ui::CONTROL_HEIGHT))
+                    .p_0()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(ui::CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(colors.border)
+                    .cursor_pointer()
+                    .text_color(colors.accent)
+                    .hover(|trigger| trigger.bg(colors.selected))
+                    .focus_ring(colors.accent, colors.selected)
+                    .accessibility_label("Display options: reading mode, diff layout, stack view")
+                    .child("\u{22ef}"),
+            )
+            .content(move |_, _, _| {
+                let row = |id: &'static str, label: String, selected: bool| {
+                    div()
+                        .id(id)
+                        .debug_selector(move || id.to_owned())
+                        .h(px(ui::ROW_HEIGHT))
+                        .px(px(ui::MENU_INSET))
+                        .flex()
+                        .items_center()
+                        .gap(px(ui::GAP_FIELD))
+                        .rounded(px(ui::CONTROL_RADIUS))
+                        .cursor_pointer()
+                        .hover(|row| row.bg(colors.selected))
+                        .when(selected, |row| row.text_color(colors.accent))
+                        .child(
+                            div()
+                                .w(px(14.))
+                                .child(if selected { "\u{2713}" } else { "" }),
+                        )
+                        .child(label)
+                };
+                let stream_root = root.clone();
+                let file_root = root.clone();
+                let layout_root = root.clone();
+                let stack_root = root.clone();
+                div()
+                    .id("view-menu-card")
+                    .debug_selector(|| "view-menu-card".to_owned())
+                    .w(px(260.))
+                    .p(px(ui::GAP_ICON))
+                    .flex()
+                    .flex_col()
+                    .gap(px(ui::GAP_ICON))
+                    .rounded(px(ui::POPOVER_RADIUS))
+                    .bg(colors.surface)
+                    .border_1()
+                    .border_color(colors.border)
+                    .ui_text(TextRole::Body)
+                    .child(
+                        ui::kicker("Reading")
+                            .text_color(colors.faint)
+                            .ml(px(ui::MENU_INSET)),
+                    )
+                    .child(
+                        row(
+                            "view-mode-stream",
+                            "All files in one scroll".into(),
+                            mode == ReadingMode::Stream,
+                        )
+                        .on_click(move |_, window, cx| {
+                            stream_root.update(cx, |root, cx| {
+                                root.review
+                                    .set_reading_mode(ReadingMode::Stream, window, cx);
+                            });
+                        }),
+                    )
+                    .child(
+                        row(
+                            "view-mode-file",
+                            "One file at a time".into(),
+                            mode == ReadingMode::File,
+                        )
+                        .on_click(move |_, window, cx| {
+                            file_root.update(cx, |root, cx| {
+                                root.review.set_reading_mode(ReadingMode::File, window, cx);
+                            });
+                        }),
+                    )
+                    .child(
+                        ui::kicker("Layout")
+                            .text_color(colors.faint)
+                            .ml(px(ui::MENU_INSET)),
+                    )
+                    .child(
+                        row(
+                            "view-cycle-layout",
+                            match layout {
+                                DiffMode::Auto => "Automatic".into(),
+                                DiffMode::Unified => "Unified".into(),
+                                DiffMode::SideBySide => "Side by side".into(),
+                            },
+                            false,
+                        )
+                        .on_click(move |_, window, cx| {
+                            layout_root.update(cx, |root, cx| {
+                                root.review.cycle_diff(&CycleDiffMode, window, cx);
+                            });
+                        }),
+                    )
+                    .child(
+                        row("view-open-stack", "Stack  \u{21e7}\u{2318}S".into(), false).on_click(
+                            move |_, _, cx| {
+                                stack_root.update(cx, |root, cx| {
+                                    root.review.open_stack(cx);
+                                });
+                            },
+                        ),
+                    )
+                    .into_any_element()
+            })
+    }
+
     fn render_local_changes_control(
         &self,
         index: usize,
@@ -26775,13 +26246,14 @@ impl ReviewWorkspace {
                 }
             })
             .unwrap_or_else(|| "Select a changed file".into());
-        let rows = tab.diff_rows.clone();
+        let rows = tab.diff.rows.clone();
         let count = rows.len();
-        let split_mode = tab.diff_split;
-        let scroll = tab.diff_scroll.clone();
-        let horizontal = tab.diff_horizontal.clone();
-        let split_text_width = tab.diff_text_width;
-        let unified_text_width = tab.diff_text_width;
+        let split_mode = tab.diff.split;
+        let scroll = tab.diff.vertical.clone();
+        let horizontal = tab.diff.horizontal.clone();
+        let contexts = tab.diff.scroll_contexts();
+        let streaming = tab.diff.streaming();
+        let cursor = tab.diff.cursor;
         let focus = self.diff_focus.clone();
         let root = cx.entity();
         let file_action_root = root.clone();
@@ -26912,6 +26384,7 @@ impl ReviewWorkspace {
                     .child("No text patch is available. Binary and media content is never loaded.")
                     .into_any_element()
             } else {
+                let ruler = render_diff_ruler(&tab.diff, colors, &cx.entity());
                 let body = div()
                     .id(SharedString::from(format!("diff-horizontal-{index}")))
                     .flex_1()
@@ -26922,57 +26395,78 @@ impl ReviewWorkspace {
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         window.focus(&focus, cx);
                     });
-                if split_mode {
-                    let row_horizontal = horizontal.clone();
+                let pane = if split_mode {
+                    let contexts = contexts.clone();
                     body.child(
                         list(scroll.clone(), move |index, _, _| {
-                            render_interactive_diff_row(
-                                &rows[index],
+                            let (row_horizontal, text_width) = contexts.for_row(index);
+                            with_cursor(
+                                render_interactive_diff_row(
+                                    &rows[index],
+                                    colors,
+                                    true,
+                                    row_horizontal,
+                                    text_width,
+                                    &root,
+                                    &composer,
+                                    &reply_input,
+                                    reply_thread.as_ref(),
+                                    pending_review.as_ref(),
+                                    &inline_reactions,
+                                    inline_reactions_cached,
+                                    mutation_busy,
+                                ),
+                                cursor == Some(index),
                                 colors,
-                                true,
-                                &row_horizontal,
-                                split_text_width,
-                                &root,
-                                &composer,
-                                &reply_input,
-                                reply_thread.as_ref(),
-                                pending_review.as_ref(),
-                                &inline_reactions,
-                                inline_reactions_cached,
-                                mutation_busy,
                             )
                         })
                         .w_full()
                         .h_full(),
                     )
-                    .child(diff_horizontal_scrollbar(index, &horizontal))
+                    .when(!streaming, |body| {
+                        body.child(diff_horizontal_scrollbar(index, &horizontal))
+                    })
                     .into_any_element()
                 } else {
-                    let row_horizontal = horizontal.clone();
+                    let contexts = contexts.clone();
                     body.child(
                         list(scroll.clone(), move |index, _, _| {
-                            render_interactive_diff_row(
-                                &rows[index],
+                            let (row_horizontal, text_width) = contexts.for_row(index);
+                            with_cursor(
+                                render_interactive_diff_row(
+                                    &rows[index],
+                                    colors,
+                                    false,
+                                    row_horizontal,
+                                    text_width,
+                                    &root,
+                                    &composer,
+                                    &reply_input,
+                                    reply_thread.as_ref(),
+                                    pending_review.as_ref(),
+                                    &inline_reactions,
+                                    inline_reactions_cached,
+                                    mutation_busy,
+                                ),
+                                cursor == Some(index),
                                 colors,
-                                false,
-                                &row_horizontal,
-                                unified_text_width,
-                                &root,
-                                &composer,
-                                &reply_input,
-                                reply_thread.as_ref(),
-                                pending_review.as_ref(),
-                                &inline_reactions,
-                                inline_reactions_cached,
-                                mutation_busy,
                             )
                         })
                         .w_full()
                         .h_full(),
                     )
-                    .child(diff_horizontal_scrollbar(index, &horizontal))
+                    .when(!streaming, |body| {
+                        body.child(diff_horizontal_scrollbar(index, &horizontal))
+                    })
                     .into_any_element()
-                }
+                };
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(pane)
+                    .when_some(ruler, |row, ruler| row.child(ruler))
+                    .into_any_element()
             })
     }
 
@@ -28074,15 +27568,15 @@ impl ReviewWorkspace {
                 let avatars = self.claim_avatars(displayed_details, cx);
                 let mut activity = Vec::new();
                 if displayed_details.is_none() {
-                    if let Some(error) = &tab.submitted_summary_editor.persistence_error {
+                    if let Some(error) = tab.submitted_summary_editor.persistence_error() {
                         activity.push(
                             div()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
-                                .child(error.clone()),
+                                .child(error.to_owned()),
                         );
                     }
-                    for draft in &tab.submitted_summary_editor.drafts {
+                    for draft in tab.submitted_summary_editor.drafts() {
                         activity.push(
                             layout::section("Recovered review", colors)
                                 .child(div().ui_text(TextRole::Body).text_color(colors.amber).child(format!(
@@ -28526,7 +28020,7 @@ impl ReviewWorkspace {
                                 ),
                             );
                         }
-                        for draft in controller.composition.file_drafts.iter().filter(|draft| {
+                        for draft in controller.composition().file_drafts.iter().filter(|draft| {
                             draft.disposition == cibergit::participation::DraftDisposition::Pending
                                 && draft.remote.is_none()
                         }) {
@@ -28641,7 +28135,7 @@ impl ReviewWorkspace {
                                 let comment = linked.comment.coordinates.clone();
                                 let comment_id = comment.remote_id.clone();
                                 let linked_local_draft = controller
-                                    .composition
+                                    .composition()
                                     .drafts
                                     .iter()
                                     .find(|draft| {
@@ -28728,7 +28222,7 @@ impl ReviewWorkspace {
                                             ),
                                         ),
                                 ).when(
-                                    controller.composition.drafts.iter().all(|draft| {
+                                    controller.composition().drafts.iter().all(|draft| {
                                         draft.remote.as_ref().is_none_or(|remote| {
                                             remote.comment_id != linked.comment.coordinates.remote_id
                                         })
@@ -28987,31 +28481,26 @@ impl ReviewWorkspace {
                                 }),
                         );
                     }
-                    if tab.submitted_summary_editor.in_flight.is_some()
-                        || tab.submitted_summary_editor.pending.is_some()
-                        || tab.submitted_summary_editor.clear_in_flight
-                        || tab.submitted_summary_editor.pending_clear.is_some()
-                    {
+                    let submitted_activity = tab.submitted_summary_editor.activity();
+                    if submitted_activity != SubmittedDraftActivity::Idle {
                         activity.push(
                             div()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
-                                .child(if tab.submitted_summary_editor.clear_in_flight
-                                    || tab.submitted_summary_editor.pending_clear.is_some()
-                                {
+                                .child(if submitted_activity == SubmittedDraftActivity::Clearing {
                                     "Acknowledged edit is clearing only its exact durable local draft; durability pending."
                                 } else {
                                     "Submitted-review draft save pending; it is not yet claimed durable."
                                 }),
                         );
                     }
-                    if let Some(error) = &tab.submitted_summary_editor.persistence_error {
+                    if let Some(error) = tab.submitted_summary_editor.persistence_error() {
                         let root = cx.entity();
                         activity.push(
                             layout::block()
                                 .ui_text(TextRole::Caption)
                                 .text_color(colors.amber)
-                                .child(error.clone())
+                                .child(error.to_owned())
                                 .child(
                                     div()
                                         .flex()
@@ -29054,7 +28543,7 @@ impl ReviewWorkspace {
                             .join("\n\n");
                         let current_text = tab
                             .submitted_summary_editor
-                            .drafts
+                            .drafts()
                             .iter()
                             .map(|draft| {
                                 format!(
@@ -29116,11 +28605,19 @@ impl ReviewWorkspace {
                                 ),
                         );
                     }
-                    for draft in tab.submitted_summary_editor.drafts.iter().filter(|draft| {
-                        !details.reviews.iter().any(|review| {
-                            same_review_coordinates(&review.coordinates, &draft.review.coordinates)
+                    for draft in tab
+                        .submitted_summary_editor
+                        .drafts()
+                        .iter()
+                        .filter(|draft| {
+                            !details.reviews.iter().any(|review| {
+                                same_review_coordinates(
+                                    &review.coordinates,
+                                    &draft.review.coordinates,
+                                )
+                            })
                         })
-                    }) {
+                    {
                         activity.push(
                             layout::block()
                                 .child(div().ui_text(TextRole::Body).child(format!(
@@ -29358,26 +28855,16 @@ impl ReviewWorkspace {
                         ) && review.submitted_at.is_some();
                         if selected_author && submitted {
                             let availability = if tab.write_in_flight
-                                || tab.submitted_summary_editor.clear_in_flight
-                                || tab.submitted_summary_editor.pending_clear.is_some()
+                                || tab.submitted_summary_editor.has_clear_work()
                             {
                                 Err("A submitted-review write or exact local clear is still settling."
                                     .to_owned())
                             } else if !tab.submitted_summary_editor.is_ready() {
-                                Err(match &tab.submitted_summary_editor.load_state {
-                                    SubmittedDraftLoadState::Loading => {
-                                        "Local submitted-review drafts are still loading.".to_owned()
-                                    }
-                                    SubmittedDraftLoadState::Conflict { .. } => {
-                                        "Resolve the two preserved same-review draft versions first."
-                                            .to_owned()
-                                    }
-                                    SubmittedDraftLoadState::Failed => {
-                                        "Local submitted-review draft recovery failed; retry it before editing."
-                                            .to_owned()
-                                    }
-                                    SubmittedDraftLoadState::Ready => unreachable!(),
-                                })
+                                Err(tab
+                                    .submitted_summary_editor
+                                    .unavailable_reason()
+                                    .expect("not ready has a reason")
+                                    .to_owned())
                             } else if tab.details.is_none() {
                                 Err(
                                     "Cached collaboration is read-only; refresh for current edit capability."
@@ -29433,13 +28920,8 @@ impl ReviewWorkspace {
                             tab.submitted_summary_editor.draft_for(&review.coordinates)
                         {
                             let source_changed = draft.review != *review;
-                            let active = tab
-                                .submitted_summary_editor
-                                .active_review
-                                .as_ref()
-                                .is_some_and(|active| {
-                                    same_review_coordinates(active, &review.coordinates)
-                                });
+                            let active =
+                                tab.submitted_summary_editor.is_active(&review.coordinates);
                             card = card.when(!active, |card| {
                                 card.child(
                                     div()
@@ -31427,6 +30909,86 @@ impl ReviewWorkspace {
             })
     }
 
+    /// Reading a diff by keyboard, as a table rather than as a block of
+    /// hand-written rows.
+    ///
+    /// Each entry dispatches the real action, so the palette runs exactly what
+    /// the key runs and there is no second copy of the handler to fall out of
+    /// step. The older rows above still carry their own bodies and their own
+    /// hand-typed glyphs; those are the drift this table exists to avoid
+    /// repeating.
+    fn diff_command_rows(&self, colors: Palette, cx: &mut Context<Root>) -> Vec<AnyElement> {
+        let commands: [DiffCommand; 9] = [
+            (
+                "command-cursor-down",
+                "Next diff row",
+                "\u{2318}\u{2193}",
+                || Box::new(DiffCursorDown),
+            ),
+            (
+                "command-cursor-up",
+                "Previous diff row",
+                "\u{2318}\u{2191}",
+                || Box::new(DiffCursorUp),
+            ),
+            ("command-next-hunk", "Next hunk", "\u{2325}\u{2193}", || {
+                Box::new(DiffNextHunk)
+            }),
+            (
+                "command-previous-hunk",
+                "Previous hunk",
+                "\u{2325}\u{2191}",
+                || Box::new(DiffPreviousHunk),
+            ),
+            (
+                "command-next-thread",
+                "Next comment thread",
+                "\u{2325}\u{2318}\u{2193}",
+                || Box::new(DiffNextThread),
+            ),
+            (
+                "command-previous-thread",
+                "Previous comment thread",
+                "\u{2325}\u{2318}\u{2191}",
+                || Box::new(DiffPreviousThread),
+            ),
+            (
+                "command-cursor-start",
+                "Top of file",
+                "\u{2318}\u{2196}",
+                || Box::new(DiffCursorToStart),
+            ),
+            (
+                "command-cursor-end",
+                "Bottom of file",
+                "\u{2318}\u{2198}",
+                || Box::new(DiffCursorToEnd),
+            ),
+            (
+                "command-mark-viewed",
+                "Mark viewed and go to next unviewed",
+                "\u{21e7}\u{2318}V",
+                || Box::new(MarkViewedAndAdvance),
+            ),
+        ];
+        commands
+            .into_iter()
+            .map(|(id, label, shortcut, make)| {
+                command_row(label, shortcut, colors)
+                    .id(id)
+                    .debug_selector(move || id.to_owned())
+                    .cursor_pointer()
+                    .hover(|row| row.bg(colors.selected))
+                    .on_click(cx.listener(move |root, _, window, cx| {
+                        root.review.command_palette = false;
+                        cx.notify();
+                        window.dispatch_action(make(), cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
     fn render_palette(&self, colors: Palette, cx: &mut Context<Root>) -> impl IntoElement {
         div()
             .absolute()
@@ -31454,6 +31016,7 @@ impl ReviewWorkspace {
                             .text_color(colors.muted)
                             .child("COMMANDS"),
                     )
+                    .children(self.diff_command_rows(colors, cx))
                     .child(
                         command_row("Refresh repository and active PR", "⌘R", colors)
                             .id("command-refresh")
@@ -31962,7 +31525,8 @@ const HISTORY_LANE_PITCH: f32 = 14.;
 /// is drawn larger because a 2px border eats most of a 4px disc.
 const HISTORY_NODE_RADIUS: f32 = 3.5;
 const HISTORY_MERGE_RADIUS: f32 = 5.;
-const HISTORY_COMMIT_COLUMN: f32 = 460.;
+const HISTORY_COMMIT_COLUMN: f32 = 320.;
+const MIN_HISTORY_COMMIT_COLUMN: f32 = 240.;
 
 /// A tab-strip chip for a page that is not a pull request.
 ///
@@ -34174,24 +33738,94 @@ fn group_label(group: Option<&GroupBy>) -> &'static str {
     }
 }
 
-fn build_rows(diff: ParsedDiff, mode: DiffMode) -> Vec<DiffRow> {
-    let mut rows = Vec::new();
-    for hunk in diff.hunks {
-        rows.push(DiffRow::Hunk(hunk.header.clone()));
-        match mode {
-            DiffMode::SideBySide => {
-                rows.extend(hunk.aligned_rows().into_iter().map(DiffRow::Split))
-            }
-            _ => rows.extend(hunk.lines.into_iter().map(DiffRow::Unified)),
-        }
+/// Past this much patch text a comparison opens one file at a time.
+///
+/// Streaming parses every file up front, and a pull request that rewrites a
+/// lockfile or checks in a bundle is mostly machine-written text nobody reads
+/// line by line. The bound is on bytes rather than on the row count because it
+/// has to be decidable before the parsing it is meant to avoid. Crossing it
+/// says so on the pane rather than quietly rendering one file and letting the
+/// reader conclude the rest were unchanged.
+const MAX_STREAM_PATCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// Whether a comparison can be streamed, and what to say when it cannot.
+fn stream_budget(files: &[cibergit::domain::ChangedFile]) -> Result<(), String> {
+    let bytes: usize = files
+        .iter()
+        .filter_map(|file| file.patch.as_ref())
+        .map(|patch| patch.len())
+        .sum();
+    if bytes <= MAX_STREAM_PATCH_BYTES {
+        return Ok(());
     }
-    match diff.status {
-        PatchStatus::Complete => {}
-        PatchStatus::Truncated { reason } | PatchStatus::Unsupported { reason } => {
-            rows.push(DiffRow::Hunk(format!("Notice: {reason}")))
+    Err(format!(
+        "This comparison carries {} of patch text, past the {} one scroll is built for. \
+         Showing one file at a time; choose files in the tree.",
+        bounded_megabytes(bytes),
+        bounded_megabytes(MAX_STREAM_PATCH_BYTES),
+    ))
+}
+
+fn bounded_megabytes(bytes: usize) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024. * 1024.))
+}
+
+/// Build one scroll out of every file in the comparison.
+///
+/// Each file contributes a header and then its own rows, with its own threads
+/// placed among them — `place_threads_with_canonical` already returns anchors
+/// for every file, so the only thing that was ever single-file here was the
+/// filter in `attach_inline_rows`.
+///
+/// A file whose patch has not been read contributes its header alone. That is
+/// the honest rendering: History and local-inventory pull requests load one
+/// patch at a time, and a header with no rows reads as "not read yet" where a
+/// silent gap would read as "nothing changed".
+fn build_stream(
+    session: &ReviewSession,
+    mode: DiffMode,
+    threads: &[InlineThread],
+    composer: Option<&ComposerState>,
+    collapsed: &std::collections::HashSet<String>,
+) -> (Vec<DiffRow>, Vec<diff_pane::FileSpan>, bool) {
+    let files = &session.comparison().files;
+    let mut rows: Vec<DiffRow> = Vec::new();
+    let mut spans = Vec::with_capacity(files.len());
+    let mut any_split = false;
+    for file in files {
+        let key = file_key(file);
+        let folded = collapsed.contains(&key);
+        let start = rows.len();
+        rows.push(DiffRow::FileHeader {
+            key: key.clone(),
+            path: file.path.clone(),
+            additions: file.additions,
+            deletions: file.deletions,
+            loaded: file.patch.is_some(),
+            collapsed: folded,
+        });
+        // A folded file keeps its header and its span, and contributes no
+        // rows. Its place in the scroll and on the ruler is unchanged, so
+        // folding one file cannot move the reader off another.
+        if file.patch.is_some() && !folded {
+            let built = build_rows(parse_file(file), mode);
+            rows.extend(attach_inline_rows(built, &key, threads, composer));
         }
+        // Measured over this file's rows alone. One minified line in one file
+        // must not make every other file's source column scroll to its width.
+        let (split, text_width) = diff_text_metrics(&rows[start..]);
+        any_split |= split;
+        spans.push(diff_pane::FileSpan {
+            key,
+            path: file.path.clone(),
+            additions: file.additions,
+            deletions: file.deletions,
+            rows: start..rows.len(),
+            horizontal: ScrollHandle::new(),
+            text_width,
+        });
     }
-    rows
+    (rows, spans, any_split)
 }
 
 fn attach_inline_rows(
@@ -34203,18 +33837,31 @@ fn attach_inline_rows(
     let mut attached =
         Vec::with_capacity(rows.len() + threads.len() + usize::from(composer.is_some()));
     for row in rows {
-        attached.push(row.clone());
+        let old_line = match &row {
+            DiffRow::Unified(line) => line.old_line,
+            DiffRow::Split(row) => row.old.as_ref().and_then(|line| line.old_line),
+            _ => None,
+        };
+        let new_line = match &row {
+            DiffRow::Unified(line) => line.new_line,
+            DiffRow::Split(row) => row.new.as_ref().and_then(|line| line.new_line),
+            _ => None,
+        };
+        let has_line = |side, line| match side {
+            DiffSide::Old => old_line == Some(line),
+            DiffSide::New => new_line == Some(line),
+        };
+        attached.push(row);
         for thread in threads.iter().filter(|thread| {
             thread.anchor.as_ref().is_some_and(|anchor| {
-                anchor.file_key == selected_file_key
-                    && diff_row_has_line(&row, anchor.side, anchor.line)
+                anchor.file_key == selected_file_key && has_line(anchor.side, anchor.line)
             })
         }) {
             attached.push(DiffRow::Thread(Box::new(thread.clone())));
         }
         if let Some(composer) = composer
             && composer.coordinate.file_key == selected_file_key
-            && diff_row_has_line(&row, composer.coordinate.side, composer.coordinate.line)
+            && has_line(composer.coordinate.side, composer.coordinate.line)
         {
             attached.push(DiffRow::Composer {
                 side: composer.coordinate.side,
@@ -34225,106 +33872,6 @@ fn attach_inline_rows(
         }
     }
     attached
-}
-
-fn diff_row_has_line(row: &DiffRow, side: DiffSide, wanted: u64) -> bool {
-    match row {
-        DiffRow::Unified(line) => match side {
-            DiffSide::Old => line.old_line == Some(wanted),
-            DiffSide::New => line.new_line == Some(wanted),
-        },
-        DiffRow::Split(row) => match side {
-            DiffSide::Old => row.old.as_ref().and_then(|line| line.old_line) == Some(wanted),
-            DiffSide::New => row.new.as_ref().and_then(|line| line.new_line) == Some(wanted),
-        },
-        DiffRow::Hunk(_) | DiffRow::Thread(_) | DiffRow::Composer { .. } => false,
-    }
-}
-
-fn display_columns(text: &str) -> usize {
-    let mut columns = 0usize;
-    for character in text.chars() {
-        columns += match character {
-            '\t' => 4 - columns % 4,
-            '\u{0000}'..='\u{001f}' | '\u{007f}' => 1,
-            character if character.is_ascii() => 1,
-            _ => 2,
-        };
-    }
-    columns
-}
-
-fn diff_content_width(rows: &[DiffRow], mode: DiffMode) -> f32 {
-    let maximum = rows
-        .iter()
-        .map(|row| match row {
-            DiffRow::Hunk(header) => 24. + display_columns(header) as f32 * DIFF_CELL_WIDTH,
-            DiffRow::Unified(line) => {
-                DIFF_FIXED_COLUMNS + display_columns(&line.text) as f32 * DIFF_CELL_WIDTH
-            }
-            DiffRow::Split(row) => {
-                let old = row
-                    .old
-                    .as_ref()
-                    .map(|line| display_columns(&line.text))
-                    .unwrap_or(0);
-                let new = row
-                    .new
-                    .as_ref()
-                    .map(|line| display_columns(&line.text))
-                    .unwrap_or(0);
-                2. * (76. + old.max(new) as f32 * DIFF_CELL_WIDTH)
-            }
-            DiffRow::Thread(_) | DiffRow::Composer { .. } => 0.,
-        })
-        .fold(0f32, f32::max);
-    let minimum = match mode {
-        DiffMode::SideBySide => MIN_SPLIT_DIFF_WIDTH,
-        DiffMode::Auto | DiffMode::Unified => 420.,
-    };
-    maximum.max(minimum)
-}
-
-fn diff_text_metrics(rows: &[DiffRow]) -> (bool, f32) {
-    let split = rows.iter().any(|row| matches!(row, DiffRow::Split(_)));
-    (
-        split,
-        if split {
-            split_text_content_width(rows)
-        } else {
-            unified_text_content_width(rows)
-        },
-    )
-}
-
-fn split_text_content_width(rows: &[DiffRow]) -> f32 {
-    rows.iter()
-        .filter_map(|row| match row {
-            DiffRow::Split(row) => Some(
-                row.old
-                    .iter()
-                    .chain(row.new.iter())
-                    .map(|line| display_columns(&line.text) as f32 * DIFF_CELL_WIDTH)
-                    .fold(0f32, f32::max),
-            ),
-            DiffRow::Hunk(_)
-            | DiffRow::Unified(_)
-            | DiffRow::Thread(_)
-            | DiffRow::Composer { .. } => None,
-        })
-        .fold(1f32, f32::max)
-}
-
-fn unified_text_content_width(rows: &[DiffRow]) -> f32 {
-    rows.iter()
-        .filter_map(|row| match row {
-            DiffRow::Unified(line) => Some(display_columns(&line.text) as f32 * DIFF_CELL_WIDTH),
-            DiffRow::Hunk(_)
-            | DiffRow::Split(_)
-            | DiffRow::Thread(_)
-            | DiffRow::Composer { .. } => None,
-        })
-        .fold(1f32, f32::max)
 }
 
 #[cfg(feature = "ui-smoke")]
@@ -34342,29 +33889,32 @@ fn effective_diff_viewport_width(rows: &[DiffRow], horizontal: &ScrollHandle) ->
 /// bound; every chunk remains in the same horizontal row and stays reachable.
 fn line_text_chunks(text: &str) -> Vec<String> {
     let mut chunks = Vec::new();
-    let mut chunk = String::new();
+    let mut chunk = String::with_capacity(text.len().min(EXCEPTIONAL_LINE_CHUNK_BYTES));
     let mut columns = 0usize;
     for character in text.chars() {
-        let expansion = if character == '\t' {
-            " ".repeat(4 - columns % 4)
+        let (rendered, bytes, width) = if character == '\t' {
+            let width = 4 - columns % 4;
+            (' ', width, width)
         } else if character.is_control() {
-            "�".to_owned()
+            ('�', '�'.len_utf8(), usize::from(!character.is_ascii()) + 1)
         } else {
-            character.to_string()
+            (
+                character,
+                character.len_utf8(),
+                usize::from(!character.is_ascii()) + 1,
+            )
         };
-        let width = if character == '\t' {
-            expansion.len()
-        } else if character.is_ascii() {
-            1
-        } else {
-            2
-        };
-        if !chunk.is_empty()
-            && chunk.len().saturating_add(expansion.len()) > EXCEPTIONAL_LINE_CHUNK_BYTES
-        {
-            chunks.push(std::mem::take(&mut chunk));
+        if !chunk.is_empty() && chunk.len() + bytes > EXCEPTIONAL_LINE_CHUNK_BYTES {
+            chunks.push(std::mem::replace(
+                &mut chunk,
+                String::with_capacity(EXCEPTIONAL_LINE_CHUNK_BYTES),
+            ));
         }
-        chunk.push_str(&expansion);
+        if character == '\t' {
+            chunk.extend(std::iter::repeat_n(' ', width));
+        } else {
+            chunk.push(rendered);
+        }
         columns += width;
     }
     if !chunk.is_empty() || chunks.is_empty() {
@@ -34388,6 +33938,7 @@ fn line_text(text: &str, foreground: Rgba) -> Div {
 
 fn render_diff_row(row: &DiffRow, colors: Palette) -> AnyElement {
     match row {
+        DiffRow::FileHeader { .. } => div().into_any_element(),
         DiffRow::Hunk(header) => div()
             .h(px(ui::ROW_HEIGHT))
             .w_full()
@@ -34439,8 +33990,19 @@ fn render_read_only_diff_row(
     colors: Palette,
     horizontal: &ScrollHandle,
     text_width: f32,
+    root: &Entity<Root>,
 ) -> AnyElement {
     match row {
+        DiffRow::FileHeader {
+            key,
+            path,
+            additions,
+            deletions,
+            loaded,
+            collapsed,
+        } => file_header_row(
+            key, path, *additions, *deletions, *loaded, *collapsed, colors, root,
+        ),
         DiffRow::Hunk(_) => render_diff_row(row, colors),
         DiffRow::Unified(line) => {
             let style = line_style(line.kind, colors);
@@ -34521,6 +34083,16 @@ fn render_interactive_diff_row(
     mutation_busy: bool,
 ) -> AnyElement {
     match row {
+        DiffRow::FileHeader {
+            key,
+            path,
+            additions,
+            deletions,
+            loaded,
+            collapsed,
+        } => file_header_row(
+            key, path, *additions, *deletions, *loaded, *collapsed, colors, root,
+        ),
         DiffRow::Hunk(header) => render_diff_row(&DiffRow::Hunk(header.clone()), colors),
         DiffRow::Unified(line) => {
             render_unified_scrolled(line, colors, horizontal, text_width, root)
@@ -35068,6 +34640,349 @@ fn render_file_composer(
         .into_any_element()
 }
 
+/// The one line naming what a diff pane is showing. A file whose patch has not
+/// been loaded says so rather than reading as an empty change.
+fn selected_file_header(file: Option<&cibergit::domain::ChangedFile>) -> String {
+    match file {
+        Some(file) if file.patch.is_some() => {
+            format!("{}   +{} −{}", file.path, file.additions, file.deletions)
+        }
+        Some(file) => format!("{}   metadata only", file.path),
+        None => "Select a changed file".into(),
+    }
+}
+
+/// The split diff's column headers. Structure inside content, so this is one of
+/// the few bands that keeps a fill and a rule of its own.
+fn split_column_headers(colors: Palette) -> Div {
+    div()
+        .h(px(ui::ROW_HEIGHT))
+        .flex_none()
+        .flex()
+        .font_family(CODE_FONT)
+        .ui_text(TextRole::Caption)
+        .text_color(colors.muted)
+        .bg(colors.elevated)
+        .border_b_1()
+        .border_color(colors.border)
+        .child(div().w_1_2().px(px(ui::CONTROL_INSET)).child("OLD"))
+        .child(
+            div()
+                .w_1_2()
+                .px(px(ui::CONTROL_INSET))
+                .border_l_1()
+                .border_color(colors.border)
+                .child("NEW"),
+        )
+}
+
+/// Shared page chrome around the virtualized read-only rows owned by `diff_pane`.
+#[allow(clippy::too_many_arguments)]
+fn render_read_only_diff_pane(
+    diff: &diff_pane::DiffPaneState,
+    header: String,
+    empty_message: &str,
+    body_id: SharedString,
+    scrollbar_id: usize,
+    minimum_width: f32,
+    focus: &FocusHandle,
+    ruler: Option<AnyElement>,
+    root: &Entity<Root>,
+    colors: Palette,
+) -> Div {
+    let rows = diff.rows.clone();
+    let count = rows.len();
+    let vertical = diff.vertical.clone();
+    let horizontal = diff.horizontal.clone();
+    let contexts = diff.scroll_contexts();
+    let streaming = diff.streaming();
+    let cursor = diff.cursor;
+    let focus = focus.clone();
+    let click_focus = focus.clone();
+    let row_root = root.clone();
+    div()
+        .flex_1()
+        .min_w(px(minimum_width))
+        .h_full()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .h(px(ui::DESKTOP_HIT))
+                .px(px(ui::PANEL_GUTTER))
+                .flex_none()
+                .flex()
+                .items_center()
+                .border_b_1()
+                .border_color(colors.border)
+                .font_family(CODE_FONT)
+                .ui_text(TextRole::Body)
+                .child(header),
+        )
+        .when(diff.split, |pane| pane.child(split_column_headers(colors)))
+        .child(if count == 0 {
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(ui::PANEL_GUTTER))
+                .text_center()
+                .text_color(colors.muted)
+                .child(empty_message.to_owned())
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .child(
+                    div()
+                        .id(body_id)
+                        .flex_1()
+                        .min_h_0()
+                        .relative()
+                        .track_focus(&focus)
+                        .key_context("DiffPane")
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            window.focus(&click_focus, cx);
+                        })
+                        .child(
+                            list(vertical, move |row, _, _| {
+                                let (row_horizontal, text_width) = contexts.for_row(row);
+                                with_cursor(
+                                    render_read_only_diff_row(
+                                        &rows[row],
+                                        colors,
+                                        row_horizontal,
+                                        text_width,
+                                        &row_root,
+                                    ),
+                                    cursor == Some(row),
+                                    colors,
+                                )
+                            })
+                            .w_full()
+                            .h_full(),
+                        )
+                        .when(!streaming, |body| {
+                            body.child(diff_horizontal_scrollbar(scrollbar_id, &horizontal))
+                        }),
+                )
+                .when_some(ruler, |row, ruler| row.child(ruler))
+                .into_any_element()
+        })
+}
+
+/// The keyboard's position in the diff, drawn over the row rather than inside
+/// it. An absolutely positioned bar takes no width, so the gutters stay where
+/// they are and the 28px row pitch the density tests pin is untouched — a left
+/// border on the row would move every column right by its own width.
+fn cursor_bar(colors: Palette) -> Div {
+    div()
+        .absolute()
+        .left_0()
+        .top_0()
+        .bottom_0()
+        .w(px(2.))
+        .bg(colors.accent)
+        .debug_selector(|| "diff-cursor".to_owned())
+}
+
+/// Wrap a built row so the cursor shows on it, or hand it back untouched.
+fn with_cursor(row: AnyElement, on_cursor: bool, colors: Palette) -> AnyElement {
+    if !on_cursor {
+        return row;
+    }
+    div()
+        .relative()
+        .w_full()
+        .child(row)
+        .child(cursor_bar(colors))
+        .into_any_element()
+}
+
+/// A file's name inside the scroll, and the control that folds it.
+///
+/// This is what makes one continuous diff navigable rather than merely long:
+/// the header names what you are reading, and the whole row is the disclosure,
+/// so folding a file you have finished with takes one click anywhere along it
+/// rather than a hunt for a small triangle.
+///
+/// It takes the panel gutter rather than a control inset, so it lines up with
+/// the header a File-mode pane puts above the same content, and it keeps a fill
+/// and a rule because it is structure inside content — the one thing the
+/// no-cards rule exempts.
+#[allow(clippy::too_many_arguments)]
+fn file_header_row(
+    key: &str,
+    path: &str,
+    additions: u64,
+    deletions: u64,
+    loaded: bool,
+    collapsed: bool,
+    colors: Palette,
+    root: &Entity<Root>,
+) -> AnyElement {
+    let toggle_key = key.to_owned();
+    let toggle_root = root.clone();
+    let selector = format!("file-header-{key}");
+    div()
+        .id(SharedString::from(format!("file-header-{key}")))
+        .debug_selector(move || selector.clone())
+        .h(px(ui::DESKTOP_HIT))
+        .w_full()
+        .px(px(ui::PANEL_GUTTER))
+        .flex()
+        .items_center()
+        .gap(px(ui::GAP_GROUP))
+        .bg(colors.elevated)
+        .border_b_1()
+        .border_color(colors.border)
+        .cursor_pointer()
+        .hover(|header| header.bg(colors.selected))
+        .aria_label(format!(
+            "{path}, +{additions} \u{2212}{deletions}, {}",
+            if collapsed { "collapsed" } else { "expanded" }
+        ))
+        .child(
+            div()
+                .w(px(12.))
+                .flex_none()
+                .text_color(colors.muted)
+                .child(if collapsed { "\u{203a}" } else { "\u{2304}" }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_family(CODE_FONT)
+                .ui_text(TextRole::Body)
+                .font_weight(ui::WEIGHT_EMPHASIS)
+                .text_color(colors.text)
+                .child(path.to_owned()),
+        )
+        .when(loaded, |header| {
+            header
+                .child(
+                    div()
+                        .flex_none()
+                        .ui_text(TextRole::Caption)
+                        .text_color(colors.green)
+                        .child(format!("+{additions}")),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .ui_text(TextRole::Caption)
+                        .text_color(colors.red)
+                        .child(format!("\u{2212}{deletions}")),
+                )
+        })
+        .when(!loaded, |header| {
+            header.child(
+                div()
+                    .flex_none()
+                    .ui_text(TextRole::Caption)
+                    .text_color(colors.faint)
+                    .child("not read yet"),
+            )
+        })
+        .on_click(move |_, window, cx| {
+            let key = toggle_key.clone();
+            toggle_root.update(cx, |root, cx| {
+                root.review.toggle_diff_file(&key, window, cx);
+            });
+        })
+        .into_any_element()
+}
+
+/// The rows the hunk and thread jumps look for.
+fn is_hunk_row(row: &DiffRow) -> bool {
+    matches!(row, DiffRow::Hunk(_))
+}
+
+fn is_thread_row(row: &DiffRow) -> bool {
+    matches!(row, DiffRow::Thread(_))
+}
+
+/// Where you are in the whole change, as a strip down the diff's right edge.
+///
+/// One segment per file, sized by how much of the comparison that file is and
+/// tinted by whether it mostly adds or mostly removes. The file at the top of
+/// the viewport is marked, and a click jumps to a file's first row. A scroll
+/// bar says how far down a list you are; this says which file that is, which
+/// is the question a reader of a forty-file pull request actually has.
+///
+/// Only streaming has one. Showing a single file, the pane header already
+/// names what you are looking at and a ruler would be a picture of one thing.
+fn render_diff_ruler(
+    diff: &diff_pane::DiffPaneState,
+    colors: Palette,
+    root: &Entity<Root>,
+) -> Option<AnyElement> {
+    let spans = diff.spans.clone();
+    if spans.is_empty() {
+        return None;
+    }
+    let total = diff.rows.len().max(1) as f32;
+    let leading = diff.leading_file().map(|span| span.key.clone());
+    Some(
+        div()
+            .id("diff-ruler")
+            .debug_selector(|| "diff-ruler".to_owned())
+            .w(px(DIFF_RULER_WIDTH))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_l_1()
+            .border_color(colors.border)
+            .children(spans.iter().enumerate().map(|(index, span)| {
+                let share = span.rows.len() as f32 / total;
+                let here = leading.as_deref() == Some(span.key.as_str());
+                let tint = if span.rows.len() <= 1 {
+                    // Header only: nothing read yet, so nothing to weigh.
+                    colors.border
+                } else if span.deletions > span.additions {
+                    colors.del_gutter
+                } else {
+                    colors.add_gutter
+                };
+                let key = span.key.clone();
+                let jump_root = root.clone();
+                div()
+                    .id(SharedString::from(format!("diff-ruler-{index}")))
+                    .aria_label(format!(
+                        "{} +{} \u{2212}{}",
+                        span.path, span.additions, span.deletions
+                    ))
+                    .w_full()
+                    .h(relative(share))
+                    .bg(tint)
+                    .cursor_pointer()
+                    .when(here, |segment| {
+                        segment.border_l_2().border_color(colors.accent)
+                    })
+                    .hover(|segment| segment.bg(colors.accent_subtle))
+                    .on_click(move |_, _, cx| {
+                        let key = key.clone();
+                        jump_root.update(cx, |root, cx| {
+                            if let Some(diff) = root.review.active_diff_mut()
+                                && diff.reveal_file(&key)
+                            {
+                                cx.notify();
+                            }
+                        });
+                    })
+            }))
+            .into_any_element(),
+    )
+}
+
 fn diff_horizontal_scrollbar(index: usize, horizontal: &ScrollHandle) -> Div {
     div()
         .absolute()
@@ -35256,6 +35171,118 @@ fn split_cell_scrolled_interactive(
 
 #[cfg(test)]
 mod layout_tests {
+    mod local_file_load_fencing {
+        use super::super::{SelectedLocalFileCompletion, accept_local_file_load_results};
+        use cibergit::{
+            domain::{ChangedFile, Comparison, Revision},
+            review::ReviewSession,
+        };
+
+        fn file(path: &str, loaded: bool) -> ChangedFile {
+            ChangedFile {
+                path: path.into(),
+                previous_path: None,
+                raw_path: None,
+                raw_previous_path: None,
+                status: "modified".into(),
+                additions: u64::from(loaded),
+                deletions: u64::from(loaded),
+                patch: loaded.then(|| "@@ -1 +1 @@\n-old\n+new\n".into()),
+                patch_complete: loaded,
+            }
+        }
+
+        fn session(loaded_a: bool) -> ReviewSession {
+            ReviewSession::new(Comparison {
+                revision: Revision {
+                    base_sha: "a".repeat(40),
+                    head_sha: "b".repeat(40),
+                },
+                files: vec![file("a.rs", loaded_a), file("b.rs", false)],
+                complete: true,
+                notice: None,
+            })
+        }
+
+        fn moved_readers() -> (
+            ReviewSession,
+            cibergit::review::LazyPatchRequest,
+            ReviewSession,
+            cibergit::review::LazyPatchRequest,
+        ) {
+            let mut selected = session(false);
+            let selected_request = selected.begin_file_patch("a.rs").unwrap();
+            let mut canonical = session(false);
+            let canonical_request = canonical.begin_file_patch("a.rs").unwrap();
+            assert!(selected.select_file("b.rs"));
+            (selected, selected_request, canonical, canonical_request)
+        }
+
+        #[test]
+        fn stale_selected_success_does_not_control_presentation_while_canonical_installs() {
+            let (mut selected, selected_request, mut canonical, canonical_request) =
+                moved_readers();
+            let completion = accept_local_file_load_results(
+                Some(&mut selected),
+                &selected_request,
+                Some(Ok(file("a.rs", true))),
+                Some(&mut canonical),
+                Some(&canonical_request),
+                Some(Ok(file("a.rs", true))),
+            );
+
+            assert_eq!(completion.selected, SelectedLocalFileCompletion::Stale);
+            assert!(completion.canonical_installed);
+            assert_eq!(selected.selected_file().unwrap().path, "b.rs");
+            assert!(selected.comparison().files[0].patch.is_none());
+            assert!(canonical.comparison().files[0].patch.is_some());
+        }
+
+        #[test]
+        fn stale_selected_error_does_not_control_presentation_while_canonical_installs() {
+            let (mut selected, selected_request, mut canonical, canonical_request) =
+                moved_readers();
+            let completion = accept_local_file_load_results(
+                Some(&mut selected),
+                &selected_request,
+                Some(Err(anyhow::anyhow!("stale selected failure"))),
+                Some(&mut canonical),
+                Some(&canonical_request),
+                Some(Ok(file("a.rs", true))),
+            );
+
+            assert_eq!(completion.selected, SelectedLocalFileCompletion::Stale);
+            assert!(completion.canonical_installed);
+            assert_eq!(selected.selected_file().unwrap().path, "b.rs");
+            assert!(canonical.comparison().files[0].patch.is_some());
+        }
+
+        #[test]
+        fn canonical_only_success_is_presentation_neutral_after_display_moves() {
+            let mut selected = session(true);
+            let selected_request = selected.begin_file_patch("a.rs").unwrap();
+            let mut canonical = session(false);
+            let canonical_request = canonical.begin_file_patch("a.rs").unwrap();
+            assert!(selected.select_file("b.rs"));
+
+            let completion = accept_local_file_load_results(
+                Some(&mut selected),
+                &selected_request,
+                None,
+                Some(&mut canonical),
+                Some(&canonical_request),
+                Some(Ok(file("a.rs", true))),
+            );
+
+            assert_eq!(
+                completion.selected,
+                SelectedLocalFileCompletion::NotRequested
+            );
+            assert!(completion.canonical_installed);
+            assert_eq!(selected.selected_file().unwrap().path, "b.rs");
+        }
+    }
+
     #[cfg(feature = "ui-smoke")]
     use super::ci_read::MemoryRead;
     #[cfg(feature = "ui-smoke")]
@@ -35272,10 +35299,10 @@ mod layout_tests {
         MIN_SIDEBAR_WIDTH, MIN_SPLIT_DIFF_WIDTH, NativeConfirmation, PanelKind, PanelLayout,
         PendingReviewStartConfirmationMode, PendingReviewStartConfirmationToken,
         ReactionCompletionToken, SubmittedConfirmationToken, SubmittedDraftCallbackToken,
-        SubmittedDraftCloseDisposition, SubmittedDraftLoadState, SubmittedSummaryEditor,
-        active_review_composer_body, active_review_composer_needs_save, activity_thread_visible,
+        SubmittedDraftCloseDisposition, SubmittedSummaryEditor, active_review_composer_body,
+        active_review_composer_needs_save, activity_thread_visible,
         apply_submitted_draft_save_if_current, available_diff_width_for, bounded_log_render_range,
-        bounded_page, collaboration_completion_matches, comment_age_label, diff_content_width,
+        bounded_page, collaboration_completion_matches, comment_age_label, diff_text_metrics,
         display_columns, exact_timestamp_label, file_confirmation_matches_visible_body,
         iso8601_unix_ms, journal_operation_description, journal_operation_summary,
         line_text_chunks, media_free_markdown, observe_auxiliary,
@@ -35285,10 +35312,12 @@ mod layout_tests {
     #[cfg(feature = "ui-smoke")]
     use super::{
         ActionsReadError, ActionsReadErrorCategory, ActionsReadFixture, ActionsRunControlAction,
-        CiCompletionToken, CiPane, DismissalConfirmationToken, DismissalPreparationToken,
-        InspectorSection, InstallTabOptions, InteractionState, LoadState, NextCheck, NextCheckPage,
-        OpenChecks, OpenSelectedCheckJobs, RUN_CONTROLS, RepoRuntime, ReviewWorkspace, Root,
-        Startup, ToggleCheckIdentity, check_identity_button, checks_page_button, palette,
+        CiCompletionToken, CiPane, DiffCursorDown, DiffCursorToEnd, DiffCursorToStart,
+        DiffCursorUp, DiffNextHunk, DiffPreviousHunk, DismissalConfirmationToken,
+        DismissalPreparationToken, InspectorSection, InstallTabOptions, InteractionState,
+        LoadState, NextCheck, NextCheckPage, NextFile, OpenChecks, OpenSelectedCheckJobs,
+        RUN_CONTROLS, RepoRuntime, ReviewWorkspace, Root, Startup, ToggleAllFileSections,
+        ToggleCheckIdentity, check_identity_button, checks_page_button, palette,
     };
     use cibergit::domain::{
         Account, MergeEligibility, PendingFileCommentSource, PendingFileReviewAbsence,
@@ -36358,14 +36387,14 @@ mod layout_tests {
         for _ in 0..2 {
             let was_split = root.read_with(cx, |root, _| {
                 let this = &root.review;
-                this.tabs[0].diff_split
+                this.tabs[0].diff.split
             });
             let toggle = cx.debug_bounds("toggle-diff-layout").unwrap();
             cx.simulate_click(toggle.center(), Modifiers::default());
             cx.update(|window, cx| window.draw(cx).clear(cx));
             root.read_with(cx, |root, _| {
                 let this = &root.review;
-                assert_eq!(this.tabs[0].diff_split, !was_split);
+                assert_eq!(this.tabs[0].diff.split, !was_split);
                 assert_eq!(
                     this.tabs[0].session.as_ref().unwrap().diff_mode(),
                     if was_split {
@@ -36558,27 +36587,36 @@ mod layout_tests {
             gutters[2].2, top,
             "Checks and Conversation must open their page on the same line"
         );
-        // The page gutter is the title block's gutter, so the chrome above the
-        // tabs and the content below them line up on one edge.
-        // The page tabs and the Compare bar are two rows of the same chip
-        // component, so they share a gutter, a pitch and a height. They used to
-        // be built separately: the Compare bar's chips were plain divs at a
-        // different inset, landing 8px right of the tab labels above them.
+        // The page tabs now ride in the header bar rather than on a row of
+        // their own, so the relationship worth pinning changed with them: the
+        // tabs no longer share the Compare bar's gutter, because the Compare
+        // bar is page content on Commits while the tabs are chrome above it.
+        //
+        // What must still hold is that every page-level band starts on the one
+        // page gutter — and, as before, that is measured against the other
+        // bands rather than against a constant. Pinning this step against a
+        // constant is what let the original defect through: measured on
+        // Commits alone it looked deliberate, when Files changed put the
+        // identical bar 20px higher.
         let commits_chip = cx.debug_bounds("pr-tab-commits").unwrap();
         cx.simulate_click(commits_chip.center(), Modifiers::default());
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        let conversation_chip = cx.debug_bounds("pr-tab-conversation").unwrap();
-        let full_pr_chip = cx.debug_bounds("comparison-full").unwrap();
+        let header = cx.debug_bounds("pr-header-row").unwrap();
+        let compare_bar = cx.debug_bounds("comparison-bar").unwrap();
         assert_eq!(
-            full_pr_chip.left(),
-            conversation_chip.left(),
-            "the Compare bar and the tab row above it must start on one gutter"
+            compare_bar.left(),
+            header.left(),
+            "the Compare bar and the header above it must start on one gutter"
         );
         assert_eq!(
-            cx.debug_bounds("comparison-bar").unwrap().left(),
+            compare_bar.left(),
             left + px(cibergit::ui::PANEL_GUTTER),
             "the Compare bar must sit on the page gutter, not inside a second one"
         );
+        // The chips kept their component, so they kept their geometry: one
+        // height and one pitch between them, measured against each other.
+        let conversation_chip = cx.debug_bounds("pr-tab-conversation").unwrap();
+        let full_pr_chip = cx.debug_bounds("comparison-full").unwrap();
         assert_eq!(
             full_pr_chip.size.height, conversation_chip.size.height,
             "both chip rows must give their chips the same pointer target"
@@ -36590,33 +36628,36 @@ mod layout_tests {
             checks_chip.left() - cx.debug_bounds("pr-tab-commits").unwrap().right(),
             "both chip rows must use one pitch between chips"
         );
-        // Pinning this step against a constant is what let the defect through
-        // the first time: measured on Commits alone it looked deliberate, when
-        // in fact Files changed put the identical bar 20px higher. The property
-        // is that the two tabs agree, so measure both and compare them.
-        let commits_step = full_pr_chip.top() - conversation_chip.bottom();
+
+        // Files changed is the diff itself rather than a fourth inspector
+        // page, so it closes the inspector rather than laying out another one.
+        // The Compare bar leaves the diff with it: there it is a popover on
+        // the key it already owned, which is the row the diff gets back.
         let files_chip = cx.debug_bounds("pr-tab-files").unwrap();
         cx.simulate_click(files_chip.center(), Modifiers::default());
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        let files_step = cx.debug_bounds("comparison-full").unwrap().top()
-            - cx.debug_bounds("pr-tab-conversation").unwrap().bottom();
-        assert_eq!(
-            commits_step, files_step,
-            "the Compare bar must sit the same distance under the tab row on \
-             every tab that shows it"
-        );
-
-        // `pr-content-scroll` is measured outside its own padding, so the
-        // first character on the page sits one gutter in from its left edge —
-        // which is exactly where the title above the tabs starts. Files changed
-        // is the selected tab here, and it is the diff itself rather than a
-        // fourth inspector page, so it closes the inspector rather than laying
-        // out another one.
         assert!(cx.debug_bounds("pr-content-scroll").is_none());
+        assert!(
+            cx.debug_bounds("comparison-bar").is_none(),
+            "the Compare bar must not take a band from the diff"
+        );
+        assert!(
+            cx.debug_bounds("toggle-compare-popover").is_some(),
+            "and must still be reachable from the header"
+        );
         assert_eq!(
             cx.debug_bounds("pr-header-row").unwrap().left(),
             left + px(cibergit::ui::PANEL_GUTTER),
-            "the PR title and the page under the tabs must share one gutter"
+            "the PR header and the page under the tabs must share one gutter"
+        );
+        // The whole point of the restructure: one band of chrome above the
+        // diff rather than four. Measured against the row's own height so it
+        // stays true if the control height ever moves.
+        let header = cx.debug_bounds("pr-header-row").unwrap();
+        let tree = cx.debug_bounds("file-scroll").unwrap();
+        assert!(
+            tree.top() - header.top() <= header.size.height + px(1.),
+            "nothing may sit between the header bar and the diff"
         );
     }
 
@@ -36933,7 +36974,7 @@ mod layout_tests {
                 this.tabs[0].session = Some(cibergit::review::ReviewSession::new(comparison));
                 this.tabs[0].canonical_session = this.tabs[0].session.clone();
                 this.store = None;
-                this.tabs[0].diff_rows = Rc::new(
+                this.tabs[0].diff.rows = Rc::new(
                     (0..20000)
                         .map(|number| {
                             DiffRow::Unified(DiffLine {
@@ -36945,14 +36986,14 @@ mod layout_tests {
                         })
                         .collect(),
                 );
-                (this.tabs[0].diff_split, this.tabs[0].diff_text_width) =
-                    super::diff_text_metrics(&this.tabs[0].diff_rows);
-                this.tabs[0].diff_scroll =
+                (this.tabs[0].diff.split, this.tabs[0].diff.text_width) =
+                    super::diff_text_metrics(&this.tabs[0].diff.rows);
+                this.tabs[0].diff.vertical =
                     gpui::ListState::new(20000, gpui::ListAlignment::Top, gpui::px(480.));
                 cx.notify();
                 (
                     this.tabs[0].file_tree.rows(),
-                    this.tabs[0].diff_rows.clone(),
+                    this.tabs[0].diff.rows.clone(),
                 )
             })
         });
@@ -36969,7 +37010,7 @@ mod layout_tests {
                 this.tabs[0]
                     .file_tree_scroll
                     .scroll_to_item(5000, gpui::ScrollStrategy::Bottom);
-                this.tabs[0].diff_scroll.scroll_to_reveal_item(19999);
+                this.tabs[0].diff.vertical.scroll_to_reveal_item(19999);
                 cx.notify();
             });
             window.draw(cx).clear(cx);
@@ -36986,7 +37027,7 @@ mod layout_tests {
                     "rendered {rendered} rows after end scroll"
                 );
                 assert!(Rc::ptr_eq(&tree_rows, &this.tabs[0].file_tree.rows()));
-                assert!(Rc::ptr_eq(&diff_rows, &this.tabs[0].diff_rows));
+                assert!(Rc::ptr_eq(&diff_rows, &this.tabs[0].diff.rows));
                 assert_eq!(
                     this.tabs[0].file_tree.rows()[5000].file_key(),
                     Some("src/file-4999.rs")
@@ -38536,8 +38577,8 @@ mod layout_tests {
                 "session": tab.session,
                 "canonical": tab.canonical_session,
                 "pin": tab.canonical_full_revision,
-                "composition": controller.composition,
-                "durable": controller.durable_composition,
+                "composition": controller.composition(),
+                "durable": controller.durable_composition(),
                 "submitted": format!("{:?}", tab.submitted_summary_editor.current_snapshot()),
                 "dismissal": format!("{:?}", tab.dismissal_editor),
                 "journal": format!("{:?}", tab.journal_operations),
@@ -38621,7 +38662,7 @@ mod layout_tests {
                 let saved = controller
                     .stage_composer_text("retained LINE rationale".into())
                     .unwrap();
-                controller.store.save(&saved).unwrap();
+                controller.store_for_test().save(&saved).unwrap();
                 let line_id = controller
                     .composer
                     .as_ref()
@@ -38641,7 +38682,7 @@ mod layout_tests {
                 let saved = controller
                     .stage_composer_text("retained FILE rationale".into())
                     .unwrap();
-                controller.store.save(&saved).unwrap();
+                controller.store_for_test().save(&saved).unwrap();
                 let file_id = controller
                     .file_composer
                     .as_ref()
@@ -38702,17 +38743,17 @@ mod layout_tests {
                     .unwrap();
                 assert!(
                     controller
-                        .authority
+                        .authority_for_test()
                         .execute_if_current(
-                            &controller.store,
-                            controller.durable_composition.as_ref(),
+                            controller.store_for_test(),
+                            controller.durable_composition(),
                             || ()
                         )
                         .is_err()
                 );
                 controller.pending_review_start = Some(record.clone());
-                assert!(!controller.composition.drafts.is_empty());
-                assert!(!controller.composition.file_drafts.is_empty());
+                assert!(!controller.composition().drafts.is_empty());
+                assert!(!controller.composition().file_drafts.is_empty());
                 this.tabs[0].interactions = InteractionState::Ready(controller);
                 this.tabs[0].session = Some(session.clone());
                 this.tabs[0].canonical_session = Some(session);
@@ -38854,10 +38895,10 @@ mod layout_tests {
                 Some(stopped)
             );
             controller
-                .authority
+                .authority_for_test()
                 .execute_if_current(
-                    &controller.store,
-                    controller.durable_composition.as_ref(),
+                    controller.store_for_test(),
+                    controller.durable_composition(),
                     || (),
                 )
                 .unwrap();
@@ -38935,7 +38976,7 @@ mod layout_tests {
         let active = editor.active_draft().expect("A draft remains active");
         assert_eq!(active.body, "typed A");
         assert_eq!(active.review.body, "remote changed");
-        assert_eq!(editor.drafts.len(), 2);
+        assert_eq!(editor.drafts().len(), 2);
     }
 
     #[test]
@@ -38955,7 +38996,10 @@ mod layout_tests {
             drafts: vec![saved],
         };
         let mut editor = SubmittedSummaryEditor::default();
-        assert!(!editor.merge_loaded(0, disk));
+        assert!(matches!(
+            editor.complete_load(0, Ok(disk)),
+            super::SubmittedDraftLoadCompletion::Restored { .. }
+        ));
         let (_, mut fresh) = submitted_review_fixture();
         fresh.coordinates.host = "GITHUB.COM".into();
         fresh.coordinates.owner = "Octo".into();
@@ -38964,11 +39008,11 @@ mod layout_tests {
         assert_eq!(body, "typed under canonical storage identity");
         assert!(source_changed);
         assert!(resumed);
-        assert_eq!(editor.drafts.len(), 1);
-        assert_eq!(editor.drafts[0].review, fresh);
+        assert_eq!(editor.drafts().len(), 1);
+        assert_eq!(editor.drafts()[0].review, fresh);
         assert!(same_review_coordinates(
-            &editor.drafts[0].review.coordinates,
-            &editor.active_review.clone().unwrap()
+            &editor.drafts()[0].review.coordinates,
+            editor.active_coordinates().unwrap()
         ));
     }
 
@@ -39038,10 +39082,10 @@ mod layout_tests {
                 .enumerate()
                 {
                     let editor = &mut this.tabs[index].submitted_summary_editor;
-                    editor.load_state = SubmittedDraftLoadState::Ready;
+                    editor.assume_loaded_for_test();
                     editor.begin(review);
                     editor.store_active_body(body.into());
-                    editor.durable = editor.current_snapshot();
+                    editor.mark_current_durable(false);
                 }
 
                 let session = ReviewSession::new(Comparison {
@@ -39085,7 +39129,7 @@ mod layout_tests {
                             .unwrap();
                     }
                     let snapshot = controller.stage_composer_text(body.into()).unwrap();
-                    controller.store.save(&snapshot).unwrap();
+                    controller.store_for_test().save(&snapshot).unwrap();
                     let id = controller
                         .composer
                         .as_ref()
@@ -39110,19 +39154,19 @@ mod layout_tests {
                 let editor = &mut this.tabs[0].submitted_summary_editor;
                 editor.store_active_body("pending draft A".into());
                 editor.queue_current();
-                assert!(editor.start_next().is_some());
+                let save = editor.start_next_save().unwrap();
                 let token = SubmittedDraftCallbackToken {
                     workspace_instance: this.workspace_instance,
                     tab_instance: this.tabs[0].instance_generation,
                     repository_key: repository.cache_key(),
                     pull_request: 7,
-                    generation: this.tabs[0].submitted_summary_editor.save_generation,
+                    generation: save.operation_generation(),
                 };
                 this.close_tab(&crate::CloseTab, window, cx);
-                assert!(this.tabs[0].submitted_summary_editor.close_after_save);
+                assert!(this.tabs[0].submitted_summary_editor.close_after_save());
                 assert!(this.composer_input.read(cx).presentation().is_disabled());
                 let before = match &this.tabs[0].interactions {
-                    super::InteractionState::Ready(c) => c.composition.clone(),
+                    super::InteractionState::Ready(c) => c.composition().clone(),
                     _ => unreachable!(),
                 };
                 this.open_inline_composer(DiffSide::New, 1, false, window, cx);
@@ -39144,7 +39188,7 @@ mod layout_tests {
                     .update(cx, |input, cx| input.set_value("late text", window, cx));
                 this.persist_composer(cx);
                 let after = match &this.tabs[0].interactions {
-                    super::InteractionState::Ready(c) => c.composition.clone(),
+                    super::InteractionState::Ready(c) => c.composition().clone(),
                     _ => unreachable!(),
                 };
                 assert_eq!(before, after);
@@ -39166,12 +39210,12 @@ mod layout_tests {
                 ));
                 assert!(!this.composer_input.read(cx).presentation().is_disabled());
                 assert_eq!(this.tabs.len(), 3);
-                this.tabs[0].submitted_summary_editor.persistence_error = None;
                 this.tabs[0]
                     .submitted_summary_editor
                     .store_active_body("exact draft A".into());
-                this.tabs[0].submitted_summary_editor.durable =
-                    this.tabs[0].submitted_summary_editor.current_snapshot();
+                this.tabs[0]
+                    .submitted_summary_editor
+                    .mark_current_durable(false);
                 this.submitted_summary_input
                     .update(cx, |input, cx| input.set_value("exact draft A", window, cx));
 
@@ -40512,11 +40556,10 @@ mod layout_tests {
             }],
         };
 
-        assert!(!editor.merge_loaded(0, disk));
-        assert!(matches!(
-            editor.load_state,
-            SubmittedDraftLoadState::Conflict { .. }
-        ));
+        assert_eq!(
+            editor.complete_load(0, Ok(disk)),
+            super::SubmittedDraftLoadCompletion::Conflict
+        );
         assert_eq!(
             editor.active_draft().unwrap().body,
             "typed before load callback"
@@ -40525,17 +40568,17 @@ mod layout_tests {
             editor.conflict().unwrap().drafts[0].body,
             "preexisting two-window durable text"
         );
-        assert!(editor.pending.is_none());
-        assert_eq!(editor.durable.generation, None);
+        assert!(editor.pending_snapshot().is_none());
+        assert_eq!(editor.durable_snapshot().generation, None);
 
         assert!(editor.resolve_conflict_keep_current());
-        assert_eq!(editor.durable.generation, Some(8));
+        assert_eq!(editor.durable_snapshot().generation, Some(8));
         assert_eq!(
             editor.active_draft().unwrap().body,
             "typed before load callback"
         );
         assert_eq!(
-            editor.pending.as_ref().unwrap().snapshot.drafts[0].body,
+            editor.pending_snapshot().unwrap().drafts[0].body,
             "typed before load callback"
         );
     }
@@ -40571,13 +40614,16 @@ mod layout_tests {
             active_review: None,
             drafts: vec![saved_a.clone(), saved_c.clone()],
         };
-        let mut editor = SubmittedSummaryEditor {
-            active_review: Some(local_a.review.coordinates.clone()),
-            drafts: vec![local_a.clone(), local_b.clone()],
-            edit_generation: 2,
-            ..Default::default()
-        };
-        assert!(!editor.merge_loaded(0, disk));
+        let mut editor = SubmittedSummaryEditor::default();
+        editor.begin(local_a.review.clone());
+        editor.store_active_body(local_a.body.clone());
+        editor.begin(local_b.review.clone());
+        editor.store_active_body(local_b.body.clone());
+        editor.begin(local_a.review.clone());
+        assert_eq!(
+            editor.complete_load(0, Ok(disk)),
+            super::SubmittedDraftLoadCompletion::Conflict
+        );
 
         let mut use_saved = editor.clone();
         assert!(use_saved.resolve_conflict_use_saved());
@@ -40602,8 +40648,8 @@ mod layout_tests {
                 .body,
             "disk-only C"
         );
-        assert!(use_saved.active_review.is_none());
-        assert_eq!(use_saved.pending.as_ref().unwrap().snapshot.drafts.len(), 3);
+        assert!(use_saved.active_coordinates().is_none());
+        assert_eq!(use_saved.pending_snapshot().unwrap().drafts.len(), 3);
 
         assert!(editor.resolve_conflict_keep_current());
         assert_eq!(
@@ -40618,64 +40664,60 @@ mod layout_tests {
             editor.draft_for(&saved_c.review.coordinates).unwrap().body,
             "disk-only C"
         );
-        assert!(editor.active_review.is_some());
-        assert_eq!(editor.pending.as_ref().unwrap().snapshot.drafts.len(), 3);
+        assert!(editor.active_coordinates().is_some());
+        assert_eq!(editor.pending_snapshot().unwrap().drafts.len(), 3);
     }
 
     #[test]
     fn rejected_save_state_keeps_exact_current_text_and_close_barrier_dirty() {
         let (_, review) = submitted_review_fixture();
-        let mut editor = SubmittedSummaryEditor {
-            load_state: SubmittedDraftLoadState::Ready,
-            ..Default::default()
-        };
+        let mut editor = SubmittedSummaryEditor::default();
+        editor.assume_loaded_for_test();
         editor.begin(review);
         editor.store_active_body("must remain after rejected save".into());
         editor.queue_current();
-        let started = editor.start_next().unwrap();
+        let started = editor.start_next_save().unwrap();
         assert_eq!(
-            editor.close_disposition(),
+            editor.request_close(),
             SubmittedDraftCloseDisposition::WaitForOperation
         );
         assert_eq!(
-            started.snapshot.drafts[0].body,
+            started.snapshot().drafts[0].body,
             "must remain after rejected save"
         );
-        assert_eq!(
-            editor.complete_save(Err("injected rejection".into())),
-            Err("injected rejection".into())
-        );
+        let failure = editor
+            .complete_save(
+                started.operation_generation(),
+                Err("injected rejection".into()),
+            )
+            .unwrap()
+            .unwrap_err();
+        assert!(failure.ends_with("injected rejection"));
         assert_eq!(
             editor.active_draft().unwrap().body,
             "must remain after rejected save"
         );
         assert!(!editor.is_current_durable());
-        assert_eq!(
-            editor.close_disposition(),
-            SubmittedDraftCloseDisposition::Save
-        );
+        assert_eq!(editor.request_close(), SubmittedDraftCloseDisposition::Save);
     }
 
     #[test]
     fn delayed_save_actual_apply_path_rejects_tab_and_workspace_replacements() {
         let (repository, review) = submitted_review_fixture();
-        let mut editor = SubmittedSummaryEditor {
-            load_state: SubmittedDraftLoadState::Ready,
-            ..Default::default()
-        };
+        let mut editor = SubmittedSummaryEditor::default();
+        editor.assume_loaded_for_test();
         editor.begin(review);
         editor.store_active_body("delayed exact snapshot".into());
         editor.queue_current();
-        let started = editor.start_next().unwrap();
-        editor.save_generation = 9;
+        let started = editor.start_next_save().unwrap();
         let token = SubmittedDraftCallbackToken {
             workspace_instance: 40,
             tab_instance: 50,
             repository_key: repository.cache_key(),
             pull_request: 7,
-            generation: 9,
+            generation: started.operation_generation(),
         };
-        let mut receipt = started.snapshot.clone();
+        let mut receipt = started.snapshot().clone();
         receipt.generation = Some(1);
 
         assert!(
@@ -40690,7 +40732,7 @@ mod layout_tests {
             )
             .is_none()
         );
-        assert!(editor.in_flight.is_some());
+        assert!(editor.has_active_operation());
         assert!(
             apply_submitted_draft_save_if_current(
                 &token,
@@ -40720,32 +40762,29 @@ mod layout_tests {
             ),
             Some(Ok(()))
         );
-        assert!(editor.in_flight.is_none());
+        assert!(!editor.has_active_operation());
         assert!(editor.is_current_durable());
     }
 
     #[test]
     fn acknowledged_clear_queue_does_not_invalidate_owned_save_completion() {
         let (repository, review) = submitted_review_fixture();
-        let mut editor = SubmittedSummaryEditor {
-            load_state: SubmittedDraftLoadState::Ready,
-            ..Default::default()
-        };
+        let mut editor = SubmittedSummaryEditor::default();
+        editor.assume_loaded_for_test();
         editor.begin(review);
         editor.store_active_body("owned save before clear".into());
         let captured = editor.active_draft().unwrap().clone();
         editor.queue_current();
-        let started = editor.start_next().unwrap();
-        editor.save_generation = 17;
+        let started = editor.start_next_save().unwrap();
         editor.queue_clear(captured);
         let token = SubmittedDraftCallbackToken {
             workspace_instance: 40,
             tab_instance: 50,
             repository_key: repository.cache_key(),
             pull_request: 7,
-            generation: 17,
+            generation: started.operation_generation(),
         };
-        let mut receipt = started.snapshot;
+        let mut receipt = started.snapshot().clone();
         receipt.generation = Some(4);
 
         assert_eq!(
@@ -40760,10 +40799,10 @@ mod layout_tests {
             ),
             Some(Ok(()))
         );
-        assert!(editor.in_flight.is_none());
-        assert!(editor.pending_clear.is_some());
+        assert!(!editor.has_active_operation());
+        assert!(editor.has_clear_work());
         assert_eq!(
-            editor.close_disposition(),
+            editor.request_close(),
             SubmittedDraftCloseDisposition::WaitForOperation
         );
     }
@@ -40771,19 +40810,19 @@ mod layout_tests {
     #[test]
     fn acknowledged_clear_actual_apply_path_preserves_newer_typed_body() {
         let (_, review) = submitted_review_fixture();
-        let mut editor = SubmittedSummaryEditor {
-            load_state: SubmittedDraftLoadState::Ready,
-            ..Default::default()
-        };
+        let mut editor = SubmittedSummaryEditor::default();
+        editor.assume_loaded_for_test();
         editor.begin(review);
         editor.store_active_body("exact sent body".into());
         let captured = editor.active_draft().unwrap().clone();
-        let durable = editor.current_snapshot();
-        editor.durable = SubmittedDraftStoreSnapshot {
+        let durable = SubmittedDraftStoreSnapshot {
             generation: Some(12),
-            ..durable
+            ..editor.current_snapshot()
         };
-        editor.clear_in_flight = true;
+        let edit_generation = editor.edit_generation();
+        editor.complete_load(edit_generation, Ok(durable));
+        editor.queue_clear(captured);
+        let clear = editor.start_clear(false).unwrap().unwrap();
         editor.store_active_body("newer typed body".into());
         let tombstone = SubmittedDraftStoreSnapshot {
             generation: Some(13),
@@ -40791,11 +40830,14 @@ mod layout_tests {
             drafts: Vec::new(),
         };
 
-        assert_eq!(editor.complete_clear(&captured, Ok(tombstone)), Ok(false));
-        assert_eq!(editor.active_draft().unwrap().body, "newer typed body");
-        assert_eq!(editor.durable.generation, Some(13));
         assert_eq!(
-            editor.pending.as_ref().unwrap().snapshot.drafts[0].body,
+            editor.complete_clear(clear.operation_generation(), Ok(tombstone)),
+            Some(Ok(false))
+        );
+        assert_eq!(editor.active_draft().unwrap().body, "newer typed body");
+        assert_eq!(editor.durable_snapshot().generation, Some(13));
+        assert_eq!(
+            editor.pending_snapshot().unwrap().drafts[0].body,
             "newer typed body"
         );
     }
@@ -40819,46 +40861,59 @@ mod layout_tests {
             active_review: Some(draft_b.review.coordinates.clone()),
             drafts: vec![draft_b.clone()],
         };
-        let mut editor = SubmittedSummaryEditor {
-            load_state: SubmittedDraftLoadState::Ready,
-            active_review: Some(draft_b.review.coordinates.clone()),
-            drafts: vec![draft_a.clone(), draft_b.clone()],
-            durable: SubmittedDraftStoreSnapshot {
+        let mut editor = SubmittedSummaryEditor::default();
+        editor.complete_load(
+            0,
+            Ok(SubmittedDraftStoreSnapshot {
                 generation: Some(12),
-                active_review: Some(draft_b.review.coordinates.clone()),
-                drafts: vec![draft_a.clone(), draft_b.clone()],
-            },
-            clear_in_flight: true,
-            ..Default::default()
-        };
+                active_review: None,
+                drafts: Vec::new(),
+            }),
+        );
+        editor.begin(draft_a.review.clone());
+        editor.store_active_body(draft_a.body.clone());
+        editor.begin(draft_b.review.clone());
+        editor.store_active_body(draft_b.body.clone());
+        editor.mark_current_durable(false);
+        editor.queue_clear(draft_a.clone());
+        let clear = editor.start_clear(false).unwrap().unwrap();
         assert_eq!(
-            editor.complete_clear(&draft_a, Ok(cleared.clone())),
-            Ok(true)
+            editor.complete_clear(clear.operation_generation(), Ok(cleared.clone())),
+            Some(Ok(true))
         );
         assert!(editor.draft_for(&draft_a.review.coordinates).is_none());
         assert_eq!(editor.active_draft().unwrap().body, "newer B");
-        assert!(editor.pending.is_none());
+        assert!(editor.pending_snapshot().is_none());
 
-        let mut changed = SubmittedSummaryEditor {
-            load_state: SubmittedDraftLoadState::Ready,
-            ..Default::default()
-        };
+        let mut changed = SubmittedSummaryEditor::default();
+        changed.complete_load(
+            0,
+            Ok(SubmittedDraftStoreSnapshot {
+                generation: Some(12),
+                active_review: None,
+                drafts: Vec::new(),
+            }),
+        );
         let mut changed_a = draft_a.clone();
         changed_a.body = "new unsent A after acknowledgement".into();
-        changed.active_review = Some(changed_a.review.coordinates.clone());
-        changed.drafts = vec![changed_a.clone(), draft_b];
-        changed.durable = SubmittedDraftStoreSnapshot {
-            generation: Some(12),
-            active_review: Some(draft_a.review.coordinates.clone()),
-            drafts: vec![draft_a.clone()],
-        };
-        changed.clear_in_flight = true;
-        assert_eq!(changed.complete_clear(&draft_a, Ok(cleared)), Ok(false));
+        changed.begin(draft_a.review.clone());
+        changed.store_active_body(draft_a.body.clone());
+        changed.mark_current_durable(false);
+        changed.begin(draft_b.review.clone());
+        changed.store_active_body(draft_b.body.clone());
+        changed.begin(draft_a.review.clone());
+        changed.queue_clear(draft_a.clone());
+        let clear = changed.start_clear(false).unwrap().unwrap();
+        changed.store_active_body(changed_a.body.clone());
+        assert_eq!(
+            changed.complete_clear(clear.operation_generation(), Ok(cleared)),
+            Some(Ok(false))
+        );
         assert_eq!(
             changed.draft_for(&draft_a.review.coordinates).unwrap().body,
             "new unsent A after acknowledgement"
         );
-        assert!(changed.pending.is_some());
+        assert!(changed.pending_snapshot().is_some());
     }
 
     #[test]
@@ -41334,7 +41389,7 @@ mod layout_tests {
                 let saved = controller
                     .stage_composer_text("Whole-file rationale".into())
                     .unwrap();
-                controller.store.save(&saved).unwrap();
+                controller.store_for_test().save(&saved).unwrap();
                 let draft_id = controller
                     .file_composer
                     .as_ref()
@@ -41540,37 +41595,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn slow_reads_finish_despite_repeated_periodic_polls() {
-        // Four independent lanes: metadata, details, lifecycle and sidebar.
-        // Model a provider taking several poll intervals, without wall-clock
-        // sleeps or network calls. Each original result must remain installable.
-        let mut lanes: [super::RefreshGate; 4] = std::array::from_fn(|_| Default::default());
-        let mut dispatched = [0; 4];
-        let mut installed = [0; 4];
-        for (index, lane) in lanes.iter_mut().enumerate() {
-            dispatched[index] += usize::from(lane.request(false));
-        }
-        for _ in 0..20 {
-            for (index, lane) in lanes.iter_mut().enumerate() {
-                dispatched[index] += usize::from(lane.request(false));
-            }
-        }
-        assert_eq!(dispatched, [1; 4], "polls must not overlap an active read");
-        for (index, lane) in lanes.iter_mut().enumerate() {
-            if !lane.complete() {
-                installed[index] += 1;
-            }
-        }
-        assert_eq!(installed, [1; 4], "slow successful reads must not starve");
-        for lane in &mut lanes {
-            assert!(
-                lane.request(false),
-                "later periodic refresh remains available"
-            );
-        }
-    }
-
-    #[test]
     fn cache_load_and_save_callbacks_reject_workspace_and_tab_replacement() {
         let token = CollaborationReadToken {
             workspace_instance: 10,
@@ -41591,77 +41615,67 @@ mod layout_tests {
         assert!(!collaboration_completion_matches(10, 10, 20, 21));
     }
 
-    #[test]
-    fn delayed_startup_restore_is_fenced_by_workspace_lifetime_navigation_and_close() {
-        let token = super::StartupRestoreToken {
-            workspace_instance: 10,
-            generation: 4,
-        };
-        assert!(token.matches(10, 4, true));
-        assert!(
-            !token.matches(11, 4, true),
-            "a replaced root rejects the batch"
-        );
-        assert!(
-            !token.matches(10, 5, true),
-            "navigation invalidates its generation"
-        );
-        assert!(
-            !token.matches(10, 4, false),
-            "close/cancel clears pending admission"
-        );
-    }
-
-    #[test]
-    fn startup_restore_reorders_saved_tabs_and_explicit_destination_wins_active() {
-        use std::collections::BTreeSet;
-
-        let id = |number: u64| ("exact-account/repository".to_owned(), number);
-        let current = vec![id(2), id(1), id(3), id(99)];
-        let saved = vec![id(1), id(2), id(3)];
-        assert_eq!(super::startup_tab_order(&current, &saved), vec![1, 0, 2, 3]);
-        let available = current.iter().cloned().collect::<BTreeSet<_>>();
-        assert_eq!(
-            super::startup_active_identity(
-                &available,
-                Some(id(99)),
-                Some(id(1)),
-                Some(id(2)),
-                &saved,
-            ),
-            Some(id(99))
-        );
-        assert_eq!(
-            super::startup_active_identity(&available, None, None, None, &saved),
-            Some(id(1)),
-            "first admitted tab is the visible fallback when saved active is unavailable"
-        );
-    }
-
-    #[test]
-    fn delayed_restore_revalidates_exact_repository_account_before_install() {
-        use cibergit::domain::{Account, Repository};
-
-        let repository = |login: &str| Repository {
-            host: "github.com".into(),
-            owner: "acme".into(),
-            name: "app".into(),
-            account: Account {
-                host: "github.com".into(),
-                login: login.into(),
-            },
-            local_path: None,
-        };
-        let saved = repository("one");
-        assert!(super::saved_repository_is_current(
-            std::slice::from_ref(&saved),
-            &saved
-        ));
-        assert!(!super::saved_repository_is_current(
-            &[repository("two")],
-            &saved
-        ));
-        assert!(!super::saved_repository_is_current(&[], &saved));
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn explicit_utility_navigation_cancels_delayed_workspace_restore(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::{TabState, WorkspaceState, workspace_save};
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let data_root = data.path().to_owned();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data_root),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        let (repository, _) = submitted_review_fixture();
+        root.update(cx, |root, cx| {
+            let this = &mut root.review;
+            let mut workspace = WorkspaceState {
+                repositories: vec![repository.clone()],
+                ..Default::default()
+            };
+            let pull = transition_pull_request(7);
+            workspace.tabs.push(TabState {
+                repository_key: repository.cache_key(),
+                number: 7,
+                revision: pull.revision(),
+                pull_request: Some(pull),
+                selected_file: None,
+                scroll_offset: 0.0,
+                diff_mode: "auto".into(),
+            });
+            for page in 0..3 {
+                this.persistence =
+                    workspace_save::WorkspacePersistence::new(this.store.clone(), &workspace);
+                let delayed = this
+                    .persistence
+                    .begin_restore(&workspace)
+                    .unwrap()
+                    .execute();
+                let before = this.user_intent_generation;
+                match page {
+                    0 => this.open_history(Some(repository.clone()), cx),
+                    1 => this.open_pr_browser(Some(repository.clone()), cx),
+                    _ => this.open_settings(cx),
+                }
+                assert_eq!(this.user_intent_generation, before + 1);
+                assert!(!this.persistence.restore_pending());
+                assert!(
+                    this.persistence
+                        .complete_restore(delayed, &workspace.repositories, &[])
+                        .is_none()
+                );
+            }
+            assert!(this.settings_active);
+        });
     }
 
     #[test]
@@ -42022,258 +42036,9 @@ mod layout_tests {
     }
 
     #[test]
-    fn explicit_refresh_coalesces_and_discards_the_pre_effect_observation() {
-        let mut lane = super::RefreshGate::default();
-        assert!(lane.request(false));
-        // A mutation completed or the sidebar filter changed while its older
-        // read was active. Repeated explicit requests retain one fresh read.
-        for _ in 0..10 {
-            assert!(!lane.request(true));
-            assert!(!lane.request(false));
-        }
-        let mut displayed = "retained cache";
-        let refresh_again = lane.complete();
-        if !refresh_again {
-            displayed = "pre-effect observation";
-        }
-        assert!(refresh_again);
-        assert_eq!(displayed, "retained cache");
-        assert!(lane.request(true));
-        for _ in 0..20 {
-            assert!(!lane.request(false));
-        }
-        assert!(!lane.complete(), "polls must not queue a third read");
-        displayed = "post-effect observation";
-        assert_eq!(displayed, "post-effect observation");
-        // Errors finish the same lane, so a subsequent explicit retry can run.
-        assert!(lane.request(true));
-        assert!(!lane.complete());
-        assert!(lane.request(true));
-    }
-
-    #[test]
-    fn explicit_follow_up_retains_server_poll_floor_without_stranding_lane() {
-        let now = Instant::now();
-        let wall = UNIX_EPOCH + Duration::from_secs(40_000);
-        let account = Account {
-            host: "github.com".into(),
-            login: "alice".into(),
-        };
-        let mut lane = super::RefreshGate::default();
-        let mut reads = super::read_sync::GeneralReadController::default();
-        assert_eq!(lane.begin_admission(false), Some(false));
-        let (token, _) = reads.begin_at(&account, now).unwrap().into_parts();
-        assert_eq!(lane.begin_admission(true), None);
-        let follow_up = lane.complete();
-        assert!(follow_up);
-        let disposition = reads.complete_at(
-            &token,
-            &GeneralReadDirective {
-                x_poll_interval: Some(GeneralReadDelay::Seconds(90)),
-                rate_limit: None,
-            },
-            None,
-            false,
-            now,
-            wall,
-        );
-        assert!(disposition.matching_operation_released);
-        assert!(!disposition.payload_accepted);
-
-        assert_eq!(lane.begin_admission(true), Some(true));
-        let deferral = reads.begin_at(&account, now + Duration::from_secs(89));
-        assert!(matches!(
-            deferral,
-            Err(super::read_sync::ReadDeferral::Server(
-                super::read_sync::POLL_DEFERRED_NOTICE
-            ))
-        ));
-        lane.defer_admission(true);
-        assert!(lane.has_deferred());
-        assert_eq!(lane.begin_admission(false), Some(true));
-        assert!(
-            reads
-                .begin_at(&account, now + Duration::from_secs(90))
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn periodic_cycle_fairly_dispatches_all_same_account_lanes() {
-        let now = Instant::now();
-        let wall = UNIX_EPOCH + Duration::from_secs(50_000);
-        let account = Account {
-            host: "github.com".into(),
-            login: "alice".into(),
-        };
-        // Metadata, details, lifecycle, then a later sidebar repository.
-        let mut lanes: [super::RefreshGate; 4] = std::array::from_fn(|_| Default::default());
-        let mut reads = super::read_sync::GeneralReadController::default();
-        let mut dispatched = [0usize; 4];
-
-        assert_eq!(lanes[0].begin_admission(false), Some(false));
-        let (metadata, _) = reads.begin_at(&account, now).unwrap().into_parts();
-        dispatched[0] += 1;
-        for lane in &mut lanes[1..] {
-            let explicit = lane.begin_admission(false).unwrap();
-            assert!(matches!(
-                reads.begin_at(&account, now),
-                Err(super::read_sync::ReadDeferral::Busy)
-            ));
-            lane.defer_admission(explicit);
-            assert!(lane.has_deferred());
-        }
-        assert!(
-            reads
-                .complete_at(
-                    &metadata,
-                    &GeneralReadDirective::default(),
-                    None,
-                    false,
-                    now,
-                    wall,
-                )
-                .matching_operation_released
-        );
-        assert!(!lanes[0].complete());
-
-        let mut cursor = 0usize;
-        while dispatched.contains(&0) {
-            let mut pending = (0..lanes.len())
-                .filter(|index| lanes[*index].has_deferred())
-                .collect::<Vec<_>>();
-            super::rotate_general_read_followups(&mut pending, &mut cursor);
-            let mut started = None;
-            for index in pending {
-                let explicit = lanes[index].begin_admission(false).unwrap();
-                match reads.begin_at(&account, now) {
-                    Ok(admission) => {
-                        dispatched[index] += 1;
-                        started = Some((index, admission.into_parts().0));
-                    }
-                    Err(super::read_sync::ReadDeferral::Busy) => {
-                        lanes[index].defer_admission(explicit)
-                    }
-                    Err(other) => panic!("unexpected server deferral: {other:?}"),
-                }
-            }
-            let (started_index, token) = started.expect("one pending lane must dispatch");
-
-            // Another periodic tick while this lane is active re-coalesces the
-            // other automatic intents. The rotating resume order must still
-            // reach lifecycle and the later repository.
-            for (index, lane) in lanes.iter_mut().enumerate() {
-                if let Some(explicit) = lane.begin_admission(false) {
-                    match reads.begin_at(&account, now) {
-                        Ok(_) => panic!("periodic work overlapped lane {started_index}"),
-                        Err(super::read_sync::ReadDeferral::Busy) => lane.defer_admission(explicit),
-                        Err(other) => panic!("unexpected server deferral: {other:?}"),
-                    }
-                } else {
-                    assert_eq!(index, started_index);
-                }
-            }
-            assert!(
-                reads
-                    .complete_at(
-                        &token,
-                        &GeneralReadDirective::default(),
-                        None,
-                        false,
-                        now,
-                        wall,
-                    )
-                    .matching_operation_released
-            );
-            assert!(!lanes[started_index].complete());
-        }
-        assert_eq!(dispatched, [1, 1, 1, 1]);
-    }
-
-    #[test]
-    fn stale_workspace_ok_and_error_callbacks_mutate_no_lane_or_ui_state() {
-        for result in ["ok", "error"] {
-            let mut lane = super::RefreshGate::default();
-            assert_eq!(lane.begin_admission(false), Some(false));
-            let mut status = "replacement status";
-            let mut state = "replacement state";
-            let mut schedule = "replacement schedule";
-            if super::general_read_callback_is_current(10, 11) {
-                lane.complete();
-                status = result;
-                state = result;
-                schedule = result;
-            }
-            assert!(
-                lane.active,
-                "stale callback must not release replacement lane"
-            );
-            assert_eq!(status, "replacement status");
-            assert_eq!(state, "replacement state");
-            assert_eq!(schedule, "replacement schedule");
-        }
-    }
-
-    #[test]
     fn pending_local_tab_close_blocks_general_read_start_and_resume() {
         assert!(super::general_read_tab_can_start(false));
         assert!(!super::general_read_tab_can_start(true));
-    }
-
-    #[test]
-    fn admission_deferral_leaves_pinned_diff_draft_and_journal_unchanged() {
-        let now = Instant::now();
-        let account = Account {
-            host: "github.com".into(),
-            login: "alice".into(),
-        };
-        let mut reads = super::read_sync::GeneralReadController::default();
-        let _active = reads.begin_at(&account, now).unwrap();
-        let mut lane = super::RefreshGate::default();
-        let explicit = lane.begin_admission(false).unwrap();
-        let pinned = ("base-sha", "head-sha", "selected-file", 144.0f32);
-        let draft = ("draft-id", "exact unsent body", true);
-        let journal = vec![("operation-id", "uncertain")];
-        assert!(matches!(
-            reads.begin_at(&account, now),
-            Err(super::read_sync::ReadDeferral::Busy)
-        ));
-        lane.defer_admission(explicit);
-        assert!(lane.has_deferred());
-        assert_eq!(pinned, ("base-sha", "head-sha", "selected-file", 144.0));
-        assert_eq!(draft, ("draft-id", "exact unsent body", true));
-        assert_eq!(journal, [("operation-id", "uncertain")]);
-    }
-
-    #[test]
-    fn mutation_invalidated_read_releases_its_slot_without_installing() {
-        let mut lane = super::RefreshGate::default();
-        assert!(lane.request(false));
-        let read = super::TabReadEpoch {
-            instance: 7,
-            generation: 1,
-        };
-        let current = super::TabReadEpoch {
-            instance: 7,
-            generation: 2,
-        };
-        assert!(!read.matches(current.instance, current.generation));
-        // The mutation invalidates the result, not the task's ownership. Its
-        // callback must release the lane before rejecting the old generation.
-        assert_eq!(read.instance, current.instance);
-        assert!(!lane.complete());
-        assert!(
-            lane.request(true),
-            "post-effect refresh must not stay stuck"
-        );
-        assert!(!lane.complete());
-        // A completed mutation may also queue its refresh before the old read
-        // returns. In that order, the callback schedules exactly one follow-up.
-        assert!(lane.request(false));
-        assert!(!lane.request(true));
-        assert!(lane.complete());
-        assert!(lane.request(true));
-        assert!(!lane.complete());
     }
 
     #[test]
@@ -42357,7 +42122,7 @@ mod layout_tests {
             .select_line(&session, LineSelection::single(DiffSide::New, 1))
             .unwrap();
         let older = controller.stage_composer_text("older text".into()).unwrap();
-        controller.store.save(&older).unwrap();
+        controller.store_for_test().save(&older).unwrap();
         let draft_id = controller
             .composer
             .as_ref()
@@ -42368,7 +42133,7 @@ mod layout_tests {
         let latest = controller
             .stage_composer_text("latest text".into())
             .unwrap();
-        controller.store.save(&latest).unwrap();
+        controller.store_for_test().save(&latest).unwrap();
         // Deliver completion two before completion one. Its accepted durable
         // baseline must survive the delayed callback, just as the disk does.
         controller.finish_composer_save(&latest, &draft_id, "latest text", Ok(()));
@@ -42379,14 +42144,14 @@ mod layout_tests {
         if old_epoch.matches(41, 2) {
             controller.finish_composer_save(&older, &draft_id, "older text", Ok(()));
         }
-        assert_eq!(controller.durable_composition.as_ref(), Some(&latest));
+        assert_eq!(controller.durable_composition(), Some(&latest));
         assert_eq!(controller.composer.as_ref().unwrap().body, "latest text");
         // Another window can save while this PR tab is closed. The root write
         // sequence stays two; lifetime, not sequence, rejects the old callback.
         let newest = controller
             .stage_composer_text("saved while closed".into())
             .unwrap();
-        controller.store.save(&newest).unwrap();
+        controller.store_for_test().save(&newest).unwrap();
         let mut reopened = load();
         let prior_tab_epoch = super::TabReadEpoch {
             instance: 41,
@@ -42395,8 +42160,8 @@ mod layout_tests {
         if prior_tab_epoch.matches(58, 2) {
             reopened.finish_composer_save(&latest, &draft_id, "latest text", Ok(()));
         }
-        assert_eq!(reopened.durable_composition.as_ref(), Some(&newest));
-        assert_eq!(load().durable_composition.as_ref(), Some(&newest));
+        assert_eq!(reopened.durable_composition(), Some(&newest));
+        assert_eq!(load().durable_composition(), Some(&newest));
     }
 
     #[test]
@@ -42448,7 +42213,7 @@ mod layout_tests {
             .select_file_with_canonical(&session, &session)
             .unwrap();
         let saved_file = controller.stage_composer_text("file A".into()).unwrap();
-        controller.store.save(&saved_file).unwrap();
+        controller.store_for_test().save(&saved_file).unwrap();
         let file_id = controller
             .file_composer
             .as_ref()
@@ -42464,18 +42229,18 @@ mod layout_tests {
                 .unwrap_err()
                 .contains("Save the open file-level draft")
         );
-        controller.store.save(&staged_file).unwrap();
+        controller.store_for_test().save(&staged_file).unwrap();
         controller.finish_composer_save(&staged_file, &file_id, "file B", Ok(()));
         controller
             .select_line(&session, LineSelection::single(DiffSide::New, 1))
             .unwrap();
         assert_eq!(
-            controller.composition.file_draft(&file_id).unwrap().body,
+            controller.composition().file_draft(&file_id).unwrap().body,
             "file B"
         );
 
         let saved_line = controller.stage_composer_text("line A".into()).unwrap();
-        controller.store.save(&saved_line).unwrap();
+        controller.store_for_test().save(&saved_line).unwrap();
         let line_id = controller
             .composer
             .as_ref()
@@ -42491,13 +42256,13 @@ mod layout_tests {
                 .unwrap_err()
                 .contains("Save the open inline draft")
         );
-        controller.store.save(&staged_line).unwrap();
+        controller.store_for_test().save(&staged_line).unwrap();
         controller.finish_composer_save(&staged_line, &line_id, "line B", Ok(()));
         controller
             .select_file_with_canonical(&session, &session)
             .unwrap();
         assert_eq!(
-            controller.composition.draft(&line_id).unwrap().body,
+            controller.composition().draft(&line_id).unwrap().body,
             "line B"
         );
     }
@@ -42541,6 +42306,30 @@ mod layout_tests {
     }
 
     #[test]
+    fn line_chunks_preserve_tab_stops_and_replace_control_characters() {
+        assert_eq!(
+            line_text_chunks("a\t界\t\0\u{0085}\tend").concat(),
+            "a   界  �� end"
+        );
+        assert_eq!(line_text_chunks(""), vec![String::new()]);
+    }
+
+    #[test]
+    fn line_chunks_preserve_unicode_and_tab_stops_across_chunk_boundaries() {
+        let text = format!("{}界\tend", "a".repeat(EXCEPTIONAL_LINE_CHUNK_BYTES - 1));
+        let chunks = line_text_chunks(&text);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.len() <= EXCEPTIONAL_LINE_CHUNK_BYTES)
+        );
+        assert_eq!(
+            chunks.concat(),
+            format!("{}界   end", "a".repeat(EXCEPTIONAL_LINE_CHUNK_BYTES - 1))
+        );
+    }
+
+    #[test]
     fn long_line_width_accounts_for_tabs_and_unicode_without_clipping() {
         assert_eq!(display_columns("a\tb"), 5);
         assert_eq!(display_columns("a界b"), 4);
@@ -42560,7 +42349,9 @@ mod layout_tests {
             new_line: Some(1),
             text,
         })];
-        assert!(diff_content_width(&rows, DiffMode::Unified) > 140_000.);
+        let (split, text_width) = diff_text_metrics(&rows);
+        assert!(!split);
+        assert!(text_width > 140_000.);
     }
 
     #[test]
@@ -42749,6 +42540,345 @@ mod layout_tests {
     /// Every row's gutter is the graph's full width, so the subjects beside
     /// them start on one line instead of stepping in and out with each row's
     /// own lane count.
+    /// A review window on the layout fixture with the diff showing.
+    #[cfg(feature = "ui-smoke")]
+    fn diff_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::Entity<Root>,
+        &mut gpui::VisualTestContext,
+        tempfile::TempDir,
+    ) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(900.)));
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.install_pr_layout_fixture(window, cx);
+                this.inspector_open = false;
+            });
+            window.draw(cx).clear(cx);
+        });
+        (root, cx, data)
+    }
+
+    /// The diff cursor on the real review window, through the real dispatch
+    /// tree and the real key bindings. A bare `DiffPaneState` already proves
+    /// the traversal; what this adds is that the bindings reach the pane at
+    /// all, which is the half a harness cannot show.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn diff_navigation_actions_move_the_cursor_and_paint_it(cx: &mut gpui::TestAppContext) {
+        let (root, cx, _data) = diff_window(cx);
+        let cursor = |cx: &mut gpui::VisualTestContext| {
+            root.read_with(cx, |root, _| {
+                root.review.active_diff().expect("a diff pane is up").cursor
+            })
+        };
+        let redraw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        };
+
+        // Streaming opens on the selected file, so the cursor starts on that
+        // file's header rather than nowhere.
+        assert_eq!(
+            cursor(cx),
+            Some(0),
+            "a streamed comparison opens on the first selected file"
+        );
+
+        cx.dispatch_action(DiffCursorDown);
+        redraw(cx);
+        assert_eq!(cursor(cx), Some(1), "the first move steps off the header");
+        let painted = cx
+            .debug_bounds("diff-cursor")
+            .expect("a placed cursor must paint");
+
+        // The bar marks a row without taking any of its width, so it is thin
+        // and it is as tall as the row it sits on, not the pane.
+        assert_eq!(painted.size.width, px(2.));
+        assert!(
+            painted.size.height <= px(cibergit::ui::ROW_HEIGHT),
+            "the cursor must not span more than the row it marks"
+        );
+
+        cx.dispatch_action(DiffCursorDown);
+        redraw(cx);
+        assert_eq!(cursor(cx), Some(2));
+        cx.dispatch_action(DiffCursorUp);
+        redraw(cx);
+        assert_eq!(cursor(cx), Some(1));
+
+        // The fixture has three files, so a streamed scroll has three headers
+        // and three hunks, and both jumps walk them in order.
+        cx.dispatch_action(DiffCursorToStart);
+        redraw(cx);
+        assert_eq!(cursor(cx), Some(0));
+        let first_hunk = {
+            cx.dispatch_action(DiffNextHunk);
+            redraw(cx);
+            cursor(cx).expect("the fixture patch has a hunk header")
+        };
+        cx.dispatch_action(DiffNextHunk);
+        redraw(cx);
+        let second_hunk = cursor(cx).expect("and a second file with one");
+        assert!(
+            second_hunk > first_hunk,
+            "a forward jump must move forward, not wrap"
+        );
+        cx.dispatch_action(DiffPreviousHunk);
+        redraw(cx);
+        assert_eq!(cursor(cx), Some(first_hunk), "and backwards returns to it");
+
+        // The end of a streamed scroll is the last row of the last file.
+        cx.dispatch_action(DiffCursorToEnd);
+        redraw(cx);
+        let rows = root.read_with(cx, |root, _| root.review.tabs[0].diff.rows.len());
+        assert_eq!(cursor(cx), Some(rows - 1));
+    }
+
+    /// Stream renders every file, so the tree stops being the only way to
+    /// reach one and the spans have to describe the whole comparison.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn a_streamed_comparison_covers_every_file_in_one_scroll(cx: &mut gpui::TestAppContext) {
+        let (root, cx, _data) = diff_window(cx);
+        root.read_with(cx, |root, _| {
+            let diff = &root.review.tabs[0].diff;
+            let files = root.review.tabs[0]
+                .session
+                .as_ref()
+                .expect("the fixture installs a session")
+                .comparison()
+                .files
+                .len();
+            assert!(diff.streaming(), "a small comparison streams");
+            assert_eq!(diff.spans.len(), files, "every file gets a span");
+
+            // Contiguous and ordered, each opening on its own header. The
+            // cursor, the sticky header and the ruler all read row indices
+            // through these, so a gap or an overlap would put every one of
+            // them on the wrong file.
+            let mut expected = 0;
+            for span in diff.spans.iter() {
+                assert_eq!(span.rows.start, expected, "spans must not skip rows");
+                assert!(span.rows.end > span.rows.start, "a span owns its header");
+                assert!(
+                    matches!(diff.rows[span.rows.start], DiffRow::FileHeader { .. }),
+                    "a span must begin on the file's header"
+                );
+                assert_eq!(
+                    diff.span_of(span.rows.start).map(|found| found.key.clone()),
+                    Some(span.key.clone()),
+                    "a row must resolve to the file it belongs to"
+                );
+                expected = span.rows.end;
+            }
+            assert_eq!(expected, diff.rows.len(), "spans must cover every row");
+        });
+    }
+
+    /// Folding is what makes a long stream usable, so it has to hold two
+    /// things at once: the folded file keeps its place in the scroll, and the
+    /// files around it keep theirs.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn folding_a_file_keeps_its_header_and_leaves_the_others_alone(cx: &mut gpui::TestAppContext) {
+        let (root, cx, _data) = diff_window(cx);
+        let redraw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        };
+        let (first_key, rows_before, files) = root.read_with(cx, |root, _| {
+            let diff = &root.review.tabs[0].diff;
+            (diff.spans[0].key.clone(), diff.rows.len(), diff.spans.len())
+        });
+        assert!(files >= 2, "the fixture must have more than one file");
+
+        let header = cx
+            .debug_bounds(Box::leak(
+                format!("file-header-{first_key}").into_boxed_str(),
+            ))
+            .expect("every streamed file paints a header");
+        cx.simulate_click(header.center(), Modifiers::default());
+        redraw(cx);
+
+        root.read_with(cx, |root, _| {
+            let diff = &root.review.tabs[0].diff;
+            assert!(
+                diff.collapsed.contains(&first_key),
+                "clicking the header folds the file it names"
+            );
+            assert!(diff.rows.len() < rows_before, "its rows are gone");
+            assert_eq!(diff.spans.len(), files, "but its span is not");
+            let span = diff
+                .span_for_key(&first_key)
+                .expect("a folded file keeps a span");
+            assert_eq!(span.rows.len(), 1, "a folded file is its header alone");
+            assert!(
+                matches!(
+                    diff.rows[span.rows.start],
+                    DiffRow::FileHeader {
+                        collapsed: true,
+                        ..
+                    }
+                ),
+                "and the header says so"
+            );
+            // Contiguity is what the cursor and the ruler read, so folding
+            // must not leave a hole where the rows were.
+            let mut expected = 0;
+            for span in diff.spans.iter() {
+                assert_eq!(span.rows.start, expected);
+                expected = span.rows.end;
+            }
+            assert_eq!(expected, diff.rows.len());
+        });
+
+        // Clicking again opens it, and the scroll returns to its full length.
+        let header = cx
+            .debug_bounds(Box::leak(
+                format!("file-header-{first_key}").into_boxed_str(),
+            ))
+            .expect("a folded file still shows its header");
+        cx.simulate_click(header.center(), Modifiers::default());
+        redraw(cx);
+        root.read_with(cx, |root, _| {
+            let diff = &root.review.tabs[0].diff;
+            assert!(!diff.collapsed.contains(&first_key));
+            assert_eq!(diff.rows.len(), rows_before, "unfolding restores the rows");
+        });
+    }
+
+    /// One button, whose direction depends on what is already folded.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn one_control_folds_every_file_and_opens_them_again(cx: &mut gpui::TestAppContext) {
+        let (root, cx, _data) = diff_window(cx);
+        let redraw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        };
+        let files = root.read_with(cx, |root, _| root.review.tabs[0].diff.spans.len());
+
+        cx.dispatch_action(ToggleAllFileSections);
+        redraw(cx);
+        root.read_with(cx, |root, _| {
+            let diff = &root.review.tabs[0].diff;
+            assert!(diff.all_collapsed(), "every file folds");
+            assert_eq!(
+                diff.rows.len(),
+                files,
+                "a fully folded comparison is one row per file"
+            );
+        });
+
+        // The same control now opens them, because with everything folded that
+        // is the only thing it could usefully mean.
+        cx.dispatch_action(ToggleAllFileSections);
+        redraw(cx);
+        root.read_with(cx, |root, _| {
+            let diff = &root.review.tabs[0].diff;
+            assert!(!diff.all_collapsed());
+            assert!(diff.rows.len() > files);
+        });
+    }
+
+    /// Each file scrolls sideways on its own handle. One shared offset is what
+    /// would let a single minified line make every other file scrollable to
+    /// its width.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn streamed_files_scroll_sideways_independently(cx: &mut gpui::TestAppContext) {
+        let (root, cx, _data) = diff_window(cx);
+        root.read_with(cx, |root, _| {
+            let diff = &root.review.tabs[0].diff;
+            let first = diff.spans.first().expect("a first file");
+            let second = diff.spans.get(1).expect("a second file");
+            let (first_handle, _) = diff.scroll_context(first.rows.start);
+            let (second_handle, _) = diff.scroll_context(second.rows.start);
+            first_handle.set_offset(point(px(-120.), px(0.)));
+            assert_eq!(first_handle.offset().x, px(-120.));
+            assert_eq!(
+                second_handle.offset().x,
+                px(0.),
+                "one file's horizontal offset must not move another's"
+            );
+        });
+    }
+
+    /// Selecting another file replaces the rows, so an index into the old ones
+    /// must not survive into the new.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn changing_file_moves_the_cursor_rather_than_stranding_it(cx: &mut gpui::TestAppContext) {
+        let (root, cx, _data) = diff_window(cx);
+        let redraw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        };
+
+        // Streaming holds every file at once, so moving to the next file is a
+        // move within one scroll: the cursor lands on that file's header, and
+        // the rows underneath it are the ones that were already there.
+        cx.dispatch_action(DiffCursorDown);
+        redraw(cx);
+        let (before_rows, cursor) = root.read_with(cx, |root, _| {
+            let diff = &root.review.tabs[0].diff;
+            (diff.rows.clone(), diff.cursor)
+        });
+        assert_eq!(cursor, Some(1), "the first move steps off the file header");
+
+        cx.dispatch_action(NextFile);
+        redraw(cx);
+        root.read_with(cx, |root, _| {
+            let diff = &root.review.tabs[0].diff;
+            let second = diff.spans.get(1).expect("the fixture has three files");
+            assert_eq!(
+                diff.cursor,
+                Some(second.rows.start),
+                "the cursor follows the selection to the next file's header"
+            );
+            assert!(
+                Rc::ptr_eq(&before_rows, &diff.rows),
+                "choosing a file in a streamed comparison must not rebuild the rows"
+            );
+        });
+
+        // One file at a time is the case where the rows really are replaced,
+        // and there an index into the old ones must not survive.
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.review
+                    .set_reading_mode(super::ReadingMode::File, window, cx);
+            });
+        });
+        redraw(cx);
+        cx.dispatch_action(DiffCursorDown);
+        redraw(cx);
+        root.read_with(cx, |root, _| {
+            assert!(!root.review.tabs[0].diff.streaming());
+            assert_eq!(root.review.tabs[0].diff.cursor, Some(0));
+        });
+        cx.dispatch_action(NextFile);
+        redraw(cx);
+        root.read_with(cx, |root, _| {
+            assert_eq!(
+                root.review.tabs[0].diff.cursor, None,
+                "a cursor from the previous file must not carry over"
+            );
+        });
+    }
+
     #[cfg(feature = "ui-smoke")]
     #[gpui::test]
     fn commit_rows_share_one_gutter_width_and_one_subject_edge(cx: &mut gpui::TestAppContext) {
@@ -42909,6 +43039,95 @@ mod layout_tests {
             super::lane_color(cibergit::history::GRAPH_LANE_COLORS, false),
             "the palette cycles rather than running off its end"
         );
+    }
+
+    mod diff_pane_cursor {
+        use super::super::diff_pane::{DiffPaneState, DiffRow};
+        use cibergit::review::{DiffLine, DiffLineKind};
+        use std::rc::Rc;
+
+        fn rows() -> Vec<DiffRow> {
+            let line = |text: &str| {
+                DiffRow::Unified(DiffLine {
+                    kind: DiffLineKind::Context,
+                    old_line: Some(1),
+                    new_line: Some(1),
+                    text: text.to_owned(),
+                })
+            };
+            vec![
+                DiffRow::Hunk("@@ -1,2 +1,2 @@".into()),
+                line("one"),
+                line("two"),
+                DiffRow::Hunk("@@ -9,2 +9,2 @@".into()),
+                line("three"),
+                line("four"),
+            ]
+        }
+
+        fn pane() -> DiffPaneState {
+            let mut pane = DiffPaneState::new();
+            pane.rows = Rc::new(rows());
+            pane
+        }
+
+        #[test]
+        fn first_move_places_the_cursor_at_the_requested_end() {
+            let mut down = pane();
+            assert!(down.move_cursor(1));
+            assert_eq!(down.cursor, Some(0));
+
+            let mut up = pane();
+            assert!(up.move_cursor(-1));
+            assert_eq!(up.cursor, Some(5));
+        }
+
+        #[test]
+        fn cursor_stops_at_both_ends() {
+            let mut pane = pane();
+            pane.cursor = Some(5);
+            assert!(!pane.move_cursor(1));
+            assert_eq!(pane.cursor, Some(5));
+            pane.cursor = Some(0);
+            assert!(!pane.move_cursor(-1));
+            assert_eq!(pane.cursor, Some(0));
+        }
+
+        #[test]
+        fn jump_lands_on_the_next_matching_row_in_each_direction() {
+            let mut pane = pane();
+            let hunk = |row: &DiffRow| matches!(row, DiffRow::Hunk(_));
+            assert!(pane.jump(true, hunk));
+            assert!(pane.jump(true, hunk));
+            assert_eq!(pane.cursor, Some(3));
+            assert!(pane.jump(false, hunk));
+            assert_eq!(pane.cursor, Some(0));
+        }
+
+        #[test]
+        fn jump_searches_strictly_past_the_cursor() {
+            let mut pane = pane();
+            let four = |row: &DiffRow| matches!(row, DiffRow::Unified(line) if line.text == "four");
+            pane.cursor = Some(5);
+            assert!(!pane.jump(true, four));
+        }
+
+        #[test]
+        fn empty_pane_has_nowhere_to_put_a_cursor() {
+            let mut pane = DiffPaneState::new();
+            assert!(!pane.move_cursor(1));
+            assert!(!pane.cursor_to_start());
+            assert!(!pane.cursor_to_end());
+            assert_eq!(pane.cursor, None);
+        }
+
+        #[test]
+        fn clearing_rows_clears_the_cursor() {
+            let mut pane = pane();
+            assert!(pane.cursor_to_end());
+            pane.clear();
+            assert_eq!(pane.cursor, None);
+        }
     }
 
     #[test]

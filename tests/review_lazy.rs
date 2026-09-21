@@ -206,6 +206,7 @@ fn session_installs_only_matching_current_snapshot_file() {
     assert!(session.mark_viewed("one", true));
     let selected_before = file_key(session.selected_file().unwrap());
     let loaded = load_local_file(path, &revision, "one", false).unwrap();
+    let request = session.begin_file_patch("one").unwrap();
 
     let stale = Revision {
         base_sha: "a".repeat(40),
@@ -225,7 +226,7 @@ fn session_installs_only_matching_current_snapshot_file() {
     absent.path = "absent".into();
     assert!(session.install_file_patch(&revision, absent).is_err());
 
-    session.install_file_patch(&revision, loaded).unwrap();
+    session.accept_file_patch(&request, loaded).unwrap();
     assert_eq!(session.revision(), &revision);
     assert_eq!(file_key(session.selected_file().unwrap()), selected_before);
     assert!(session.comparison().files[0].patch_complete);

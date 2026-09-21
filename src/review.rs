@@ -13,7 +13,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -77,9 +77,43 @@ pub struct ViewedFile {
     pub fingerprint: String,
 }
 
+static READER_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn next_reader_instance() -> u64 {
+    READER_INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Opaque authority to install one background-loaded patch into one live reader.
+///
+/// The request captures reader lifetime as well as comparison and file identity.
+/// A result issued before another file selection, comparison replacement, clone,
+/// close/reopen, or newer request is rejected by `ReviewSession::accept_file_patch`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LazyPatchRequest {
+    reader_instance: u64,
+    generation: u64,
+    revision: Revision,
+    file_key: String,
+    path: String,
+    previous_path: Option<String>,
+    raw_path: Option<Vec<u8>>,
+    raw_previous_path: Option<Vec<u8>>,
+    status: String,
+}
+
+impl LazyPatchRequest {
+    pub fn revision(&self) -> &Revision {
+        &self.revision
+    }
+
+    pub fn file_key(&self) -> &str {
+        &self.file_key
+    }
+}
+
 /// One instance per PR tab. Collaboration refreshes have no access to the selected
 /// snapshot; a new revision is only installed by an explicit user action.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ReviewSession {
     comparison: Arc<Comparison>,
     #[serde(skip)]
@@ -92,6 +126,28 @@ pub struct ReviewSession {
     scroll_positions: HashMap<String, f32>,
     #[serde(default)]
     horizontal_scroll_positions: HashMap<String, f32>,
+    #[serde(skip, default = "next_reader_instance")]
+    reader_instance: u64,
+    #[serde(skip)]
+    lazy_patch_generation: u64,
+}
+
+impl Clone for ReviewSession {
+    fn clone(&self) -> Self {
+        Self {
+            comparison: Arc::clone(&self.comparison),
+            file_indices: Arc::clone(&self.file_indices),
+            available_revision: self.available_revision.clone(),
+            selected_file: self.selected_file.clone(),
+            diff_mode: self.diff_mode,
+            metadata: self.metadata.clone(),
+            viewed: self.viewed.clone(),
+            scroll_positions: self.scroll_positions.clone(),
+            horizontal_scroll_positions: self.horizontal_scroll_positions.clone(),
+            reader_instance: next_reader_instance(),
+            lazy_patch_generation: 0,
+        }
+    }
 }
 impl ReviewSession {
     pub fn new(comparison: Comparison) -> Self {
@@ -108,10 +164,16 @@ impl ReviewSession {
             viewed: HashMap::new(),
             scroll_positions: HashMap::new(),
             horizontal_scroll_positions: HashMap::new(),
+            reader_instance: next_reader_instance(),
+            lazy_patch_generation: 0,
         }
     }
     pub fn comparison(&self) -> &Comparison {
         &self.comparison
+    }
+    /// Share the immutable file inventory without copying patch contents for a view.
+    pub fn shared_comparison(&self) -> Arc<Comparison> {
+        Arc::clone(&self.comparison)
     }
     pub fn revision(&self) -> &Revision {
         &self.comparison.revision
@@ -158,7 +220,10 @@ impl ReviewSession {
     }
     pub fn select_file(&mut self, path: &str) -> bool {
         if self.file_index(path).is_some() {
-            self.selected_file = Some(path.to_owned());
+            if self.selected_file.as_deref() != Some(path) {
+                self.selected_file = Some(path.to_owned());
+                self.invalidate_lazy_patch_requests();
+            }
             true
         } else {
             false
@@ -186,6 +251,7 @@ impl ReviewSession {
             return false;
         };
         self.selected_file = Some(file_key(file));
+        self.invalidate_lazy_patch_requests();
         true
     }
     pub fn set_scroll_position(&mut self, position: f32) {
@@ -244,6 +310,69 @@ impl ReviewSession {
     pub fn is_viewed(&self, path: &str) -> bool {
         self.viewed.contains_key(path)
     }
+
+    /// Issue the only identity a background patch result may be accepted with.
+    /// Starting another request supersedes the previous request for this reader.
+    pub fn begin_file_patch(&mut self, key: &str) -> Result<LazyPatchRequest> {
+        let index = self
+            .file_index(key)
+            .context("file patch request does not match the displayed comparison")?;
+        let file = &self.comparison.files[index];
+        self.lazy_patch_generation = self.lazy_patch_generation.saturating_add(1);
+        Ok(LazyPatchRequest {
+            reader_instance: self.reader_instance,
+            generation: self.lazy_patch_generation,
+            revision: self.comparison.revision.clone(),
+            file_key: file_key(file),
+            path: file.path.clone(),
+            previous_path: file.previous_path.clone(),
+            raw_path: file.raw_path.clone(),
+            raw_previous_path: file.raw_previous_path.clone(),
+            status: file.status.clone(),
+        })
+    }
+
+    /// Whether this reader lifetime and comparison can still accept `request`.
+    /// Result metadata is checked by `accept_file_patch` before mutation.
+    pub fn accepts_file_patch(&self, request: &LazyPatchRequest) -> bool {
+        self.reader_instance == request.reader_instance
+            && self.lazy_patch_generation == request.generation
+            && self.comparison.revision == request.revision
+            && self.file_index(&request.file_key).is_some_and(|index| {
+                let file = &self.comparison.files[index];
+                file.path == request.path
+                    && file.previous_path == request.previous_path
+                    && file.raw_path == request.raw_path
+                    && file.raw_previous_path == request.raw_previous_path
+                    && file.status == request.status
+            })
+    }
+
+    /// Install a background result only when the issuing reader is still current.
+    pub fn accept_file_patch(
+        &mut self,
+        request: &LazyPatchRequest,
+        file: ChangedFile,
+    ) -> Result<()> {
+        ensure!(
+            self.accepts_file_patch(request),
+            "file patch request is no longer current"
+        );
+        ensure!(
+            file_key(&file) == request.file_key
+                && file.path == request.path
+                && file.previous_path == request.previous_path
+                && file.raw_path == request.raw_path
+                && file.raw_previous_path == request.raw_previous_path
+                && file.status == request.status,
+            "file patch result identity differs from its request"
+        );
+        self.install_file_patch(&request.revision, file)
+    }
+
+    fn invalidate_lazy_patch_requests(&mut self) {
+        self.lazy_patch_generation = self.lazy_patch_generation.saturating_add(1);
+    }
     /// Install one lazily loaded file without changing the published snapshot or
     /// navigation. A load for a replaced snapshot, or for different metadata, is
     /// rejected instead of being applied to whichever file is currently selected.
@@ -280,6 +409,7 @@ impl ReviewSession {
             self.viewed.remove(&key);
         }
         Arc::make_mut(&mut self.comparison).files[index] = file;
+        self.invalidate_lazy_patch_requests();
         Ok(())
     }
     /// Reject an outdated background load if another revision was observed meanwhile.
@@ -298,6 +428,7 @@ impl ReviewSession {
         self.metadata = metadata;
     }
     fn install(&mut self, comparison: Comparison) {
+        self.invalidate_lazy_patch_requests();
         let same_revision = comparison.revision == self.comparison.revision;
         self.viewed.retain(|path, viewed| {
             comparison
