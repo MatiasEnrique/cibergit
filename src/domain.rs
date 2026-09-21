@@ -92,6 +92,36 @@ impl PullRequest {
     }
 }
 
+/// One row of a pull-request index: enough to list and identify a pull request,
+/// never enough to review it. It carries no revision, so it can neither pin nor
+/// advance a comparison. Opening a row reads the full `PullRequest` by number.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PullRequestSummary {
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub source_branch: String,
+    pub target_branch: String,
+    pub labels: Vec<String>,
+    pub draft: bool,
+    /// OPEN, CLOSED, MERGED.
+    pub state: String,
+    /// Provider timestamp, exactly as reported.
+    pub updated_at: String,
+    pub url: String,
+}
+
+/// One page of a pull-request index, newest activity first.
+#[derive(Clone, Debug, Default)]
+pub struct PullRequestSummaryPage {
+    pub summaries: Vec<PullRequestSummary>,
+    /// The 1-based page this read asked for.
+    pub page: usize,
+    /// A full page was returned, so another page may exist. This is what the
+    /// provider observed, not a count: GitHub does not report a total here.
+    pub has_more: bool,
+}
+
 /// Stable coordinates for a provider-owned collaboration object.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCoordinates {

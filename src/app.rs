@@ -4,7 +4,8 @@ use crate::{
     DiffScrollEnd, DiffScrollHome, DiffScrollLeft, DiffScrollRight, EditPrMetadata,
     FileTreeActivate, FileTreeDown, FileTreeLeft, FileTreeNarrower, FileTreeRight, FileTreeUp,
     FileTreeWider, MergePullRequest, NewPrDiscussion, NextFile, OpenPullRequestCreation,
-    OpenRepositorySetup, OpenStackView, PostImmediateComment, PreviousFile, Refresh,
+    OpenPullRequestBrowser, OpenRepositorySetup, OpenStackView, PostImmediateComment, PreviousFile,
+    Refresh,
     RefreshStackView, ResetLayout, ReturnToPullRequest, Save, SaveReviewDraft,
     SelectFullComparison, SelectNextComparisonCommit, SelectNextStackTip,
     SelectPreviousComparisonCommit, SelectSinceLastReview, SidebarNarrower, SidebarWider,
@@ -22,6 +23,7 @@ mod local_checkout;
 #[allow(dead_code)] // Public component surface also serves standalone native verification.
 mod local_workspace;
 mod notifications_view;
+mod pr_browser;
 mod pr_creation;
 mod pr_lifecycle;
 mod read_sync;
@@ -2175,6 +2177,19 @@ pub struct ReviewWorkspace {
     dismissal_reason_input_owner: Option<DismissalReasonInputOwner>,
     dismissal_reason_subscription: Option<Subscription>,
     setup_open: bool,
+    /// The Pull requests index keeps a chip in the tab strip beside the open
+    /// pull requests rather than covering them from a sheet: it is somewhere
+    /// you browse from and come back to, not a modal question.
+    browser_open: bool,
+    /// ...and is the selected tab.
+    browser_active: bool,
+    /// Provisioned on first use, because the page costs a network round trip
+    /// and most sessions never open it. Closing drops it, so reopening reads
+    /// afresh rather than showing a history of someone else's session.
+    browser: Option<pr_browser::PullRequestBrowser>,
+    browser_scroll: UniformListScrollHandle,
+    browser_filter_input: Entity<InputState>,
+    browser_filter_generation: u64,
     repository_setup_state: LoadState,
     repository_setup_generation: u64,
     repository_picker_open: bool,
@@ -2899,6 +2914,7 @@ impl ReviewWorkspace {
             window,
             cx,
         );
+        let browser_filter_input = new_input("", "Filter loaded pull requests", window, cx);
         let composer_input = new_textarea("", "Write a revision-bound review comment…", window, cx);
         let review_summary_input = new_textarea("", "Review summary (optional)", window, cx);
         let submitted_summary_input =
@@ -2989,6 +3005,12 @@ impl ReviewWorkspace {
             dismissal_reason_input_owner: None,
             dismissal_reason_subscription: None,
             setup_open: startup.repository.is_none() && !startup_restore_pending,
+            browser_open: false,
+            browser_active: false,
+            browser: None,
+            browser_scroll: UniformListScrollHandle::new(),
+            browser_filter_input,
+            browser_filter_generation: 0,
             repository_setup_state: LoadState::Ready,
             repository_setup_generation: 0,
             repository_picker_open: false,
@@ -3258,6 +3280,37 @@ impl ReviewWorkspace {
                 }
             }),
         );
+
+        this._subscriptions.push(cx.subscribe(
+            &this.browser_filter_input,
+            |root, _, event: &InputEvent, cx| {
+                let Root::Review(this) = root else { return };
+                match event {
+                    InputEvent::PressEnter { .. } => this.apply_pr_browser_filter(cx),
+                    InputEvent::Change => {
+                        // Same debounce the sidebar search uses: narrowing is
+                        // local work, but rebuilding the list on every
+                        // keystroke still shows through on a long index.
+                        this.browser_filter_generation += 1;
+                        let generation = this.browser_filter_generation;
+                        cx.spawn(async move |root, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(180))
+                                .await;
+                            let _ = root.update(cx, |root, cx| {
+                                if let Root::Review(this) = root
+                                    && this.browser_filter_generation == generation
+                                {
+                                    this.apply_pr_browser_filter(cx);
+                                }
+                            });
+                        })
+                        .detach();
+                    }
+                    _ => {}
+                }
+            },
+        ));
 
         for input in [&this.repository_input, &this.pr_input] {
             this._subscriptions
@@ -13788,6 +13841,9 @@ impl ReviewWorkspace {
                     .scroll_to_item(row, gpui::ScrollStrategy::Nearest);
             }
             self.setup_open = false;
+            // The index stays open behind the pull request it was used to
+            // find; selecting a tab only stops it being the selected one.
+            self.browser_active = false;
             cx.notify();
             true
         } else {
@@ -20454,6 +20510,13 @@ impl ReviewWorkspace {
     }
 
     fn refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Root>) {
+        if self.browser_active {
+            // Re-reads from the first page. The index is ordered by activity,
+            // so appending to pages read minutes ago would interleave rows
+            // that have since moved.
+            self.load_pr_browser(false, cx);
+            return;
+        }
         if self
             .active_tab
             .is_some_and(|index| self.tabs[index].stack.visible)
@@ -20463,6 +20526,21 @@ impl ReviewWorkspace {
         }
         self.refresh_all(cx);
         self.refresh_active(cx);
+    }
+
+    fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Root>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if self.active_tab != Some(index) {
+            self.activate_tab(index, window, cx);
+            if self.active_tab != Some(index) {
+                // The transition refused and set its own status; leave the tab
+                // open rather than closing one the inputs do not describe.
+                return;
+            }
+        }
+        self.close_tab(&CloseTab, window, cx);
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Root>) {
@@ -21064,6 +21142,11 @@ impl ReviewWorkspace {
             .on_action(cx.listener(|root, _: &OpenRepositorySetup, window, cx| {
                 if let Root::Review(this) = root {
                     this.open_repository_picker(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|root, _: &OpenPullRequestBrowser, _, cx| {
+                if let Root::Review(this) = root {
+                    this.open_pr_browser(None, cx);
                 }
             }))
             .on_action(
@@ -21751,7 +21834,23 @@ impl ReviewWorkspace {
                             }
                         })),
                     )
-                    .children(filters),
+                    .children(filters)
+                    .child(
+                        // The filters above narrow the working set, which is
+                        // open pull requests. This leaves it, which is why it
+                        // sits apart from them rather than reading as a fifth.
+                        sidebar_nav_button(
+                            "open-pr-browser".into(),
+                            "Browse all pull requests",
+                            self.browser_active,
+                            colors,
+                        )
+                        .on_click(cx.listener(|root, _, _, cx| {
+                            if let Root::Review(this) = root {
+                                this.open_pr_browser(None, cx);
+                            }
+                        })),
+                    ),
             )
             .when(self.workspace.views.len() > 1, |sidebar| {
                 sidebar.child(
@@ -22352,7 +22451,9 @@ impl ReviewWorkspace {
             .flex_col()
             .bg(colors.canvas)
             .child(self.render_tabs(colors, cx))
-            .child(if self.setup_open {
+            .child(if self.browser_active {
+                self.render_pr_browser(colors, cx).into_any_element()
+            } else if self.setup_open {
                 self.render_setup(colors, cx).into_any_element()
             } else if let Some(index) = self.active_tab {
                 self.render_review(index, colors, window, cx)
@@ -22419,7 +22520,7 @@ impl ReviewWorkspace {
                             Button::new(close_id.clone())
                                 .debug_selector({
                                     let close_id = close_id.clone();
-                                    move || close_id.clone()
+                                    move || close_id.to_string()
                                 })
                                 .group(close_id.clone())
                                 .size(px(ui::BADGE_HEIGHT))
@@ -22459,6 +22560,7 @@ impl ReviewWorkspace {
                     }
                 }))
         });
+        let browser_active = self.browser_active;
         div()
             .h(px(ui::DESKTOP_HIT))
             .px(px(ui::GAP_FIELD))
@@ -22467,6 +22569,628 @@ impl ReviewWorkspace {
             .gap(px(ui::GAP_ICON))
             .bg(colors.canvas)
             .children(tabs)
+            .when(self.browser_open, |strip| {
+                // The index keeps a chip of its own rather than replacing the
+                // open pull requests: browsing is how you find the next one to
+                // open, which means leaving the ones already open alone.
+                strip.child(
+                    div()
+                        .id("tab-browser")
+                        .debug_selector(|| "tab-browser".to_owned())
+                        .group("tab-browser")
+                        .h_full()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .h(px(ui::CONTROL_HEIGHT))
+                                .pl(px(ui::CONTROL_INSET))
+                                .pr(px(ui::GAP_ICON))
+                                .flex()
+                                .items_center()
+                                .gap(px(ui::GAP_ICON))
+                                .rounded(px(ui::CONTROL_RADIUS))
+                                .text_color(if browser_active {
+                                    colors.text
+                                } else {
+                                    colors.muted
+                                })
+                                .when(browser_active, |tab| tab.bg(colors.surface))
+                                .when(!browser_active, |tab| {
+                                    tab.group_hover("tab-browser", |tab| tab.bg(colors.selected))
+                                })
+                                .child("Pull requests")
+                                .child(
+                                    Button::new("close-tab-browser")
+                                        .debug_selector(|| "close-tab-browser".to_owned())
+                                        .group("close-tab-browser")
+                                        .size(px(ui::BADGE_HEIGHT))
+                                        .flex_none()
+                                        .p_0()
+                                        .rounded(px(ui::BADGE_RADIUS))
+                                        .border_1()
+                                        .border_color(rgba(0x00000000))
+                                        .focus_ring(colors.accent, colors.selected)
+                                        .cursor_pointer()
+                                        .hover(|close| close.bg(colors.elevated))
+                                        .accessibility_label("Close Pull requests")
+                                        .child(
+                                            sidebar_icon(
+                                                "close",
+                                                if browser_active {
+                                                    colors.muted
+                                                } else {
+                                                    colors.faint
+                                                },
+                                            )
+                                            .size(px(ui::ICON_SIZE - 2.))
+                                            .group_hover("close-tab-browser", |icon| {
+                                                icon.text_color(colors.text)
+                                            }),
+                                        )
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(|root, _, _, cx| {
+                                            if let Root::Review(this) = root {
+                                                this.close_pr_browser(cx);
+                                            }
+                                        })),
+                                ),
+                        )
+                        .on_click(cx.listener(|root, _, _, cx| {
+                            if let Root::Review(this) = root {
+                                this.browser_active = true;
+                                cx.notify();
+                            }
+                        })),
+                )
+            })
+    }
+
+    /// The repository the index opens against: the active pull request's, else
+    /// the first one configured. This is the same resolution the sidebar's
+    /// account footer uses, so the page opens on what the window is already
+    /// about.
+    fn default_browser_repository(&self) -> Option<Repository> {
+        self.active_tab
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.repository.clone())
+            .or_else(|| {
+                self.repositories
+                    .first()
+                    .map(|runtime| runtime.repository.clone())
+            })
+    }
+
+    fn open_pr_browser(&mut self, repository: Option<Repository>, cx: &mut Context<Root>) {
+        let Some(repository) = repository.or_else(|| self.default_browser_repository()) else {
+            self.status = "Add a repository before browsing its pull requests.".into();
+            cx.notify();
+            return;
+        };
+        let key = repository.cache_key();
+        let account = repository.account.clone();
+        let fresh = match self.browser.as_mut() {
+            Some(browser) => browser.retarget(key.clone(), account.clone()),
+            None => {
+                self.browser = Some(pr_browser::PullRequestBrowser::new(key, account));
+                true
+            }
+        };
+        self.browser_open = true;
+        self.browser_active = true;
+        self.setup_open = false;
+        self.command_palette = false;
+        // A new controller starts with no filter while the box keeps whatever
+        // was typed into it. Adopting the visible text is what keeps the two
+        // from disagreeing about which rows the reader asked for.
+        self.apply_pr_browser_filter(cx);
+        if fresh {
+            self.browser_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            self.load_pr_browser(false, cx);
+        }
+        cx.notify();
+    }
+
+    fn close_pr_browser(&mut self, cx: &mut Context<Root>) {
+        self.browser_open = false;
+        self.browser_active = false;
+        // Dropping the controller drops its loaded pages; reopening reads
+        // afresh rather than showing an index that stopped being true while
+        // the page was closed.
+        self.browser = None;
+        cx.notify();
+    }
+
+    fn browser_repository_index(&self) -> Option<usize> {
+        let key = self.browser.as_ref()?.repository_key();
+        self.repositories
+            .iter()
+            .position(|runtime| runtime.repository.cache_key() == key)
+    }
+
+    fn browser_repository(&self) -> Option<Repository> {
+        let index = self.browser_repository_index()?;
+        Some(self.repositories[index].repository.clone())
+    }
+
+    /// Read one page of the index.
+    ///
+    /// This deliberately does not pass through `read_sync::GeneralReadController`.
+    /// That admission serializes the polled reads that keep the sidebar and the
+    /// open tabs fresh, and refusing a Load more press with `ReadDeferral::Busy`
+    /// behind a sidebar poll would make the control look broken. A page here is
+    /// explicit, bounded to one request, read-only, and only ever happens
+    /// because someone asked for it.
+    fn load_pr_browser(&mut self, append: bool, cx: &mut Context<Root>) {
+        let Some(repository) = self.browser_repository() else {
+            if let Some(browser) = self.browser.as_mut() {
+                browser.fail("This repository is no longer configured.".into());
+            }
+            cx.notify();
+            return;
+        };
+        let Some(browser) = self.browser.as_mut() else {
+            return;
+        };
+        if append && (!browser.has_more || browser.appending) {
+            return;
+        }
+        let token = browser.begin_read(append);
+        let state = token.state().query();
+        let page = token.page();
+        let request_repository = repository.clone();
+        let task = cx.background_spawn(async move {
+            GithubProvider::new(request_repository.account.clone())
+                .list_pull_request_summaries(&request_repository, state, page)
+                .map_err(|error| format!("{error:#}"))
+        });
+        cx.spawn(async move |root, cx| {
+            let result = task.await;
+            let _ = root.update(cx, |root, cx| {
+                let Root::Review(this) = root else { return };
+                let Some(browser) = this.browser.as_mut().filter(|it| it.accepts(&token)) else {
+                    return;
+                };
+                match result {
+                    Ok(page) => browser.install(page),
+                    Err(error) => browser.fail(format!("Pull requests unavailable: {error}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn set_pr_browser_state(&mut self, state: pr_browser::BrowseState, cx: &mut Context<Root>) {
+        let changed = self
+            .browser
+            .as_mut()
+            .is_some_and(|browser| browser.set_state(state));
+        if changed {
+            self.browser_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            self.load_pr_browser(false, cx);
+        }
+        cx.notify();
+    }
+
+    fn set_pr_browser_repository(&mut self, index: usize, cx: &mut Context<Root>) {
+        let Some(repository) = self
+            .repositories
+            .get(index)
+            .map(|runtime| runtime.repository.clone())
+        else {
+            return;
+        };
+        self.open_pr_browser(Some(repository), cx);
+    }
+
+    fn apply_pr_browser_filter(&mut self, cx: &mut Context<Root>) {
+        let filter = self.browser_filter_input.read(cx).value().to_string();
+        let changed = self
+            .browser
+            .as_mut()
+            .is_some_and(|browser| browser.set_filter(filter));
+        if changed {
+            self.browser_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            cx.notify();
+        }
+    }
+
+    /// The Pull requests index: one repository's pull requests, open and
+    /// closed, newest activity first. Clicking a row opens it as an ordinary
+    /// review tab whatever its state — a merged pull request reads exactly
+    /// like an open one, minus the write actions the provider refuses.
+    fn render_pr_browser(&self, colors: Palette, cx: &mut Context<Root>) -> impl IntoElement {
+        let Some(browser) = self.browser.as_ref() else {
+            return div().flex_1().into_any_element();
+        };
+        let visible = browser.visible_indices();
+        let repository_label = self
+            .browser_repository()
+            .map(|repository| repository.full_name())
+            .unwrap_or_else(|| "No repository".to_owned());
+        let states = pr_browser::BrowseState::ALL.map(|state| {
+            let selected = browser.state == state;
+            side_control(state.label(), selected, colors)
+                .id(SharedString::from(format!(
+                    "browse-state-{}",
+                    state.query()
+                )))
+                .debug_selector({
+                    let query = state.query();
+                    move || format!("browse-state-{query}")
+                })
+                .on_click(cx.listener(move |root, _, _, cx| {
+                    if let Root::Review(this) = root {
+                        this.set_pr_browser_state(state, cx);
+                    }
+                }))
+        });
+        let repositories = (self.repositories.len() > 1).then(|| {
+            self.repositories
+                .iter()
+                .enumerate()
+                .map(|(index, runtime)| {
+                    let selected = self
+                        .browser
+                        .as_ref()
+                        .is_some_and(|it| it.repository_key() == runtime.repository.cache_key());
+                    side_control(&runtime.repository.name, selected, colors)
+                        .id(SharedString::from(format!("browse-repository-{index}")))
+                        .on_click(cx.listener(move |root, _, _, cx| {
+                            if let Root::Review(this) = root {
+                                this.set_pr_browser_repository(index, cx);
+                            }
+                        }))
+                })
+                .collect::<Vec<_>>()
+        });
+        let count = if browser.filter.trim().is_empty() {
+            format!(
+                "{} loaded{}",
+                browser.summaries.len(),
+                if browser.has_more { ", more available" } else { "" }
+            )
+        } else {
+            format!(
+                "{} of {} loaded match this filter",
+                visible.len(),
+                browser.summaries.len()
+            )
+        };
+        // Positions, not summaries: this list re-renders on every frame, and
+        // the row renderer looks each one up rather than carrying a copy.
+        let row_count = visible.len();
+        let rows = Rc::new(visible);
+        let root = cx.entity();
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(ui::PANEL_GUTTER))
+                    .pt(px(ui::GAP_GROUP))
+                    .pb(px(ui::GAP_FIELD))
+                    .flex()
+                    .flex_col()
+                    .gap(px(ui::GAP_FIELD))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(ui::GAP_GROUP))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .ui_text(TextRole::Title)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("Pull requests"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .ui_text(TextRole::Caption)
+                                    .text_color(colors.faint)
+                                    .child(repository_label),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(240.))
+                                    .h(px(ui::CONTROL_HEIGHT))
+                                    .px(px(ui::CELL_INSET))
+                                    .rounded(px(ui::CONTROL_RADIUS))
+                                    .bg(colors.selected)
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .child(Input::new(&self.browser_filter_input)),
+                            ),
+                    )
+                    .when_some(repositories, |header, repositories| {
+                        header.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(ui::GAP_ICON))
+                                .children(repositories),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(ui::GAP_ICON))
+                            .children(states)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_right()
+                                    .ui_text(TextRole::Caption)
+                                    .text_color(colors.faint)
+                                    .debug_selector(|| "browse-count".to_owned())
+                                    .child(count),
+                            ),
+                    )
+                    .when_some(browser.load.notice(), |header, notice| {
+                        header.child(
+                            div()
+                                .ui_text(TextRole::Caption)
+                                .text_color(if matches!(browser.load, LoadState::Error(_)) {
+                                    colors.amber
+                                } else {
+                                    colors.muted
+                                })
+                                .child(notice),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .when(row_count == 0, |list| {
+                        list.child(
+                            div()
+                                .px(px(ui::PANEL_GUTTER))
+                                .py_5()
+                                .ui_text(TextRole::Caption)
+                                .text_color(colors.muted)
+                                .child(if matches!(browser.load, LoadState::Loading(_)) {
+                                    "Loading…"
+                                } else if browser.summaries.is_empty() {
+                                    "No pull requests in this state."
+                                } else {
+                                    "Nothing loaded matches this filter."
+                                }),
+                        )
+                    })
+                    .when(row_count > 0, |list| {
+                        let rows = rows.clone();
+                        list.child(
+                            uniform_list(
+                                "browse-scroll",
+                                row_count,
+                                move |range: Range<usize>, _, cx| {
+                                    let rows = rows.clone();
+                                    let root = root.clone();
+                                    root.read_with(cx, |workspace, _| {
+                                        let Root::Review(this) = workspace else {
+                                            return Vec::new();
+                                        };
+                                        range
+                                            .map(|row| {
+                                                this.render_browse_row(
+                                                    rows.get(row).copied(),
+                                                    colors,
+                                                    root.clone(),
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                },
+                            )
+                            .track_scroll(&self.browser_scroll)
+                            .h_full()
+                            .w_full(),
+                        )
+                        .child(
+                            div().absolute().inset_0().child(
+                                Scrollbar::vertical(&self.browser_scroll)
+                                    .id("browse-scrollbar")
+                                    .viewport_from_layout(),
+                            ),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(ui::DESKTOP_HIT))
+                    .px(px(ui::PANEL_GUTTER))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .child(if browser.appending {
+                        div()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.muted)
+                            .child("Loading…")
+                            .into_any_element()
+                    } else if browser.has_more {
+                        Button::new("browse-load-more")
+                            .debug_selector(|| "browse-load-more".to_owned())
+                            .control()
+                            .bg(colors.elevated)
+                            .border_1()
+                            .border_color(colors.border)
+                            .focus_ring(colors.accent, colors.selected)
+                            .cursor_pointer()
+                            .hover(|button| button.bg(colors.selected))
+                            .accessibility_label("Load more pull requests")
+                            .child("Load more")
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                if let Root::Review(this) = root {
+                                    this.load_pr_browser(true, cx);
+                                }
+                            }))
+                            .into_any_element()
+                    } else {
+                        div()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.faint)
+                            .child(if browser.summaries.is_empty() {
+                                ""
+                            } else {
+                                "End of list"
+                            })
+                            .into_any_element()
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// One index row: what the pull request is on the first line, and where it
+    /// came from on the second. Two lines rather than one because a closed pull
+    /// request is identified by its branches and its age as much as its title.
+    fn render_browse_row(
+        &self,
+        row: Option<usize>,
+        colors: Palette,
+        root: Entity<Root>,
+    ) -> AnyElement {
+        // A list can be asked to paint a row that a reply has since removed.
+        // Reserving its height keeps the list from jumping while it settles.
+        let Some(summary) = row
+            .and_then(|row| self.browser.as_ref()?.summary(row))
+            .filter(|_| self.browser_repository_index().is_some())
+        else {
+            return div().h(px(ui::TWO_LINE_ROW)).into_any_element();
+        };
+        let number = summary.number;
+        let repository_index = self.browser_repository_index();
+        let open = repository_index.is_some_and(|index| {
+            let key = self.repositories[index].repository.cache_key();
+            self.tabs.iter().any(|tab| {
+                tab.repository.cache_key() == key && tab.pull_request.number == number
+            })
+        });
+        let labels = summary
+            .labels
+            .iter()
+            .take(3)
+            .map(|label| {
+                div()
+                    .badge()
+                    .flex_none()
+                    .w_auto()
+                    .bg(colors.elevated)
+                    .text_color(colors.muted)
+                    .child(label.clone())
+            })
+            .collect::<Vec<_>>();
+        let age = iso8601_unix_ms(&summary.updated_at)
+            .map(|observed| format!("updated {}", collaboration_age_label(observed)))
+            .unwrap_or_else(|| "updated at an unreported time".to_owned());
+        div()
+            .w_full()
+            .h(px(ui::TWO_LINE_ROW))
+            .px(px(ui::PANEL_GUTTER))
+            .child(
+                Button::new(format!("browse-pr-{number}"))
+                    .debug_selector(move || format!("browse-pr-{number}"))
+                    .w_full()
+                    .min_w_0()
+                    .h(px(ui::TWO_LINE_ROW))
+                    .px(px(ui::CELL_INSET))
+                    .py_0()
+                    .rounded(px(ui::CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(rgba(0x00000000))
+                    .focus_ring(colors.accent, colors.selected)
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    // The control centres its children; a column of two text
+                    // lines has to start at the left edge like every other row.
+                    .items_start()
+                    .gap(px(1.))
+                    .cursor_pointer()
+                    .selected(open)
+                    .when(open, |row| row.bg(colors.selected))
+                    .hover(|row| row.bg(colors.selected))
+                    .accessibility_label(format!(
+                        "{} · #{number} · {} · by {} · {age}",
+                        summary.title, summary.state, summary.author
+                    ))
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(ui::GAP_ICON))
+                            .child(state_pill(&summary.state, summary.draft, colors))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .ui_text(TextRole::Body)
+                                    .text_color(colors.text)
+                                    .child(summary.title.clone()),
+                            )
+                            .children(labels),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.faint)
+                            .child(format!(
+                                "#{number} · {} · {} → {} · {age}",
+                                summary.author, summary.source_branch, summary.target_branch
+                            )),
+                    )
+                    .on_click(move |_, window, cx| {
+                        let Some(repository_index) = repository_index else {
+                            return;
+                        };
+                        root.update(cx, |root, cx| {
+                            if let Root::Review(this) = root {
+                                // Opening reads the full pull request by
+                                // number, so a merged or closed one arrives
+                                // exactly as an open one does.
+                                this.open_pr_in_window(repository_index, number, window, cx);
+                            }
+                        });
+                    }),
+            )
+            .into_any_element()
     }
 
     fn render_setup(&self, colors: Palette, cx: &mut Context<Root>) -> impl IntoElement {
@@ -29352,6 +30076,17 @@ impl ReviewWorkspace {
                             })),
                     )
                     .child(
+                        command_row("Browse all pull requests", "⇧⌘L", colors)
+                            .id("command-browse")
+                            .cursor_pointer()
+                            .hover(|row| row.bg(colors.selected))
+                            .on_click(cx.listener(|root, _, _, cx| {
+                                if let Root::Review(this) = root {
+                                    this.open_pr_browser(None, cx);
+                                }
+                            })),
+                    )
+                    .child(
                         command_row("Next changed file", "⌘]", colors)
                             .id("command-next")
                             .cursor_pointer()
@@ -29815,6 +30550,7 @@ fn sidebar_icon_button(id: &'static str, label: &str, icon: &str, colors: Palett
 fn sidebar_nav_button(id: String, label: &str, selected: bool, colors: Palette) -> Button {
     let icon = match id.as_str() {
         "open-pr-creation" => "edit",
+        "open-pr-browser" => "folder",
         "filter-review" => "review",
         "filter-mine" => "person",
         "filter-participating" => "conversation",
@@ -31038,6 +31774,53 @@ fn empty_unknown(value: &str) -> String {
     }
 }
 
+/// Convert a GitHub timestamp to Unix milliseconds so an index row can say how
+/// old a pull request is rather than printing a machine's date at the reader.
+///
+/// GitHub emits exactly `YYYY-MM-DDTHH:MM:SSZ` on these records, and there is
+/// no date crate in the dependency set, so this parses that one shape and
+/// refuses everything else rather than guessing. A refusal is reported as an
+/// unknown time, never as the epoch.
+fn iso8601_unix_ms(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return None;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' || bytes[19] != b'Z' {
+        return None;
+    }
+    let field = |range: std::ops::Range<usize>| value.get(range)?.parse::<u64>().ok();
+    let (year, month, day) = (field(0..4)?, field(5..7)?, field(8..10)?);
+    let (hour, minute, second) = (field(11..13)?, field(14..16)?, field(17..19)?);
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        // A leap second is a real value GitHub can emit.
+        || second > 60
+    {
+        return None;
+    }
+    let leap = |year: u64| {
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+    };
+    const MONTH_LENGTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut days = 0u64;
+    for past in 1970..year {
+        days += if leap(past) { 366 } else { 365 };
+    }
+    for past in 1..month {
+        days += MONTH_LENGTHS[past as usize - 1];
+        if past == 2 && leap(year) {
+            days += 1;
+        }
+    }
+    days += day - 1;
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    seconds.checked_mul(1_000)
+}
+
 fn collaboration_age_label(observed_at_unix_ms: u64) -> String {
     let now = now_unix_ms().unwrap_or(observed_at_unix_ms);
     let elapsed_seconds = now.saturating_sub(observed_at_unix_ms) / 1_000;
@@ -32229,7 +33012,7 @@ mod layout_tests {
         active_review_composer_body, active_review_composer_needs_save, activity_thread_visible,
         apply_submitted_draft_save_if_current, available_diff_width_for, bounded_log_render_range,
         bounded_page, collaboration_completion_matches, diff_content_width, display_columns,
-        file_confirmation_matches_visible_body, journal_operation_description,
+        file_confirmation_matches_visible_body, iso8601_unix_ms, journal_operation_description,
         journal_operation_summary, line_text_chunks, media_free_markdown, observe_auxiliary,
         pending_review_start_confirmation_matches_visible_body, resolved_panel_widths_for,
         review_subject_allows_actions, submitted_review_edit_action,
@@ -32278,6 +33061,38 @@ mod layout_tests {
     };
     #[cfg(feature = "ui-smoke")]
     use tempfile::tempdir;
+
+    #[test]
+    fn github_timestamps_convert_and_anything_else_is_reported_unknown() {
+        // Anchors checked against the Unix epoch day count, including a leap
+        // day and a date past February in a leap year.
+        for (timestamp, expected_ms) in [
+            ("1970-01-01T00:00:00Z", 0),
+            ("1970-01-01T00:00:01Z", 1_000),
+            ("2000-02-29T00:00:00Z", 951_782_400_000),
+            ("2000-03-01T00:00:00Z", 951_868_800_000),
+            ("2026-09-12T12:00:00Z", 1_789_214_400_000),
+        ] {
+            assert_eq!(iso8601_unix_ms(timestamp), Some(expected_ms), "{timestamp}");
+        }
+        // A leap second is a real value, and must not be refused.
+        assert!(iso8601_unix_ms("2016-12-31T23:59:60Z").is_some());
+        for rejected in [
+            "",
+            "2026-09-12",
+            "2026-09-12T12:00:00",
+            "2026-09-12T12:00:00+02:00",
+            "2026-09-12 12:00:00Z",
+            "1969-12-31T23:59:59Z",
+            "2026-13-01T00:00:00Z",
+            "2026-09-32T00:00:00Z",
+            "2026-09-12T24:00:00Z",
+            "2026-09-12T12:60:00Z",
+            "yyyy-mm-ddThh:mm:ssZ",
+        ] {
+            assert_eq!(iso8601_unix_ms(rejected), None, "accepted {rejected:?}");
+        }
+    }
 
     #[cfg(feature = "ui-smoke")]
     #[gpui::test]

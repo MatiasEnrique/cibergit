@@ -33,6 +33,7 @@ actions!(
         ToggleInspector,
         CycleDiffMode,
         OpenRepositorySetup,
+        OpenPullRequestBrowser,
         ComposeInlineComment,
         SaveReviewDraft,
         AddPendingComment,
@@ -197,6 +198,7 @@ fn main() {
             KeyBinding::new("cmd-shift-i", ToggleInspector, None),
             KeyBinding::new("cmd-shift-d", CycleDiffMode, None),
             KeyBinding::new("cmd-o", OpenRepositorySetup, None),
+            KeyBinding::new("cmd-shift-l", OpenPullRequestBrowser, None),
             KeyBinding::new("cmd-shift-n", OpenPullRequestCreation, None),
             KeyBinding::new("cmd-enter", PreparePullRequestCreation, Some("PrCreation")),
             KeyBinding::new(
