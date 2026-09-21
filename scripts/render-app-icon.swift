@@ -134,18 +134,21 @@ func render(size: Int, destination: URL) throws {
 
     let tile = NSBezierPath(roundedRect: NSRect(x: 90, y: 90, width: 844, height: 844),
         xRadius: 190, yRadius: 190)
+    // The tile is white, so the only thing separating it from a light Finder
+    // list or Dock is its shadow and the hairline below. A gradient would read
+    // as a tint at this size and there is nothing here to tint.
     NSGraphicsContext.saveGraphicsState()
     let shadow = NSShadow()
     shadow.shadowColor = color(0.10, 0.16, 0.19, 0.25)
     shadow.shadowBlurRadius = 28
     shadow.shadowOffset = NSSize(width: 0, height: -12)
     shadow.set()
-    color(0.93, 0.94, 0.95).setFill()
+    color(1, 1, 1).setFill()
     tile.fill()
     NSGraphicsContext.restoreGraphicsState()
-    NSGradient(starting: color(0.995, 0.995, 1), ending: color(0.87, 0.89, 0.91))!
-        .draw(in: tile, angle: -90)
-    color(1, 1, 1, 0.72).setStroke()
+    // A white tile on white has no edge of its own. This hairline is what keeps
+    // the rounded square a shape rather than a hole the mark floats in.
+    color(0.82, 0.84, 0.86).setStroke()
     tile.lineWidth = 3
     tile.stroke()
 

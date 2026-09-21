@@ -404,3 +404,27 @@ harness. Normal bundles omit that harness.
 This ad-hoc signature uses no signing identity or credentials. It does not provide
 Developer ID distribution signing, notarization, or validation on macOS 15. Those
 remain separate release gates.
+
+Install a built bundle to launch it from Spotlight and the Dock instead of a
+terminal. The packager refuses to overwrite, so replacing an install is an
+explicit delete:
+
+```sh
+./scripts/package-app.sh --release --output /tmp/cibergit-pkg/cibergit.app
+rm -rf /Applications/cibergit.app
+cp -R /tmp/cibergit-pkg/cibergit.app /Applications/cibergit.app
+```
+
+The icon comes from `assets/icons/cibergit.icns`. Regenerate it from the mark in
+`assets/icons/cibergit.svg` after changing either:
+
+```sh
+swift scripts/render-app-icon.swift /tmp/icon-out   # the directory must be new
+cp /tmp/icon-out/cibergit.icns /tmp/icon-out/cibergit.png assets/icons/
+```
+
+macOS 26 re-renders a bundle that ships only an `.icns`, so the flat mark
+appears embossed in the Dock and Finder. Presenting the artwork exactly as drawn
+needs an asset catalog or an Icon Composer `.icon`, and both are built by tools
+that ship with the full Xcode rather than the Command Line Tools this build path
+requires.
