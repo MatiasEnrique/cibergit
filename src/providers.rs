@@ -2913,6 +2913,39 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
         .map_err(|_| anyhow::anyhow!("Invalid or incomplete GitHub JSON response"))
 }
 
+/// Absolute directories searched for a runtime tool after `PATH`.
+///
+/// A packaged app launched from Finder inherits launchd's `PATH`, which omits
+/// both Homebrew prefixes. `gh` normally installs into one of them, so a bare
+/// program name spawns from a terminal launch and fails from a GUI launch.
+const TOOL_DIRECTORIES: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+
+/// Whether this path is a file the current process may execute.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .is_ok_and(|data| data.is_file() && data.permissions().mode() & 0o111 != 0)
+}
+
+/// The first executable named `name` on `PATH`, else in `TOOL_DIRECTORIES`.
+///
+/// `name` is always a literal chosen here, never caller or response data, and
+/// the fallback list is fixed, so discovery cannot be steered by a remote. A
+/// tool that resolves nowhere keeps its bare name and fails at spawn as before.
+fn resolve_tool(name: &str) -> PathBuf {
+    resolve_tool_on_path(name, std::env::var_os("PATH").as_deref())
+}
+
+/// `resolve_tool` against an explicit search path, so a test can pin the
+/// launchd environment without mutating this process's own.
+fn resolve_tool_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> PathBuf {
+    std::env::split_paths(path.unwrap_or_default())
+        .chain(TOOL_DIRECTORIES.iter().map(PathBuf::from))
+        .map(|directory| directory.join(name))
+        .find(|candidate| is_executable_file(candidate))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
 #[derive(Clone)]
 struct Runner {
     gh: PathBuf,
@@ -2926,8 +2959,8 @@ struct Runner {
 impl Default for Runner {
     fn default() -> Self {
         Self {
-            gh: "gh".into(),
-            git: "git".into(),
+            gh: resolve_tool("gh"),
+            git: resolve_tool("git"),
             ssh: "/usr/bin/ssh".into(),
             curl: "/usr/bin/curl".into(),
             timeout: Duration::from_secs(30),
@@ -8088,6 +8121,54 @@ else:
             .is_err()
         );
         assert!(validate_sha("main").is_err());
+    }
+
+    #[test]
+    fn tools_resolve_outside_the_launchd_path() {
+        // A GUI launch inherits launchd's PATH, which carries neither Homebrew
+        // prefix. Every tool the provider spawns must still resolve under that
+        // PATH, or the app reaches GitHub from a terminal launch only.
+        let launchd = std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin");
+        for name in ["gh", "git"] {
+            let resolved = resolve_tool_on_path(name, Some(launchd));
+            assert!(
+                resolved.is_absolute() && is_executable_file(&resolved),
+                "{name} did not resolve to an executable under the launchd PATH"
+            );
+        }
+        let runner = Runner::default();
+        for tool in [&runner.ssh, &runner.curl] {
+            assert!(
+                is_executable_file(tool),
+                "{} is not executable",
+                tool.display()
+            );
+        }
+    }
+
+    #[test]
+    fn tool_resolution_prefers_the_search_path_over_the_fallbacks() {
+        let dir = TempDir::new().unwrap();
+        let shim = dir.path().join("gh");
+        fs::write(&shim, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            resolve_tool_on_path("gh", Some(dir.path().as_os_str())),
+            shim
+        );
+        // A name present nowhere keeps its bare form rather than inventing one.
+        assert_eq!(
+            resolve_tool_on_path("cibergit-absent-tool", Some(dir.path().as_os_str())),
+            PathBuf::from("cibergit-absent-tool")
+        );
+        // A non-executable file does not satisfy the search.
+        let plain = dir.path().join("cibergit-absent-tool");
+        fs::write(&plain, "").unwrap();
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            resolve_tool_on_path("cibergit-absent-tool", Some(dir.path().as_os_str())),
+            PathBuf::from("cibergit-absent-tool")
+        );
     }
 
     #[test]
