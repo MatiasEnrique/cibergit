@@ -232,12 +232,6 @@ const WINDOW_CONTROLS_INSET: f32 = 88.;
 // at the file tree's edge. The tree already carries its own right hairline, so
 // the two panes meet on that and the band rides over the seam.
 const SPLITTER_WIDTH: f32 = 8.;
-// The conversation's metadata rail, sized like GitHub's: wide enough for a
-// login and a label chip, narrow enough to leave the discussion the page.
-const CONVERSATION_RAIL_WIDTH: f32 = 256.;
-// Below this the rail would be taking the discussion's width rather than its
-// own, so the conversation drops back to a single column.
-const CONVERSATION_RAIL_MIN_PAGE: f32 = 760.;
 const MIN_SPLIT_DIFF_WIDTH: f32 = 560.;
 const PANEL_KEYBOARD_STEP: f32 = 16.;
 // Menlo at the diff's 12px text size advances about 7.225px per ASCII cell on
@@ -20144,7 +20138,28 @@ impl ReviewWorkspace {
 
     /// Fold or unfold one file, and leave the cursor on the header that did it
     /// so the keyboard keeps its place rather than jumping to the top.
+    ///
+    /// An unread header has no body rows to hide: the useful first click is to
+    /// select and load that file. Folding only starts once a patch is present.
     fn toggle_diff_file(&mut self, key: &str, _window: &mut Window, cx: &mut Context<Root>) {
+        if let Some(index) = self.active_tab
+            && !self.history_active
+            && !self.tabs[index].stack.visible
+            && self.tabs[index]
+                .session
+                .as_ref()
+                .and_then(|session| {
+                    session
+                        .comparison()
+                        .files
+                        .iter()
+                        .find(|file| file_key(file) == key)
+                })
+                .is_some_and(|file| file.patch.is_none())
+        {
+            self.select_file(key, self.wide, cx);
+            return;
+        }
         let Some(diff) = self.active_diff_mut() else {
             return;
         };
@@ -24226,7 +24241,7 @@ impl ReviewWorkspace {
             ),
             (
                 "pr-tab-files",
-                "Files changed",
+                "Changes",
                 Some(
                     tab.session
                         .as_ref()
@@ -25894,6 +25909,20 @@ impl ReviewWorkspace {
         let focus = self.file_tree_focus.clone();
         let click_focus = focus.clone();
         let (_, tree_width, _) = self.resolved_panel_widths(window);
+        // Viewed marks are read once per paint, not once per visible row. The
+        // list closure only indexes into this map; rebuilding it from the
+        // session on every row was the slow path on large comparisons.
+        let viewed: Rc<HashMap<String, bool>> = Rc::new(
+            tab.session
+                .as_ref()
+                .map(|session| {
+                    rows.iter()
+                        .filter_map(|row| row.file_key())
+                        .map(|key| (key.to_owned(), session.is_viewed(key)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
         if self.panel_layout.file_tree_collapsed {
             return div()
                 .w(px(tree_width))
@@ -25978,23 +26007,9 @@ impl ReviewWorkspace {
                         uniform_list(
                             SharedString::from(format!("changed-file-tree-{index}")),
                             count,
-                            move |range: Range<usize>, _, cx| {
-                                let viewed = root.read_with(cx, |root, _| {
-                                    let this = &root.review;
-                                    let session =
-                                        this.tabs.get(index).and_then(|tab| tab.session.as_ref());
-                                    range
-                                        .clone()
-                                        .filter_map(|row| rows[row].file_key())
-                                        .map(|key| {
-                                            (
-                                                key.to_owned(),
-                                                session
-                                                    .is_some_and(|session| session.is_viewed(key)),
-                                            )
-                                        })
-                                        .collect::<HashMap<_, _>>()
-                                });
+                            {
+                                let viewed = viewed.clone();
+                                move |range: Range<usize>, _, _| {
                                 range
                                     .map(|row_index| {
                                         let row = rows[row_index].clone();
@@ -26215,7 +26230,7 @@ impl ReviewWorkspace {
                                         item
                                     })
                                     .collect::<Vec<_>>()
-                            },
+                            }},
                         )
                         .track_scroll(&scroll)
                         .w_full()
@@ -26238,6 +26253,32 @@ impl ReviewWorkspace {
         cx: &mut Context<Root>,
     ) -> impl IntoElement {
         let tab = &self.tabs[index];
+        let streaming = tab.diff.streaming();
+        // In Stream the sticky chrome names the file at the top of the viewport
+        // and is the fold control that stays reachable after its in-list header
+        // has scrolled away. File mode keeps the selected-path label.
+        let sticky = streaming
+            .then(|| tab.diff.leading_file())
+            .flatten()
+            .map(|span| {
+                (
+                    span.key.clone(),
+                    span.path.clone(),
+                    span.additions,
+                    span.deletions,
+                    tab.diff.collapsed.contains(&span.key),
+                    tab.session
+                        .as_ref()
+                        .and_then(|session| {
+                            session
+                                .comparison()
+                                .files
+                                .iter()
+                                .find(|file| file_key(file) == span.key)
+                        })
+                        .is_some_and(|file| file.patch.is_some()),
+                )
+            });
         let header = tab
             .session
             .as_ref()
@@ -26256,7 +26297,6 @@ impl ReviewWorkspace {
         let scroll = tab.diff.vertical.clone();
         let horizontal = tab.diff.horizontal.clone();
         let contexts = tab.diff.scroll_contexts();
-        let streaming = tab.diff.streaming();
         let cursor = tab.diff.cursor;
         let focus = self.diff_focus.clone();
         let root = cx.entity();
@@ -26296,58 +26336,165 @@ impl ReviewWorkspace {
                 .cloned(),
             _ => None,
         };
+        let chrome = if let Some((key, path, additions, deletions, collapsed, loaded)) = sticky {
+            let toggle_root = root.clone();
+            let toggle_key = key.clone();
+            let selector = format!("sticky-file-header-{}", sanitize_element_id(&key));
+            div()
+                .h(px(ui::DESKTOP_HIT))
+                .px(px(ui::PANEL_GUTTER))
+                .flex()
+                .items_center()
+                .gap(px(ui::GAP_GROUP))
+                .border_b_1()
+                .border_color(colors.border)
+                .bg(colors.elevated)
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "sticky-file-header-{}",
+                            sanitize_element_id(&key)
+                        )))
+                        .debug_selector(move || selector.clone())
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(ui::GAP_GROUP))
+                        .cursor_pointer()
+                        .hover(|header| header.bg(colors.selected))
+                        .aria_label(format!(
+                            "{path}, +{additions} \u{2212}{deletions}, {}",
+                            if collapsed { "collapsed" } else { "expanded" }
+                        ))
+                        .child(
+                            div()
+                                .w(px(12.))
+                                .flex_none()
+                                .text_color(colors.muted)
+                                .child(if collapsed { "\u{203a}" } else { "\u{2304}" }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(CODE_FONT)
+                                .ui_text(TextRole::Body)
+                                .font_weight(ui::WEIGHT_EMPHASIS)
+                                .text_color(colors.text)
+                                .child(path),
+                        )
+                        .when(loaded, |header| {
+                            header
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .ui_text(TextRole::Caption)
+                                        .text_color(colors.green)
+                                        .child(format!("+{additions}")),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .ui_text(TextRole::Caption)
+                                        .text_color(colors.red)
+                                        .child(format!("\u{2212}{deletions}")),
+                                )
+                        })
+                        .on_click(move |_, window, cx| {
+                            let key = toggle_key.clone();
+                            toggle_root.update(cx, |root, cx| {
+                                root.review.toggle_diff_file(&key, window, cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("toggle-diff-layout")
+                        .debug_selector(|| "toggle-diff-layout".into())
+                        .control()
+                        .flex_none()
+                        .border_1()
+                        .border_color(colors.border)
+                        .font_family(ui::TEXT_FONT)
+                        .accessibility_label(if split_mode {
+                            "Switch to unified diff"
+                        } else {
+                            "Switch to side-by-side diff"
+                        })
+                        .child(if split_mode {
+                            "Unified"
+                        } else {
+                            "Side by side"
+                        })
+                        .on_click(cx.listener(|root, _, _, cx| {
+                            let this = &mut root.review;
+                            this.toggle_diff_layout(cx);
+                        })),
+                )
+                .child(
+                    action_link_with_id("comment-on-file".into(), "Comment on file…", colors)
+                        .on_click(move |_, window, cx| {
+                            file_action_root.update(cx, |root, cx| {
+                                let this = &mut root.review;
+                                this.open_file_composer(window, cx);
+                            });
+                        }),
+                )
+        } else {
+            div()
+                .h(px(ui::DESKTOP_HIT))
+                .px(px(ui::PANEL_GUTTER))
+                .flex()
+                .items_center()
+                .justify_between()
+                .border_b_1()
+                .border_color(colors.border)
+                .font_family(CODE_FONT)
+                .ui_text(TextRole::Body)
+                .child(div().flex_1().min_w_0().truncate().child(header))
+                .child(
+                    Button::new("toggle-diff-layout")
+                        .debug_selector(|| "toggle-diff-layout".into())
+                        .control()
+                        .flex_none()
+                        .mr(px(ui::GAP_GROUP))
+                        .border_1()
+                        .border_color(colors.border)
+                        .font_family(ui::TEXT_FONT)
+                        .accessibility_label(if split_mode {
+                            "Switch to unified diff"
+                        } else {
+                            "Switch to side-by-side diff"
+                        })
+                        .child(if split_mode {
+                            "Unified"
+                        } else {
+                            "Side by side"
+                        })
+                        .on_click(cx.listener(|root, _, _, cx| {
+                            let this = &mut root.review;
+                            this.toggle_diff_layout(cx);
+                        })),
+                )
+                .child(
+                    action_link_with_id("comment-on-file".into(), "Comment on file…", colors)
+                        .on_click(move |_, window, cx| {
+                            file_action_root.update(cx, |root, cx| {
+                                let this = &mut root.review;
+                                this.open_file_composer(window, cx);
+                            });
+                        }),
+                )
+        };
         div()
             .flex_1()
             .min_w_0()
             .h_full()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .h(px(ui::DESKTOP_HIT))
-                    .px(px(ui::PANEL_GUTTER))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .font_family(CODE_FONT)
-                    .ui_text(TextRole::Body)
-                    .child(div().flex_1().min_w_0().truncate().child(header))
-                    .child(
-                        Button::new("toggle-diff-layout")
-                            .debug_selector(|| "toggle-diff-layout".into())
-                            .control()
-                            .flex_none()
-                            .mr(px(ui::GAP_GROUP))
-                            .border_1()
-                            .border_color(colors.border)
-                            .font_family(ui::TEXT_FONT)
-                            .accessibility_label(if split_mode {
-                                "Switch to unified diff"
-                            } else {
-                                "Switch to side-by-side diff"
-                            })
-                            .child(if split_mode {
-                                "Unified"
-                            } else {
-                                "Side by side"
-                            })
-                            .on_click(cx.listener(|root, _, _, cx| {
-                                let this = &mut root.review;
-                                this.toggle_diff_layout(cx);
-                            })),
-                    )
-                    .child(
-                        action_link_with_id("comment-on-file".into(), "Comment on file…", colors)
-                            .on_click(move |_, window, cx| {
-                                file_action_root.update(cx, |root, cx| {
-                                    let this = &mut root.review;
-                                    this.open_file_composer(window, cx);
-                                });
-                            }),
-                    ),
-            )
+            .child(chrome)
             .when_some(file_composer, |pane, composer_state| {
                 pane.child(render_file_composer(
                     &composer_state,
@@ -26533,10 +26680,11 @@ impl ReviewWorkspace {
         // would be a button that cannot do anything new.
         let mut actions = div()
             .flex()
-            .flex_col()
-            .gap(px(ui::GAP_FIELD))
-            .when(!lifecycle.editing_metadata, |column| {
-                column.child(rail_link("Edit details…", colors).on_click(cx.listener(
+            .flex_wrap()
+            .items_center()
+            .gap(px(ui::GAP_GROUP))
+            .when(!lifecycle.editing_metadata, |row| {
+                row.child(rail_link("Edit details…", colors).on_click(cx.listener(
                     |root, _, window, cx| {
                         let this = &mut root.review;
                         this.begin_metadata_edit(window, cx);
@@ -27566,6 +27714,7 @@ impl ReviewWorkspace {
                             )))
                         })
                         .child(self.render_lifecycle_overview(index, colors, cx))
+                        .child(self.render_conversation_controls(index, colors, cx))
                         .child(pr_reactions)
                         .into_any_element(),
                 ]
@@ -29687,208 +29836,102 @@ impl ReviewWorkspace {
     /// Only sections backed by a real read appear. GitHub also prints Projects,
     /// Milestone and Development headings with "None yet" under them; this app
     /// never asks for those, and an empty heading would read as an answer.
-    fn render_conversation_rail(
+    /// Pull-request actions and metadata deltas live in the conversation
+    /// column itself. A side rail stole width from the thread without giving
+    /// the discussion anything back; keeping the controls inline leaves the
+    /// page one reading column wide.
+    fn render_conversation_controls(
         &self,
         index: usize,
-        docked: bool,
         colors: Palette,
         cx: &mut Context<Root>,
-    ) -> impl IntoElement {
-        let actions = self.render_lifecycle_actions(index, colors, cx);
-        let (reviewer_delta, label_delta, assignee_delta) =
-            match self.render_lifecycle_deltas(index, colors, cx) {
-                Some((reviewers, labels, assignees)) => {
-                    (Some(reviewers), Some(labels), Some(assignees))
-                }
-                None => (None, None, None),
-            };
+    ) -> AnyElement {
         let tab = &self.tabs[index];
-        let cached = tab.details.is_none() && tab.cached_collaboration.is_some();
-        let details = tab.details.as_ref().or_else(|| {
-            tab.cached_collaboration
-                .as_ref()
-                .map(|observation| &observation.details)
-        });
-        let people = |names: &[String]| -> AnyElement {
-            if names.is_empty() {
-                return rail_empty("None yet", colors);
-            }
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(ui::GAP_FIELD))
-                .children(names.iter().map(|name| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(ui::GAP_FIELD))
-                        .child(sidebar_icon("person", colors.muted))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .font_weight(ui::WEIGHT_EMPHASIS)
-                                .child(name.to_owned()),
-                        )
-                }))
-                .into_any_element()
-        };
-        let reviewers = match details {
-            Some(details) => details.requested_reviewers.as_slice(),
-            None => tab.pull_request.reviewers.as_slice(),
-        };
-        let assignees = match details {
-            Some(details) => details.assignees.as_slice(),
-            None => tab.pull_request.assignees.as_slice(),
-        };
-        let labels = match details {
-            Some(details) => details.labels.as_slice(),
-            None => tab.pull_request.labels.as_slice(),
-        };
-        let participants = tab.pull_request.participants.as_slice();
-        let mut sections: Vec<(String, AnyElement)> = Vec::new();
-        let mut status = div()
+        let actions = self.render_lifecycle_actions(index, colors, cx);
+        let deltas = self.render_lifecycle_deltas(index, colors, cx);
+        div()
+            .id("pr-conversation-controls")
+            .debug_selector(|| "pr-conversation-controls".to_owned())
+            .w_full()
             .flex()
             .flex_col()
-            .gap(px(ui::GAP_FIELD))
-            .child(rail_row("Author", &tab.pull_request.author, colors))
+            .gap(px(ui::GAP_COLUMNS))
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
-                    .justify_between()
-                    .gap(px(ui::GAP_FIELD))
-                    .child(div().text_color(colors.muted).child("State"))
+                    .gap(px(ui::GAP_GROUP))
+                    .child(
+                        div()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.muted)
+                            .child(format!("Author · {}", tab.pull_request.author)),
+                    )
                     .child(state_pill(
                         &tab.pull_request.state,
                         tab.pull_request.draft,
                         colors,
-                    )),
+                    ))
+                    .when(
+                        !tab.pull_request.review_status.trim().is_empty(),
+                        |row| {
+                            row.child(
+                                div()
+                                    .ui_text(TextRole::Caption)
+                                    .text_color(colors.muted)
+                                    .child(format!(
+                                        "Review · {}",
+                                        empty_unknown(&tab.pull_request.review_status)
+                                    )),
+                            )
+                        },
+                    ),
             )
-            .child(rail_row(
-                "Review",
-                &empty_unknown(&tab.pull_request.review_status),
-                colors,
-            ));
-        if let Some(details) = details {
-            status = status.child(rail_row(
-                "Mergeable",
-                &details.merge_eligibility.mergeable,
-                colors,
-            ));
-            status = status.child(rail_row(
-                "Merge state",
-                &details.merge_eligibility.merge_state_status,
-                colors,
-            ));
-        }
-        sections.push((
-            if cached {
-                "Pull request (cached observation)".into()
-            } else {
-                "Pull request".into()
-            },
-            rail_body(status.into_any_element(), actions),
-        ));
-        sections.push((
-            "Reviewers".into(),
-            rail_body(people(reviewers), reviewer_delta),
-        ));
-        sections.push((
-            "Assignees".into(),
-            rail_body(people(assignees), assignee_delta),
-        ));
-        sections.push((
-            "Labels".into(),
-            rail_body(
-                if labels.is_empty() {
-                    rail_empty("None yet", colors)
-                } else {
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap(px(ui::GAP_ICON))
-                        .children(labels.iter().map(|name| label_chip(name, colors)))
-                        .into_any_element()
-                },
-                label_delta,
-            ),
-        ));
-        // The count is the count of identities this app actually observed, so
-        // it only claims to be the participant count when the read said so.
-        let participants_title = if tab.pull_request.participants_complete {
-            if participants.len() == 1 {
-                "1 participant".to_owned()
-            } else {
-                format!("{} participants", participants.len())
-            }
-        } else {
-            "Participants (partial)".to_owned()
-        };
-        sections.push((
-            participants_title,
-            div()
-                .child(if participants.is_empty() {
-                    rail_empty("None observed yet", colors)
-                } else {
-                    people(participants)
-                })
-                .when_some(
-                    tab.pull_request
-                        .participants_notice
-                        .clone()
-                        .filter(|_| !tab.pull_request.participants_complete),
-                    |section, notice| {
-                        section.child(
-                            div()
-                                .mt(px(ui::GAP_FIELD))
-                                .ui_text(TextRole::Caption)
-                                .text_color(colors.amber)
-                                .child(notice),
-                        )
-                    },
-                )
-                .into_any_element(),
-        ));
-        div()
-            .id("pr-conversation-rail")
-            .debug_selector(|| "pr-conversation-rail".to_owned())
-            // Docked under the discussion on a narrow page, the rail is the
-            // page: the actions it carries have no other entry point, so it
-            // widens rather than disappearing.
-            .map(|rail| {
-                if docked {
-                    rail.w_full()
-                } else {
-                    rail.w(px(CONVERSATION_RAIL_WIDTH))
-                }
-            })
-            .flex_none()
-            .flex()
-            .flex_col()
-            .children(
-                sections
-                    .into_iter()
-                    .enumerate()
-                    .map(|(position, (title, body))| {
+            .when_some(actions, |column, actions| column.child(actions))
+            .when_some(deltas, |column, (reviewers, labels, assignees)| {
+                column
+                    .child(
                         div()
-                            .py(px(ui::GAP_COLUMNS))
-                            .when(position == 0, |section| section.pt_0())
-                            .when(position > 0, |section| {
-                                section.border_t_1().border_color(colors.border)
-                            })
+                            .flex()
+                            .flex_col()
+                            .gap(px(ui::GAP_FIELD))
                             .child(
                                 div()
-                                    .mb(px(ui::GAP_FIELD))
                                     .ui_text(TextRole::Label)
                                     .text_color(colors.muted)
-                                    .child(title),
+                                    .child("Reviewers"),
                             )
-                            .child(body)
-                    }),
-            )
+                            .child(reviewers),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(ui::GAP_FIELD))
+                            .child(
+                                div()
+                                    .ui_text(TextRole::Label)
+                                    .text_color(colors.muted)
+                                    .child("Labels"),
+                            )
+                            .child(labels),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(ui::GAP_FIELD))
+                            .child(
+                                div()
+                                    .ui_text(TextRole::Label)
+                                    .text_color(colors.muted)
+                                    .child("Assignees"),
+                            )
+                            .child(assignees),
+                    )
+            })
+            .into_any_element()
     }
 
     fn render_inspector(
@@ -29901,22 +29944,11 @@ impl ReviewWorkspace {
         let tab = &self.tabs[index];
         let confirmation_open = tab.confirmation.is_some();
         let current = tab.inspector_section;
-        // Conversation runs denser than the other sections: it is a reading
-        // page, so the gutter it can afford to spend is the one between its two
-        // columns, not one around every card.
         let conversation = matches!(
             current,
             InspectorSection::Overview | InspectorSection::Activity
         );
-        let rail = conversation && self.available_diff_width(window) >= CONVERSATION_RAIL_MIN_PAGE;
-        let side_rail = rail.then(|| {
-            self.render_conversation_rail(index, false, colors, cx)
-                .into_any_element()
-        });
-        let docked_rail = (conversation && !rail).then(|| {
-            self.render_conversation_rail(index, true, colors, cx)
-                .into_any_element()
-        });
+        let _ = window;
         let content = if conversation {
             let mut content =
                 self.render_pr_section_content(index, InspectorSection::Overview, colors, cx);
@@ -29939,14 +29971,6 @@ impl ReviewWorkspace {
             .h_full()
             .flex()
             .flex_col()
-            // Freshness and completeness now ride in the tab row's notice
-            // icon; see `render_tab_notices`.
-            //
-            // A confirmation sits above the scrolling page rather than in it.
-            // Preparing a comment from the composer at the foot of a long
-            // conversation used to insert the card at the top of the same
-            // scroll, hundreds of pixels above the reader, so the click that
-            // asked for the confirmation looked like it had done nothing.
             .children(
                 [
                     self.render_confirmation(index, colors, cx),
@@ -29970,9 +29994,6 @@ impl ReviewWorkspace {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    // Every PR tab is the same page. Conversation used to pad
-                    // 12 while its three neighbours padded 20, so switching
-                    // tabs moved the content sideways.
                     .px(px(ui::PANEL_GUTTER))
                     .py(px(ui::PANEL_GUTTER))
                     .flex()
@@ -29985,24 +30006,12 @@ impl ReviewWorkspace {
                             panel.child(
                                 div()
                                     .w_full()
-                                    .max_w(px(1240.))
+                                    .max_w(px(860.))
                                     .mx_auto()
                                     .flex()
-                                    .items_start()
+                                    .flex_col()
                                     .gap(px(ui::GAP_PAGE))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(ui::GAP_PAGE))
-                                            .children(content)
-                                            .when_some(docked_rail, |column, rail| {
-                                                column.child(rail)
-                                            }),
-                                    )
-                                    .when_some(side_rail, |row, rail| row.child(rail)),
+                                    .children(content),
                             )
                         } else {
                             panel.children(content)
@@ -32795,59 +32804,6 @@ fn state_pill(state: &str, draft: bool, colors: Palette) -> Div {
         .child(label)
 }
 
-/// A rail line: muted name on the left, observed value on the right.
-fn rail_row(label: &str, value: &str, colors: Palette) -> Div {
-    div()
-        .flex()
-        .items_baseline()
-        .justify_between()
-        .gap(px(ui::GAP_FIELD))
-        .child(
-            div()
-                .flex_none()
-                .text_color(colors.muted)
-                .child(label.to_owned()),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .text_right()
-                .child(value.to_owned()),
-        )
-}
-
-/// A rail section: what the section reports, then the controls that change it.
-fn rail_body(list: AnyElement, controls: Option<AnyElement>) -> AnyElement {
-    div()
-        .child(list)
-        .when_some(controls, |body, controls| {
-            body.child(div().mt(px(ui::GAP_FIELD)).child(controls))
-        })
-        .into_any_element()
-}
-
-fn rail_empty(text: &str, colors: Palette) -> AnyElement {
-    div()
-        .text_color(colors.muted)
-        .child(text.to_owned())
-        .into_any_element()
-}
-
-fn label_chip(name: &str, colors: Palette) -> Div {
-    div()
-        .badge()
-        .flex_none()
-        .w_auto()
-        .rounded_full()
-        .bg(colors.elevated)
-        .border_1()
-        .border_color(colors.border)
-        .child(name.to_owned())
-}
-
 fn detail(label: &str, value: impl Into<String>, colors: Palette) -> Div {
     detail_element(label, value.into().into_any_element(), colors)
 }
@@ -35167,9 +35123,10 @@ fn file_header_row(
 ) -> AnyElement {
     let toggle_key = key.to_owned();
     let toggle_root = root.clone();
-    let selector = format!("file-header-{key}");
+    let element_id = sanitize_element_id(key);
+    let selector = format!("file-header-{element_id}");
     div()
-        .id(SharedString::from(format!("file-header-{key}")))
+        .id(SharedString::from(format!("file-header-{element_id}")))
         .debug_selector(move || selector.clone())
         .h(px(ui::DESKTOP_HIT))
         .w_full()
@@ -35237,6 +35194,14 @@ fn file_header_row(
             });
         })
         .into_any_element()
+}
+
+/// Element ids cannot carry NUL (raw `file_key`s do). Keep the toggle key as
+/// the real file key; only the painted identity is sanitized.
+fn sanitize_element_id(key: &str) -> String {
+    key.chars()
+        .map(|ch| if ch.is_control() { '-' } else { ch })
+        .collect()
 }
 
 /// The rows the hunk and thread jumps look for.
@@ -36229,9 +36194,9 @@ mod layout_tests {
         });
     }
 
-    /// Every control the conversation offers lives in its rail. A button that
-    /// drifted back into the discussion column would still be clickable, so
-    /// this measures where each one is painted rather than that it exists.
+    /// Pull-request controls live in the conversation column. Measuring them
+    /// against a side rail is gone: the page is one reading column, and every
+    /// action still has to paint with real area inside that column.
     #[cfg(feature = "ui-smoke")]
     #[gpui::test]
     fn conversation_rail_carries_the_pull_request_controls(cx: &mut gpui::TestAppContext) {
@@ -36324,9 +36289,13 @@ mod layout_tests {
         let conversation = cx.debug_bounds("pr-tab-conversation").unwrap();
         cx.simulate_click(conversation.center(), Modifiers::default());
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        let rail = cx
-            .debug_bounds("pr-conversation-rail")
-            .expect("the conversation must paint its rail");
+        let page = cx
+            .debug_bounds("pr-conversation-controls")
+            .expect("the conversation must paint its controls in the reading column");
+        assert!(
+            cx.debug_bounds("pr-conversation-rail").is_none(),
+            "the metadata side rail is gone; controls live in the reading column"
+        );
         for selector in [
             "action-Edit details…",
             "action-Close PR",
@@ -36344,39 +36313,23 @@ mod layout_tests {
                 "{selector} must have real painted area"
             );
             assert!(
-                control.origin.x >= rail.origin.x
-                    && control.origin.x + control.size.width
-                        <= rail.origin.x + rail.size.width + px(1.),
-                "{selector} is painted outside the rail column"
+                control.origin.y >= page.origin.y - px(1.)
+                    && control.origin.y + control.size.height
+                        <= page.origin.y + page.size.height + px(40.),
+                "{selector} is painted outside the conversation controls"
             );
         }
-        // A narrow page has no room for a column beside the discussion. The
-        // rail docks under it instead of disappearing, because these controls
-        // have no other entry point on this screen. `resize` only moves the
-        // platform window's bounds; without `bounds_changed` the layout keeps
-        // drawing at the old viewport and the narrow case is never exercised.
         cx.update(|window, cx| {
             window.resize(size(px(1040.), px(620.)));
             window.bounds_changed(cx);
             window.draw(cx).clear(cx);
         });
-        let docked = cx
-            .debug_bounds("pr-conversation-rail")
-            .expect("the rail must dock under the discussion rather than vanish");
-        assert!(
-            docked.size.width > px(super::CONVERSATION_RAIL_WIDTH),
-            "this window must be narrow enough to actually exercise the docked \
-             rail; at the side-column width the rest of this proves nothing"
-        );
         let control = cx
             .debug_bounds("action-Close PR")
-            .expect("the docked rail must still carry the pull request's actions");
+            .expect("narrowing the window must keep the pull request's actions");
         assert!(
-            control.origin.y > docked.origin.y - px(1.)
-                && control.origin.x >= docked.origin.x
-                && control.origin.x + control.size.width
-                    <= docked.origin.x + docked.size.width + px(1.),
-            "the docked rail must contain the controls it carries"
+            control.size.width > px(0.) && control.size.height > px(0.),
+            "the actions must still paint on a narrow page"
         );
     }
 
@@ -36504,7 +36457,7 @@ mod layout_tests {
                     "pr-header-row",
                     "pr-section-page",
                     "pr-content-scroll",
-                    "pr-conversation-rail",
+                    "pr-conversation-controls",
                     "action-Close PR",
                     "lifecycle-delta-Reviewers-Add USER rae",
                     "file-scroll",
@@ -36689,22 +36642,25 @@ mod layout_tests {
                 }
             }
             if id == "pr-tab-conversation" {
-                // The rail is the conversation's metadata column. It has to be
-                // painted beside the discussion and inside the scrolled page;
-                // a rail that wrapped under the discussion or ran off the right
-                // edge would still have bounds, so check where they are.
-                let rail = cx
-                    .debug_bounds("pr-conversation-rail")
-                    .expect("the conversation must paint its metadata rail");
+                // The conversation is one reading column. Controls sit in that
+                // column rather than a side rail, so the page must stay one
+                // stack and the controls must still paint.
+                let controls = cx
+                    .debug_bounds("pr-conversation-controls")
+                    .expect("the conversation must paint its controls");
                 assert!(
-                    rail.size.width >= px(super::CONVERSATION_RAIL_WIDTH)
-                        && rail.size.height > px(0.),
-                    "the rail must have real painted area, not a collapsed box"
+                    controls.size.width > px(0.) && controls.size.height > px(0.),
+                    "conversation controls must have real painted area"
                 );
                 assert!(
-                    rail.origin.x + rail.size.width <= page.origin.x + page.size.width
-                        && rail.origin.x > page.origin.x + page.size.width / 2.,
-                    "the rail belongs beside the discussion, on the right of the page"
+                    controls.origin.x >= page.origin.x
+                        && controls.origin.x + controls.size.width
+                            <= page.origin.x + page.size.width + px(1.),
+                    "conversation controls belong inside the reading column"
+                );
+                assert!(
+                    cx.debug_bounds("pr-conversation-rail").is_none(),
+                    "the metadata side rail must not return"
                 );
             }
             if id == "pr-tab-checks" {
@@ -43439,7 +43395,7 @@ mod layout_tests {
 
         let header = cx
             .debug_bounds(Box::leak(
-                format!("file-header-{first_key}").into_boxed_str(),
+                format!("file-header-{}", super::sanitize_element_id(&first_key)).into_boxed_str(),
             ))
             .expect("every streamed file paints a header");
         cx.simulate_click(header.center(), Modifiers::default());
@@ -43480,7 +43436,7 @@ mod layout_tests {
         // Clicking again opens it, and the scroll returns to its full length.
         let header = cx
             .debug_bounds(Box::leak(
-                format!("file-header-{first_key}").into_boxed_str(),
+                format!("file-header-{}", super::sanitize_element_id(&first_key)).into_boxed_str(),
             ))
             .expect("a folded file still shows its header");
         cx.simulate_click(header.center(), Modifiers::default());
