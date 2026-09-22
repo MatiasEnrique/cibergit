@@ -45,7 +45,10 @@ pub(crate) struct FileSpan {
 /// How far past the viewport the list builds rows. One screen of a long diff,
 /// which is what keeps a fast scroll from painting an empty band before the
 /// rows catch up.
-const DIFF_OVERDRAW: f32 = 480.;
+/// How far past the viewport the list keeps materialized. Too large and every
+/// scroll rebuilds a wall of rows the reader never sees; too small and empty
+/// bands flash while scrolling fast. 240pt is about eight dense rows of slack.
+const DIFF_OVERDRAW: f32 = 240.;
 
 /// One materialized row in either an interactive or read-only comparison.
 #[derive(Clone)]
