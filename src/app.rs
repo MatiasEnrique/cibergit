@@ -24479,9 +24479,16 @@ impl ReviewWorkspace {
                                         root.review.prepare_merge_confirmation(cx);
                                     })),
                             )
-                            .children(self.render_fold_all_control(colors, cx))
+                            // Fold-all lives on the diff chrome now, beside the
+                            // layout toggle — keeping it here crowded the Local
+                            // changes mark into the window edge.
                             .child(self.render_view_menu(index, colors, cx))
-                            .child(self.render_local_changes_control(index, colors, cx)),
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .mr(px(ui::GAP_ICON))
+                                    .child(self.render_local_changes_control(index, colors, cx)),
+                            ),
                     ),
             )
             .when(compare_inline, |view| {
@@ -25331,7 +25338,7 @@ impl ReviewWorkspace {
     /// with anything still open the thing you want is to fold, and only once
     /// everything is folded does opening mean anything. It renders only while
     /// streaming — folding is a property of a scroll with more than one file
-    /// in it.
+    /// in it. It sits on the diff chrome beside the layout toggle.
     fn render_fold_all_control(&self, colors: Palette, cx: &mut Context<Root>) -> Option<Button> {
         let diff = self.active_diff()?;
         if !diff.streaming() {
@@ -25339,31 +25346,76 @@ impl ReviewWorkspace {
         }
         let collapsed = diff.all_collapsed();
         Some(
-            Button::new("toggle-all-file-sections")
-                .debug_selector(|| "toggle-all-file-sections".to_owned())
-                .size(px(ui::CONTROL_HEIGHT))
-                .p_0()
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(ui::CONTROL_RADIUS))
-                .border_1()
-                .border_color(colors.border)
-                .cursor_pointer()
-                .text_color(colors.accent)
-                .hover(|button| button.bg(colors.selected))
-                .focus_ring(colors.accent, colors.selected)
-                .accessibility_label(if collapsed {
+            chrome_icon_button(
+                "toggle-all-file-sections",
+                if collapsed {
                     "Expand every file, \u{21e7}\u{2318}J"
                 } else {
                     "Collapse every file, \u{21e7}\u{2318}J"
-                })
-                .child(if collapsed { "\u{00bb}" } else { "\u{00ab}" })
-                .on_click(cx.listener(|root, _, _, cx| {
-                    root.review.toggle_all_diff_files(cx);
-                })),
+                },
+                div()
+                    .ui_text(TextRole::Body)
+                    .font_weight(ui::WEIGHT_EMPHASIS)
+                    .child(if collapsed { "\u{00bb}" } else { "\u{00ab}" })
+                    .into_any_element(),
+                colors,
+            )
+            .on_click(cx.listener(|root, _, _, cx| {
+                root.review.toggle_all_diff_files(cx);
+            })),
         )
+    }
+
+    /// Layout toggle and comment affordance for the diff chrome. Icon-only so
+    /// the sticky header stays a path and a fold control, not a toolbar of
+    /// labelled buttons.
+    fn render_diff_chrome_actions(
+        &self,
+        split_mode: bool,
+        colors: Palette,
+        file_action_root: Entity<Root>,
+        cx: &mut Context<Root>,
+    ) -> Div {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(ui::GAP_ICON))
+            .children(self.render_fold_all_control(colors, cx))
+            .child(
+                chrome_icon_button(
+                    "toggle-diff-layout",
+                    if split_mode {
+                        "Switch to unified diff"
+                    } else {
+                        "Switch to side-by-side diff"
+                    },
+                    sidebar_icon(
+                        if split_mode { "rows" } else { "columns" },
+                        colors.accent,
+                    )
+                    .into_any_element(),
+                    colors,
+                )
+                .on_click(cx.listener(|root, _, _, cx| {
+                    let this = &mut root.review;
+                    this.toggle_diff_layout(cx);
+                })),
+            )
+            .child(
+                chrome_icon_button(
+                    "comment-on-file",
+                    "Comment on file…",
+                    sidebar_icon("conversation", colors.accent).into_any_element(),
+                    colors,
+                )
+                .on_click(move |_, window, cx| {
+                    file_action_root.update(cx, |root, cx| {
+                        let this = &mut root.review;
+                        this.open_file_composer(window, cx);
+                    });
+                }),
+            )
     }
 
     /// How the diff is displayed, in one menu: the reading mode, the
@@ -26410,38 +26462,7 @@ impl ReviewWorkspace {
                             });
                         }),
                 )
-                .child(
-                    Button::new("toggle-diff-layout")
-                        .debug_selector(|| "toggle-diff-layout".into())
-                        .control()
-                        .flex_none()
-                        .border_1()
-                        .border_color(colors.border)
-                        .font_family(ui::TEXT_FONT)
-                        .accessibility_label(if split_mode {
-                            "Switch to unified diff"
-                        } else {
-                            "Switch to side-by-side diff"
-                        })
-                        .child(if split_mode {
-                            "Unified"
-                        } else {
-                            "Side by side"
-                        })
-                        .on_click(cx.listener(|root, _, _, cx| {
-                            let this = &mut root.review;
-                            this.toggle_diff_layout(cx);
-                        })),
-                )
-                .child(
-                    action_link_with_id("comment-on-file".into(), "Comment on file…", colors)
-                        .on_click(move |_, window, cx| {
-                            file_action_root.update(cx, |root, cx| {
-                                let this = &mut root.review;
-                                this.open_file_composer(window, cx);
-                            });
-                        }),
-                )
+                .child(self.render_diff_chrome_actions(split_mode, colors, file_action_root.clone(), cx))
         } else {
             div()
                 .h(px(ui::DESKTOP_HIT))
@@ -26454,39 +26475,7 @@ impl ReviewWorkspace {
                 .font_family(CODE_FONT)
                 .ui_text(TextRole::Body)
                 .child(div().flex_1().min_w_0().truncate().child(header))
-                .child(
-                    Button::new("toggle-diff-layout")
-                        .debug_selector(|| "toggle-diff-layout".into())
-                        .control()
-                        .flex_none()
-                        .mr(px(ui::GAP_GROUP))
-                        .border_1()
-                        .border_color(colors.border)
-                        .font_family(ui::TEXT_FONT)
-                        .accessibility_label(if split_mode {
-                            "Switch to unified diff"
-                        } else {
-                            "Switch to side-by-side diff"
-                        })
-                        .child(if split_mode {
-                            "Unified"
-                        } else {
-                            "Side by side"
-                        })
-                        .on_click(cx.listener(|root, _, _, cx| {
-                            let this = &mut root.review;
-                            this.toggle_diff_layout(cx);
-                        })),
-                )
-                .child(
-                    action_link_with_id("comment-on-file".into(), "Comment on file…", colors)
-                        .on_click(move |_, window, cx| {
-                            file_action_root.update(cx, |root, cx| {
-                                let this = &mut root.review;
-                                this.open_file_composer(window, cx);
-                            });
-                        }),
-                )
+                .child(self.render_diff_chrome_actions(split_mode, colors, file_action_root, cx))
         };
         div()
             .flex_1()
@@ -31833,6 +31822,35 @@ fn history_ref_chip(label: &RefLabel, colors: Palette) -> Div {
         .child(label.name.clone())
 }
 
+/// Square icon control for the diff chrome. Labelled buttons ate the path;
+/// these keep the same hit target as Local changes without a text caption.
+fn chrome_icon_button(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    icon: AnyElement,
+    colors: Palette,
+) -> Button {
+    let id: SharedString = id.into();
+    let selector = id.clone();
+    Button::new(id)
+        .debug_selector(move || selector.to_string())
+        .size(px(ui::CONTROL_HEIGHT))
+        .p_0()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(ui::CONTROL_RADIUS))
+        .border_1()
+        .border_color(colors.border)
+        .cursor_pointer()
+        .text_color(colors.accent)
+        .hover(|button| button.bg(colors.selected))
+        .focus_ring(colors.accent, colors.selected)
+        .accessibility_label(label)
+        .child(icon)
+}
+
 fn sidebar_icon(name: &str, color: Rgba) -> Svg {
     let shape = match name {
         "search" => "<circle cx='10.5' cy='10.5' r='6.5'/><path d='m16 16 4 4'/>",
@@ -31869,6 +31887,14 @@ fn sidebar_icon(name: &str, color: Rgba) -> Svg {
         "person" => "<circle cx='12' cy='7' r='4'/><path d='M4 21v-2a8 8 0 0 1 16 0v2'/>",
         "conversation" => {
             "<path d='M21 11a8 8 0 0 1-8 8H8l-5 3V6a3 3 0 0 1 3-3h7a8 8 0 0 1 8 8Z'/>"
+        }
+        // Two panes side by side: the explicit split layout.
+        "columns" => {
+            "<rect x='3' y='4' width='18' height='16' rx='2'/><path d='M12 4v16'/>"
+        }
+        // One column of lines: the unified layout.
+        "rows" => {
+            "<rect x='3' y='4' width='18' height='16' rx='2'/><path d='M7 9h10M7 12h10M7 15h7'/>"
         }
         // A branch leaving a trunk and rejoining it: the commit graph in one
         // glyph, and the shape this icon already had as the fallback.
