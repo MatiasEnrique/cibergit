@@ -24379,7 +24379,10 @@ impl ReviewWorkspace {
                 div()
                     .h(px(ui::DESKTOP_HIT))
                     .flex_none()
-                    .px(px(ui::PANEL_GUTTER))
+                    .pl(px(ui::PANEL_GUTTER))
+                    // Extra trailing room so the Local changes mark clears the
+                    // window edge instead of sitting on the hairline.
+                    .pr(px(ui::PANEL_GUTTER + ui::CONTROL_INSET))
                     .flex()
                     .child(
                         div()
