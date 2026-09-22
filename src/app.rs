@@ -26928,6 +26928,7 @@ impl ReviewWorkspace {
                     "Description",
                     &snapshot.body,
                     colors,
+                    None,
                 ))
             });
         }
@@ -27561,6 +27562,7 @@ impl ReviewWorkspace {
                                 "Description",
                                 &details.body,
                                 colors,
+                                None,
                             )))
                         })
                         .child(self.render_lifecycle_overview(index, colors, cx))
@@ -27570,6 +27572,24 @@ impl ReviewWorkspace {
             }
             InspectorSection::Activity => {
                 let avatars = self.claim_avatars(displayed_details, cx);
+                // A body long enough to have been cut into pieces reports each
+                // one's geometry under a key that names the conversation: the
+                // same card in a different pull request holds different prose.
+                // A position inside a card does not shift the way a position
+                // on the page does, so this prefix carries no row count.
+                let conversation = format!(
+                    "{}/{}#{} c{} r{}",
+                    tab.repository.full_name(),
+                    tab.repository.account.login,
+                    tab.pull_request.number,
+                    tab.issue_comment_page,
+                    tab.review_page,
+                );
+                let paging = Some(ProsePaging {
+                    window: &self.page_window,
+                    scroll: &self.inspector_scroll,
+                    conversation: &conversation,
+                });
                 let mut activity = Vec::new();
                 // Rows that hold a text cursor or a control mid-use are never
                 // stood in for while the rest of the page is windowed: a
@@ -28174,10 +28194,11 @@ impl ReviewWorkspace {
                                                 linked.comment.path
                                             ),
                                         })
-                                        .child(markdown_text(
+                                        .child(markdown_body(
                                             format!("pending-comment-{comment_id}"),
                                             &linked.comment.body,
                                             colors,
+                                            paging,
                                         ))
                                         .when(
                                             known_subject,
@@ -28446,6 +28467,7 @@ impl ReviewWorkspace {
                                 action: "commented",
                                 timestamp: &comment.created_at,
                                 body: &comment.body,
+                                paging,
                                 footer,
                             },
                             colors,
@@ -28994,6 +29016,7 @@ impl ReviewWorkspace {
                                 action: review_action_label(&review.state),
                                 timestamp: submitted_at,
                                 body: &review.body,
+                                paging,
                                 footer: card,
                             },
                             colors,
@@ -29118,17 +29141,15 @@ impl ReviewWorkspace {
                                         &comment.created_at,
                                         colors,
                                     ))
-                                    .child(
-                                        markdown_text(
-                                            format!(
-                                                "activity-thread-{}-{comment_position}",
-                                                thread.thread.coordinates.remote_id
-                                            ),
-                                            &comment.body,
-                                            colors,
-                                        )
-                                        .ui_text(TextRole::Body),
-                                    )
+                                    .child(markdown_body(
+                                        format!(
+                                            "activity-thread-{}-{comment_position}",
+                                            thread.thread.coordinates.remote_id
+                                        ),
+                                        &comment.body,
+                                        colors,
+                                        paging,
+                                    ))
                                     .child(render_reaction_row(
                                         reaction_subject(
                                             details,
@@ -32892,8 +32913,14 @@ fn compact_detail(label: &str, value: impl Into<String>, colors: Palette) -> Div
         .child(value.into())
 }
 
-fn markdown_detail(id: String, label: &str, body: &str, colors: Palette) -> Div {
-    layout::field(label, colors).child(markdown_text(id, body, colors).ui_text(TextRole::Body))
+fn markdown_detail(
+    id: String,
+    label: &str,
+    body: &str,
+    colors: Palette,
+    paging: Option<ProsePaging<'_>>,
+) -> Div {
+    layout::field(label, colors).child(markdown_body(id, body, colors, paging))
 }
 
 const AVATAR_SIZE: f32 = 28.;
@@ -32980,6 +33007,9 @@ struct ActivityEntry<'a> {
     /// accessible label.
     timestamp: &'a str,
     body: &'a str,
+    /// Where the prose reports the geometry of its pieces, so a review
+    /// thousands of lines long is laid out near the reader rather than whole.
+    paging: Option<ProsePaging<'a>>,
     /// Reactions and the entry's own actions, rendered under the prose inside
     /// the card.
     footer: Div,
@@ -33003,6 +33033,7 @@ fn activity_item(entry: ActivityEntry<'_>, colors: Palette) -> Div {
         action,
         timestamp,
         body,
+        paging,
         footer,
     } = entry;
     // A review that was never submitted has no instant at all, so the byline
@@ -33049,7 +33080,7 @@ fn activity_item(entry: ActivityEntry<'_>, colors: Palette) -> Div {
                 .min_w_0()
                 .child(byline)
                 .when(!body.trim().is_empty(), |comment| {
-                    comment.child(markdown_text(id, body, colors).ui_text(TextRole::Body))
+                    comment.child(markdown_body(id, body, colors, paging))
                 })
                 .child(footer),
         )
@@ -33131,6 +33162,11 @@ fn render_reaction_row(
         .flex_wrap()
         .gap(px(ui::GAP_ICON))
         .ui_text(TextRole::Caption);
+    // Every chip's click needs the subject to dispatch with, and every redraw
+    // of a conversation builds every chip of every comment on it. Eight deep
+    // copies of the subject per comment per frame is a lot of string copying
+    // for a click that happens once an hour, so the chips share one.
+    let subject = Rc::new(snapshot.clone());
     for content in ReactionContent::ALL {
         let group = snapshot
             .reactions
@@ -33167,7 +33203,7 @@ fn render_reaction_row(
             snapshot.subject.remote_id
         );
         let root = root.clone();
-        let snapshot = snapshot.clone();
+        let subject = Rc::clone(&subject);
         let chip = Button::new(id)
             .control()
             .border_1()
@@ -33190,7 +33226,7 @@ fn render_reaction_row(
             .on_click(move |_, _, cx| {
                 root.update(cx, |root, cx| {
                     let this = &mut root.review;
-                    this.dispatch_reaction(snapshot.clone(), content, intent, cx);
+                    this.dispatch_reaction(subject.as_ref().clone(), content, intent, cx);
                 });
             });
         row = row.child(chip);
@@ -33230,47 +33266,229 @@ const SANITIZED_MARKDOWN_BUDGET: usize = 8 * 1024 * 1024;
 #[derive(Default)]
 struct SanitizedMarkdown {
     bytes: usize,
-    bodies: HashMap<String, (String, SharedString)>,
+    bodies: HashMap<String, (String, Arc<[SharedString]>)>,
 }
 
-/// The media-free form of one rich-text body, reused between frames.
+/// The media-free form of one rich-text body, in the pieces it is laid out as,
+/// reused between frames.
 ///
 /// Every scroll wheel tick redraws the window, and a redraw rebuilds the whole
 /// conversation page. Sanitizing one body is cheap; sanitizing every comment
 /// and review on the page again for each of sixty frames a second is not, and
 /// an agent's review is tens of kilobytes of prose on its own. So each body is
 /// scanned once and kept until its source changes.
-fn sanitized_markdown(id: &str, source: &str) -> SharedString {
+fn markdown_pieces(id: &str, source: &str) -> Arc<[SharedString]> {
     thread_local! {
         static SANITIZED: std::cell::RefCell<SanitizedMarkdown> =
             std::cell::RefCell::new(SanitizedMarkdown::default());
     }
     SANITIZED.with_borrow_mut(|cache| {
-        if let Some((cached, sanitized)) = cache.bodies.get(id)
+        if let Some((cached, pieces)) = cache.bodies.get(id)
             && cached == source
         {
-            return sanitized.clone();
+            return pieces.clone();
         }
         if cache.bytes > SANITIZED_MARKDOWN_BUDGET {
             cache.bodies.clear();
             cache.bytes = 0;
         }
-        let sanitized = SharedString::from(media_free_markdown(source));
-        cache.bytes += source.len() + sanitized.len();
+        let pieces: Arc<[SharedString]> = split_markdown(&media_free_markdown(source)).into();
+        let weight =
+            |pieces: &[SharedString]| pieces.iter().map(|piece| piece.len()).sum::<usize>();
+        cache.bytes += source.len() + weight(&pieces);
         if let Some((replaced_source, replaced)) = cache
             .bodies
-            .insert(id.to_owned(), (source.to_owned(), sanitized.clone()))
+            .insert(id.to_owned(), (source.to_owned(), pieces.clone()))
         {
             cache.bytes = cache
                 .bytes
-                .saturating_sub(replaced_source.len() + replaced.len());
+                .saturating_sub(replaced_source.len() + weight(&replaced));
         }
-        sanitized
+        pieces
     })
 }
 
-fn markdown_text(id: String, source: &str, colors: Palette) -> TextView {
-    let sanitized = sanitized_markdown(&id, source);
+/// How many source lines one piece gathers before it ends at the next block
+/// boundary. Around a screen of prose: short enough that scrolling a review
+/// never lays out the whole of it, long enough that a body of ordinary length
+/// stays a single piece and is rendered by exactly the element it was before.
+const MARKDOWN_PIECE_LINES: usize = 40;
+
+/// How long a body has to be before it is cut at all.
+///
+/// Cutting is only ever a saving for a body taller than the window and its
+/// overdraw, because everything inside that band is laid out whatever it was
+/// cut into. Below the bound the pieces would all be built anyway, and each
+/// one would bring a box and a text element of its own; comfortably above it,
+/// most of a review sits outside the band and stands in as a spacer.
+const MARKDOWN_UNCUT_LINES: usize = 160;
+
+/// Cut sanitized prose into pieces that each render as a document in their own
+/// right.
+///
+/// A coding agent's review is thousands of lines in one comment. `page_window`
+/// windows the page a row at a time, which does nothing for a row taller than
+/// the window: the row is always near the reader, so every frame lays out all
+/// of it. Cutting the body lets the same windowing apply inside one comment.
+///
+/// A piece may only end where a new top-level block begins, so nothing that
+/// carries meaning across its lines is ever divided: not a fenced block, a
+/// table, a quote or an indented block, and not an ordered list, whose
+/// numbering would restart at the cut.
+fn split_markdown(sanitized: &str) -> Vec<SharedString> {
+    if sanitized.lines().count() < MARKDOWN_UNCUT_LINES {
+        return vec![piece(sanitized)];
+    }
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut offset = 0;
+    let mut lines = 0;
+    let mut fence: Option<(char, usize)> = None;
+    let mut previous_blank = true;
+    for segment in sanitized.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let marker = fence_marker(line.trim_start());
+        if let Some((character, length)) = fence {
+            if marker.is_some_and(|candidate| candidate.0 == character && candidate.1 >= length) {
+                fence = None;
+            }
+        } else {
+            if lines >= MARKDOWN_PIECE_LINES
+                && offset > start
+                && opens_top_level_block(line, previous_blank)
+            {
+                pieces.push(piece(&sanitized[start..offset]));
+                start = offset;
+                lines = 0;
+            }
+            fence = marker;
+        }
+        previous_blank = line.trim().is_empty();
+        offset += segment.len();
+        lines += 1;
+    }
+    let tail = piece(&sanitized[start..]);
+    if !tail.is_empty() || pieces.is_empty() {
+        pieces.push(tail);
+    }
+    pieces
+}
+
+fn piece(source: &str) -> SharedString {
+    SharedString::from(source.trim_end_matches('\n').to_owned())
+}
+
+/// Whether a line begins a block that reads the same wherever the piece holding
+/// it begins.
+fn opens_top_level_block(line: &str, previous_blank: bool) -> bool {
+    // An indented line, and a blank one, continue whatever stands above them.
+    if line.trim().is_empty() || line.starts_with(' ') || line.starts_with('\t') {
+        return false;
+    }
+    // A quote, a table row and raw markup all read as one block down however
+    // many lines they run for, and a cut would make two of them.
+    if line.starts_with('>') || line.starts_with('|') || line.starts_with('<') {
+        return false;
+    }
+    // One bullet begins a list as well as any other, so a long list may be cut
+    // between its items. A numbered list may not: the second half would count
+    // from one again.
+    if unordered_item(line) {
+        return true;
+    }
+    if ordered_item(line) {
+        return false;
+    }
+    previous_blank
+}
+
+fn unordered_item(line: &str) -> bool {
+    matches!(line.as_bytes(), [b'-' | b'*' | b'+', b' ', ..])
+}
+
+fn ordered_item(line: &str) -> bool {
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0
+        && matches!(
+            line.as_bytes().get(digits..digits + 2),
+            Some([b'.' | b')', b' '])
+        )
+}
+
+/// Where a body reports the geometry of its pieces, so a long one is laid out
+/// near the reader rather than whole. See `page_window`.
+#[derive(Clone, Copy)]
+struct ProsePaging<'a> {
+    window: &'a page_window::PageWindow,
+    scroll: &'a ScrollHandle,
+    /// Names the conversation these keys belong to: the same card in a
+    /// different pull request holds different prose, and a height remembered
+    /// for one would be wrong for the other.
+    conversation: &'a str,
+}
+
+/// One rich-text body, laid out in windowed pieces where it is long enough to
+/// have been cut into any.
+///
+/// A body of ordinary length is a single piece and is rendered by the bare text
+/// element, the way it was before long ones were cut: a column around it would
+/// be a second box for taffy to measure the prose inside, and prose is what
+/// measuring costs.
+fn markdown_body(
+    id: String,
+    source: &str,
+    colors: Palette,
+    paging: Option<ProsePaging<'_>>,
+) -> AnyElement {
+    let pieces = markdown_pieces(&id, source);
+    let text = |index: usize, piece: &SharedString| {
+        markdown_text(format!("{id}-piece-{index}"), piece.clone(), colors).ui_text(TextRole::Body)
+    };
+    let Some(paging) = paging.filter(|_| pieces.len() > 1) else {
+        if let [only] = pieces.as_ref() {
+            return text(0, only).into_any_element();
+        }
+        return pieces
+            .iter()
+            .enumerate()
+            .fold(cut_column(), |column, (index, piece)| {
+                column.child(text(index, piece))
+            })
+            .into_any_element();
+    };
+    pieces
+        .iter()
+        .enumerate()
+        .fold(cut_column(), |column, (index, piece)| {
+            column.child(paging.window.row(
+                SharedString::from(format!("{}-{id}-piece-{index}", paging.conversation)),
+                paging.scroll,
+                div().w_full().min_w_0().child(text(index, piece)),
+            ))
+        })
+        .into_any_element()
+}
+
+/// The column a cut body is stacked in.
+///
+/// Rich text drops the space under its last block, so the block that ends a
+/// piece would sit hard against the one that begins the next. The column gives
+/// that space back, and gives it to a piece standing in as a spacer too, so a
+/// seam reads the same however much of the body is built.
+fn cut_column() -> Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(MARKDOWN_PARAGRAPH_GAP)
+}
+
+/// The space rich text leaves between two blocks, which is `TextViewStyle`'s
+/// own default and is not overridden in `markdown_text`.
+const MARKDOWN_PARAGRAPH_GAP: Rems = rems(1.);
+
+fn markdown_text(id: String, sanitized: SharedString, colors: Palette) -> TextView {
     TextView::markdown(SharedString::from(id), sanitized)
         .style(
             TextViewStyle::default()
@@ -34469,10 +34687,11 @@ fn render_inline_thread(
                                 .to_owned(),
                         ),
                 )
-                .child(markdown_text(
+                .child(markdown_body(
                     format!("inline-thread-{remote_id}-{position}"),
                     &comment.body,
                     colors,
+                    None,
                 ))
                 .child(render_reaction_row(
                     reactions.iter().find(|candidate| {
@@ -37042,6 +37261,79 @@ mod layout_tests {
             rebuilt <= 5,
             "a redraw built {rebuilt} of the conversation's {rows} rows; only \
              the handful within the viewport and its overdraw should be built"
+        );
+    }
+
+    /// Windowing the page a row at a time does nothing for a row taller than
+    /// the window: a coding agent's review is one comment thousands of lines
+    /// long, it is always near the reader, and every redraw used to lay out the
+    /// whole of it. Its prose is cut into pieces so the same windowing applies
+    /// inside the one comment.
+    #[cfg(feature = "ui-smoke")]
+    #[gpui::test]
+    fn a_redrawn_review_builds_only_the_pieces_near_the_reader(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let data = tempdir().unwrap();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::review(
+                window,
+                cx,
+                Startup {
+                    data_dir: Some(data.path().to_owned()),
+                    provider_reads_disabled: true,
+                    ..Default::default()
+                },
+            )
+        });
+        // One comment many screens long, the shape a review by a coding agent
+        // arrives in.
+        let body = "A paragraph of remark.\n\n".repeat(400);
+        let pieces = super::split_markdown(&body).len();
+        assert!(
+            pieces >= 10,
+            "the fixture must be cut into pieces: {pieces}"
+        );
+        cx.update(|window, cx| {
+            window.resize(size(px(1440.), px(620.)));
+            window.bounds_changed(cx);
+            root.update(cx, |root, cx| {
+                let this = &mut root.review;
+                this.install_pr_layout_fixture(window, cx);
+                let template = this.tabs[0].details.as_ref().unwrap().issue_comments[0].clone();
+                let details = this.tabs[0].details.as_mut().unwrap();
+                details.issue_comments.clear();
+                let mut comment = template;
+                comment.coordinates.remote_id = "COMMENT_review".to_owned();
+                comment.body = body;
+                details.issue_comments.push(comment);
+                this.tabs[0].inspector_section = InspectorSection::Overview;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let (measured, page_height) = root.update(cx, |root, _| {
+            (
+                root.review.page_window.built_rows(),
+                root.review.inspector_scroll.max_offset().y,
+            )
+        });
+        assert!(
+            page_height > px(620.) + px(900.),
+            "the review must be longer than the viewport and the band around \
+             it for any piece of it to be far enough away to stand in: \
+             {page_height:?}"
+        );
+        cx.update(|window, cx| {
+            root.update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear(cx);
+        });
+        let rebuilt = root.update(cx, |root, _| root.review.page_window.built_rows()) - measured;
+        // The card holding the review is one of these; the rest are the pieces
+        // of prose inside the viewport and the band around it.
+        assert!(
+            rebuilt < pieces / 2,
+            "a redraw built {rebuilt} of the review's {pieces} pieces; only \
+             those within the viewport and its band should be built"
         );
     }
 
@@ -42697,15 +42989,111 @@ mod layout_tests {
     /// would keep showing media a body had stopped declaring.
     #[test]
     fn a_changed_body_is_sanitized_again_rather_than_served_from_the_cache() {
-        let first = super::sanitized_markdown("comment-1", "![unsafe](https://example.test/a.png)");
-        assert!(first.contains("[Image omitted: unsafe]"));
-        let second = super::sanitized_markdown("comment-1", "Plain prose now.");
-        assert_eq!(second.as_ref(), "Plain prose now.");
+        let first = super::markdown_pieces("comment-1", "![unsafe](https://example.test/a.png)");
+        assert!(first[0].contains("[Image omitted: unsafe]"));
+        let second = super::markdown_pieces("comment-1", "Plain prose now.");
+        assert_eq!(second[0].as_ref(), "Plain prose now.");
         assert_eq!(
-            super::sanitized_markdown("comment-1", "Plain prose now."),
-            second,
+            super::markdown_pieces("comment-1", "Plain prose now.")[0],
+            second[0],
             "an unchanged body must come back identical"
         );
+    }
+
+    /// A body of ordinary length is rendered by one element, exactly as it was
+    /// before long ones were cut: cutting a short body only adds boxes.
+    #[test]
+    fn a_body_of_ordinary_length_is_left_whole() {
+        let body = "A paragraph.\n\n".repeat(20);
+        assert_eq!(super::split_markdown(&body).len(), 1);
+    }
+
+    /// The whole point of cutting: a review several screens long is laid out in
+    /// pieces, so scrolling it lays out only the pieces near the reader.
+    #[test]
+    fn a_review_several_screens_long_is_cut_into_pieces() {
+        let body = "A paragraph.\n\n".repeat(200);
+        let pieces = super::split_markdown(&body);
+        assert!(
+            pieces.len() > 1,
+            "a long body must be cut: {}",
+            pieces.len()
+        );
+        let lines = |source: &str| {
+            source
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pieces
+                .iter()
+                .flat_map(|piece| lines(piece))
+                .collect::<Vec<_>>(),
+            lines(&body),
+            "the pieces must say what the body said, in the order it said it"
+        );
+    }
+
+    /// A fence means nothing unless both of its ends are read together, so a
+    /// cut may not fall between them however long the block runs for.
+    #[test]
+    fn a_fenced_block_is_never_cut() {
+        let body = format!(
+            "{}```rust\n{}```\n\nAfter.\n",
+            "A paragraph.\n\n".repeat(180),
+            "let x = 1;\n".repeat(180)
+        );
+        for piece in super::split_markdown(&body) {
+            assert_eq!(
+                piece.matches("```").count() % 2,
+                0,
+                "a piece holds an unclosed fence: {piece}"
+            );
+        }
+    }
+
+    /// One bullet begins a list as well as any other, so a long list may be cut
+    /// between its items.
+    #[test]
+    fn a_long_bullet_list_is_cut_between_its_items() {
+        let body = "- an item\n".repeat(200);
+        assert!(super::split_markdown(&body).len() > 1);
+    }
+
+    /// A numbered list may not be cut: the piece after the cut would start its
+    /// count again from one.
+    #[test]
+    fn a_numbered_list_is_never_cut() {
+        let body = (1..=200).fold(String::new(), |mut body, number| {
+            body.push_str(&format!("{number}. an item\n"));
+            body
+        });
+        assert_eq!(super::split_markdown(&body).len(), 1);
+    }
+
+    /// A quote and a table each read as one block down however many lines they
+    /// run for, and a cut would make two of them.
+    #[test]
+    fn a_quote_and_a_table_are_never_cut() {
+        let quote = "> a quoted line\n".repeat(200);
+        assert_eq!(super::split_markdown(&quote).len(), 1);
+        let table = format!("| a | b |\n| - | - |\n{}", "| 1 | 2 |\n".repeat(200));
+        assert_eq!(super::split_markdown(&table).len(), 1);
+    }
+
+    /// An indented line continues the block above it, so a piece may not begin
+    /// with one.
+    #[test]
+    fn a_piece_never_begins_indented() {
+        let body = "A paragraph.\n\n    indented code\n\n".repeat(80);
+        for piece in super::split_markdown(&body) {
+            assert!(
+                !piece.starts_with(' ') && !piece.starts_with('\t'),
+                "a piece begins inside an indented block: {piece}"
+            );
+        }
     }
 
     #[test]
