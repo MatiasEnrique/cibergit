@@ -26,15 +26,11 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 smol = "2"
 sha2 = "0.10"
+gpui-component = { path = "vendor/gpui-component", version = "=0.6.1", features = ["tree-sitter", "tree-sitter-rust", "tree-sitter-javascript", "tree-sitter-typescript", "tree-sitter-tsx", "tree-sitter-python", "tree-sitter-go", "tree-sitter-bash", "tree-sitter-markdown", "tree-sitter-toml", "tree-sitter-yaml", "tree-sitter-html", "tree-sitter-css", "tree-sitter-swift", "tree-sitter-c", "tree-sitter-cpp", "tree-sitter-java", "tree-sitter-ruby", "tree-sitter-sql", "tree-sitter-diff"] }
+ropey = "2.0.0-beta.1"
 
 [dev-dependencies]
 tempfile = "3"
 
 [profile.dev]
 debug = 1
-
-# gpui-pre-macros 0.3.1 leaves its inspector helper ungated. Enable
-# assertions only in this host proc-macro crate so release compilation works;
-# application/runtime crates keep the standard optimized release profile.
-[profile.release.package.gpui-pre-macros]
-debug-assertions = true

@@ -30,6 +30,7 @@ mod layout;
 mod local_checkout;
 #[allow(dead_code)] // Public component surface also serves standalone native verification.
 mod local_workspace;
+mod markdown_highlight;
 mod notifications_view;
 mod open_with;
 mod page_window;
@@ -5448,7 +5449,7 @@ impl ReviewWorkspace {
         );
         tab.details = Some(serde_json::from_value(serde_json::json!({
             "number":203,
-            "body":"## A clearer place to review\n\nPull requests now have a dedicated space for the conversation, commits, checks, and changed files. Long descriptions stay readable instead of being squeezed into a narrow sidebar.\n\n### What changed\n\n- Keep discussion and review activity together.\n- Give the diff the full available width.\n- Resize navigation panels directly with the pointer.\n\n### Validation\n\nTested switching sections, retaining the selected file, and dragging both splitters. This preview uses synthetic data only.",
+            "body":"## A clearer place to review\n\nPull requests now have a dedicated space for the conversation, commits, checks, and changed files. Long descriptions stay readable instead of being squeezed into a narrow sidebar.\n\n### What changed\n\n- Keep discussion and review activity together.\n- Give the **diff** the full available width.\n- Resize navigation panels directly with the pointer.\n\n```rust\npub fn review() {\n    show_conversation();\n    show_checks();\n}\n```\n\n### Validation\n\nTested switching sections, retaining the selected file, and dragging both splitters. This preview uses synthetic data only.",
             "requested_reviewers":["alex"], "labels":["interface"], "assignees":[],
             "merge_eligibility":{"state":"OPEN","draft":false,"mergeable":"MERGEABLE","merge_state_status":"CLEAN","review_status":"REVIEW_REQUIRED","check_status":"SUCCESS","maintainer_can_modify":false,"can_rebase":false,"can_update_branch":false,"auto_merge_enabled":false,"in_merge_queue":false},
             "issue_comments":[{"coordinates":{"provider":"github","host":"github.com","owner":"acme","repository":"workspace","pull_request":203,"remote_id":"COMMENT_preview"},"author":"alex","body":"The description is much easier to read here. Keeping the selected file when switching tabs also makes reviewing simpler.","created_at":"2026-09-14T10:15:00Z","updated_at":"2026-09-14T10:15:00Z","url":"https://github.com/acme/workspace/pull/203"}],"reviews":[],"review_threads":[],"checks":[],"activity_complete":true,"checks_complete":true,"notice":null
@@ -33443,7 +33444,7 @@ fn markdown_body(
 ) -> AnyElement {
     let pieces = markdown_pieces(&id, source);
     let text = |index: usize, piece: &SharedString| {
-        markdown_text(format!("{id}-piece-{index}"), piece.clone(), colors).ui_text(TextRole::Body)
+        markdown_text(format!("{id}-piece-{index}"), piece.clone(), colors)
     };
     let Some(paging) = paging.filter(|_| pieces.len() > 1) else {
         if let [only] = pieces.as_ref() {
@@ -33490,28 +33491,32 @@ fn cut_column() -> Div {
 const MARKDOWN_PARAGRAPH_GAP: Rems = rems(1.);
 
 fn markdown_text(id: String, sanitized: SharedString, colors: Palette) -> TextView {
+    let dark = colors.dark;
     TextView::markdown(SharedString::from(id), sanitized)
         .style(
             TextViewStyle::default()
-                .with_foreground(colors.muted.into())
-                .with_muted_foreground(colors.faint.into())
+                // Body prose uses the reading colour. Muted washed every heading
+                // the same grey as captions, so titles never read as titles.
+                .with_foreground(colors.text.into())
+                .with_muted_foreground(colors.muted.into())
                 .with_link(colors.accent.into())
                 .with_code_background(colors.elevated.into())
                 .with_border(colors.border.into())
                 .with_heading_base_font_size(px(12.))
                 .with_heading_font_size(|level, base| match level {
                     1 => px(24.),
-                    2 => px(15.),
-                    3 => px(13.),
+                    2 => px(18.),
+                    3 => px(15.),
+                    4 => px(13.),
                     _ => base,
                 })
-                .with_dark(colors.dark),
+                .with_dark(dark),
         )
-        // gpui-base's inline flow measures each wrapped row from the inherited
-        // window line height. Own that metric here so a narrow panel cannot
-        // combine 12px body text and independently-sized headings on a 13px row.
-        .ui_text(TextRole::Body)
+        // Size and line height only — do not pin Body's Regular weight onto the
+        // TextView, or gpui-base's heading SemiBold/Bold cannot show through.
+        .text_size(px(12.))
         .line_height(px(18.))
+        .code_block_highlighter(move |block| markdown_highlight::highlight_code_block(block, dark))
         .selectable(true)
 }
 
