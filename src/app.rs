@@ -24483,12 +24483,7 @@ impl ReviewWorkspace {
                             // layout toggle — keeping it here crowded the Local
                             // changes mark into the window edge.
                             .child(self.render_view_menu(index, colors, cx))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .mr(px(ui::GAP_ICON))
-                                    .child(self.render_local_changes_control(index, colors, cx)),
-                            ),
+                            .child(self.render_local_changes_control(index, colors, cx)),
                     ),
             )
             .when(compare_inline, |view| {
@@ -25251,8 +25246,11 @@ impl ReviewWorkspace {
             .debug_selector(|| "edit-selected-file-locally".to_owned())
             // Square at the shared control height, so it sits on the same
             // baseline and the same right edge as the labelled buttons beside it.
+            // Trailing inset keeps the mark off the window border; the header's
+            // own gutter alone left it kissing the edge.
             .size(px(ui::CONTROL_HEIGHT))
             .p_0()
+            .mr(px(ui::CONTROL_INSET))
             .flex_none()
             .flex()
             .items_center()
@@ -25381,7 +25379,6 @@ impl ReviewWorkspace {
             .flex()
             .items_center()
             .gap(px(ui::GAP_ICON))
-            .children(self.render_fold_all_control(colors, cx))
             .child(
                 chrome_icon_button(
                     "toggle-diff-layout",
@@ -25402,6 +25399,7 @@ impl ReviewWorkspace {
                     this.toggle_diff_layout(cx);
                 })),
             )
+            .children(self.render_fold_all_control(colors, cx))
             .child(
                 chrome_icon_button(
                     "comment-on-file",
