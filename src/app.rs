@@ -25367,9 +25367,9 @@ impl ReviewWorkspace {
         )
     }
 
-    /// Layout toggle and comment affordance for the diff chrome. Icon-only so
-    /// the sticky header stays a path and a fold control, not a toolbar of
-    /// labelled buttons.
+    /// Layout, fold-all, and comment — one icon cluster on the sticky chrome.
+    /// Fold sits between layout and comment so expand/collapse stays next to
+    /// the other file-header actions, not parked left of the path.
     fn render_diff_chrome_actions(
         &self,
         split_mode: bool,
@@ -25377,46 +25377,14 @@ impl ReviewWorkspace {
         file_action_root: Entity<Root>,
         cx: &mut Context<Root>,
     ) -> Div {
-        div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(ui::GAP_ICON))
-            .child(
-                chrome_icon_button(
-                    "toggle-diff-layout",
-                    if split_mode {
-                        "Switch to unified diff"
-                    } else {
-                        "Switch to side-by-side diff"
-                    },
-                    sidebar_icon(
-                        if split_mode { "rows" } else { "columns" },
-                        colors.accent,
-                    )
-                    .into_any_element(),
-                    colors,
-                )
-                .on_click(cx.listener(|root, _, _, cx| {
-                    let this = &mut root.review;
-                    this.toggle_diff_layout(cx);
-                })),
-            )
-            .children(self.render_fold_all_control(colors, cx))
-            .child(
-                chrome_icon_button(
-                    "comment-on-file",
-                    "Comment on file…",
-                    sidebar_icon("conversation", colors.accent).into_any_element(),
-                    colors,
-                )
-                .on_click(move |_, window, cx| {
-                    file_action_root.update(cx, |root, cx| {
-                        let this = &mut root.review;
-                        this.open_file_composer(window, cx);
-                    });
-                }),
-            )
+        diff_chrome_actions(
+            "toggle-diff-layout",
+            "comment-on-file",
+            split_mode,
+            self.render_fold_all_control(colors, cx),
+            colors,
+            file_action_root,
+        )
     }
 
     /// How the diff is displayed, in one menu: the reading mode, the
@@ -26393,6 +26361,9 @@ impl ReviewWorkspace {
             let toggle_root = root.clone();
             let toggle_key = key.clone();
             let selector = format!("sticky-file-header-{}", sanitize_element_id(&key));
+            // Path and stats on the left; layout / fold-all / comment stay a
+            // single icon cluster on the right — no left chevron competing
+            // with that group as the expand/collapse affordance.
             div()
                 .h(px(ui::DESKTOP_HIT))
                 .px(px(ui::PANEL_GUTTER))
@@ -26421,13 +26392,6 @@ impl ReviewWorkspace {
                             "{path}, +{additions} \u{2212}{deletions}, {}",
                             if collapsed { "collapsed" } else { "expanded" }
                         ))
-                        .child(
-                            div()
-                                .w(px(12.))
-                                .flex_none()
-                                .text_color(colors.muted)
-                                .child(if collapsed { "\u{203a}" } else { "\u{2304}" }),
-                        )
                         .child(
                             div()
                                 .flex_1()
@@ -31852,6 +31816,60 @@ fn chrome_icon_button(
         .child(icon)
 }
 
+/// Layout → fold → comment. Shared by the sticky chrome and each in-list file
+/// header so expand/collapse sits with the other icon actions, never alone on
+/// the left of the path.
+fn diff_chrome_actions(
+    layout_id: impl Into<SharedString>,
+    comment_id: impl Into<SharedString>,
+    split_mode: bool,
+    fold: Option<Button>,
+    colors: Palette,
+    file_action_root: Entity<Root>,
+) -> Div {
+    let layout_root = file_action_root.clone();
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(ui::GAP_ICON))
+        .child(
+            chrome_icon_button(
+                layout_id,
+                if split_mode {
+                    "Switch to unified diff"
+                } else {
+                    "Switch to side-by-side diff"
+                },
+                sidebar_icon(
+                    if split_mode { "rows" } else { "columns" },
+                    colors.accent,
+                )
+                .into_any_element(),
+                colors,
+            )
+            .on_click(move |_, _, cx| {
+                layout_root.update(cx, |root, cx| {
+                    root.review.toggle_diff_layout(cx);
+                });
+            }),
+        )
+        .children(fold)
+        .child(
+            chrome_icon_button(
+                comment_id,
+                "Comment on file…",
+                sidebar_icon("conversation", colors.accent).into_any_element(),
+                colors,
+            )
+            .on_click(move |_, window, cx| {
+                file_action_root.update(cx, |root, cx| {
+                    root.review.open_file_composer(window, cx);
+                });
+            }),
+        )
+}
+
 fn sidebar_icon(name: &str, color: Rgba) -> Svg {
     let shape = match name {
         "search" => "<circle cx='10.5' cy='10.5' r='6.5'/><path d='m16 16 4 4'/>",
@@ -34322,7 +34340,7 @@ fn render_read_only_diff_row(
             loaded,
             collapsed,
         } => file_header_row(
-            key, path, *additions, *deletions, *loaded, *collapsed, colors, root,
+            key, path, *additions, *deletions, *loaded, *collapsed, false, colors, root,
         ),
         DiffRow::Hunk(_) => render_diff_row(row, colors),
         DiffRow::Unified(line) => {
@@ -34412,7 +34430,7 @@ fn render_interactive_diff_row(
             loaded,
             collapsed,
         } => file_header_row(
-            key, path, *additions, *deletions, *loaded, *collapsed, colors, root,
+            key, path, *additions, *deletions, *loaded, *collapsed, split_mode, colors, root,
         ),
         DiffRow::Hunk(header) => render_diff_row(&DiffRow::Hunk(header.clone()), colors),
         DiffRow::Unified(line) => {
@@ -35145,13 +35163,36 @@ fn file_header_row(
     deletions: u64,
     loaded: bool,
     collapsed: bool,
+    split_mode: bool,
     colors: Palette,
     root: &Entity<Root>,
 ) -> AnyElement {
     let toggle_key = key.to_owned();
     let toggle_root = root.clone();
+    let fold_root = root.clone();
+    let fold_key = key.to_owned();
     let element_id = sanitize_element_id(key);
     let selector = format!("file-header-{element_id}");
+    let fold = chrome_icon_button(
+        format!("toggle-file-section-{element_id}"),
+        if collapsed {
+            "Expand file"
+        } else {
+            "Collapse file"
+        },
+        div()
+            .ui_text(TextRole::Body)
+            .font_weight(ui::WEIGHT_EMPHASIS)
+            .child(if collapsed { "\u{00bb}" } else { "\u{00ab}" })
+            .into_any_element(),
+        colors,
+    )
+    .on_click(move |_, window, cx| {
+        let key = fold_key.clone();
+        fold_root.update(cx, |root, cx| {
+            root.review.toggle_diff_file(&key, window, cx);
+        });
+    });
     div()
         .id(SharedString::from(format!("file-header-{element_id}")))
         .debug_selector(move || selector.clone())
@@ -35170,56 +35211,65 @@ fn file_header_row(
             "{path}, +{additions} \u{2212}{deletions}, {}",
             if collapsed { "collapsed" } else { "expanded" }
         ))
-        .child(
-            div()
-                .w(px(12.))
-                .flex_none()
-                .text_color(colors.muted)
-                .child(if collapsed { "\u{203a}" } else { "\u{2304}" }),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .font_family(CODE_FONT)
-                .ui_text(TextRole::Body)
-                .font_weight(ui::WEIGHT_EMPHASIS)
-                .text_color(colors.text)
-                .child(path.to_owned()),
-        )
-        .when(loaded, |header| {
-            header
-                .child(
-                    div()
-                        .flex_none()
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.green)
-                        .child(format!("+{additions}")),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .ui_text(TextRole::Caption)
-                        .text_color(colors.red)
-                        .child(format!("\u{2212}{deletions}")),
-                )
-        })
-        .when(!loaded, |header| {
-            header.child(
-                div()
-                    .flex_none()
-                    .ui_text(TextRole::Caption)
-                    .text_color(colors.faint)
-                    .child("not read yet"),
-            )
-        })
         .on_click(move |_, window, cx| {
             let key = toggle_key.clone();
             toggle_root.update(cx, |root, cx| {
                 root.review.toggle_diff_file(&key, window, cx);
             });
         })
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(ui::GAP_GROUP))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(CODE_FONT)
+                        .ui_text(TextRole::Body)
+                        .font_weight(ui::WEIGHT_EMPHASIS)
+                        .text_color(colors.text)
+                        .child(path.to_owned()),
+                )
+                .when(loaded, |header| {
+                    header
+                        .child(
+                            div()
+                                .flex_none()
+                                .ui_text(TextRole::Caption)
+                                .text_color(colors.green)
+                                .child(format!("+{additions}")),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .ui_text(TextRole::Caption)
+                                .text_color(colors.red)
+                                .child(format!("\u{2212}{deletions}")),
+                        )
+                })
+                .when(!loaded, |header| {
+                    header.child(
+                        div()
+                            .flex_none()
+                            .ui_text(TextRole::Caption)
+                            .text_color(colors.faint)
+                            .child("not read yet"),
+                    )
+                }),
+        )
+        .child(diff_chrome_actions(
+            format!("toggle-diff-layout-{element_id}"),
+            format!("comment-on-file-{element_id}"),
+            split_mode,
+            Some(fold),
+            colors,
+            root.clone(),
+        ))
         .into_any_element()
 }
 
